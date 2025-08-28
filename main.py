@@ -34,7 +34,8 @@ for itm in items:
     fe.title(itm['title'])
     fe.link(href=url)
 
-    res = requests.get(url,headers={'user-agent':'Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0'})
+    try: res = requests.get(url,headers={'user-agent':'Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0'})
+    except: pass
 
     if res.status_code!=200: print("Error processing URL: "+url)
     elif not isBinary(url,res.headers):
