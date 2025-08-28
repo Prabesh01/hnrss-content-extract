@@ -26,7 +26,7 @@ for itm in items:
     i+=1
     print(f"{i}/{total}")
 
-    url = "https://sci-hub.se/sci-hub-blocked-india" # itm['url']
+    url = itm['url']
     article=''
 
     fe = fg.add_entry()
