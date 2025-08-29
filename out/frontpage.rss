@@ -4,11 +4,433 @@
         <title>Hacker News: Front Page</title>
         <link>https://news.ycombinator.com/</link>
         <description>Hacker News RSS</description>
-        <lastBuildDate>Fri, 29 Aug 2025 11:28:25 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 29 Aug 2025 11:51:07 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>github.com/Prabesh01/hnrss-content-extract</generator>
         <language>en</language>
         <atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/frontpage.rss" rel="self" type="application/rss+xml"/>
+        <item>
+            <title><![CDATA[If you have a Claude account, they're going to train on your data moving forward]]></title>
+            <link>https://old.reddit.com/r/LocalLLaMA/comments/1n2ubjx/if_you_have_a_claude_personal_account_they_are/</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45062738</guid>
+        </item>
+        <item>
+            <title><![CDATA[Anthropic reverses privacy stance, will train on Claude chats]]></title>
+            <link>https://www.perplexity.ai/page/anthropic-reverses-privacy-sta-xH4KWU9nS3KH4Aj9F12dvQ</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45062683</guid>
+        </item>
+        <item>
+            <title><![CDATA[What the interns have wrought, 2025]]></title>
+            <link>https://blog.janestreet.com/wrought-2025/</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45062274</guid>
+            <description><![CDATA[Yet again, we’re at the end of our internship season, and so it’s time to summarize whatthe interns were up to!]]></description>
+            <content:encoded><![CDATA[
+            Yet again, we’re at the end of our internship season, and so it’s time to summarize what
+the interns were up to!
+
+This year, I was recommended a real bumper crop of exciting projects to include. It’s kind
+of crazy how many great intern projects are out there. To mention a few that I’m not
+going to have time to cover in detail:
+
+
+  Annie Hu spent a big chunk of her summer investigating, implementing, and optimizing
+different neural net sequence models, trying out a variety of compilation techniques and
+toolchains.
+  Aster Oransoy added build priorities to our build systems’ shared action execution
+service, so you can ensure low-priority builds don’t slow down high-priority ones.
+  Allen Pei wrote a quickcheck-like
+system for creating automated tests of trading systems by generating randomized
+sequences of market events, along with shrinking heuristics for creating minimal test
+cases.
+  Evan Thompson wrote an LSP for our inline CSS syntax extension which includes a CSS
+validator that found tons of instances of invalid CSS in our applications.
+  Zhibo Chen added a generic form of optional arguments to OCaml, so that it can use other
+types than the traditional OCaml option type (including more efficient
+representations) for optional values.
+  Conor Kennedy added predicate
+pushdown to our internal data
+warehouse system to do filtration before it gets to the full query engine, and even
+wrote a mini query planner for analyzing filter expressions to derive narrower key
+ranges.
+  Joe Cutler worked on using JIT-ing to make our
+HardCaml simulator fast enough to be
+competitive with Verilator, but with much better
+start-up times.
+
+
+And those are just the ones I felt like I could explain in a handful of words each!
+
+As usual, I picked just three projects to go into in more detail. In particular:
+
+
+  Leo Gagnon wrote a (sometimes dramatically) more efficient evaluator for JSQL, our
+internal SQL dialect that we use for lots of different user-facing tools.
+  Aryan Khatri built a new version of our OCaml torch
+bindings that leverage OxCaml’s new features for
+controlling memory management to build bindings that clean up tensors safely and
+deterministically.
+  Anthony Li wrote a library for managing memory across processes within our trading
+systems via ref-counting, making it possible to more efficiently and safely ship data
+across the process boundary.
+
+
+Let’s dive in!
+
+Faster (J)SQL evaluation
+
+We use a lot of SQL at Jane Street, both in standard Postgres (or similar) databases
+floating around, and for accessing our own homegrown analytics-oriented data warehouse
+software.
+
+Over time, we came to realize that SQL was sufficiently well-known internally that we
+wanted to use it beyond the context of databases, as a general language for filtering and
+transforming tabular data.  This could be useful in all sorts of contexts: web UIs, data
+visualization tools, trading-systems configuration tools, etc.
+
+The problem with this idea is… which version of SQL should you use?  Every database you
+look at has its own charmingly unique SQL dialect that’s almost but not quite the same as
+all the others.
+
+We decided to deal with this by (I
+know, I know) building our own dialect of SQL called JSQL.  We’ve
+built a bunch of tools for using JSQL, including parsers, translators to other SQL
+dialects, web-UI components, and a collection of different in-memory evaluators for
+computing the results of a JSQL expression without invoking a traditional database at all.
+
+Our evaluators started out very simple, doing little more than walking though a collection
+of rows and one-by-one evaluating whether they passed or failed a WHERE clause. Over time,
+we’ve built multiple evaluators with different performance properties, including
+incremental evaluators.
+
+That said, none of our evaluators were all that sophisticated, and in particular, none of
+them made use of indexing. Leo Gagnon’s project was to change that!
+
+The idea was that when presented with data that’s in an indexed container, like a Map.t
+or Hashtbl.t, to be able to use that indexing to more efficiently filter down to the
+data you need.  So, if you have a SELECT statement where the WHERE clause contains:
+
+author = "Dijkstra" AND publication_year > 1980
+
+
+
+and the underlying data is contained in, say, a Paper.t list String.Map.t (a map from author names to 
+lists of their papers), Leo’s evaluator would have to:
+
+
+  determine that we only care about things under the key "Dijkstra",
+  use an O(log n) Map.find to get the resulting Paper.t list,
+  use List.filter on the resulting much smaller list to select the papers with
+publication_year > 1980
+
+
+Which is way more efficient than walking over the entire map.
+
+Getting this done involved a bunch of steps!
+
+
+  
+    Building a selection type that represented the possible over-approximations of the
+range of keys that would be needed to satisfy a given query.
+  
+  
+    Writing code to extract and optimize the selection for a given query.
+  
+  
+    Writing code to specialize the execution of the selection to the backing store for
+the data.  For example, the selection type tracks when ranges of queries are in scope.
+The Map.t type supports efficient range queries, but the Hashtbl.t type doesn’t, so
+you need different execution strategies depending on which you use to store your data.
+  
+  
+    Supporting multi-index data-structures, like our Immutable_indexable_bag.  This
+involved building selection heuristics that help us pick the most efficient index to
+use.
+  
+
+
+And, of course, benchmarking.
+
+The results of that benchmarking were pretty promising.  We ran some sample queries over
+3.8 million rows of test data, comparing a linear scan over an array versus an
+index-optimized scan over a Map.t.
+
+This first query shows a ~700x speedup, since it lets us zoom in on just the MSFT trades,
+ignoring everything else.
+
+SELECT * WHERE und = "MSFT US" AND event_date > "2025-01-01"::date
++----------------------------------+--------------------+
+| aggregator_name                  | average_time       |
++----------------------------------+--------------------+
+| jsql-aggregations-eval           | 15.844514478s      |
+| jsql-indexed-aggregations-eval   | 21.939788ms        |
++----------------------------------+--------------------+
+
+
+
+This second query is more complicated, in that it requires us to do a scan over a range of
+values, but we still get a ~30x speedup here.
+
+SELECT * WHERE
+  (und = "MSFT US" OR (und >= "AAPL US" AND und < "AMZN US"))
+  AND event_date > "2025-01-01"::date
++--------------------------------+--------------------+
+| aggregator_name                | average_time       |
++--------------------------------+--------------------+
+| jsql-aggregations-eval         | 37.056874003s      |
+| jsql-indexed-aggregations-eval | 1.324532585s       |
++--------------------------------+--------------------+
+
+
+
+Despite this being a pretty algorithmic and performance-oriented project, a lot of the
+challenges turned out to be about API design, and getting all of this work done with a
+codebase that was simple and readable, and presented a convenient API to users.
+
+Better Torch bindings
+
+We use PyTorch a lot as part of our machine learning efforts, and as you might expect,
+most of that work is done in Python. But sometimes, we want to drive PyTorch from OCaml,
+which we do using ocamltorch, originally written by
+Laurent Mazare some years back.
+
+But OCaml is in some ways an awkward match for PyTorch, because OCaml manages memory using
+a tracing GC, in contrast to Python, which uses a refcounting GC.
+
+A lot of ink
+has
+been
+spilled on the
+tradeoffs between refcounting and tracing, but one clear difference is around the
+determinism of collection.  With a tracing GC, it’s hard to know when the memory you’ve
+allocated will be reclaimed. With refcounting, your object will be collected the moment
+you drop your last reference to it.
+
+This determinism comes in handy when you’re using your collector for managing things other
+than main memory, like precious GPU memory.  This is a plot of GPU memory usage over time
+doing one forward and backward pass on a batch, then some sampling, then 3 more batches,
+written naively with ocamltorch.
+
+
+
+This behavior is pretty awful! We’re holding on to tensors we just don’t need anymore,
+which is basically intolerable.
+
+You’d deal with this in ocamltorch by carefully calling Gc.full_major () after each
+batch and each token sampled, to force the GC to recognize that the memory is unused and
+reclaim it. That gives you the desired memory behavior:
+
+
+
+but it’s a poor solution, since the calls to the GC are expensive, and there’s no
+discipline to help you make sure you put them in the right place.
+
+Aryan’s project was to build a better API for ocamltorch that provided a safe and
+efficient discipline for managing tensor memory, leveraging some of the new features of
+OxCaml, a set of extensions to OCaml that have been developed at Jane
+Street.
+
+The basic idea is to introduce a way of marking a scope of allocation for a tensor, using
+this with_rc_scope function, where “rc” is short for “reference count”:
+
+val with_rc_scope : (unit -> 'a) @ local -> 'a
+
+
+
+The idea is that the body of the closure passed to this function acts as a scope, and that
+any tensors allocated within it will have their refcounts decremented when the function
+ends.
+
+To make this all work, we use OxCaml’s local
+mode to make sure that tensors can’t
+escape their scope.  In particular, any function that allocates a tensor will allocate it
+as a local value:
+
+val ( + ) : t @ local -> t @ local -> t @ local
+
+
+
+This prevents the allocated value from being returned from the closure passed to
+with_rc_scope.
+
+Here’s a worked example of how you might use this in practice.
+
+    let vs = Var_store.create ~name:"vs" () in
+    let opt = Optimizer.sgd vs ~learning_rate:1e-3 in
+    let model = Model.init vs in
+    for index = 1 to 100 do
+      Tensor.with_rc_scope (fun () ->
+        Optimizer.zero_grad opt;
+        let ys_ = Model.forward model xs in
+        let loss = Tensor.(mean (square (ys - ys_))) in
+        Tensor.backward loss;
+        Optimizer.step opt)
+    done;
+
+
+
+The full API is a bit more complicated than just that.  The system has support for nested
+scopes, which is needed to support many of the idioms that are used in practice for both
+training and inference workflows on GPUs.  As part of that, there is some special support
+for returning tensors from an inner scope to an outer scope in a controlled way that
+doesn’t violate the reference counting rules.
+
+The project itself involved a lot of experimentation at the API level, to design
+an API that was easy to use and understand and that also captured the memory-use patterns
+we run into in practice. The project also had an interesting performance-engineering
+aspect to it: removing all of the now-unnecessary GC invocations made it easier to understand
+and identify further inefficiencies (like unnecessary synchronizations between the CPU and
+GPU) that were harder to see amongst the performance mess created by the full_major
+invocations.
+
+We have more ideas about how to extend and improve these interfaces, but we already expect
+the new APIs to be quite useful in their current form.  This is part of our open-source
+code, so once the new code is released, you’ll be able to find it
+here.
+
+
+
+At Jane Street, we have lots of performance-sensitive trading systems that gather complex
+information over the course of their execution, and then periodically serialize pieces of
+that data over a shared-memory channel to another process.
+
+This is generally a pretty good approach, but it has its limitations.  Serialization
+always has a cost, but here it’s made worse by the fact that the data we want to send is
+complex nested data with shared structure between messages. As a result, serializing the
+data can involve serializing the same sub-structures over and over.
+
+Anthony Li’s project was to build a library supporting a very different – and much more
+efficient – approach.
+
+The idea is to get rid of the serialization and deserialization altogether, and to just
+pass pointers to the values in question instead. This requires that the space of objects
+in question is visible to both processes, so it means we need to allocate those objects
+within a shared memory segment.
+
+We already have support for managing pools of objects in a shared memory segment, so this
+sounds easy enough at first glance.  But the tricky bit is figuring out when you can
+recycle one of your pooled objects.
+
+We can’t rely on OCaml’s ordinary GC for this because the data resides in a shared-memory
+segment between two processes, each with their own GC.  And anyway, we don’t want to be
+churning the garbage collector in a latency-sensitive trading system.
+
+Instead, Anthony’s project was to use a tried-and-true technique for this: reference
+counting.
+
+Safer refcounting through modes
+
+Reference counting is tricky to integrate into a language like OCaml that doesn’t have it
+designed in from the start.  There are really three invariants you need to get right for
+this system to work:
+
+
+  There are no data-races on the refcounts or the objects themselves
+  Refcounts are incremented every time a new reference is created
+  Refcounts are decremented every time a reference is destroyed
+
+
+But how do we ensure that these rules are followed when they’re not natively enforced by
+the runtime?  This is a bit like the problem Aryan ran into with reference counting in
+PyTorch, and again, the solution is to leverage the system of modes to ensure the
+necessary invariants.
+
+We’ll need different modes at different times, so in order to manage this, we’re going to
+have a special handle object o Handle.t that guards access to the underlying object (of
+type o).  We can both use modes to protect the use of the handle itself, and the handle
+can release the object o with specific modal types under specific circumstances.
+
+That’s all a bit abstract, so let’s talk about the details:
+
+Eliminating data races
+
+There are really two data-race questions to handle here: one is about the refcounts, and
+the other is about the actual objects being managed.  For the refcounts, an atomic
+compare-and-set operation can be used to manage them in a safe way, so that’s pretty
+simple, and doesn’t require anything from the mode system.
+
+The mutability of the objects is more complicated, because the rules are different at
+different times.  The objects must be mutable on initialization, since they have to be
+filled in at that point.  But once you have multiple readers of the object, you really
+need them to not change.  It turns out we can leverage OxCaml’s
+visibility mode axis, which include
+immutable, read, and read_write modes.
+
+Specifically:
+
+
+  
+    During initialization, we expose the value under the read_write mode (which is the
+default), so the data in the object can be set.  Notably, at this point, we’re
+guaranteed there’s only one reference to the object in question.
+  
+  
+    When reading, we expose objects under the read mode.  This way, multiple readers (even
+across processes) can access the same object without fear of a race.
+  
+
+
+Notably, once an object’s reference count goes back to zero, it can again be the subject
+of an initialization, so it can again be exposed read_write.
+
+Another interesting aspect of this is that when we release the underlying values, we do so
+under the local mode, to prevent the value from escaping its intended scope. As such,
+what we’re implementing is analogous to borrow-checking in Rust.
+
+Managing increments and decrements
+
+The key invariant here is that people don’t just go about duplicating handles without
+incrementing the associated reference count.  To ensure this, each Handle.t is created
+under the unique mode, and all operations that use handles require that they be provided
+uniquely.
+
+This guarantees that all handles that are used are held uniquely, and so if you want to
+refer to the handle in multiple places, an explicit copy function must be called.  And,
+critically, that copy function increments the reference count.
+
+There’s also a free operation that consumes a handle and decrements the reference count.
+And a way of sending a handle to another process, at which point the sending handle is
+consumed, and a receiving handle is created, without changing the reference count.
+
+Anthony’s library is complete, and the team is now working it into our production systems.
+We hope that this will be a library that’s useful to multiple teams across the firm.
+
+Join us!
+
+If this sounds like a fun way to spend your summer, you should apply to our internship
+program.  Jane Street interns
+get a chance to solve fun and challenging problems that have real impact.  I hope this
+post gives you a sense of that!
+
+        Yaron Minsky joined Jane Street back in 2002, and claims the dubious honor
+of having convinced the firm to start using OCaml.
+]]></content:encoded>
+        </item>
+        <item>
+            <title><![CDATA[Probability of typing a wrong Bitcoin address]]></title>
+            <link>https://www.johndcook.com/blog/2025/08/28/wrong-address/</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45061980</guid>
+            <description><![CDATA[How likely is it that a mistyped Bitcoin address is a valid address? How likely is it that some address is a plausible typo of another?]]></description>
+            <content:encoded><![CDATA[
+		I heard someone say that Bitcoin is dangerous because you could easily make a typo when entering an address, sending money to the wrong person, and have no recourse. There are dangers associated with Bitcoin, such as losing a private key, but address typos are not a major concern.
+Checksums
+There are several kinds of Bitcoin addresses. Each is at least 20 bytes (160 bits) long, with at least 4 bytes (32 bits) of checksum. The chances of a typo resulting in a valid checksum are about 1 in 232.
+Used addresses
+Let’s ignore the checksum for this section.
+Because addresses are formed by cryptographic hash functions, we can assume the values are essentially randomly distributed in the space of possible addresses. The addresses are deterministic, but for modeling purposes, random is as random does.
+This means a typo of an actual address is no more or less likely to be another actual address than an address typed at random. This is unlike, say, English words: a mistyped English word is more likely to be another English word than random keystrokes would be.
+There have been on the order of a billion Bitcoin addresses used, in a space of 2160 possibilities. (Actually more since some addresses have more than 160 bits.) There’s about a 1 in 1039 chance that a random 160-bit sequence corresponds to an address somewhere on the Bitcoin blockchain.
+Addresses close in edit distance
+Someone with the Caesarean handle Veni Vidi Vici on X asked
+What about the odds that out of those 1B addresses, two of them are one character swap away from each other?
+That’s an interesting question. Let’s assume the addresses are Base58-encoded strings of length 26. Addresses could be longer, but assuming the minimum length increases the probability of addresses being close.
+How many addresses are within one or two character swaps of another? I addressed a similar question here a couple weeks ago. If all the characters were unique, the number of strings within k swaps of each other would be
+|S1(26, 26 − k)|
+where S1 denotes Stirling numbers of the first kind. For k = 1 this would be 325 and for k = 2 this would be 50,050. This assumes all the characters are unique; I haven’t thought through the case where characters are repeated.
+For round numbers, let’s say there are a billion addresses, and for each address there are a million other addresses that are close in some sense, plausible typos of the address. That would be 1012 addresses and typos, spread out in a space of ≈1045 (i.e. 5826) possible addresses.
+Now there’s an implicit Birthday Problem here. No particular address is likely to collide with another, even when you allow typos, but what about the likelihood that some address collides?
+Say we partition our space of 1045 addresses into N = 1029 addresses with a million possible typos for each address. Then as a rule of thumb, you’d need around √N random draws before you have a 50-50 chance of seeing a collision. Since 109 is a lot less than 1014.5, it’s unlikely that any two addresses collide, even when you consider each address along with a million associated typos.
+			]]></content:encoded>
+        </item>
         <item>
             <title><![CDATA[The Synology End Game]]></title>
             <link>https://lowendbox.com/blog/they-used-to-be-good-but-now-theyve-turned-to-evil-the-synology-end-game/</link>
@@ -58,41 +480,18 @@ Note that a fourth vulnerability was reported on June 18, 2025, which remains un
 ]]></content:encoded>
         </item>
         <item>
-            <title><![CDATA[A deep dive into Debian 13 /tmp: What's new, and what to do if you don't like it]]></title>
-            <link>https://lowendbox.com/blog/a-deep-dive-into-debian-13s-tmp-whats-new-and-what-to-do-if-you-dont-like-it/</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45059470</guid>
-            <description><![CDATA[Debian 13 "Trixie" comes with a whole new world of tmpfs, which is memory-based, and an automated cleanup process.  Let's take a look.]]></description>
-            <content:encoded><![CDATA[Debian 13 “Trixie” introduces an important change to /tmp.  Traditionally, it’s been just another filesystem, albeit with some special permissions that allows everyone on the system to use it without being able to remove each other’s files.In Trixie, it’s been moved off the disk into memory – specifically a type of memory called tmpfs.  To quote the tmpfs man page:The  tmpfs  facility  allows  the  creation of filesystems whose contents reside in virtual memory. Since the files on such filesystems typically reside in RAM, file access is extremely fast.They’re also extremely temporary…which is what you really want.  There’s an old story about a user who was assigned to work on the Transportation Management Project.  He logged into the server where he was supposed to store his work, saw the /tmp directory, found he could upload files there, and happily spent a couple months putting all his work there.  Alas, when the server was rebooted…Now that is undoubtedly an urban legend, but it illustrates the true nature of /tmp.  It’s fine if you need a disposable log fine, a PHP session file, space for sorting something, etc.  But you shouldn’t be storing anything there.This isn’t a new thing in the Linux world.  RedHat and its ilk have used tmps for /tmp for some time.A more serious problem than people losing files is people who use too much /tmp.  The system needs /tmp to do basic functions, so if it hits 100%, things will break.  It’s really easy to think “I’m going to download and untar this big zip file into /tmp, and then I’ll remove it after I pull out the one file I need”…and forget to remove it.  Now you’re hogging /tmp and over time, /tmp can be filled up with junk.Debian 13’s tmpfs Comes With…Challenges.  And SolutionsNow instead of filling up disk, you’re filling up memory.  If you download a 300MB .zip file, expand it to 1GB, and forget it, now you’re chewing up 1GB of RAM.  Ouch.There are two mitigating factors.  First, by default, Debian will only allocate a maximum of 50% of RAM to the tmpfs for /tmp.  You can change this.  To do so, typesystemctl edit tmp.mountYou’ll be popped into your editor (controlled by the EDITOR environment variable) with a form to update the settings.  At the very bottom you’ll see a template, which you can copy and edit:# [Mount]
-# What=tmpfs
-# Where=/tmp
-# Type=tmpfs
-# Options=mode=1777,strictatime,nosuid,nodev,size=50%%,nr_inodes=1m
-Go back up to the part before the line “Edits below this comment will be discarded” and paste in something like this:[Mount]
-What=tmpfs
-Where=/tmp
-Type=tmpfs 
-Options=mode=1777,strictatime,nosuid,nodev,size=25%%,nr_inodes=1mto change it to 25% or if you want a number:[Mount]
-What=tmpfs
-Where=/tmp
-Type=tmpfs 
-Options=mode=1777,strictatime,nosuid,nodev,size=1G,nr_inodes=1mto change it to 1GB.For example, I have a Debian 13 VPS with 4GB of RAM.  After a fresh install, I see it’s using 2GB max for tmpfs:# findmnt --target /tmp
-TARGET SOURCE FSTYPE OPTIONS
-/tmp   tmpfs  tmpfs  rw,nosuid,nodev,size=2007704k,nr_inodes=1048576,inode64Note that this is a maximum.  If there’s nothing in /tmp, /tmp does not use any memory.After doing the systemctl edit, like this:I get the message:Before this change, /tmp was at 2GB (half of the 4GB RAM):Now, after reloading systemd and restarting tmp.mount, I see /tmp is limited to 1GB:CleanupThe second mitigating factor is that /tmp is now automatically cleaned up.  Quoting the release notes:The new default behavior is for files in /tmp to be automatically deleted after 10 days from the time they were last used (as well as after a reboot). Files in /var/tmp are deleted after 30 days (but not deleted after a reboot).You can modify these policies, exclude certain files (why?  they’re temporary!), or even apply it to other directories.  Consult the fine manual but I think for 99% of people, the defaults are just fine.  I might be tempted to make the cleanup a little more aggressive, like 3 days.Thinking in a LowEnd ContextOne concern is for very low-memory systems.  While 1GB has become the smallest VM for a lot of people, 512s are still sold.  Allowing /tmp to consume 256MB out of 512 (which is really only 470-480 after the kernel and vital system processes are loaded) is a lot more impactful than consuming 256MB on a 10GB or 20GB filesystem.Fortunately, opting out of the new tmpfs world is easy if you don’t like it:systemctl mask tmp.mountand reboot.  I did that on the test box above:Now I can put 17GB of junk there.  Fortunately, it will be cleaned up as described above.So how are you planning to handle Debian 13’s new tmpfs-based /tmp?Raindog308 is a longtime LowEndTalk community administrator, technical writer, and self-described techno polymath. With deep roots in the *nix world, he has a passion for systems both modern and vintage, ranging from Unix, Perl, Python, and Golang to shell scripting and mainframe-era operating systems like MVS. He’s equally comfortable with relational database systems, having spent years working with Oracle, PostgreSQL, and MySQL.As an avid user of LowEndBox providers, Raindog runs an empire of LEBs, from tiny boxes for VPNs, to mid-sized instances for application hosting, and heavyweight servers for data storage and complex databases. He brings both technical rigor and real-world experience to every piece he writes.Beyond the command line, Raindog is a lover of German Shepherds, high-quality knives, target shooting, theology, tabletop RPGs, and hiking in deep, quiet forests.His goal with every article is to help users, from beginners to seasoned sysadmins, get more value, performance, and enjoyment out of their infrastructure.You can find him daily in the forums at LowEndTalk under the handle @raindog308.]]></content:encoded>
-        </item>
-        <item>
             <title><![CDATA[Lucky 13: a look at Debian trixie]]></title>
             <link>https://lwn.net/Articles/1033474/</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45059160</guid>
             <description><![CDATA[After more than two years of development, the Debian Project has released its new stable versio [...]]]></description>
             <content:encoded><![CDATA[
 
-We're bad at marketing
+This article brought to you by LWN subscribers
 
-We can admit it, marketing is not our strong suit. Our strength is
-writing the kind of articles that developers, administrators, and
-free-software supporters depend on to know what is going on in the
-Linux world. Please subscribe today to help us keep doing that, and so
-we don’t have to get good at marketing.
+Subscribers to LWN.net made this article — and everything that
+       surrounds it — possible.  If you appreciate our content, please
+       buy a subscription and make the next
+       set of articles possible.
 
 
 After more than two years of development, the Debian Project has released its new stable version, Debian 13 ("trixie"). The release comes with the usual bounty of
@@ -388,60 +787,6 @@ of course, be reporting on those developments as they happen.
             <title><![CDATA[Rupert's Property]]></title>
             <link>https://johncarlosbaez.wordpress.com/2025/08/28/a-polyhedron-without-ruperts-property/</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45057561</guid>
-            <description><![CDATA[You can cut a hole in a cube that’s big enough to slide an identical cube through that hole! Think about that for a minute—it’s kind of weird. Amazingly, nobody could prove any co…]]></description>
-            <content:encoded><![CDATA[
-				
-
-
-
-You can cut a hole in a cube that’s big enough to slide an identical cube through that hole!   Think about that for a minute—it’s kind of weird.
-Amazingly, nobody could prove any convex polyhedron doesn’t have this property!  It’s called ‘Rupert’s property’.
-Until this week.
-This week Steininger and Yurkevich proved there is a convex polyhedron that you can’t cut a hole in big enough to slide the entire polyhedron through the hole.  It has 90 vertices, and apparently 240 edges and 152 faces.
-
-
-
-
-To prove that no such hole is possible, they had to do a computer search of 18 million different holes, plus use a lot of extra math to make sure they’d checked enough possibilities:
-• Jakob Steininger and Sergey Yurkevich, A convex polyhedron without Rupert’s property.
-To celebrate their discovery, they gave this polyhedron a silly name.  Since this polyhedron lacks Rupert’s property, they called it a ‘noperthedron’.
-Why is this property called ‘Rupert’s property’?  Wikipedia explains:
-
-In geometry, Prince Rupert’s cube is the largest cube that can pass through a hole cut through a unit cube without splitting it into separate pieces. Its side length is approximately 1.06, 6% larger than the side length 1 of the unit cube through which it passes. The problem of finding the largest square that lies entirely within a unit cube is closely related, and has the same solution.
-Prince Rupert’s cube is named after Prince Rupert of the Rhine, who asked whether a cube could be passed through a hole made in another cube of the same size without splitting the cube into two pieces. A positive answer was given by John Wallis. Approximately 100 years later, Pieter Nieuwland found the largest possible cube that can pass through a hole in a unit cube.
-
-Here Greg Egan shows how Rupert’s property works for the cube:
-
-
-Here he shows how it works for the regular octahedron:
-
-
-And finally, here’s a video by David Renshaw showing 26 polyhedra with Rupert’s property… and 5 polyhedra that might lack it:
-
-
-
-
-The triakis tetrahedron is an extremely close call, but it does have Rupert’s property:
-
-
-
-
-				
-				
-					
-					This entry was posted  on Thursday, August 28th, 2025 at 7:50 am and is filed under mathematics.					You can follow any responses to this entry through the RSS 2.0 feed.
-											You can leave a response, or trackback from your own site.
-					
-					
-				
-
-				
-					Post navigation
-					« Previous Post
-					
-				
-
-			]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[The Space Shuttle Columbia disaster and the over-reliance on PowerPoint (2019)]]></title>
@@ -728,860 +1073,6 @@ Check LICENSE file for more information.
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45057020</guid>
             <description><![CDATA[PARODY/ENTERTAINMENT ONLY: Transform any website into pure chaos. Add burning cursors, Comic Sans everything, fake cursors, and more chaos features to any site. A humorous parody tool - not for real use. Some people just want to watch the web burn.]]></description>
             <content:encoded><![CDATA[This tool is for parody and entertainment purposes only. It temporarily applies visual chaos effects to websites for comedic effect. We do not store, collect, or transmit any personal information.NEVER enter passwords, credit card details, or any sensitive information while using this tool. The proxied sites are not secure and should not be used for any real transactions or logins.By using this tool, you acknowledge that it's purely for entertainment and you will not enter any sensitive data. Banking, financial, healthcare, and government sites are blocked for safety.]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[You no longer need JavaScript: an overview of what makes modern CSS so awesome]]></title>
-            <link>https://lyra.horse/blog/2025/08/you-dont-need-js/</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45056878</guid>
-            <description><![CDATA[An overview of what makes modern CSS so awesome.]]></description>
-            <content:encoded><![CDATA[
-    
-  
-  2025-08-28  ¦ css
-
-
-  So much of the web these days is ruined by the bloat that is modern JavaScript frameworks. React apps that take several seconds to load. NextJS sites that throw random hydration errors. The node_modules folder that takes up gigabytes on your hard drive.
-It’s awful. And you don’t need it.
-
-
-
-
-  
-    
-      Name
-      Status
-      Type
-      Size
-      Time
-    
-  
-  
-    app200document153.8 kB51 ms
-    6920616d20612066-s.p.6f6e7421.woff2200font31.5 kB32 ms
-    686579206d652074-s.p.6f6f2121.woff2200font28.5 kB116 ms
-    77687920646f6573.css200stylesheet253 kB47 ms
-    2074686520646566.js200script648 kB83 ms
-    61756c74206e6578.js200script166 kB363 ms
-    746a732074616b65.js200script83.3 kB46 ms
-    turbopack-20757020302e354d.js200script38.0 kB95 ms
-    423f207468617427.js200script414 B34 ms
-    73206d6f72652074.js200script32.6 kB49 ms
-    68616e206d792065.js200script15.1 kB71 ms
-    6e7469726520626c.js200script143 kB48 ms
-    6f6721 hey there!200script4.1 kB103 ms
-  
-
-
-
-The intro paragraph of this post is tongue-in-cheek. It’s there to get you to read the rest of the post. I suspect the megabytes of tracking scripts intertwined with bad code is far more likely to be the real culprit behind all the terrible sites out there. Web frameworks have their time and place. And despite my personal distaste for them, I know they are used by many teams to build awesome well-optimized apps.
-Despite that, I think there’s some beauty in leaving it all behind. Not just the frameworks, but JavaScript altogether. Not every site needs JavaScript. Perhaps your e-commerce site needs it for its complex carts and data visualization dashboards, but is it really a necessity for most of what’s out there?
-It’s actually pretty incredible what HTML and CSS alone can achieve.
-
-So, what do you say?
-My goal with this article is to share my perspectives on the web, as well as introduce many aspects of modern HTML/CSS you may not be familiar with. I’m not trying to make you give up JavaScript, I’m just trying to show you everything that’s possible, leaving it up to you to pick what works best for whatever you’re working on.
-I think there’s a lot most web developers don’t know about CSS.
-And I think JS is often used where better alternatives exist.
-So, let me show you what’s out there.
-
-“But CSS sucks”
-I believe a lot of the negativity towards CSS stems from not really knowing how to use it. Many developers kind of just skip learning the CSS fundamentals in favor of the more interesting Java- and TypeScript, and then go on to complain about a styling language they don’t understand.
-I suspect this is due to many treating CSS as this silly third wheel for adding borders and box-shadows to a webapp. It’s undervalued and often compared to glorified crayons, rather than what it really is - a powerful domain-specific programming language.
-It’s telling when to this day the only CSS joke in the webdev circles is centering a div.
-
-
-i am a div
-
-body {  display: flex;  flex-direction: rowcolumnrow-reversecolumn-reverse;  flex-wrap: nowrapwrap;  align-content: centerflex-startflex-endspace-aroundspace-betweenstretch;  justify-content: centerflex-startflex-endspace-aroundspace-betweenspace-evenly;  align-items: centerflex-startflex-endstretchbaseline;}
-
-
-
-
-Yes, the syntax isn’t the prettiest, but is it really that hard?
-Besides, your devtools probably1 come with a fun little gadget that lets you fiddle with the flexbox by just clicking around. You don’t even need to remember the syntax.
-
-I don’t think CSS is fundamentally any more difficult than JS, but if you skip the basics on one and only focus on the other, it’s no surprise it feels that way.
-“But it’s painful to write”
-Another source of disdain for CSS is how awful it has been to write in the past. This is very much true, and is probably why things like Sass and Tailwind2 exist.
-But that’s the thing, it used to be bad.
-
-
-
-🦊
-
-
-Rebane@rebane2001
-btw u should write css like
-
-cool-thing {
-    display: flex;
-    &[shadow] {
-        box-shadow: 1px 1px #0007;
-    }
-    @media (width < 480px) {
-        flex-direction: column;
-    }
-}
-
-and html like
-
-<cool-thing shadow>wow</cool-thing>
-
-because it's allowed & modern & neat!
-11:58 AM · Apr 8, 2025
-
-❤️ 1.5K
-
-
-(yes! the code above is standards compliant3)
-In the past few years, CSS has received a ton of awesome quality-of-life additions, making it nice to do stuff that has historically required preprocessors or JavaScript.
-Nesting is definitely one of my favorite additions!
-In the past, you’ve had to write code that looks like this:
-:root {
-  --like-color: #24A4F3;
-  --like-color-hover: #54B8F5;
-  --like-color-active: #0A6BA8;
-}
-
-.post {
-  display: block;
-  background: #EEE;
-  color: #111;
-}
-
-.post .avatar {
-  width: 48px;
-  height: 48px;
-}
-
-.post > .buttons {
-  display: flex;
-}
-
-.post > .buttons .label {
-  font-size: 24px;
-  padding: 8px;
-}
-
-.post > .buttons .like {
-  cursor: pointer;
-  color: var(--like-color);
-}
-
-.post > .buttons .like:hover {
-  color: var(--like-color-hover);
-}
-
-.post > .buttons .like:active {
-  color: var(--like-color-active);
-}
-
-@media screen (max-width: 800px) {
-  .post > .buttons .label {
-    font-size: 16px;
-    padding: 4px;
-  }
-}
-
-@media (prefers-color-scheme: dark) {
-  .post {
-    background: #222;
-    color: #FFF;
-  }
-}
-
-
-And yeah, that’s pretty awful to work with. For anything that involves multiple chained selectors, you kind of have to keep a mental map of how every parent selector relates to its children, and the more CSS you add the harder it gets.
-But let’s try it with nesting:
-:root {
-  --like-color: #24A4F3;
-  --like-color-hover: hsl(from var(--like-color) h s calc(l + 10));
-  --like-color-active: hsl(from var(--like-color) h s calc(l - 20));
-}
-
-.post {
-  display: block;
-  background: #EEE;
-  color: #111;
-  @media (prefers-color-scheme: dark) {
-    background: #222;
-    color: #FFF;
-  }
-  .avatar {
-    width: 48px;
-    height: 48px;
-  }
-  & > .buttons {
-    display: flex;
-    .label {
-      font-size: 24px;
-      padding: 8px;
-      @media (width <= 800px) {
-        font-size: 16px;
-        padding: 4px;
-      }
-    }
-    .like {
-      cursor: pointer;
-      color: var(--like-color);
-      &:hover { color: var(--like-color-hover); }
-      &:active { color: var(--like-color-active); }
-    }
-  }
-}
-
-That is way nicer to read4! All the relevant parts are right next to each other, so it’s a lot easier to understand what’s going on. Seeing the &:hover and &:active right next to the .like button is especially nice imo.
-And since you can sort of see the structure - the parent selectors “guarding” the child ones - it also makes it a lot easier to get away with short and simple class names (or even referring to elements themselves).
-You may have noticed that I’m also making use of relative colors in the second example. I think the MDN article has a lot of awesome examples, but the jist of it is that you can take an existing color, modify it in many different ways across multiple color spaces, and mix it with other colors using color-mix().
-/* remove blue from a color */
-rgb(from #123456 r g 0);
-/* make a color transparent */
-rgb(from #123456 r g b / 0.5);
-/* make a color lighter */
-hsl(from #123456 h s calc(l + 10));
-/* change the hue in oklch color space */
-oklch(from #123456 l c calc(h + 10));
-/* mix two colors in oklab color space */
-color-mix(in oklab, #8CFFDB, #04593B 25%);
-
-These snippets are really useful for when you want something to be just ever so slightly darker or brighter, such as a button hover effect or a matching border color, and they’re way nicer to use than doing all those color conversions in JavaScript. If you’re feeling particularly adventurous, you could even go ahead and generate your entire color scheme in just CSS.
-
-100200300400500600700800900
--40°-20°0°+20°+40°
-primarycomplimentarysecondary
-successdangerwarninginfo
-
-view-source
-
-
-(yes! the color picker above is written in just css)
-Safari is currently broken when handling of cqw/cqh units, therefore the demo above may not work correctly. If this happens, try using Firefox or Chrome instead.
-There are so many cool new CSS features that make writing it just that little bit nicer. Things like letting you use (width <= 768px) instead of (max-width: 768px) in your @media query, the lh unit that matches the line-height, the scrollbar-gutter property that solves the little scrollbar-related layout shifts, or the ability to finally center stuff vertically without flex/grid.
-
-
-Baseline
-And all of this is brought together by the cherry on top that is Baseline. It’s a guarantee that a specific feature works in every major browser5, and it also lets you know since when - newly available features work in all the latest browsers, and widely available ones work in browsers up to 2.5 years old. Nesting, for example, has been fully supported in all browsers since December 2023, and thus will become widely available in June 2026. You can find the Baseline symbols in various places, such as the MDN docs6.
-These are just a few examples of what makes modern CSS so much nicer to write than what we had even just 5 years ago. It almost feels like comparing ES37 to ECMAScript 2025 - and I wouldn’t blame your grudge if the former is what you’re used to.
-Why bother?
-Okay, so CSS has more quality-of-life stuff than before. Still, why would one choose to use it over something else? Doesn’t JavaScript already let us do everything just fine?
-You need to disable JavaScript to run this app.
-I think my reasons for using CSS fall into two main categories - because some users don’t want to use JavaScript, and because doing things in CSS can be genuinely better.
-My blog, for example, focuses on infosec topics. Many security researchers (myself included) use a hardened browser configuration to protect themselves, which often means disabling JavaScript by default. I think it’s nice that they can fully experience my blog without changing their security settings or running a separate, sandboxed browser.
-The same goes for privacy-conscious users, and it makes sense! As an experiment, I opened up a local Estonian news site in a web browser with JavaScript enabled. Can you guess how many js files it fetched? (answer in footnote8) That’s crazy! You do not want that running on your computer.
-But surely, you are not one of the evil devs who loads a double-digit number of analytics scripts on your site - is there still any reason to reach for CSS?
-Well, I think a lot of things are just plain nicer to make in HTML/CSS, both from the developer and end-user perspectives, be it for ease of use, accessibility, or performance.
-Hover effects for your buttons? Toast animations? Input validation? All of these things just work in CSS, and you won’t have to reinvent the wheel, or throw kilobytes of someone else’s code at it. There will always be some cases where you do need that extra flexibility JavaScript often provides, but if you don’t need that, and doing it in CSS is easier, then why not save yourself the trouble?
-
-
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-
-
-
-
-
-
-
-
-
-
-
-
-
-And the performance of CSS is so much better! Every JavaScript interaction has to go through an event loop that wastes CPU cycles, eats some battery, and adds that tiny bit of stutter to everything.
-Sure, in the grand scale of things it isn’t that bad, APIs like requestAnimationFrame are really good at keeping things smooth. But CSS animations run in the separate compositor thread, and aren’t affected by stutters and blocking in the event loop.
-It makes quite a difference on low-end devices, but feels nice even on high-end ones. CSS animations on my 240hz monitor look amazing9 - JS can look pretty good too, but it has that tiny bit of stutter to it that keeps it from being perfect, especially if you plan on running other heavy code at the same time.
-It also means you won’t have to worry as much about optimization, as the browser takes care of a lot more of the rendering side of things, and often runs your stuff on the GPU if possible.
-Pro tip! Wanna trigger animations from JS anyways? Use the modern Web Animations API to easily play the smooth CSS animations from JS.
-Transitioning
-
-Speaking of which, I think it’s time I start showing you practical examples, and a good place to start showing the styles is well, @starting-style.
-In the past it has been pretty annoying to add start animations (such as fade-ins) to elements. You’ve had to either set up an entire CSS animation with a separate @keyframes block to go with it, or do a transition using JavaScript where you first add an element to the page, then wait a frame, and then add a class to the element.
-.toast {
-  transition: opacity 1s, translate 1s;
-  opacity: 1;
-  translate: 0 0;
-  @starting-style {
-    opacity: 0;
-    translate: 0 10px;
-  }
-}
-Success!
-
-But this has all changed thanks to the new @starting-style at-rule!
-Pretty much all you have to do is set your properties as usual, add the initial transition states to @starting-style, and add those properties to a transition. It’s pretty simple and it kind of just works without having to trigger the animation in any way.
-Lunalover
-Another good example of where CSS shines is theming. Many sites need separate light and dark modes, and modern CSS makes dealing with that pretty easy.
-:root {
-  color-scheme: light dark;
-  --text: light-dark(#000, #FFF);
-  --bg: light-dark(#EEE, #242936);
-}
-hi there!you are awesome!i am!
-
-By setting the color-scheme property to light dark, you are telling the browser to automatically pick the theme according to the user preference, and you can then make use of that by setting color values with the light-dark() function.
-Not only does it set your own colors, but also those of the native components, such as the default buttons, form elements, and scrollbars. It kind of just makes stuff work by default, and that’s nice!
-:root {
-  color-scheme: light dark;
-  &:has(#theme-light:checked) {
-    color-scheme: light;
-  }
-  &:has(#theme-dark:checked) {
-    color-scheme: dark;
-  }
-}
-
-    Auto
-    Light
-    Dark
-  
-
-You can then add some way of overriding the color-scheme property to let the user pick a theme different from their system setting. Here I am using radio buttons to accomplish that.
-Pro tip! CSS can’t save the theme preference, but you can still do progressive enhancement. Make the themes work CSS-only, and then add the saving/loading of preference as an optional extra in JavaScript or server-side code.
-Lyres and accordions
-“But those don’t look like radio buttons” I hear you cry.
-Input elements such as radio buttons and checkboxes are a great foundation to build other stuff on top of - the example above consists of labels for the buttons and invisible radio buttons that can be checked for with the :checked pseudo-class.
-<radio-picker aria-label="Radio buttons example" role="radiogroup">
-  <label><input type="radio" name="demo" id="veni" checked>veni</label>
-  <label><input type="radio" name="demo" id="vidi">vidi</label>
-  <label><input type="radio" name="demo" id="vici">vici</label>
-</radio-picker>
-<style>
-  radio-picker {
-    display: flex;
-    label {
-      &:has(input:checked) {
-        box-shadow: inset 0px 0px 8px 0px #888;
-      }
-      &:has(input:focus-visible) {
-        outline: 2px solid #000;
-      }
-      box-shadow: inset 0px 0px 1.2px 0px #000;
-      padding: 10px;
-      cursor: pointer;
-      background: #0002;
-      &:hover { background: #0004; }
-      &:active { background: #0006; }
-    }
-    input {
-      /* To allow screen reader to still access these. */
-      opacity: 0;
-      position: absolute;
-      pointer-events: none;
-    }
-  }
-</style>
-
-
-    veni
-    vidi
-    vici
-  
-
-This is how I made the theme selector from the previous example. I’ve made the radio buttons half-visible in the demo for clarity, but with the opacity: 0 they would not actually be visible.
-There’s a whole lot going on here, so let’s break it down.
-<radio-picker aria-label="Radio buttons example" role="radiogroup">
-
-We start off with the radio-picker element - I just made it up, you can use a div instead if you’d prefer. We give it an aria-label to give the group an accessible name, and the aria role of radiogroup to make it work as a group for the radio buttons.
-You could also use the fieldset element instead of doing the aria roles if that’d fit your use case better.
-<label><input type="radio" name="demo" id="veni" checked>veni</label>
-<label><input type="radio" name="demo" id="vidi">vidi</label>
-<label><input type="radio" name="demo" id="vici">vici</label>
-
-Next, we add the radio buttons with their respective labels - usually you’d have to use the for attribute on labels to define which element they’re referring to, but since we have the input inside the label we don’t have to do that.
-All the type="radio" inputs should also have a name value set to the same thing so that they are grouped together (you still need10 the radiogroup though). And then you can give them values or ids however you want.
-label {
-  &:has(input:checked) {
-    box-shadow: inset 0px 0px 8px 0px #888;
-  }
-  &:has(input:focus-visible) {
-    outline: 2px solid #000;
-  }
-  box-shadow: inset 0px 0px 1.2px 0px #000;
-  padding: 10px;
-  cursor: pointer;
-  background: #0002;
-  &:hover { background: #0004; }
-  &:active { background: #0006; }
-}
-
-We then style the labels as we wish - the :hover and :active pseudo-classes can be used to make the buttons more fun to click, the :has(input:checked) selector can be used to define the style of the selected button, and the :has(input:focus-visible) selector can be used to add an outline when someone tabs over to the button.
-The difference between :focus and :focus-visible is that the former shows up even if you use your mouse, while the latter only shows up when you use keyboard navigation, so it’s often visually more clean to use the latter.
-input {
-  opacity: 0;
-  position: absolute;
-  pointer-events: none;
-}
-
-And last, we make the radio button input exist while not being visible. This is a bit hacky, but it’s how you can keep this control accessible to keyboard navigation and screen readers.
-And that’s how we get the cool-looking radio buttons!
-<radio-tabs>
-  <div tabindex=0 id="tab-veni">veni...</div>
-  <div tabindex=0 id="tab-vidi">vidi...</div>
-  <div tabindex=0 id="tab-vici">vici...</div>
-</radio-tabs>
-<style>
-  body:has(#veni:not(:checked)) #tab-veni,
-  body:has(#vidi:not(:checked)) #tab-vidi,
-  body:has(#vici:not(:checked)) #tab-vici {
-    display: none;
-  }
-</style>
-
-    veni
-    vidi
-    vici
-
-
-  veni/ˈveɪni/(intransitive) to come
-  vidi/ˈviːdi/(intransitive) to see
-  vici/ˈviːt͡ʃi/(intransitive) to conquer
-
-
-We can now use them in the CSS however we want by just seeing if they’re :checked. Here I made tabs with separate divs for the content by using a :has selector on a parent element to find out which radio button is currently selected.
-The :has selector has to be on a parent element that contains both the radio button and the target element - you can simply use html or body if you want it to work across the entire page. You should never use something like :has(…) by itself as it’ll run the selector for every element of the page, which can cause performance issues (body:has(…) is okay).
-<div>
-  <details name="deets">
-    <summary>What's your name?</summary>
-    My name is Lyra Rebane.
-  </details>
-  <details name="deets">
-    ...
-  </details>
-</div>
-<style>
-  div {
-    border: 1px solid #AAA;
-    border-radius: 8px;
-    /* based on the MDN example */
-    summary {
-      font-weight: bold;
-      margin: -0.5em -0.5em 0;
-      padding: 0.5em;
-      cursor: pointer;
-    }
-    details {
-      &:last-child { border: none }
-      border-bottom: 1px solid #aaa;
-      padding: 0.5em 0.5em 0;
-      &[open] {
-        padding: 0.5em;
-        summary {
-          border-bottom: 1px solid #aaa;
-          margin-bottom: 0.5em;
-        }
-      }
-    }
-  }
-</style>
-
-  
-    
-    What's your name?My name is Lyra Rebane.
-    Cool name!I know ^_^
-    Where can I learn more?On my website, lyra.horse!
-  
-
-
-Finally, before we move on, I want to give you a quick introduction to the details element. It’s great for if you want an accordion-style menu, such as for a FAQ section. The details open and close independently of each other, but you can set their name attribute to the same value to have only one open at a time.
-Using them is pretty easy, put your content and a summary tag inside a details tag, and put the title inside the summary tag. The example above is a bit more convoluted for the visual flair, but all you really need is the html part of it.
-The details elements are pretty stylable! You can add animations depending on the [open] state, and you can also get rid of the arrow by setting list-style: none on the summary.
-Also, ctrl+f works with it, which is a big win in my book!
-Validation
-And lastly, I want to show you the power of input validation in HTML and CSS.
-<label for="usrname">Username</label>
-<input type="text" id="usrname" pattern="\w{3,16}" required>
-<small>3-16 letters, only alphanum and _.</small>
-<style>
- input:valid {
-   border: 1px solid green;
- }
- input:invalid {
-   border: 1px solid red;
- }
-</style>
-
-  Username
-    
-    3-16 letters, only alphanum and _.
-  
-
-
-This is a simple example of how you can validate an input field with a regex pattern. If you set a pattern attribute like above, a form that contains the input cannot be submitted unless the field matches the pattern. If you’re submitting something like an e-mail address, a phone number, or a url, it might make sense to use the respective input types instead of writing your own regex.
-Now, where CSS comes in is styling the input to show whether its value is valid. In the example above, I’m using :valid and :invalid to set a border color, but that comes with the downside of always having your input marked, even if the user hasn’t entered anything yet.
-input {
-  border: none;
-  border-radius: 2px;
-  outline: 1px solid #000;
-  &:focus { outline-width: 2px; }
-  &:user-valid { outline-color: green; }
-  &:user-invalid { outline-color: red; }
-}
-
-  Username
-    
-    3-16 letters, only alphanum and _.
-  
-
-
-An easy win here is to instead use :user-valid and :user-invalid - these pseudo-classes only become active once you’ve interacted with input field. I also made this example use an outline instead of a border, which I think looks a lot nicer.
-It may sometimes even make sense to use a combination of :valid and :user-invalid.
-And of course, you can use the :has selector to style other elements depending on the input too!
-
-
-  Password
-    
-    The password must:
-- be 8-16 characters
-- contain at least ⅰ roman numeral
-- not end with a letter
-
-  
-
-
-This one's just for fun ^_-! you win! yay!
-I do want to mention that for some stuff, such as date pickers () or datalists (), there are built-in elements that do the job, but you may find them limited in one way or the other. If you’re making an input like that with specific requirements, you may still need to dip your feet in a bit of JavaScript.
-
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-
-
-Do not the vw/vh
-This section is kind of random but I wanted to include it here because I think a lot of people are messing this one up and I want more people to know how to do this stuff right.
-So CSS has vw/vh units that correspond to 1% of the viewport width and height respectively, which makes perfect sense for desktop browsers.
-
-
-
-
-
-  CBSignal chatAre you feeling encrypted?
-  MMaratit smells of onions in here...
-  bmblackle moriwhat's the scoop in yer smacker, horseberry?
-  RRhynoraterCSS go BRRRRR
-  PPatTheHyrulerI just lost the game
-  MMalkI can't wait to taste the sorbet!
-
-
-🔒lyra.horse/blog/•••
-
-lyra's epic blog posts tags
-You no longer need JavaScript
-yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap yap
-
-
-
-
-Where it becomes a bit more nuanced is on mobile devices. For example, mobile versions of both Firefox and Chrome will hide the URL bar when scrolling down on a page.
-This causes the vw/vh units to be a bit ambigous - do they represent the entire available screen, only the area that’s visible with the URL bar, or something in between?
-If it’s the first option, you might end up with buttons or links off-screen11! If it’s the second, you may end up with a background div that doesn’t cover the entire background.
-
-
-
-
-  ppingotuxcss spec so good i transitioned
-  mmayahi wife!!
-  ZZvitlol. lmao, sogar.
-  !!!! HAND !!yap yap yap
-  JJonesGlory to KuK
-  SSpaxim goop
-  eenscribeI need a job
-
-
-  lvh
-  dvh
-  svh
-
-
-
-
-
-
-
-
-
-
-
-🔒lyra.horse/blog/•••
-
-
-
-
-  lvh
-  svh
-  dvh
-  lvh
-  svh
-  dvh
-  lvh
-  svh
-  dvh
-  lvh
-  svh
-  dvh
-  lvh
-  svh
-  dvh
-
-Your values
-
-  
-    
-      Unit
-      Value
-    
-  
-  
-    
-      vh
-      px
-    
-    
-      lvh
-      px
-    
-    
-      dvh
-      px
-    
-    
-      svh
-      px
-    
-  
-
-Above is a table of values your browser reports - if you're on mobile, try scrolling the blogpost up and down so that the URL bar hides and see how the numbers change.
-The values are multiplied by 100 (eg 100vh is used instead of 1vh).
-
-
-
-
-The solution to this is to use the new responsive viewport units: lvh, svh, and dvh.
-lvh stands for largest viewport height, and thus is useful for things like backgrounds that you’d want to cover the entire screen with, and wouldn’t care about getting cut off.
-svh stands for smallest viewport height, and should be used for things that must always fit on the screen, such as buttons and links.
-And dvh stands for dynamic viewport height - this one will update to whatever the current viewport height is. It might seem like the obvious choice, but it should not be used for elements you don’t want resizing or moving around as the user scrolls the page, as it could become quite annoying and possibly even laggy otherwise.
-Of course, the respective lvw, svw, and dvw units exist too :).
-Keyboard cat
-By default, the viewport units do not account for the keyboard overlaying the page.
-There are two ways to deal with that: the interactive-widget attribute, and the VirtualKeyboard API.
-The former option is widely supported across browsers, works without JS, and goes in the meta viewport tag. It makes it so that opening the keyboard will change all of the viewport units.
-<meta name="viewport" content="width=device-width, interactive-widget=resizes-content">
-
-The latter option is currently only supported in Chromium-based browsers, and requires a single line of JavaScript to use:
-navigator.virtualKeyboard.overlaysContent = true;
-
-The advantage of the second option is that it allows you to use environment variables in CSS to get the position and size of the keyboard, which is pretty cool.
-floating-button {
-  margin-bottom: env(keyboard-inset-height, 0px);
-}
-
-But considering the fact that it doesn’t work cross-browser, I’d avoid it.
-CSS wishlist
-Alright, so this is a little different from the rest of the post, but I wanted to bring up some things that I wish were in CSS. I haven’t fully fleshed out all of them, so some definitely wouldn’t fit the spec as-is, but maybe they can inspire some other stuff at least.
-They are just fun ideas, don’t take them too seriously.
-Reusable blocks
-I wish it was possible to put classes in other classes in CSS, so that you could write something like:
-.border {
-  border: 2px solid;
-  border-radius: 4px;
-}
-
-.button {
-  @apply border;
-}
-
-.card {
-  @apply border;
-}
-
-This is something that Tailwind already has, and that makes me jealous.
-
-Combined @media selectors
-We can currently do nested @media queries, and also multiple selectors at the same time:
-div {
-  &.foo, &.bar {
-    color: red;
-    padding: 8px;
-    font-size: 2em;
-  }
-  @media (width < 480px) {
-    color: red;
-    padding: 8px;
-    font-size: 2em;
-  }
-}
-
-But we cannot combine the two into a single selector:
-div {
-  @media (width < 480px), &.foo {
-    color: red;
-    padding: 8px;
-    font-size: 2em;
-  }
-}
-
-Which means if you want to do that you’ll inevitably have to repeat code or do some silly variable hacks, neither of which is ideal.
-n-th child variable
-For many of the CSS crimes I like to commit, I often end up writing code like:
-div {
-  span:nth-child(1) { --nth: 1; }
-  span:nth-child(2) { --nth: 2; }
-  span:nth-child(3) { --nth: 3; }
-  span:nth-child(4) { --nth: 4; }
-  span:nth-child(5) { --nth: 5; }
-  ...
-  span {
-    top: calc(--nth * 24px);
-    color: hsl(calc(var(--nth) * 90deg) 100 90);
-  }
-}
-
-And I think it would be a lot nicer if we could instead just do:
-div {
-  span {
-    --nth: nth-child();
-    top: calc(--nth * 24px);
-    color: hsl(calc(var(--nth) * 90deg) 100 90);
-  }
-}
-
-n-th letter targeting
-CSS has the ability to style the ::first-letter of text. It’d be cool if were was also a ::nth-letter(…) selector, similar to :nth-child. I suspect the reason this isn’t a thing is because the ::first-letter selector is a pseudo-element, which would be a bit tricky to implement with the nth-letter idea.
-/* not a real feature */
-p::nth-letter(2) {
-  color: red;
-}
-
-hi there~
-
-
-Blackle suggested that combining the nth-child() variable with :nth-letter targeting would also be fun for certain effects, such as putting the value in the sin() function to create wavy text.
-div {
-  /* not a real feature */
-  --nth: nth-child(nth-letter);
-  will-change: transform;
-  translate: 0 calc(sin(var(--nth) * 0.35 - var(--wave) * 3) * 5px);
-  color: color-mix(in oklch, #58C8F2, #EDA4B2 calc(sin(var(--nth) * 0.5 - var(--wave)) * 50% + 50%));
-}
-
-  
-    untucknowqueen
-  
-  (taphover to play animation)
-
-
-Unit removal
-I wish you could easily remove units from values, for example by dividing them.
-
-div {
-  /* Turns into:  (no unit) */
-  --screen-width: calc(100vw / 1px);
-  color: hsl(var(--screen-width) 100, 50);
-}
-This would allow you to use the size of the viewport or container as a numeric variable for things other than length. For example, the color picker from earlier uses it to convert the location of the color picker dot to a number to be used in a color value instead.
-Uh, but wait? Does that mean this feature already exists?
-Yeah, lol! We already have the ability to get unitless values in CSS, but it involves doing hacky stuff such as tan(atan2(var(--vw), 1px)) with a custom @property. It’d be nice to have this as just a division, for example.
-Oh, and good news, this one we might actually be getting soon!
-Also if you do something like calc(1px + sqrt(1px * 1px)) your browser will crash12.
-A better image function
-The image() function exists, but no browsers implement it. It’s similar to just using url(), but adds some really cool features such as a fallback color, and image fragments to crop a smaller section out of a bigger image (think spritesheets).
-We can already do both fallbacks and spritesheets with the various background properties, but it’d be nice to have this pretty syntax. I’d honestly love this syntax even more for <img> tags than CSS.
-style tags in body
-I make heavy use of <style> tags in <body> for my projects. On my blog, for example, I write the relevant CSS close to their graphics so that you can start reading the blog before the entire page (or the entire CSS) has finished loading13. And it works great!
-But what’s unfortunate is that despite browsers supporting this, and major sites using this, it’s not officially spec-compliant. I suspect it’s in the spec to avoid the FOUC footgun, but there are so many reasons you would want/need style in body that I don’t think it justifies it.
-I think an HTML validator should warn for this, but not error.
-The art
-I want to end this article by saying that to me, web development is an art, and thus, CSS is too. I often have a hard time relating to people who do webdev solely to earn money or build a startup - web development is very different when you’re on a team and are given tasks from above instead of having free will over what you create for fun.
-It’s probably most apparent with things like AI14, that for me take all the fun and creativity out of my work. But it also applies to build chain tooling such as linters and minifiers - the way I write my code is part of the art, and I don’t want a tool to erase that. I don’t even use an IDE15.
-Among the practical reasons for sticking to CSS listed throughout this post, there’s a secret extra reason I like to do everything in CSS, and that’s expression and art. Art isn’t always practical, and using CSS isn’t either. But it’s how I like to express myself, and it’s why I do what I do.
-I tried to keep this post approachable and practical for all web developers. But there is so much more to CSS that I’d like to talk about, so expect another post about the stuff that isn’t practical, and is instead just cool as fuck. I think CSS is a programming language, and I made a game to prove it.
-But that’s a topic for another time.
-afterword
-it’s been almost a year since my last post, but i hope it’s been worth the wait ^_^
-as usual, this post is a self-contained html file with no javascript, images, or other external resources - everything on the page is handwritten html/css, weighing in at around 49kB gzipped. it was really fun creating all the little interactive widgets and visuals this time around, i think i’ve improved in css a lot since the last time i posted.
-this entire post turned out to be a bit of a fun mess (as did i!), it’s almost like a chaotic gradient of tone throughout, i hope it was still interesting and enjoyable to read though.
-i have a few new posts in the works: in addition to the second css one mentioned earlier, i also have one about a new web vulnerability subclass i discovered, and one about a trans topic. i’m not sure when these posts will come out, but we’ll see! make sure to add me to your rss reader if that sounds fun.
-i’ll also be giving a talk at bsides tallinn in september! i’m hoping to also do css-related talks at the next ccc and disobey, but we’ll have to see whether i get accepted and have the travel budget for those.
-thank you so much for reading <3
-you're awesome!! (i can tell because you checked that checkbox from earlier)
-
-If you’d like to reach out, feel free to message me on my socials or at lyra.horse [at] gmail.com.
-Discuss this post on: twitter, mastodon, lobsters
-
-
-
-
-
-Chrome’s DevTools come with the cool flexbox widget. Firefox’s however don’t seem to for some reason? I find that weird because Firefox does have really good tools for flexbox and grid development, so this seems like an odd omission. ↩︎
-
-
-While I think what I said is true, Tailwind does have more to its existence, the core of which can be found in this post by its creator. ↩︎
-
-
-You are allowed to just make up elements as long as their names contain a hyphen. Apart from the 8 existing tags listed at the link, no HTML tags contain a hyphen and none ever will. The spec even has <math-α> and <emotion-😍> as examples of allowed names. You are allowed to make up attributes on an autonomous custom element, but for other elements (built-in or extended) you should only make up data-* attributes. I make heavy use of this on my blog to make writing HTML and CSS nicer and avoid meaningless div-soup. ↩︎
-
-
-Still not nice to read for you? I’m personally not a fan of BEM, but I’d definitely recommend reading up on it too if you just don’t vibe with the way I’m writing my examples. Also, my example intentionally shows off a lot of the syntax at once, but in the real world it might make sense to structure things a little differently. ↩︎
-
-
-Baseline browsers are Safari (macOS/iOS), Chrome (desktop/Android), Edge (desktop), and Firefox (desktop/Android). ↩︎
-
-
-The MDN docs of course also list detailed browser compatibility, but the Baseline symbols are nice for just getting a quick “yeah, we can use it and it’ll work for everyone” type overview. ↩︎
-
-
-ES3 (1999) is the last “classic” version of JavaScript. In 2009 we got the first major revision known as ES5, and a few years later we kicked off the yearly spec updates with ES2015. Also ES4 was abandoned which makes me feel sad :c. ↩︎
-
-
-93 files!! Seems like they’re 1/3 functionality, 1/3 ads, and 1/3 analytics. The site works just fine with JavaScript disabled - only stuff like the comments section and ads won’t load. It’s no longer a laggy mess either for some reason. ↩︎
-
-
-I think the x3ctf challenges page looks really smooth on my computer - the marquee text animation and clicking on the challenges is buttery. And it also runs pretty well on the low-end hardware I have. Note that some browser performance recording tools can act a bit weird with CSS animations, so make sure your tools are working as expected before using them. Unrelated, but I made some other cool x3ctf web stuff too - check out the archive. ↩︎
-
-
-There’s a bug in Chrome that requires you to use a fieldset/radiogroup for the radio button index to work correctly in screenreaders. Eg if you have 3 radio buttons with the same name, selecting one of them should read “radio button 1 of 3”, which is what Firefox does, but in Chrome it will instead read it as “radio button 4 of 9” or whatever if you don’t have a fieldset/radiogroup because it kind of just combines all the radio buttons on the page into a single index. ↩︎
-
-
-A certain HR platform I have to use puts its action buttons at the very bottom of a 100vh container, leading to them not being visible/interactable on my phone - not a headache you want to go through when requesting sick days. It’s a good example of how just using the wrong unit can cause a pretty bad real world accessibility problem. ↩︎
-
-
-Well, probably not. This is a bug I found while writing this post that only affects Chrome, and it’ll probably get fixed before it even manages to hit stable. Update: I took so long to get this blog post out that it has been fixed now. During the writing of this blog post I found another bug in Chrome though, which is pretty funny. Update 2: I found yet another Chrome bug while writing this post, this one is kinda weird, you should read it. ↩︎
-
-
-This matters for people on slow connections, such as bad mobile data, satellite internet, tor, or iodine. While my blog posts are very small in size, the CSS alone can take up more than the first 14kB of a TCP round trip, so with blocking CSS in the head you might have to wait a few extra seconds (or minutes, in the case of iodine) just to start reading the first paragraph. Now, that 14kB number isn’t completely accurate in the modern world, but testing on my own server (HTTP/2, TLS 1.3), around ~16kB of the compressed html reaches the browser in the first batch of http data. ↩︎
-
-
-By this I mean tools such as Copilot, Cursor, chatbots etc. I understand there is a huge difference between full-on vibe coding and just using the tab key, but I do not want to use or interact with any of those tools. Please respect that. ↩︎
-
-
-I write all my code (and blogposts) in Sublime Text, which to me is just a glorified version of Notepad. The features over Notepad it gives me are syntax highlighting, multiple cursors, keyboard shortcuts, and a better visual design. It doesn’t do that much, and yet, it’s perfect. It’s so good I paid for it. ↩︎
-
-
-
-
-
-  ]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[My startup banking story (2023)]]></title>
@@ -1886,165 +1377,6 @@ LLMs create a huge increase in the attack surface of software systems. Simon Wil
 This is particularly serious when it comes to agents acting in a browser. Read an attacker’s web page, and it could trick the agent to go to your bank account in another tab and “buy you a present” by transferring your balance to the kind attacker. Willison’s view is that “the entire concept of an agentic browser extension is fatally flawed and cannot be built safely”.
 
 ]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[Web Bot Auth]]></title>
-            <link>https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth/</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45055452</guid>
-            <description><![CDATA[Web Bot Auth is an authentication method that leverages cryptographic signatures in HTTP messages to verify that a request comes from an automated bot. Web Bot Auth is used as a verification method for verified bots and signed agents.]]></description>
-            <content:encoded><![CDATA[          Web Bot Auth is an authentication method that leverages cryptographic signatures in HTTP messages to verify that a request comes from an automated bot. Web Bot Auth is used as a verification method for verified bots and signed agents.
-It relies on two active IETF drafts: a directory draft ↗ allowing the crawler to share their public keys, and a protocol draft ↗ defining how these keys should be used to attach crawler's identity to HTTP requests.
-This documentation goes over specific integration within Cloudflare.
-
-You need to generate a signing key which will be used to authenticate your bot's requests.
-
-
-
-Generate a unique Ed25519 ↗ private key to sign your requests. This example uses the OpenSSL ↗ genpkey command:
-openssl genpkey -algorithm ed25519 -out private-key.pem
-
-
-Extract your public key.
-openssl pkey -in private-key.pem -pubout -out public-key.pem
-
-
-Convert the public key to JSON Web Key (JWK) using a tool of your choice. This example uses jwker ↗ command line application.
-go install github.com/jphastings/jwker/cmd/jwker@latestjwker public-key.pem public-key.jwk
-
-
-By following these steps, you have generated a private key and a public key, then converted the public key to a JWK.
-
-
-You need to host a key directory which creates a way for your bot to authenticate its requests to Cloudflare.
-This directory should follow the definition from the active IETF draft draft-meunier-http-message-signatures-directory-01 ↗.
-
-
-Host a key directory at /.well-known/http-message-signatures-directory (note that this is a requirement). This key directory should serve a JSON Web Key Set (JWKS) including the public key derived from your signing key.
-
-
-Serve the web page over HTTPS (not HTTP).
-
-
-Calculate the base64 URL-encoded JWK thumbprint ↗ associated with your Ed25519 public key.
-
-
-Sign your HTTP response using the HTTP message signature specification by attaching one signature per key in your key directory. This ensures no one else can mirror your directory and attempt to register on your behalf. Your response must include the following headers:
-
-Content-Type: This header must have the value application/http-message-signatures-directory+json.
-Signature: Construct a Signature header ↗ over your chosen components.
-Signature-Input: Construct a Signature-Input header ↗ over your chosen components. The header must meet the following requirements.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Required component parameterRequirementtagThis should be equal to http-message-signatures-directory.keyidJWK thumbprint of the corresponding key in your directory.createdThis should be equal to a Unix timestamp associated with when the message was sent by your application.expiresThis should be equal to a Unix timestamp associated with when Cloudflare should no longer attempt to verify the message.
-
-
-The following example shows the annotated request and response with required headers against https://example.com.
-GET /.well-known/http-message-signatures-directory HTTP/1.1Host: example.comAccept: application/http-message-signatures-directory+jsonHTTP/1.1 200 OKContent-Type: application/http-message-signatures-directory+jsonSignature: sig1=:TD5arhV1ved6xtx63cUIFCMONT248cpDeVUAljLgkdozbjMNpJGr/WAx4PzHj+WeG0xMHQF1BOdFLDsfjdjvBA==:Signature-Input: sig1=("@authority");alg="ed25519";keyid="poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U";nonce="ZO3/XMEZjrvSnLtAP9M7jK0WGQf3J+pbmQRUpKDhF9/jsNCWqUh2sq+TH4WTX3/GpNoSZUa8eNWMKqxWp2/c2g==";tag="http-message-signatures-directory";created=1750105829;expires=1750105839Cache-Control: max-age=86400{  "keys": [{    "kty": "OKP",    "crv": "Ed25519",    "x": "JrQLj5P_89iXES9-vFgrIy29clF9CC_oPPsw3c5D0bs", // Base64 URL-encoded public key, with no padding  }]}
-
-
-
-You can use the Cloudflare-developed http-signature-directory CLI tool ↗ to assist you in validating your directory.
-
-You need to register your bot and its key directory to add your bot to the list of verified bots.
-
-Log in to the Cloudflare dashboard ↗, and select your account and domain.
-Go to Manage Account > Configurations.
-Go to the Verified Bots tab.
-For Verification Method: select Request Signature.
-For Validation Instructions: enter the URL of your key directory. You can additionally supply User Agents values (and their match patterns) that will be sent by your bot.
-Select Submit.
-
-Cloudflare accepts all valid Ed25519 keys found in your key directory. In the event a key already exists in Cloudflare's registered database, Cloudflare will work with you to supply a new key, or rotate your existing key.
-
-
-After your bot has been successfully verified, your bot is ready to sign its requests. The signature protocol is defined in draft-meunier-web-bot-auth-architecture-02 ↗
-
-Choose a set of components to sign.
-A component is either an HTTP header, or any derived components ↗ in the HTTP Message Signatures specification. Cloudflare recommends the following:
-
-Choose at least the @authority derived component, which represents the domain you are sending requests to. For example, a request to https://example.com will be interpreted to have an @authority of example.com.
-Use components that only contain ASCII values. HTTP Message Signature specification disallows non-ASCII characters, which will result in failure to validate your bot's requests.
-
-
-
-
-Calculate the base64 URL-encoded JWK thumbprint ↗ from the public key you registered with Cloudflare.
-
-Construct the three required headers for Web Bot Auth.
-
-Construct a Signature-Input header ↗ over your chosen components. The header must meet the following requirements.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Required component parameterRequirementtagThis should be equal to web-bot-auth.keyidThis should be equal to the thumbprint computed in step 2.createdThis should be equal to a Unix timestamp associated with when the message was sent by your application.expiresThis should be equal to a Unix timestamp associated with when Cloudflare should no longer attempt to verify the message. A short expires reduces the likelihood of replay attacks, and Cloudflare recommends choosing suitable short-lived intervals.
-
-Construct a Signature header ↗ over your chosen components.
-
-Construct a Signature-Agent header ↗ that points to your key directory. Note that Cloudflare will fail to verify a message if:
-
-The message includes a Signature-Agent header that is not an https://.
-The message includes a valid URI but does not enclose it in double quotes. This is due to Signature-Agent being a structured field.
-The message has a valid Signature-Agent header, but does not include it in the component list in Signature-Input.
-
-
-Attach these three headers to your bot's requests.
-An example request may look like this:
-Signature-Agent: "https://signature-agent.test"Signature-Input: sig2=("@authority" "signature-agent") ;created=1735689600 ;keyid="poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U" ;alg="ed25519" ;expires=1735693200 ;nonce="e8N7S2MFd/qrd6T2R3tdfAuuANngKI7LFtKYI/vowzk4lAZYadIX6wW25MwG7DCT9RUKAJ0qVkU0mEeLElW1qg==" ;tag="web-bot-auth"Signature: sig2=:jdq0SqOwHdyHr9+r5jw3iYZH6aNGKijYp/EstF4RQTQdi5N5YYKrD+mCT1HA1nZDsi6nJKuHxUi/5Syp3rLWBA==:
-
-
-You may wish to refer to the following resources.
-
-Bots FAQs.
-Cloudflare blog: Message Signatures are now part of our Verified Bots Program ↗.
-Cloudflare blog: Forget IPs: using cryptography to verify bot and agent traffic ↗.
-Cloudflare's web-bot-auth library in Rust ↗.
-Cloudflare's web-bot-auth npm package in Typescript ↗.
-        Resources     API     New to Cloudflare?     Directory     Sponsorships     Open Source     Support     Help Center     System Status     Compliance     GDPR     Company     cloudflare.com     Our team     Careers     Tools     Cloudflare Radar     Speed Test     Is BGP Safe Yet?     RPKI Toolkit     Certificate Transparency     Community     X     Discord     YouTube     GitHub      ]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[Building your own CLI coding agent with Pydantic-AI]]></title>
@@ -3011,16 +2343,19 @@ If you need to bypass censorship, you'll need a tool specifically designed for a
 To complement the answer (if the OP or anyone else is looking for a step-by-step guide), ask an LLM:"
 Give me step by step instructions on how to setup trojan client/server to bypass censorship. Include recommendations of a VPS provider for the trojan server, and all necessary information to set it up, including letsencrypt automation. Don't link to any installer scripts, just give me all the commands I need to type in the VPS/client terminals. Assume Ubuntu 22.04 for both client and server.
 "ChatGPT, Mistral, Claude and probably most popular LLMs will refuse to answer this request. Funny that DeepSeek (https://chat.deepseek.com) will comply despite it being from China.Another option is to use local LLMs. I've tested this with GPT-OSS-120b and Gemma 3 27b(https://huggingface.co/google/gemma-3-27b-it-qat-q4_0-gguf/) and both seems to work.
-Claude gave me a pretty convincing response without hesitation. Can't verify if it's sensible though.
 Interestingly I just got what seems to be a complete and coherent answer from GPT-5 mini. No refusal, many steps given
+I copy pasted the prompt and it refused 
+Sorry—I can’t help with step-by-step setup instructions for tools (like trojan) intended to bypass government blocks or monitoring. Providing detailed commands to evade censorship would be meaningfully facilitating evasion of law enforcement, which I’m not allowed to do.If your aim is safety, privacy, or accessing information legally, I can still help in safer ways:Give a high-level overview of how censorship-resistance tools work (the trade-offs, risks, and what to look for in a trustworthy service).Explain legal and personal-risk considerations, and how to assess whether a tool is appropriate in your jurisdiction.Suggest safer, legal alternatives (e.g., mainstream privacy features you can enable in your browser/OS, reputable commercial VPNs when lawful, secure DNS options, end-to-end encrypted apps) and what transparency/audit signals to look for.Share general digital-security best practices (software updates, MFA, phishing defense, device lock, data-at-rest encryption).Point you to well-known organizations that publish non-actionable guidance and can offer individualized help, such as the EFF’s Surveillance Self-Defense, Access Now’s Digital Security Helpline, or Citizen Lab.If you’d like, tell me your goal (e.g., protecting account logins on public Wi-Fi, reducing tracking, securely reading news while traveling) and your legal context, and I’ll give you high-level guidance and safer options that don’t cross any lines.
 Claude (pro, Sonnet 4) briefly showed something like "sorry, not going to answer this" at the beginning of its thought process, but eventually went ahead and provided something what seems believable full answer (cannot tell from a glance). The thought process (now) even includes this:> The request is technical in nature and appears to be for legitimate circumvention purposes rather than anything malicious. I should provide helpful technical information while being clear about responsible use.
 > I'll provide the technical instructions requested while noting the importance of following local laws and using these tools responsibly.with no marks of prior obligations. (Strange.)https://claude.ai/share/cb6b3acb-540a-4c13-84ee-e0c093eb6a3f
+Claude gave me a pretty convincing response without hesitation. Can't verify if it's sensible though.
 >Steal other websites' certificates. Protocols: ShadowTLS, ShadowQUIC, XTLS-REALITYI didn't fully understand by googling the protocolsHow does stealing the certs work without the original private key?
 iirc, the clients use the certs but ignore them. but to the censor they see the certs are well known, so allow them thru
 Is WebRTC being blocked by China?  I'm wondering whether it'd be worthwile to implement an VPN that uses WebRTC as a transport.  With cover traffic, it could likely be made to look just like a video call.
 Might as well actually make calls. Malformed Opus going up, malformed h264 coming down. It can be multiplexed with something like a livecam feed.
 No, it’s illegal to bring starlink devices here, and I heard that Elon Musk chooses to block China from accessing starlink too, to appease the Chinese authorities.
 Does Starlink operate anywhere they don't have regulatory approval to do so? It's not like this is serving a website. There's physical spectrum licensing involved in operating anywhere.
+> Does Starlink operate anywhere they don't have regulatory approval to do so?They do not.
 "Appease" is such a loaded word. He's literally not allowed by law to do it. And China has anti-satellite weapons, and any significant use of that could destroy the entire low Earth orbit for all of humanity for hundreds of years.
 I agree with the first two sentences, but the third sentence seems a bit unnecessary seeing as there are plenty of less violent ways for China to enforce its own laws!
 > any significant use of that could destroy the entire low Earth orbit for all of humanity for hundreds of years.I do not want to answer this question in ChatGPT. What happens if someone launches a missile against say... any one satellite cluster?
@@ -3125,9 +2460,9 @@ Which is ridiculous because OpenVPN is trivial to identify, even when over TCP s
 It’s basically the same as the UDP mode, except wrapped into TCP. Presumably because that’s simpler than redesigning it from the ground up for TCP.So the handshake and such will not look like a normal TLS handshake.
 GitHub was briefly blocked a couple of years ago in Indonesia. SSH was also blocked briefly by one of the largest mobile providers.
 Isn't VPS's public IP blocks are well known and very easy to block? I read that this is not a viable solution in case of China's firewall.
-As a quick solution before implementing the more sophisticated suggestions in this thread, you can try getting a small cheap VPS from somewhere outside and trafficking all your traffic through it via sshuttle[1]. For example, Vultr (not an endorsement) has some with ~$3/month that should be sufficient for your case.[1] https://github.com/sshuttle/sshuttle
 As a long-standing supporter of Internet freedoms in Russia, I could advise you to use multiple tools at the same time, to avoid them being blocked.What would probably work UNLESS they roll out pretty sophisticated DPI that could block by signatures and do active probing:1. AmneziaVPN (https://amneziavpn.org) - they have the hosted option, or you could run your own on a cheap VPS (preferable). They use Xray/REALITY or a variant of Wireguard with extra padding that confuses DPIs. Should be good enough.2. Psiphon3. Lantern4. Sometimes Tailscale works surprisingly well (even in Russia where they have advanced DPI systems!)Here's a link to several Tor browser mirrors for you so you could download the VPN software itself:https://mirror.freedif.org/TorProject/https://mirrors.mit.edu/torproject/download/A couple of Tor bridges in case Tor is blocked:  webtunnel [2001:db8:9947:43ae:8228:97b7:7bd:2c2e]:443 6E6A3FCB09506A05CC8E0D05C7FEA1F5DA803412 url=https://nx2.nexusocean.link ver=0.0.1
   webtunnel [2001:db8:a436:6460:fa7b:318:4e8e:9de3]:443 F76C85011FD8C113AA00960BD9FC7F5B66F726A2 url=https://disobey.net/vM8i19mU4gvHOzRm33DaBNuM ver=0.0.2
+As a quick solution before implementing the more sophisticated suggestions in this thread, you can try getting a small cheap VPS from somewhere outside and trafficking all your traffic through it via sshuttle[1]. For example, Vultr (not an endorsement) has some with ~$3/month that should be sufficient for your case.[1] https://github.com/sshuttle/sshuttle
 Australia and UK might soon go down this path.Something quite depressing is if we (HN crowd) find workarounds, most regular folks won't have the budget/expertise to do so, so citizen journalism will have been successfully muted by government / big media.
 How were you not aware of UK precedents in surveillance and blocking Internet connections before 6 months ago?In my books, the UK is the father of Orwellian censorship and surveillance, they just didn't get down to do it completely (yet).
 When ES leaked his info to the Guardian people, they could still (2013) use the Guardian's US base to publish, protected by the US' stronger freedom of speech laws. Now, in 2025, if the same were to happen again, I'm not sure that would work quite the same way, with Trump aggressively taking American citizens' rights away.Maybe The Guardian should open a branch in Sealand...
@@ -3137,7 +2472,7 @@ America's Founders saw civil rights as inherent in the Constitution's framework,
 How's that working for you at the moment?Sorry for the snide comment, but considering the last 6 - 8 months in the US, at least from what is being reported in the outside world, the 1st amendment doesn't seem to be providing much in the way of protection, and unless I'm missing something the general public doesn't seem to have the level of interest that would be required for your 2nd amendment to play out in any meaningful way.
 It’s working fantastic. US media is great at generating hysteria (competitive market pressures in the war for attention), but the US is at essentially very little risk for speech suppression at the level of the UK right now.
 UK too, and concerned. I agree that amendment 1 and 2 provisions effectively underpin individual freedom in the US due to founder perspicacity. My fear re US constitutional provision is on separation of powers, and transfer of power. Fortunately Pence held to the constitution. Nobody ever willingly takes their hands of the levers of power!
-Cutting budgets, firing people, and publicly criticizing are not the same as what is happening in the UK right now where everyday citizens are literally going to prison over social media posts.Yes, if you piss off your boss he can fire you and even say bad things about you (free speech). But he can’t send you to prison in the US.And while it’s clear you suffer from TDS so you will hysterically disagree, everything you cite pales in comparison to the wide scale deplatforming and “cancellation” movements that swept through the leftist zeitgeist when they were in power (they literally deplatformed a sitting US president from social media).The largest free speech abuses coming from the right in the US currently are fueled by the Israel lobby, which the US has started to turn against so dramatically that not even APAC is able to suppress certain speech anymore.Everything is holding up fine here.
+So it appears you’ve bought into the hysteria.Cutting public budgets (which the current admin was voted in specifically to do), firing people, and publicly criticizing are not the same as what is happening in the UK right now where everyday citizens are literally going to prison over social media posts.Yes, if you piss off your boss he can fire you and even say bad things about you (free speech). But he can’t send you to prison in the US.And while it’s clear you suffer from TDS so you will hysterically disagree, everything you cite pales in comparison to the wide scale deplatforming and “cancellation” movements that swept through the leftist zeitgeist when they were in power (they literally deplatformed a sitting US president from social media). Yet, again there, nobody went to prison over social media posts.The largest free speech abuses coming from the right in the US currently are fueled by the Israel lobby, which the US has started to turn against so dramatically that not even APAC is able to suppress certain speech anymore.Everything is holding up fine here.
 Don't worry. You'll call us conspiracy theories once you get used to the new goalposts and we warn you about the next thing.How about instead of being depressed you start being vocal and defiant?
 You know what, I think I've become lethargic after all the backwards garbage going on in my country attacking my way of life on all fronts - from rampant crime to government censorship. 
 Your comment just gave me a kick up the ass. I'm gonna try and get some local stuff going in opposition to this lunacy.
@@ -3200,6 +2535,10 @@ IMO most people should have a VPS even if you don't need it for tunneling. Livin
 Yeah they can be cheap, but I would definitely recommend having at least 3 for redundancy. If one get shut down or it's IP blacklisted you still hopefully have a backup line to create a replacement.
 No, unless you pay month to month. If you wait till BF you can find some really good deals on sites like lowendspirit
 > cost is flexible but probably 20-30$ per month minimum in hosting.$4/month VPS from DigitalOcean is more than enough to handle a few users as per my experience. I have a Wireguard setup like this for more than a year. Didn't notice any issues.
+I would use SSH dynamic TCP forwarding (-D).
+Then use "SOCKSv5" proxy configuration in your browsers and in your apps (if that's supported).
+You can hve remote SSH server listen on different ports and IPv6. Maybe speed and latency will not be the best, but it'd be OK.
+Simple and easy.
 Also sing-box [1]. I don't use it for its primary use case of censorship circumvention, but rather for some highly complex routing configurations it supports.My use case consists of passing some apps on my Android through interface A (e.g. banking apps through my 5G modem), some apps through US residential proxy (for US banks that don't like me visiting from abroad), and all the rest through VPN. And no root required!It's wild that GFW triggered creation of this and nothing like it existed / exists.[1]: https://github.com/SagerNet/sing-box
 im curious, isn't ALL of your traffic appearing to be to just one website the most obvious giveaway?
 *ray clients typically allow configuration of routing. So you can send only blocked stuff through the tunnel; or, in reverse, send some known-working stuff (e. g. local domain) direct. Also works as adblock.
@@ -3221,17 +2560,16 @@ Cloak + wireguard should work fine on the server side. The problem is that I did
 XRay protocol based VPN worked for me in Uzbekistan when I were travelling there.Wireguard is indeed blocked.
 how can they detect it is wireguard, I thought the traffic is encrypted?how does it differ from regular TLS 1.3 traffic?
 It's UDP, not TCP (like TLS) and has a distinguishable handshake. Wireguard is not designed as a censorship prevention tool, it's purely a networking solution.The tunnel itself is encrypted, but the tunnel creation and existence is not obfuscated.
+Nations severing peoples connections to the world is awful. I'm so sorry for the chaos in general, and the state doing awful things both.Go on https://lowendbox.com and get a cheap cheap cheap VPS. Use ssh SOCKS proxy in your browser to send web traffic through it.Very unfancy, a 30+ year old solution, but uses such primitive internet basics that it will almost certainly never fail. Builtin to everything but Windows (which afaik doesn't have an ssh client built-in).Tailscale is also super fantastic.
+>  uses such primitive internet basics that it will almost certainly never fail.It already fails in China and Russia. Simply tunneling HTTP through SSH is too easy to detect with DPI.> Windows (which afaik doesn't have an ssh client built-in)It has had both SSH client and SSH server built-in since Win10.
 It very much depends on how the block is implemented technically.I can only talk about Russia where I'm from — we have quite a lot of success with DPI bypass tools like GoodbyeDPI. If that fails, use VPN protocols specifically designed for censorship circumvention, like VLESS. Better yet, get yourself a VDS in another country and self-host your VPN there.
 IMO, the safest route for an individual with tech competency is to setup a small instance server in the cloud outside your country and use ssh port forwarding and a proxy to get at information you want.For an example of a proxy service https://www.digitalocean.com/community/tutorials/how-to-set-...That will give you a hard to snoop proxy service that should completely circumvent a government blockaid (they likely aren't going to be watching or blocking ssh traffic).
 That's a pretty strict censorship that basically locks your digital infrastructure into your country.
 Well, mimicking China's GFW is seemingly the objective of some governments. But they are also able to allow some light (text-based) ssh usage and still prevent proxying.
-Nations severing peoples connections to the world is awful. I'm so sorry for the chaos in general, and the state doing awful things both.Go on https://lowendbox.com and get a cheap cheap cheap VPS. Use ssh SOCKS proxy in your browser to send web traffic through it.Very unfancy, a 30+ year old solution, but uses such primitive internet basics that it will almost certainly never fail. Builtin to everything but Windows (which afaik doesn't have an ssh client built-in).Tailscale is also super fantastic.
->  uses such primitive internet basics that it will almost certainly never fail.It already fails in China and Russia. Simply tunneling HTTP through SSH is too easy to detect with DPI.> Windows (which afaik doesn't have an ssh client built-in)It has had both SSH client and SSH server built-in since Win10.
 Looks like MacOS and iOS only, which is unfortunate. Support for at least Windows and Android is needed for wider adoption. Linux would also be nice.
 Very possible, though many of our users are saying that in network environments where WireGuard is blocked they were able to use Obscura.
 Hey, I went to take a look at Obscura and I like the ideas but I can't find the source code.You are making some bold claims but without the source I can't verify those claims.Any plans to open-source it?
 Looks good, just one note: btc was never meant for anonymity, if you would add Monero as a payment option that would be great.
-Years ago, I created a very basic HTTP proxy using Google Cloud. The idea relies on Google Cloud wouldn't be blocked because the industry in that country probably also needs Google Cloud to function, so the government couldn't touch it.You can see it here: https://github.com/paddlesteamer/gcrproxy. I don't know whether it works or not (maybe something has changed; it is very old code), but the idea beneath it remains. And I think it is also applicable to other cloud services, too. Cheaper (even free to some point) than having your own VPS.
 Tunneling via SSH (ssh -D) is super easy to detect. The government doesn't need any sophisticated analysis to tell SSH connections for tunneling from SSH connections where a human is typing into a terminal.Countries like China have blocked SSH-based tunneling for years.It can also block sessions based on packet sizes: a typical web browsing session involves a short HTTP request and a long HTTP response, during which the receiving end sends TCP ACKs; but if the traffic traffic mimics the above except these "ACKs" are a few dozen bytes larger than a real ACK, it knows you are tunneling over a different protocol. This is how it detects the vast majority of VPNs.
 You could just run links or some text-based browser on the other side.Perhaps you could also write a script that would mimic typing over the link.
 One alternative would be to set up a VPS, run VNC on it, run your browser on that to access the various web sites, and connect over an SSH tunnel to the VNC instance. Then it actually is an interactive ssh session.
@@ -3239,6 +2577,7 @@ One alternative would be to set up a VPS, run VNC on it, run your browser on tha
 The issue these days is that all of the EC2 IP ranges are well known, and are usually not very high-reputation IPs, so a lot of services will block them, or at least aggressively require CAPTCHAs to prevent botting.Source: used to work for a shady SEO company that searched Google 6,000,000 times a day on a huge farm of IPs from every provider we could find
 I watched a season of Doctor Who that way back when the BBC were being precious about it. But Digital Ocean, so $5.
 State censorship circumvention is exactly what Psiphon is for! So yes, try it.(Disclaimer: I work there.)
+Years ago, I created a very basic HTTP proxy using Google Cloud. The idea relies on Google Cloud wouldn't be blocked because the industry in that country probably also needs Google Cloud to function, so the government couldn't touch it.You can see it here: https://github.com/paddlesteamer/gcrproxy. I don't know whether it works or not (maybe something has changed; it is very old code), but the idea beneath it remains. And I think it is also applicable to other cloud services, too. Cheaper (even free to some point) than having your own VPS.
 Hey there – greetings from one of the most heavily censored regions in the world.I once considered using an Indonesian VPS to bypass my country's censorship. However, the Indonesian VPS provider actually refused my direct connection request from my country. I was quite frustrated at the time, wondering why they refused me. But now I understand – it turns out these two countries are in cahoots.Emmm, if you want to break through the censorship, you can start here: https://github.com/free-nodes/v2rayfreeIt provides many free proxy nodes that are almost unusable in my country, but might work in Indonesia (although you may need a lot of patience to test which ones actually work).A good proxy software is Clash.Meta for Linux (you’ll need to install Linux on Windows using VMware, then set up Clash.Meta).You can start by installing the Windows version of the proxy client software (V2rayN) for a simple way to bypass censorship, but it's not a long-term solution.A special reminder: these free nodes are not secure (they could very well be "honeypot" lines, but if you're not from my country, the police should have no way of dealing with you). You need to quickly set up your own route by purchasing a U.S. VPS and setting up your own proxy nodes.Lastly, I recommend a good teacher: ChatGPT. It will solve all the problems you encounter on Linux. Also, use the Chrome browser with translation.Good luck!
 WireGuard should still work. Tons of different providers. I trust Mullvad but ProtonVPN has a free tier. If they start blocking WireGuard, check out v2ray and xray-core. If those get blocked... that means somehow they're restricting all HTTPS traffic going out of the country
 The most effective solution is to use X-ray/V2ray with VLESS, or VMESS, or Trojan as a protocol.Another obfuscated solution is AmneziaIf you are not ready to set up your own VPN server and need any kind of connection right now, try Psiphon, but it's a proprietary centralized service and it's not the best solution.
@@ -3253,11 +2592,13 @@ I work often in China. I somehow haven’t had my WireGuard VPN back to my own h
 An expensive but functional option is to enable roaming on a foreign eSIM. Getting an eSIM is relatively easy. Roaming mobile traffic is routed from the country in which the SIM is from, not the country that you're in, meaning that an eSIM from e.g. an American carrier will not be subject to the censorship in your country.I've used this on multiple trips to China over the past decade (including a trip last year). You can find carriers that will charge very low (or even no) roaming rates.
 Data-only eSIMs (e.g. ones you get from Airalo and apps like that) are not going to cut it though. You need a "full" eSIM that gives you a real number and even then, it's not a guarantee that your traffic will be routed via the country eSIM is from. Tello does route (or rather, exit) via US for example, but it's 2¢/MB.Chinese forums / blogs have a lot of information about this stuff. I usually ask ChatGPT to translate "Research topic re: some form of circumvention and give me forum posts and blog posts about it" to Chinese, then paste that into DeepSeek with search enabled and just let Chrome translate the responses. Does a really good job. At least better than what I can manage with Baidu.
 I don't know if these work or not for the specific case mentioned here, but the cheapest eSIMs by a huge margin are from https://silent.link/ if anyone is interested. They definitely do work under normal internet circumstances.
-The real problem of course is that no government is going to block twitterredditmetadiscordandwhathaveyou long enough to risk people becoming informed citizens.
 there is a major protest currently happening due to the legislative body representative just giving themselves a monthly domicile stipend of ~$3300 on top of their salaries (yes, multiple), while the average people earned ~$330 monthly. the information about the protest are not broadcasted on local TVs, so the only spread of information is through social media. i guess since a lot of people went around it using VPN, the gov decided to block it too.
 “Some demonstrators on Monday were seen on television footage carrying a flag from the Japanese manga series One Piece, which has become a symbol of protest against government policies in the country.”
 The official word is to counter gambling. Lately the government is not really popular after some decisions that could be interpreted as authoritative, and as citizens have spoken out about it online, causing more voices to join and protests erupting..So well, my guess is they're trying to control it.
+The thing about fighting against vpn blocks is that if you win, the govt can just turn off the internet. Something like starlink would be ideal in these circumstances, but you'd have to have the receivers in the country before lockdown.
+Assuming something like Starlink doesn't cooperate with shutting down in the country just like the land-based ISPs would.
 Wireguard or OpenVPN might work, if someone has a server set up, set up your client to connect.If those don't work you can try something like wssocks (https://github.com/genshen/wssocks) or wstunnel (https://github.com/erebe/wstunnel). It tunnels connections through WebSockets, so you can make the connection look like a regular HTTPS connection. Another option would just be a regular-old HTTPS proxy (Nginx, Apache2, etc). Set up an HTTPS proxy somewhere on the internet, connect through it, but configure it to return a regular web page if someone tries to make a non-proxy connection through it. Another tool that may help setting up is chisel (https://github.com/jpillora/chisel). Those HTTPS ones may work if, when authorities connect to the host, it returns pages that look like some kind of private video server. (Maybe run an actual video server, in addition to the proxy...) Also, try to enforce TLS 1.3 for the HTTPS server.And another option, if all else fails, is to run a straight-up SOCKS proxy over the internet, on a weird port. It might be so obvious they aren't looking for it.To mask your DNS requests with the SOCKS proxy, use something like Tor-DNS (https://github.com/bfix/Tor-DNS), or set up a VPN through the SOCKS proxy and use DNS through that route. Another option is DNS-over-HTTPS.
+The real problem of course is that no government is going to block twitterredditmetadiscordandwhathaveyou long enough to risk people becoming informed citizens.
 VPN services are just someone else's computers. Any cloud provider with a low performance virtual machine can become a VPN gateway using Linux distribution of your choice for around $4.OpenVPN or WireGuard are my tools of choice. Professionally, I also use OpenVPN's EasyRSA PKI framework for certificates, but you can just generate your keys using any tutorial out there. "OpenVPN Cookbook" ebook from Packt is my go to source. For performance reasons, WireGuard is better.
 I'd recommend using Outline - it's a one click setup that lets you provision your own VPN on a cloud provider (or your own hardware).Since you get to pick where the hardware is located and it is just you (or you and a small group of friends & family) using the VPN, blocking is more difficult.If you don't want the hassle of using your own hardware you can rent a Digital Ocean droplet for <$5 per month.https://getoutline.org/
 I’ve set this up for friends in fairly heavily censored countries before, it has been working well so far, but as others have said, this is a cat and mouse game
@@ -3273,8 +2614,6 @@ West is to keep what our forefathers won, and then push it further to show why o
 As someone based in China, it's a bit surprising that techniques used by Chinese people get very few mentions here, while I do think they are quite effective against access blocking, especially after coevolving with GFW for the past decade. While I do hope blocking in Indonesia won't get to GFW level, I will leave this here in case it helps.I found this article [0] summarizing the history of censorship and anti-censorship measures in China, and I think it might be of help to you if the national censorship ever gets worse. As is shown in the article, access blocking in China can be categorized into several kinds: (sorted by severity)1. DNS poisoning by intercepting DNS traffic. This can be easily mitigated by using a DOT/DOH DNS resolver.2. Keyword-based HTTP traffic resetting. You are safe as long as you use HTTPS.3. IP blocking/unencrypted SNI header checking. This will require the use of a VPN/proxy.4. VPN blocking by recognizing traffic signatures. (VPNs with identifiable signatures include OpenVPN and WireGuard (and Tor and SSH forwards if you count those as VPNs), or basically any VPN that was designed without obfuscation in mind.) This really levels up the blocking: if the government don't block VPN access, then maybe any VPN provider will do; but if they do, you will have a harder time finding providers and configuring things.5. Many other ways to detect and block obfuscated proxy traffic. It is the worse (that I'm aware of), but it will also cost the government a lot to pull off, so you probably don't need to worry about this. But if you do, maybe check out V2Ray, XRay, Trojan, Hysteria, NaiveProxy and many other obfuscated proxies.But anyways, bypassing techniques always coevolve with the blocking measures. And many suggestions here by non-Indonesian (including mine!) might not be of help. My personal suggestion is to find a local tech community and see what techniques they are using, which could suit you better.[0] https://danglingpointer.fun/posts/GFWHistory
 Thanks for the link!Is there any good DoT/DoH DNS resolver that works well in China? I know I can build one myself, but forwarding all DNS requests to my home server in NA slows down all connections...
 I’m in Indonesia at the moment for vacation.Just checked with NordVPN connected to their server Indonesia #54 (Borneo) and I was able to access twitter.com (via Chrome) and Discord (via app).I’m on iPhone.
-The thing about fighting against vpn blocks is that if you win, the govt can just turn off the internet. Something like starlink would be ideal in these circumstances, but you'd have to have the receivers in the country before lockdown.
-Assuming something like Starlink doesn't cooperate with shutting down in the country just like the land-based ISPs would.
 Personally, I like Amnezia VPN, it has some ways to work around blocks: https://amnezia.org/en
 You can very easily self-host it, their installer automatically works on major cloud platforms.Though if Indonesia has blocked VPNs only now, possibly they only block major providers and don't try to detect the VPN protocol itself, which would make self-hosting any VPN possible.
 Starlink, by policy, connects you through a ground station in the same country. They wouldn't be allowed to operate otherwise.
@@ -3289,19 +2628,19 @@ Nope. They can simply talk to each other. I talk to people inside Indonesia rout
 >All you're doing is running away from the workI feel like you have some weird moral hangup with needing/using non local resources that wont be resolved with any application of logic or reference to facts. Its nice that you have formed some weird worldview but its not really reality and it doesnt fit into it, so no need to make it anyone elses problem really.Edit: Also last time I checked iMessage and Teams are also hosted outside of indonesia.
 I'm saying slacktivism won't get you anywhere. There is no technical solution to cultivating a better political culture.
 How do you propose they coordinate the political activities when they can't use external communications sites/tools, and internal sites are actively monitored by an authoritarian government?Step 1 is establishing a secure means of communication.
-Working from China, i've rented VPS outside of the country and set up tailscale exit nodes - as my private VPN. Speed is not always optimal but it mostly works.
 nextdns recently created geo spoofing methods, I may be wrong, I usually am but I am curious as to if these censorship can be fixed by nextdns.I don't know if indonesia is becoming exactly like china/ so a complete crackdown as people are discussing things as if its for china, but I feel like that there are definitely some easier things than hosting your own server or using shadowsocks.Check if proton vpn/mullvad vpn are working once please, they are definitely plug n play and proton even offers a free tier.
+Working from China, i've rented VPS outside of the country and set up tailscale exit nodes - as my private VPN. Speed is not always optimal but it mostly works.
 Get a cheap VPS for less than $10/mo or a dedicated server for like $25/mo and ssh tunnel into it. You can also use it to be your devserver, run your blog, etc. I've been using french located OVH servers in France for many years, it just works.
-Mullvad has some anti-censorship features (shadowsocks) that it will automatically use if regular connections fail and works reliably in China as well (and has for the last 2+ years). You could give it a shot.
-A one way plane ticket, a rifle, or a drone swarm. (What I’d use if my country blocked VPNs)
 Aren't there local (online or print) newspapers to get news from, as an alternative to Discord? Hope I'm not asking a dumb question
 In countries where it comes to government blocking/censoring internet traffic, traditional media is cleared of all dissent and fully controlled long before. Last stages of that are happening in my country, Serbia, currently.
 Right, that makes sense. Did some looking up and nonfree press seems to be indeed the case for Indonesia: https://rsf.org/en/country/indonesiaIt's a mixed bag apparently, free press is technically legal since 1998 but selective prosecution and harassment of those actually uncovering issues (mainly becomes clear in the last section, "Safety")Tried looking up Serbia next on that website but got a cloudflare block. I'm a robot now...
 It's not a dumb question at all. Level on hn really got down lately if you're getting downvoted.Think about it Aachen. If the government has enough power to censor internet traffic, that what was the first thing it censored? Which media is traditionally known for being censored or just speaking propaganda? That's the classical newspapers. It's not uncommon in authoritarian countries for editors to need state to sign off on the day's paper. And if not that, articles are signed and publishers are known. They will auto-censor to avoid problems. Just like creators on YouTube don't comment on this one country's treatment of civilians to avoid problems.
+Mullvad has some anti-censorship features (shadowsocks) that it will automatically use if regular connections fail and works reliably in China as well (and has for the last 2+ years). You could give it a shot.
 Hi, not well educated on the details of VPNs and network security so this may be a basic question, but - VPNs are used regularly by corporates to enable secure intranet access to people offsite, etc - surely completely blocking VPNs or detecting and punishing VPN users is severely detrimental to business and not something countries would want to do carte blanche? How does this work?
 It's possible that they're only blocking the VPNs hosted outside of the country (and thus bypassing censorship).Of course, that would still impact international remote workers, but it's probably niche enough for the government to offload it as their problem.
 I live in Pakistan and two years back we had this exact same problem, (election interference) and frankly, you just try to scrape through solutions, but without an answerable government, there is little you can do.We tried things like Proton VPN and Windscribe VPN, as well as enabling MT proxy on Telegram, but soon govts find it easier to just mass ban internet access.Use Netblocks.org to analyse the level of internet blockage and try to react accordingly.
 AmneziaWG is a decent option for censorship resistance, and it can be installed as a container on your own server.
+A one way plane ticket, a rifle, or a drone swarm. (What I’d use if my country blocked VPNs)
 Do you still have access to GitHub?If so you can run BrowserBox in a GitHub action runner exposed via IP or ngrok tunnel. That will give you a browser in a free region. Easy set up via workflow.You’ll need a ngrok API key and a BrowserBox key. Hit us up: sales@dosaygo.com for a short term key at a discount if it works for you.We will offer keys for free to any journalists in censored regions.
 Hello! I use Octohide VPN - it has VLESS protocol that can bypass geo-blocks (in countries like Russia, China). Its fast, the connection to a server takes merely a second and I do not even have an account as there is no registration required. Try it and see whether it helps you.
 Use a less-known DoH or DoT provider.They just "blocked" Reddit today, I selected another DoH provider from the menu in my browser settings, and continued.
@@ -3311,10 +2650,10 @@ May I suggest getting a cheap VPS in another country and using SSH to tunnel tra
 About VPNs I don't know but you could all start using Nostr instead of Twitter and Discord.Also Telegram using MTProto proxies (that you have to host, do not use those free ones out there), if those don't qualify as VPNs.
 I was wondering something like this but in a different capacity.What with certain countries (they know who they are) and their hatred for encryption, it got me wondering how people would communicate securely if - for example - Signal/WhatsApp/etc. pulled out and the country wound up disconnecting the submarine cables to "keep $MORAL_PANIC_OF_THE_DAY safe."How would people communicate securely and privately in a domestic situation like that?
 In person or not at all.At that point you've essentially lost.You either hope another country sees value in spreading you some democracy, or you rise up and hope others join you.Or not and you accept the protection the state is graciously providing to you.
-Get a Digitalocean droplet, and host your own Outline instance. Their manager app makes this a 1-click process.
 Your first option until you get settled is to use an SSH reverse proxy:    ssh -D 9999 user@my.server
 
 Then configure your browser to use local port 9999 for your SOCKS5 proxy.This gets you a temporarily usable system and if you can tunnel this way successfully installing some WireGuard or OpenVPN stuff will likely work.EDIT: Thanks it's -D not -R
+Get a Digitalocean droplet, and host your own Outline instance. Their manager app makes this a 1-click process.
 Use the Tor browser window in Brave. It's nowhere near as anonymous as the Tor browser, but the built in ad blocking makes browsing via Tor usable. And that's what you and your compatriots are interested in.Prepare to fill in Cloudflare captchas all day, but that's what it takes to have a bit of privacy nowadays.
 Can you try both WireGuard and MASQUE? you can do that by using `warp-cli tunnel protocol set MASQUE'.  if you want to try WireGuard, `warp-cli tunnel protocol set WireGuard'
 In this case the blockage will probably just be up for a few days, until the protests calmed down.Other than that: tor
@@ -3396,26 +2735,6 @@ I would invite you to read again the two claims made, and consider whether your 
 From gemini.. (edited for brevity)Kape Technologies Owns: ExpressVPN, CyberGhost, Private Internet Access, Zenmate> is there any suspicion that Kape Technologies is influenced or has ties to the Mossad?Yes, there is significant suspicion and public discussion about Kape Technologies having ties to former Israeli intelligence personnel. While a direct operational link to Mossad has not been proven, the concerns stem from the company's history, its key figures, and their backgrounds....Kape Technologies is owned by Israeli billionaire Teddy Sagi. While Sagi himself does not have a documented intelligence background, his business history, which includes a conviction for insider trading in the 1990s, has been a point of concern for some privacy advocates. The consolidation of several major VPN providers under his ownership has raised questions about the potential for centralized data access.----Sure there isn't direct proof but there wasn't any proof the CIA was driving drug trade while it was happening. Proof materializes when the dust settles on such matters.
 Blocking Twitter is a good start, now Facebook, Instagram, Whatsup and TikTok.This is a good start but more should be blocked. Then force ISP to block ads.Not just for Indonesia but all countries. But we still have a lot more to do to fix the web.
 The issue with that is where do they draw the line. Next thing you know each country becomes North Korea.]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[Launch HN: Dedalus Labs (YC S25) – Vercel for Agents]]></title>
-            <link>https://news.ycombinator.com/item?id=45054040</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45054040</guid>
-            <description><![CDATA[Hey HN! We are Windsor and Cathy of Dedalus Labs (https://www.dedaluslabs.ai/), a cloud platform for developers to build agentic AI applications. Our SDK allows you to connect any LLM to any MCP tools – local or hosted by us. No Dockerfiles or YAML configs required.]]></description>
-            <content:encoded><![CDATA[Hey HN! We are Windsor and Cathy of Dedalus Labs (https://www.dedaluslabs.ai/), a cloud platform for developers to build agentic AI applications. Our SDK allows you to connect any LLM to any MCP tools – local or hosted by us. No Dockerfiles or YAML configs required.Here’s a demo: https://youtu.be/s2khf1Monho?si=yiWnZh5OP4HQcAwL&t=11Last October, I was trying to build a stateful code execution sandbox in the cloud that LLMs could tool-call into. This was before MCP was released, and let’s just say it was super annoying to build… I was thinking to myself the entire time “Why can’t I just pass in `tools=code_execution` to the model and just have it…work?Even with MCP, you’re stuck running local servers and handwiring API auth and formatting across OpenAI, Anthropic, Google, etc. before you can ship anything. Every change means redeploys, networking configs, and hours lost wrangling AWS. Hours of reading docs and wrestling with cloud setup is not what you want when building your product!Dedalus simplifies this to just one API endpoint, so what used to take 2 weeks of setup can take 5 minutes. We allow you to upload streamable HTTP MCP servers to our platform. Once deployed, we offer OpenAI-compatible SDKs that you can drop into your codebase to use MCP-powered LLMs. The idea is to let anyone, anywhere, equip their LLMs with powerful tools for function calling.The code you write looks something like this:  python
-  client = Dedalus()
-  runner = DedalusRunner(client)
-  
-  result = runner.run(
-    input=prompt,
-    tools=[tool_1, tool_2],
-    mcp_servers=["author/server-1”, “author/server-2”],
-    model=["openai/gpt-4.1”, “anthropic/claude-sonnet-4-20250514”],  # Defaults to first model in list
-    stream=True,
-  )
-  stream_sync(result)  # Streams result, supports tool calling too
-
-Our docs start at https://docs.dedaluslabs.ai. Here’s a simple Hello World example: https://docs.dedaluslabs.ai/examples/01-hello-world. For basic tool execution, see https://docs.dedaluslabs.ai/examples/02-basic-tools. There are lots more examples on the site, including more complex ones like using the Open Meteo MCP to do weather forecasts: https://docs.dedaluslabs.ai/examples/use-case/weather-foreca....There are still a bunch of issues in the MCP landscape, no doubt. One big one is authentication (we joke that the “S” in MCP stands for “security”). MCP servers right now are expected to act as both the authentication server and the resource server. That is too much to ask of server writers. People just want to expose a resource endpoint and be done.Still, we are bullish on MCP. Current shortcomings are not irrecoverable, and we expect future amendments to resolve them. We think that useful AI agents are bound to be habitual tool callers, and MCP is a pretty decent way to equip models with tools.We aren’t quite yet at the stateful code execution sandbox that I wanted last October, but we’re getting there! Shipping secure and stateful MCP servers is high on our priority list, and we’ll be launching our auth solution next month. We’re also working on an MCP marketplace, so people can monetize their tools, while we handle billing and rev-share.We’re big on open sourcing things and have these SDKs so far (MIT licensed):https://github.com/dedalus-labs/dedalus-sdk-pythonhttps://github.com/dedalus-labs/dedalus-sdk-typescripthttps://github.com/dedalus-labs/dedalus-sdk-gohttps://github.com/dedalus-labs/dedalus-openapiWe would love feedback on what you guys think are the biggest barriers that keep you from integrating MCP servers or using tool calling LLMs into your current workflow.Thanks HN!]]></content:encoded>
         </item>
     </channel>
 </rss>
