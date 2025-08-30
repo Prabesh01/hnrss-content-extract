@@ -4,7 +4,7 @@
         <title>Hacker News: Front Page</title>
         <link>https://news.ycombinator.com/</link>
         <description>Hacker News RSS</description>
-        <lastBuildDate>Sat, 30 Aug 2025 14:31:57 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 30 Aug 2025 14:50:43 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>github.com/Prabesh01/hnrss-content-extract</generator>
         <language>en</language>
@@ -17,9 +17,56 @@
             <content:encoded><![CDATA[Condor Computing, a subsidiary of Andes Technology that creates licensable RISC-V cores, has a business model with parallels to Arm (the company) and SiFive. Andes formed Condor in 2023, so Condor is a relatively young player on the RISC-V scene. However, Andes does have RISC-V design experience prior to Condor’s formation with a few RISC-V cores under their belt from years past.Condor is presenting their Cuzco core at Hot Chips 2025. This core is a heavyweight within the RISC-V scene, with wide out-of-order execution and a modern branch predictor and some new time based tricks. It’s in the same segment as high performance RISC-V designs like SiFive’s P870 and Veyron’s V1. Like those cores, Cuzco should stand head and shoulders above currently in-silicon RISC-V cores like Alibaba T-HEAD’s C910 and SiFive’s P550.Besides being a wide out-of-order design, Cuzco uses mostly static scheduling in the backend to save power and reduce complexity. Condor calls this a “time-based” scheduling scheme. I’ll cover more on this later, but it’s important to note that this is purely an implementation detail. It doesn’t require ISA modifications or special treatment from the compiler for optimal performance.Cuzco is a 8-wide out-of-order core with a 256 entry ROB and clock speed targets around 2 GHz SS (Slow-Slow) to 2.5 GHz (Typical-Typical) on TSMC’s 5nm process. The pipeline has 12 stages counting from instruction fetch to data cache access completion. However, a 10 cycle mispredict penalty probably more accurately describes the core’s pipeline length relative to its competitors.As a licensed core, Cuzco is meant to be highly configurable to widen its target market. The core is built from a variable number of execution slices. Customization options also include L2 TLB size, off-cluster bus widths, and L2/L3 capacity. Condor can also adjust the size of various internal core structures to meet customer performance requirements. Cuzco cores are arranged into clusters with up to eight cores. Clusters interface with the system via a CHI bus, so customers can bring their own network-on-chip (NoC) to hit higher core counts via multi-cluster setups.Cuzco’s frontend starts with a sophisticated branch predictor, as is typical for modern cores targeting any reasonable performance level. Conditional branches are handled via a TAGE-SC-L predictor. TAGE stands for Tagged Geometric, a technique that uses multiple tables each handling a different history length. It seeks to efficiently use branch predictor storage by selecting the most appropriate history length for each branch, as opposed to older techniques that use a fixed history length. The SC (Statistical Corrector) part handles the small subset of branches where TAGE doesn’t work well, and can invert the prediction if it sees TAGE often getting things wrong under certain circumstances. Finally, L indicates a loop predictor. A loop predictor is simply a set of counters that come into play for branches that are taken a certain number of times, then not taken once. If the branch predictor detects such loop behavior, the loop predictor can let it avoid mispredicting on the last iteration of the loop. Basically, TAGE-SC-L is an augmented version of the basic TAGE predictor.AMD’s Zen 2, Ampere’s AmpereOne, and Qualcomm’s Oryon also use TAGE predictors of some sort, and achieve excellent branch prediction accuracy. AMD, Ampere, and Qualcomm also likely augment the basic TAGE prediction strategy in some way. How Cuzco’s TAGE predictor performs will depend on how large its history tables are, as well as how well the predictor is tuned (selection of index vs tag bits, history lengths, distribution of storage budget across TAGE tables, etc). For Cuzco’s part, they’ve disclosed that the TAGE predictor’s base component uses a 16K entry table of bimodal counters.Branch target caching on Cuzco is provided by a 8K entry branch target buffer (BTB) split into two levels. Condor’s slides show the BTB hit/miss occurring on the cycle after instruction cache access starts, so a taken branch likely creates a single pipeline bubble. Returns are predicted using a 32 entry return stack. Cuzco also has an indirect branch predictor, which is typical on modern CPUs.Cuzco’s instruction fetch logic feeds from a 64 KB 8-way set associative instruction cache, and speeds up address translations with a 64 entry fully associative TLB. The instruction fetch stages pull an entire 64B cacheline into the ICQ (instruction cache queue), and then pull instructions from that into an instruction queue (XIQ). The decoders feed from the XIQ, and can handle up to eight instructions per cycle.Much of the action in Condor’s presentation relates to the rename and allocate stage, which acts as a bridge between the frontend and out-of-order backend. In most out-of-order cores, the renamer carries out register renaming and allocates resources in the backend. Then, the backend dynamically schedules instructions as their dependencies become available. Cuzco’s renamer goes a step further and predicts instruction schedules as well.One parallel to this is Nvidia’s static scheduling in Kepler and subsequent GPU architectures. Both simplify scheduling by telling an instruction to execute a certain number of cycles in the future, rather than having hardware dynamically check for dependencies. But Nvidia does this in their compiler because GPU ISAs aren’t standardized. Cuzco still uses hardware to create dynamic schedules, but moves that job into the rename/allocate stage rather than the schedulers in the backend. Schedulers can be expensive structures in conventional out-of-order CPUs, because they have to check whether instructions are ready to execute every cycle. On Cuzco, the backend schedulers can simply wait a specified number of cycles, and then issue an instruction knowing the dependencies will be ready by then.To carry out time-based scheduling, Cuzco maintains a Time Resource Matrix (TRM), which tracks utilization of various resources like execution ports, functional units, and data buses for a certain number of cycles in the future. The TRM can look 256 cycles into the future, which keeps storage requirements under control. Because searching a 256 row matrix in hardware would be extremely expensive, Cuzco only looks for available resources in a small window after an instruction’s dependencies are predicted to be ready. Condor found searching a window of eight cycles provided a good tradeoff. Because the renamer can handle up to eight instructions, it at most has to access 64 rows in the TRM per cycle. If the renamer can’t find free resources in the search window, the instruction will be stalled at the ID2 stage.Another potential limitation is the TRM size, which could be a limitation for long latency instructions. However, the longest latency instructions tend to be loads that miss cache. Cuzco always assumes a L1D hit for TRM scheduling, and uses replay to handle L1D misses. That means stalls at ID2 from TRM size limitations should also be rare.Compared to a hypothetical “greedy” setup, where the core is able to create a perfect schedule with execution resource limitations in mind, limiting the TRM search window decreases performance by a few percent. Condor notes that creating a core to match the “greedy” figure may not even be possible. A conventional out-of-order core wouldn’t have TRM-related restrictions, but may face difficulties creating an optimal schedule for other reasons. For example, a distributed scheduler may have several micro-ops become ready in one scheduling queue, and face “false” delays even though free execution units may be available on other scheduling queues.Static scheduling only works when instruction latencies are known ahead of time. Some instructions have variable latency, like loads that can miss caches or TLBs, encounter bank conflicts, or require store forwarding. As mentioned before, Cuzco uses instruction replay to handle variable latency instructions and the associated dynamic behavior. The renamer does take some measures to reduce replays, like checking to see if a load gets its address from the same register as a prior store. However, it doesn’t attempt to predict memory dependencies like Intel’s Core 2, and also doesn’t try to predict whether a load will miss cache.Out of order execution in Cuzco is relatively simple, because the rename/allocate stage takes care of figuring out when instructions will execute. Each instruction is simply held within the schedulers until a specified number of cycles pass, after which it’s sent for execution. If the rename/allocate stage guesses wrong, replay gets handled via “poison” bits. The erroneously executed instruction’s result data is effectively marked as poisoned, and any instructions consuming that data will get re-executed. Replaying instructions costs power and wastes execution throughput, so replays should ideally be a rare event. 70.07 replays per 1000 instructions feels like a bit of a high figure, but likely isn’t a major problem because execution resources are rarely a limitation in an out-of-order core. Taking about 7% more execution resources may be an acceptable tradeoff, considering most modern chips rarely use their core width in a sustained fashion.Execution resources are grouped into slices, each of which have a pair of pipelines. A slice can execute all of the core’s supported RISC-V instructions, making it easy to scale execution resources by changing slice count. Each slice consists of a set of execution queues (XEQs), which hold micro-ops waiting for a functional unit. Cuzco has XEQs per functional unit, unlike conventional designs that tend to have a scheduling queue that feeds all functional units attached to an execution port. Four register read ports supply operands to the slice, and two write ports handle result writeback. Bus conflicts are handled by the TRM as well. A slice cannot execute more than two micro-ops per cycle, even doing so would not oversubscribe the register read ports. For example, a slice can’t issue an integer add, a branch, and a load in the same cycle even though that would only require four register inputs.XEQs are sized to match workload characteristics, much like tuning a distributed scheduler. While XEQ sizes can be set to match customer requirements, Condor was able to give some figures for a baseline configuration. ALUs get 16 entry queues, while branches and address generation units (LS) get 8 entry queues. XEQ sizes are adjustable in powers of two, from 2 to 32 entries. There’s generally a single cycle of latency for forwarding between slices. The core can be configured to do zero cycle cross-slice forwarding, but that would be quite difficult to pull off.On the vector side, Cuzco supports 256/512-bit VLENs via multiple micro-ops, which are distributed across the execution slices. Execution units are natively 64 bits wide. There’s one FMA unit per slice, so peak FP32 throughput is eight FMA operations per cycle, or 16 FLOPS when counting the add and multiply as separate operations. FP adds execute with 2 cycle latency, while FP multiplies and multiply-adds have four cycle latency. The two cycle FP add latency is nice to see, and matches recent cores like Neoverse N1 and Intel’s Golden Cove, albeit at much lower clocks.Cuzco’s load/store unit has a 64 entry load queue, a 64 entry store queue, and a 64 entry queue for data cache misses. Loads can leave the load queue after accessing the data cache, likely creating behavior similar to AMD’s Zen series where the out-of-order backend can have far more loads pending retirement than the documented load queue capacity would suggest. The core has four load/store pipelines in a four slice configuration, or one pipeline per slice. Maximum load bandwidth is 64B/cycle, achievable with vector loads.The L1D is physically indexed and physically addressed (PIPT), so address translation has to complete before L1D access.To speed up address translation, Cuzco has a 64 entry fully associative data TLB. The L2 TLB is 4-way set associative, and can have 1K, 2K, or 4K entries. Cuzco’s core private, unified L2 cache has configurable capacity as well. An example 2 MB L2 occupies 1.04 mm2 on TSMC 5nm.Eight cores per cluster share a L3 cache, which is split into slices to handle bandwidth demands from multiple cores. Each slice can deliver 64B/cycle, and slice count matches core count. Thus Cuzco enjoys 64B/cycle of load bandwidth throughout the cache hierarchy, of course with the caveat that L3 bandwidth may be lower if accesses from different cores clash into the same slice. Cores and L3 slices within a cluster are linked by a crossbar. The L3 cache can run at up to core clock. Requests to the system head out through a 64B/cycle CHI interface. System topology beyond the cluster is up to the implementer.Replays for cache misses are carried out by rescheduling the data consumer to a later time when data is predicted to be ready. Thus a L3 hit would cause a consuming instruction to be executed three times - once for the predicted L1D hit, once for the predicted L2 hit, and a final time for the L3 hit with the correct data.High performance CPU design has settled down over the past couple decades, and converged on an out-of-order execution model. There’s no denying that out-of-order execution is difficult. Numerous alternatives have been tried through the years but didn’t have staying power. Intel’s Itanium sought to use an ISA-based approach, but failed to unseat the company’s own x86 cores that used out-of-order execution. Nvidia’s Denver tried to dynamically compile ARM instructions into microcode bundles, but that approach was not carried forward. All successful high performance designs today generally use the same out-of-order execution strategy, albeit with plenty of variation. That’s driven by the requirements of ISA compatibility, and the need to deliver high single threaded performance across a broad range of applications. Breaking from the mould is obviously fraught with peril.Condor seeks to break from the mould, but does so deep in the core in a way that should be invisible to software a functional perspective, and mostly invisible from a performance perspective. The core runs RISC-V instructions and thus benefits from that software ecosystem, unlike Itanium. It doesn’t rely on a compiled microcode cache like Denver, so it doesn’t end up running in a degraded performance beyond what a typical OoO core would see when dealing with poor code locality. Finally, instruction replay effectively creates dynamic schedules and handles cache missesIf you like the content then consider heading over to the Patreon or PayPal if you want to toss a few bucks to Chips and Cheese. Also consider joining the Discord.]]></content:encoded>
         </item>
         <item>
+            <title><![CDATA[Americans Are Having Less Sex]]></title>
+            <link>https://www.wsj.com/lifestyle/relationships/americans-are-having-less-sex-than-ever-785973ce</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45074840</guid>
+        </item>
+        <item>
             <title><![CDATA[AI models need a virtual machine]]></title>
             <link>https://blog.sigplan.org/2025/08/29/ai-models-need-a-virtual-machine/</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45074467</guid>
+        </item>
+        <item>
+            <title><![CDATA[Show HN: OpenAnimation – KMP app for exploring and editing Lottie animations]]></title>
+            <link>https://github.com/orispok/OpenAnimationApp</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45074399</guid>
+            <description><![CDATA[Discover beautiful Lottie animations powered by Kotlin Multiplatform. - orispok/OpenAnimationApp]]></description>
+            <content:encoded><![CDATA[
+  OpenAnimation
+  
+    ✨ Check out the live web version: openanimation.web.app ✨
+  
+  
+    Discover and draw inspiration from a curated collection of beautiful Lottie animations, all powered by Kotlin Multiplatform.
+  
+  
+    
+
+  
+  
+  
+
+🔥 New Features
+
+🙏 Libraries Used
+
+Compottie
+Koin
+Kotlin Multiplatform
+
+Contributing
+Contributions are welcome! Please feel free to submit a Pull Request.
+License
+This project is licensed under the MIT License - see the LICENSE file for details.
+🚀 Roadmap & TODO
+Features
+
+ 🎨 Animation Color Scheme Picker - Add ability for users to customize animation color palettes
+ 👥 Community Animations - Implement support for user-submitted animations with voting system
+ ⚡ Rendering Optimization - Improve animation playback performance across platforms
+ 📊 Performance Metrics - Add analytics for rendering times and resource usage
+
+]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[Cognitive Load is what matters]]></title>
@@ -297,6 +344,59 @@ Readable version
 ]]></content:encoded>
         </item>
         <item>
+            <title><![CDATA[FBI cyber cop: Salt Typhoon pwned 'nearly every American']]></title>
+            <link>https://www.theregister.com/2025/08/28/fbi_cyber_cop_salt_typhoon/</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45074157</guid>
+            <description><![CDATA[: Plus millions of other people across 80+ countries]]></description>
+            <content:encoded><![CDATA[
+China's Salt Typhoon cyberspies hoovered up information belonging to millions of people in the United States over the course of the years-long intrusion into telecommunications networks, according to a top FBI cyber official.
+"There's a good chance this espionage campaign has stolen information from nearly every American," Michael Machtinger, deputy assistant director for the FBI's cyber division, told The Register.
+"There's a thought among the public that if you don't work in a sensitive area that the PRC might be interested in for its traditional espionage activities, then you are safe, they will not target you," he said, during a Thursday interview with The Register. "As we have seen from Salt Typhoon, this is no longer an assumption that anyone can afford to make."
+
+    
+
+The Beijing-backed spying campaign began at least in 2019 but wasn't uncovered by US authorities until last fall. On Wednesday, US law enforcement and intelligence agencies along with those from 12 other countries warned the ongoing espionage activity expanded far beyond nine American telcos and government networks. According to Machtinger, at least 80 countries were hit by the digital intrusions.
+
+        
+
+
+        
+
+Around 200 American organizations were compromised by the espionage activity, Machtinger said, including the previously disclosed telecommunications firms such as Verizon and AT&T.
+Yesterday's joint security alert also pointed the allies' collective finger at three China-based entities affiliated with Salt Typhoon: Sichuan Juxinhe Network Technology, Beijing Huanyu Tianqiong Information Technology, and Sichuan Zhixin Ruijie Network Technology. These companies, and likely others, provide cyber products and services to China's Ministry of State Security and People's Liberation Army, the governments said.
+
+
+What the PRC is doing through these proxy actors is really reckless and unbounded, in a way that is significantly outside of the norms of what we see in the espionage space
+
+"This is one of the most consequential cyber espionage breaches that we've ever seen in the United States," Machtinger said.
+"What this really underscores is that what the PRC is doing through these proxy actors is really reckless and unbounded, in a way that is significantly outside of the norms of what we see in the espionage space," he added. "And that should really set off alarm bells for us — not only in the United States. The scale of indiscriminate targeting is unlike what we've seen in the past."
+
+        
+
+This indiscriminate targeting, as the FBI and White House security officials have previously noted, allowed Beijing’s snoops to geo-locate millions of mobile phone users, monitor their internet traffic, and, in some cases, record their phone calls. Victims reportedly included President Donald Trump and Vice President JD Vance.
+Machtinger declined to confirm whether Trump and Vance were among those surveilled, but did say that victims included more than 100 current and former presidential administration officials.
+"As we look at the impact on the different sets of victims," he said, Salt Typhoon collected "bulk information from millions of Americans."
+
+        
+
+For the more targeted group of individuals, "most of whom are very high-profile, current and former presidential administration officials, and campaign appointees from both major political parties," the data collection went much deeper, Machtinger added. "Down to intercepting actual content."
+
+
+If you thought China's Salt Typhoon was booted off critical networks, think again
+
+China's Salt Typhoon spies spotted on US govt networks before telcos, CISA boss says
+
+This is the FBI, open up. China's Volt Typhoon is on your network
+
+How does China keep stealing our stuff, wonders DoD group responsible for keeping foreign agents out
+
+In addition to Salt Typhoon, the feds over the past year have issued warnings about other Chinese cyber operations. These include Volt Typhoon intruders, who infected hundreds of outdated routers to build a botnet and break into US critical infrastructure facilities. The Beijing-backed crew, we would later learn, was prepositioning itself and readying destructive cyberattacks.
+Another China-linked crew, Silk Typhoon has spent more than a decade compromising IT and cloud providers to steal sensitive data from their government, technology, education, and legal and professional services customers.
+China is not the only source of threats, Machtinger noted. Russia, Iran, North Korea, plus along with home-grown and international cybercriminals and ransomware crooks, assault computers and networks of both individuals and organizations, every day.
+"These actors are going to continue their efforts, and they're going to get more sophisticated," Machtinger said. "We need to make sure that we, a nation, are taking cybersecurity seriously, updating systems, removing end-of-life devices, and making it as hard and costly as possible for the myriad of actors that are out there to successfully compromise." ®                                
+                    ]]></content:encoded>
+        </item>
+        <item>
             <title><![CDATA[Agent Client Protocol]]></title>
             <link>https://agentclientprotocol.com/overview/introduction</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45074147</guid>
@@ -395,155 +495,6 @@ We should resist the urge to data-fy and commodify our personal websites. Unintu
 
 
 ]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[Computing simplified coverage polygons]]></title>
-            <link>https://www.volkerkrause.eu/2025/08/30/simplified-coverage-polygons.html</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45073469</guid>
-            <description><![CDATA[A somewhat recurring problem I encounter in things I work on is the need to compute simplified geographic polygons, or more specifically, simplified hulls of...]]></description>
-            <content:encoded><![CDATA[
-    A somewhat recurring problem I encounter in things I work on is the need to compute simplified geographic polygons,
-or more specifically, simplified hulls of geographic polygons. Here’s an overview on the currently used approach,
-maybe someone has pointers to better algorithms for this.
-
-Coverage polygons
-
-Geographic polygons are used in a few different places:
-
-  The Transport API Repository and consumers of it
-like KPublicTransport use them for describing areas covered by a public transport routing service,
-to automatically pick a suitable one at a given location.
-  The Emergency and Weather Aggregation Service
-uses them to describe areas affected by an emergency. Alerts that don’t carry explicit geometry but refer to an external
-dataset using a geographic code are particularly affected here, as those datasets (e.g. derived from OSM boundaries)
-are used for many different purpose and thus are often extremely detailed.
-
-
-Meter-resolution geometry isn’t needed for any of those use-cases, hundreds of meters or even a kilometers are more than sufficient.
-And using a higher resolution does come at a cost, larger geometry needs to be stored and transferred, and rendering or doing
-intersection tests becomes significantly more expensive to compute.
-
-Simplified coverage
-
-Applying generic geometry simplification algorithms here isn’t ideal, as we would want a result that is still
-covering the original geometry, ie. a simplified hull. In the above use-cases covering more area is merely inefficient or
-maybe mildly annoying, while covering a smaller area can be catastrophic (e.g. someone potentially affected by an emergency
-not getting alerted).
-
-A bounding box is the extreme case fulfilling that requirement and minimizing the resulting geometry, but we are obviously
-looking for a more reasonable trade-off between additionally covered area and geometry complexity.
-
-Also, not all additionally covered area is equal here, covering extra area at land potentially impacts more people
-than covering extra area at sea. Or even more generally, additionally covered area hurts the more the more densely it
-is populated, with the sea just being the extreme (although not uncommon) case here. None of the below takes any
-of this into consideration though, but it’s one aspect where I’d expect some room for improving the result.
-
-Douglas-Peucker
-
-An common way to simplify polylines and polygons is the Douglas-Peucker algorithm.
-What this does is check whether for two points the maximum distance of any point in between to a line
-from the first to the last one is below a given threshold. If yes, all intermediate points can be discarded, otherwise
-this is recursively repeated separately for two parts split at the point with the maximum distance.
-
-
-  
-  
-  
-  Source: Wikipedia, CC-BY-SA 3.0
-
-
-This is fairly easy to implement, and we have multiple copies of this around in different languages and for different
-polygon or polyline data structures, e.g. in
-Marble,
-KPublicTransport,
-KPublicAlerts,
-FOSS Public Alert Server and
-Transport API Repository.
-
-For sufficiently small thresholds and relatively “smooth” geometries this works quite well, although on its own it doesn’t
-guarantee the result is a hull of the input.
-
-Results however deteriorate when using a threshold in the same order of magnitude as there are features in the geometry,
-say a kilometer threshold on a geometry containing a highly detailed Fjord-like coastline.
-
-
-  
-  
-  
-  2.6MB GeoJSON input with highly detailed complex coast lines.
-
-
-
-  
-  
-  
-  Douglas-Peucker result with a threshold of ~1km (0.5% of the overall area width).
-
-
-And if you push this further, it can also result in self-intersecting polygons, which is something we generally want
-to avoid here.
-
-Poylgon offsetting
-
-To deal with the fact that Douglas-Peucker doesn’t produce a hull, we could offset or buffer the polygon.
-That is, enlarging it by moving all points to the “outside” by a given amount.
-
-Implementing that is a bit more involved, so this is usually done by using the Clipper2 library,
-which seems to be somewhat of the reference implementation for some of the more complex polygon manipulation algorithms.
-
-There’s a few small surprises in there, such as it working with integer coordinates and typos in its API (“childs”), but beyond that
-it’s reasonably easy to use both from C++ and Python (examples in
-Marble,
-KPublicTransport,
-FOSS Public Alert Server and
-Transport API Repository).
-
-Simplifying by offsetting
-
-These two steps can also be combined in another way to obtain a simplified hull:
-
-  Offset the polygon first, by a value large enough that unwanted details will get merged together. E.g. at
-half their width narrow concave areas such as Fjords disappear that way, islands will get “swallowed” by nearby land, etc.
-  Apply Douglas-Peucker, with a threshold below the offset size. The result will then still be a hull of the original geometry,
- and since the previous step removed small details that would interfere we get a “smoother” result.
-  Apply a negative offset, to shrink the polygon closer to its original size again. The maximum value to use for that
- is the value the polygon was initially offset with minus half the threshold used for Douglas-Peucker.
-
-
-This has proven to be very effective with polygons with highly detailed relatively small concave features, such as
-land polygons with a Fjord-heavy coastline. And as a welcome side-effect it often also automatically fixes self-intersecting geometry
-in the input data.
-
-
-  
-  
-  
-  Simplified hull, reduced to just 17kB.
-
-
-It’s not quite as effective on the inverse though, ie. geometry with fine-grained convex features, such as the sea polygon
-in the above example.
-
-Truncating numbers
-
-There’s a technical simplification orthogonal to the above also worth mentioning when using GeoJSON or other
-textual formats such as CAP.
-Printed out naively floating point numbers easily end up with 12 or 13 decimals.
-That’s enough for a sub-millimeter resolution, which is pointless when working with kilometer-scale features.
-
-It’s therefore also useful to implement adaptive rounding and truncation of the coordinates based on the size of the overall
-geometry, resulting in just four to six decimals usually in our use-cases, which is a two- to three-times reduction in (textual) size
-(example).
-
-This only helps with storage and transfer volume of course, the computational complexity of processing the geometry doesn’t change by this.
-
-Can this be done better?
-
-As this isn’t really such an uncommon problem, are there better ways to do this? Ie. are there ways to achieve a higher-quality
-geometry at the same size or ways to further reduce the size without compromising quality? Are there other algorithms and approaches
-worth trying?
-
-  ]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[From Multi-Head to Latent Attention: The Evolution of Attention Mechanisms]]></title>
@@ -716,11 +667,6 @@ Of course, if the system has to scale horizontally more than a little bit, in-me
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45066395</guid>
             <description><![CDATA[Something went wrong, but don’t fret — let’s give it another shot.]]></description>
             <content:encoded><![CDATA[Something went wrong, but don’t fret — let’s give it another shot. Some privacy related extensions may cause issues on x.com. Please disable them and try again.]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[The web does not need gatekeepers: Cloudflare’s new “signed agents” pitch]]></title>
-            <link>https://positiveblue.substack.com/p/the-web-does-not-need-gatekeepers</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45066258</guid>
         </item>
         <item>
             <title><![CDATA[Wikipedia as a Graph]]></title>
@@ -1138,152 +1084,6 @@ Related PRs: #1970 #2925 #4068 #4165 #4232 #4390 #4435 #4521 #4654 #4767 #4770 #
             <title><![CDATA[Grok Code Fast 1]]></title>
             <link>https://x.ai/news/grok-code-fast-1</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45063559</guid>
-        </item>
-        <item>
-            <title><![CDATA[Andrew Ng says bottleneck in AI startups isn't coding – it's product management]]></title>
-            <link>https://www.businessinsider.com/andrew-ng-product-management-bottleneck-coding-ai-startups-2025-8</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45044155</guid>
-            <description><![CDATA[Andrew Ng says AI has sped up coding — now product management is the real bottleneck for startups.]]></description>
-            <content:encoded><![CDATA[
-
-  
-    
-  
-    
-
-  
-    
-    
-    
-    
-      
-            
-            
-            
-            
-                
-                
-                    
-                      
-                      
-                    
-                
-                  
-                        
-                          
-                          
-                            
-                              
-                                    
-                  
-                          
-                            Andrew Ng says AI has sped up coding, so product management is now the bottleneck for startups.
-                            
-                              
-                                Steve Jennings / Stringer/Getty Images
-                                        
-                          
-                        
-                  
-            
-    
-    
-    
-              
-                
-                
-                
-                  
-                      2025-08-22T05:15:43Z
-                    
-                  
-                
-                
-                        
-      
-            
-      
-              
-              
-              
-              
-                
-                    AI sped up coding. Now, the real challenge for startups is product management.
-                    If a prototype takes a day, waiting a week for user feedback is "really painful," said Andrew Ng.
-                    The former Google Brain scientist said his teams are "increasingly relying on gut" to make faster decisions.
-                
-              
-      
-            
-            
-            
-            
-            
-            
-                AI has made coding the easy part. The hard part now is product management, said Andrew Ng.The Stanford professor and former Google Brain scientist said on an episode of the "No Priors" podcast published Thursday that AI-assisted coding has compressed the startup loop.Things that used to take six engineers three months to build, "my friends and I, we'll just build on a weekend," Ng said."The bottleneck is deciding what do we actually want to build," he added.In the past, a prototype might take three weeks to develop, so waiting another week for user feedback wasn't a big deal. But today, when a prototype can be built in a single day, "if you have to wait a week for user feedback, that's really painful," Ng said.That mismatch is forcing teams to make faster product decisions — and Ng said his teams are "increasingly relying on gut."The best product managers bring "deep customer empathy," he said. It's not enough to crunch data on user behavior. They need to form a mental model of the ideal customer.It's the ability to "synthesize lots of signals to really put yourself in the other person's shoes to then very rapidly make product decisions," he added.Ng did not respond to a request for comment from Business Insider.The great product manager debateNg's comments come as the debate continues in the startup world over the role of product managers.
-              
-              
-              
-            Product managers have been referred to — both affectionately and critically — as "mini-CEOs" of the products they oversee. They act as a bridge among engineers, sales teams, customer service, and other departments, ensuring that products align with user needs.Some tech leaders have said that product managers are key in the age of AI.Microsoft's chief technology officer, Kevin Scott, said on an episode of the "Twenty Minute VC" podcast published in March that product managers play a crucial role in setting up "feedback loops" to make AI agents better.But others argue that product managers add little value.Surge AI CEO Edwin Chen said on an episode of the "No Priors" podcast published last month that product managers don't make sense early on in a company's early days.Microsoft wants to increase the number of engineers relative to product or program managers, Business Insider's Ashley Stewart reported in March.The call for executives to go "founder mode" — a concept coined by the Y Combinator cofounder Paul Graham and touted by Airbnb CEO Brian Chesky — has some leaders questioning whether they should delegate product decisions to product managers.In 2023, Chesky merged product management with marketing, and Snap told The Information in the same year that it laid off 20 product managers to help speed up the company's decision-making.
-            
-            
-            
-            
-            
-            
-            
-              
-            
-    
-    
-    
-    
-      
-
-    
-      
-
-    
-      
-      
-        
-                  
-                    
-                      Read next
-                    
-                  
-            
-                
-              
-    
-        
-    
-          
-              
-                
-              
-          
-          
-            
-            
-      
-  
-
-  
-  
-  
-
-  
-  
-
-    
-
-  
-  
-    
-  
-    
-  ]]></content:encoded>
         </item>
     </channel>
 </rss>
