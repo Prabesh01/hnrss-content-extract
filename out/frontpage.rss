@@ -4,105 +4,11 @@
         <title>Hacker News: Front Page</title>
         <link>https://news.ycombinator.com/</link>
         <description>Hacker News RSS</description>
-        <lastBuildDate>Mon, 01 Sep 2025 10:51:59 GMT</lastBuildDate>
+        <lastBuildDate>Mon, 01 Sep 2025 11:07:26 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>github.com/Prabesh01/hnrss-content-extract</generator>
         <language>en</language>
         <atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/frontpage.rss" rel="self" type="application/rss+xml"/>
-        <item>
-            <title><![CDATA[De-Googling TOTP Authenticator Codes]]></title>
-            <link>https://imrannazar.com/articles/degoogle-otp</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45091202</guid>
-            <description><![CDATA[I've been slowly removing Google apps from my life, and one of the last ones left is Authenticator. In this post I look at migrating codes out of Authenticator to a command-line OTP tool, and the steps involved.]]></description>
-            <content:encoded><![CDATA[
-   
-Back to Articles
-1st Sep 2025
-In the ongoing effort to extricate myself from Google's services, I've been paring down my usage of their apps on my (admittedly Android) phone. I'm now down to two Google apps I use regularly: Maps (for traffic data) and Authenticator (for TOTP[A]Time-based One Time Password codes).
-Now, I spend most of my time in a terminal window on MacOS or connected to a Linux machine; it'd be nice if I could get TOTPs on the command-line, and it turns out there's a utility called oathtool that allows for TOTP generation on the CLI. However, that would mean switching my OTP provider, which usually involves:
-
- Logging into each service that has an OTP registered in the app;
- Disabling two-factor authentication (2FA);
- Re-enabling 2FA and using the "manual entry" code as input to oathtool;
- Doing it all again for the next website or service.
-
-Fortunately, Google's Authenticator provides a way to migrate codes between instances of the app based on scanning QR codes, and we can use this to migrate them away from Google into a TOTP handler of our choosing. It's another four-step process:
-
- Generating a QR code in Google Authenticator for the codes you want to export;
- Decoding the QR somewhere off-device, into a URL;
- Decoding the URL into its constituent services and secret values;
- Setting up oathtool to use the secrets.
-
-Note that the below steps are presented just as I went through them, you may be able to find efficiencies or you may run into troubles that I didn't (especially if you're trying this exclusively on Windows); "your mileage may vary" is apt here.
-Going from Authenticator to a migration URL
-The first step is getting the code out of Authenticator, through the Transfer Codes menu option in the app. Picking the services you'd like to extract leads you to a code like this:
-
- 
- Figure 1: QR code exported from Google AuthenticatorUnrivalled padding between the QR and Next button
-
-You may have an app on your phone that decodes QRs, but I don't; instead, I transferred the file to my MacOS machine over Tailscale, and used a command-line tool called qrtool to get the QR content:
-
- Decoding the migration QR
- $ brew install qrtool
-$ qrtool decode Screenshot_20250901_062719_Authenticator.jpg
-otpauth-migration://offline?data=CjwKC2kqSJnNaAyKkw6jEhJUaGUgUmlja3JvbGwgU3RvcmUgASgBMAJCEzg4Yzg5ZTE3NTY3MDQzOTE0MzkQAhgBIAA%3D
-
-Decoding the URL into secrets
-So we have our migration URL, with a Base64-encoded data block. Unfortunately, if we were to simply decode the data, we'd end up with some binary gibberish:
-
- Trying to decode the URL directly
- $ php -r 'var_dump(base64_decode("CjwKC2kqSJnNaAyKkw6jEhJUaGUgUmlja3JvbGwgU3RvcmUgASgBMAJCEzg4Yzg5ZTE3NTY3MDQzOTE0MzkQAhgBIAA%3D"));'
-string(69) "
-<
-
-i*H??h??ý
-
-It turns out that this is a Protobuf-encoded data string, and we need to use Google's Protobuf library to get the data out. It turns out Tim Brooks has already done this with a short piece of Python at: https://github.com/brookst/otpauth_migrate
-I decided to install this on a Linux machine I tend to be connected to (entirely unrelated to my Python installation being broken on Mac...):
-
- Extracting the data via otpauth_migrate
- $ git clone https://github.com/brookst/otpauth_migrate
-$ cd otpauth_migrate
-$ ./otpauth_migrate.py otpauth-migration://offline?data=CjwKC2kqSJnNaAyKkw6jEhJUaGUgUmlja3JvbGwgU3RvcmUgASgBMAJCEzg4Yzg5ZTE3NTY3MDQzOTE0MzkQAhgBIAA%3D
-secret: "i*H\231\315h\014\212\223\016\243"
-name: "The Rickroll Store"
-algorithm: ALGORITHM_SHA1
-digits: DIGIT_COUNT_SIX
-type: OTP_TYPE_TOTP
-
-Secret code = NEVERGONNAGIVEYOUM======
-
-This tool is intelligent enough to extract any number of names and secrets from a migration URL, so you can export all your codes from Authenticator into one giant QR without needing to do each separately.
-Using oathtool to generate OTPs
-The final step is to use this secret code with oathtool, which takes the secret directly as a parameter. If you instead want to refer to the service by name, Michael Bushey[1]"CLI 2-Factor Authentication", Michael Bushey, 2023 has a quick wrapper script which extracts the secrets from a locally-stored file:
-
- Wrapper script to generate OTPs: /usr/local/bin/otp
- #!/bin/bash
-OTPKEY="$(sed -n "s/${1}=//p" ~/.otpkeys)"
-if [ -z "$OTPKEY" ]; then
-   echo "$(basename $0): Bad Service Name '$1'"
-   exit
-fi
-date
-oathtool --totp -b "$OTPKEY"
- OTP key store: ~/.otpkeys
- rickroll=NEVERGONNAGIVEYOUM======
-
-With this in place, you won't need to use your Authenticator app again. The tool outputs the current date and time, so you can double-check that your code won't expire (at :00 seconds) before you get a chance to type it in:
-
- $ otp rickroll
-Mon Sep  1 07:10:42 AM UTC 2025
-200213
-
-Future expansion
-There's a security issue here, of course, which is the exposed secret key sitting in a file on-disk. I'm happy to sit with that and not require a password to generate OTPs every time, but if you're interested in adapting the wrapper script to use symmetric encryption to secure the keys, Vivek Gite[2]"Use oathtool Linux command line for 2 step verification (2FA)", Vivek Gite, updated Feb 2025 has a set of scripts which employ gpg for the job.
-Now I just need to find a way to get traffic data into a maps App that doesn't involve Google's servers... Thoughts welcome.
-  
-  
- 
-    
-  ]]></content:encoded>
-        </item>
         <item>
             <title><![CDATA[National Grid: UK's largest battery storage facility at Tilbury substation]]></title>
             <link>https://www.nationalgrid.com/national-grid-connects-uks-largest-battery-storage-facility-tilbury-substation</link>
@@ -1719,9 +1625,9 @@ I built a small url shortener and also experimented with a map‑based mood trac
 I think the evolution of vibe coding tool is definitely the editor. Having a black box with no way to maintain it is an absolute liability.That's why I think app generators must be a good editor before being able to generate anything. It seems you went this way with the cool node interface.I'm doing the same thing with https://luna-park.app, but for fullstack apps.
 Well I am/was building something that looks a lot like this, a shame I never applied to YC, wondering now if I should apply to other funds now so I can continue working on it, the prototype is ready so I have the main part figured out.
 A question, perhaps, could you give some tips to pitch this specifically, just for incubators, based on your experience?
+that what everyone always says. But i think pitcing to a incubator is actually a good way to focus your idea. Anyways what is 2 hours in the grand scheme of things
 Well all incubators ask the same thing (and search for the same profile). Just blast it to every incubator you find. Take some time write a nice YC application. There are tools like acceleratorfiller.xyz to send them to multiple accelerators.
 BTW (It's my company)
-that what everyone always says. But i think pitcing to a incubator is actually a good way to focus your idea. Anyways what is 2 hours in the grand scheme of things
 Will have to try this later, the YT video looks promising. Found tools similar to this promising to create early mockups or other pre-prototypes when developing products.
 Glad to hear that. We want to make it as logical and white box as possible. Have you tried adding custom behavior after the first generation?
 Congrats! Doesn't replit have an integrated database as well? Lovable has supabase, and I'm pretty sure Base44 as well, plus other agent integrations.
@@ -1742,6 +1648,11 @@ Don't get me wrong, I wish your start-up all the best, but this particular appli
 I worry that almost all the 2025 startups I've seen are AI app builders. Where are the novel new applications? I get that codegen is currently one area where AI does well, but it also feels like we're struggling with other use cases.
 I’ve spent an enormous amount of time with practically every AI model out there, from coding to image-gen to video-genThe tech is still simply too hard to use effectively for the vast majority of lay people, especially for anything beyond a cool product demoSome of it is due to quality of the models, some of it due t quality of the toolingPrompt engineering is still a skill and that’s beyond what a casual user can figure out
 My optimism says the good new stuff is coming slowly because people who care about their craft and taking things slowly aren’t in any rush to get to market.]]></content:encoded>
+        </item>
+        <item>
+            <title><![CDATA[Plastic Before Plastic: How gutta-percha shaped the 19th century]]></title>
+            <link>https://worldhistory.substack.com/p/plastic-before-plastic</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45084193</guid>
         </item>
         <item>
             <title><![CDATA[Jujutsu for everyone]]></title>
