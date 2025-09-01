@@ -4,11 +4,114 @@
         <title>Hacker News: Front Page</title>
         <link>https://news.ycombinator.com/</link>
         <description>Hacker News RSS</description>
-        <lastBuildDate>Mon, 01 Sep 2025 10:10:20 GMT</lastBuildDate>
+        <lastBuildDate>Mon, 01 Sep 2025 10:40:41 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>github.com/Prabesh01/hnrss-content-extract</generator>
         <language>en</language>
         <atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/frontpage.rss" rel="self" type="application/rss+xml"/>
+        <item>
+            <title><![CDATA[De-Googling TOTP Authenticator Codes]]></title>
+            <link>https://imrannazar.com/articles/degoogle-otp</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45091202</guid>
+            <description><![CDATA[I've been slowly removing Google apps from my life, and one of the last ones left is Authenticator. In this post I look at migrating codes out of Authenticator to a command-line OTP tool, and the steps involved.]]></description>
+            <content:encoded><![CDATA[
+   
+Back to Articles
+1st Sep 2025
+In the ongoing effort to extricate myself from Google's services, I've been paring down my usage of their apps on my (admittedly Android) phone. I'm now down to two Google apps I use regularly: Maps (for traffic data) and Authenticator (for TOTP[A]Time-based One Time Password codes).
+Now, I spend most of my time in a terminal window on MacOS or connected to a Linux machine; it'd be nice if I could get TOTPs on the command-line, and it turns out there's a utility called oathtool that allows for TOTP generation on the CLI. However, that would mean switching my OTP provider, which usually involves:
+
+ Logging into each service that has an OTP registered in the app;
+ Disabling two-factor authentication (2FA);
+ Re-enabling 2FA and using the "manual entry" code as input to oathtool;
+ Doing it all again for the next website or service.
+
+Fortunately, Google's Authenticator provides a way to migrate codes between instances of the app based on scanning QR codes, and we can use this to migrate them away from Google into a TOTP handler of our choosing. It's another four-step process:
+
+ Generating a QR code in Google Authenticator for the codes you want to export;
+ Decoding the QR somewhere off-device, into a URL;
+ Decoding the URL into its constituent services and secret values;
+ Setting up oathtool to use the secrets.
+
+Note that the below steps are presented just as I went through them, you may be able to find efficiencies or you may run into troubles that I didn't (especially if you're trying this exclusively on Windows); "your mileage may vary" is apt here.
+Going from Authenticator to a migration URL
+The first step is getting the code out of Authenticator, through the Transfer Codes menu option in the app. Picking the services you'd like to extract leads you to a code like this:
+
+ 
+ Figure 1: QR code exported from Google AuthenticatorUnrivalled padding between the QR and Next button
+
+You may have an app on your phone that decodes QRs, but I don't; instead, I transferred the file to my MacOS machine over Tailscale, and used a command-line tool called qrtool to get the QR content:
+
+ Decoding the migration QR
+ $ brew install qrtool
+$ qrtool decode Screenshot_20250901_062719_Authenticator.jpg
+otpauth-migration://offline?data=CjwKC2kqSJnNaAyKkw6jEhJUaGUgUmlja3JvbGwgU3RvcmUgASgBMAJCEzg4Yzg5ZTE3NTY3MDQzOTE0MzkQAhgBIAA%3D
+
+Decoding the URL into secrets
+So we have our migration URL, with a Base64-encoded data block. Unfortunately, if we were to simply decode the data, we'd end up with some binary gibberish:
+
+ Trying to decode the URL directly
+ $ php -r 'var_dump(base64_decode("CjwKC2kqSJnNaAyKkw6jEhJUaGUgUmlja3JvbGwgU3RvcmUgASgBMAJCEzg4Yzg5ZTE3NTY3MDQzOTE0MzkQAhgBIAA%3D"));'
+string(69) "
+<
+
+i*H??h??ý
+
+It turns out that this is a Protobuf-encoded data string, and we need to use Google's Protobuf library to get the data out. It turns out Tim Brooks has already done this with a short piece of Python at: https://github.com/brookst/otpauth_migrate
+I decided to install this on a Linux machine I tend to be connected to (entirely unrelated to my Python installation being broken on Mac...):
+
+ Extracting the data via otpauth_migrate
+ $ git clone https://github.com/brookst/otpauth_migrate
+$ cd otpauth_migrate
+$ ./otpauth_migrate.py otpauth-migration://offline?data=CjwKC2kqSJnNaAyKkw6jEhJUaGUgUmlja3JvbGwgU3RvcmUgASgBMAJCEzg4Yzg5ZTE3NTY3MDQzOTE0MzkQAhgBIAA%3D
+secret: "i*H\231\315h\014\212\223\016\243"
+name: "The Rickroll Store"
+algorithm: ALGORITHM_SHA1
+digits: DIGIT_COUNT_SIX
+type: OTP_TYPE_TOTP
+
+Secret code = NEVERGONNAGIVEYOUM======
+
+This tool is intelligent enough to extract any number of names and secrets from a migration URL, so you can export all your codes from Authenticator into one giant QR without needing to do each separately.
+Using oathtool to generate OTPs
+The final step is to use this secret code with oathtool, which takes the secret directly as a parameter. If you instead want to refer to the service by name, Michael Bushey[1]"CLI 2-Factor Authentication", Michael Bushey, 2023 has a quick wrapper script which extracts the secrets from a locally-stored file:
+
+ Wrapper script to generate OTPs: /usr/local/bin/otp
+ #!/bin/bash
+OTPKEY="$(sed -n "s/${1}=//p" ~/.otpkeys)"
+if [ -z "$OTPKEY" ]; then
+   echo "$(basename $0): Bad Service Name '$1'"
+   exit
+fi
+date
+oathtool --totp -b "$OTPKEY"
+ OTP key store: ~/.otpkeys
+ rickroll=NEVERGONNAGIVEYOUM======
+
+With this in place, you won't need to use your Authenticator app again. The tool outputs the current date and time, so you can double-check that your code won't expire (at :00 seconds) before you get a chance to type it in:
+
+ $ otp rickroll
+Mon Sep  1 07:10:42 AM UTC 2025
+200213
+
+Future expansion
+There's a security issue here, of course, which is the exposed secret key sitting in a file on-disk. I'm happy to sit with that and not require a password to generate OTPs every time, but if you're interested in adapting the wrapper script to use symmetric encryption to secure the keys, Vivek Gite[2]"Use oathtool Linux command line for 2 step verification (2FA)", Vivek Gite, updated Feb 2025 has a set of scripts which employ gpg for the job.
+Now I just need to find a way to get traffic data into a maps App that doesn't involve Google's servers... Thoughts welcome.
+  
+  
+ 
+    
+  ]]></content:encoded>
+        </item>
+        <item>
+            <title><![CDATA[National Grid: UK's largest battery storage facility at Tilbury substation]]></title>
+            <link>https://www.nationalgrid.com/national-grid-connects-uks-largest-battery-storage-facility-tilbury-substation</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45091119</guid>
+            <description><![CDATA[The 300MW Thurrock Storage project, developed by Statera Energy, is now energised and delivering electricity flexibly to the network across London and the south east.]]></description>
+            <content:encoded><![CDATA[    
+            National Grid has connected the UK’s largest battery energy storage system (BESS) to its transmission network at Tilbury substation in Essex.
+        The 300MW Thurrock Storage project, developed by Statera Energy, is now energised and delivering electricity flexibly to the network across London and the south east.With a total capacity of 600MWh, Thurrock Storage is capable of powering up to 680,000 homes, and can help to balance supply and demand by soaking up surplus clean electricity and discharging it instantaneously when the grid needs it.Our Tilbury substation once served a coal plant, and with battery connections like this, it’s today helping to power a more sustainable future for the region and the country.National Grid reinforced its Tilbury substation to ensure the network in the region could safely carry the battery’s significant additional load, with new protection and control systems installed to ensure a robust connection.The substation previously served the coal-fired Tilbury A and B power stations on adjacent land prior to their demolition, so the connection of the Thurrock Storage facility marks a symbolic transition from coal to clean electricity at the site.John Twomey, director of customer and network development at National Grid Electricity Transmission, said:“Battery storage plays a vital role in Britain’s clean energy transition. Connecting Thurrock Storage, the UK’s biggest battery, to our transmission network marks a significant step on that journey.“Our Tilbury substation once served a coal plant, and with battery connections like this, it’s today helping to power a more sustainable future for the region and the country.”Tom Vernon, Statera Energy CEO and founder, said:“We are delighted that Thurrock Storage is now energised, following its successful connection to the grid by National Grid Electricity Transmission. Increasing BESS capacity is essential for supporting the grid when renewable generation, such as solar and wind, is low or changes quickly. It ensures that energy can be stored efficiently and returned to the grid whenever it’s needed.”National Grid is continuing work at Tilbury substation to connect the 450MW Thurrock Flexible Generation facility, another Statera project that is set to support the energy needs of the region.The connection of the UK’s biggest battery follows energisation in July of the 373MW Cleve Hill Solar Park in Kent – the largest solar plant in the country – which National Grid connected to its adjacent Cleve Hill substation.]]></content:encoded>
+        </item>
         <item>
             <title><![CDATA[Telli (YC F24) is hiring engineers, designers, and interns [on-site Berlin]]]></title>
             <link>https://hi.telli.com/join-us</link>
@@ -1602,11 +1705,11 @@ Thanks a lot for the feedback. The video was meant as a very spontaneous ‘as i
 In general to me it makes a lot of sense to lean much more into "templates" (I'm sure lovable etc already do it, because it's also a nice way to save money). And it's much easier to at least guarantee some basic security when it comes to auth, payments, db setup etc. Of course you can shoot yourself in the foot right after that.
 Totally agree, security is a big point. It’s hard to trust LLMs on security, which is why we aim to make ‘white box’ backends
 Quite like the positioning of "this is the backend to your lovable ui", probably how chef (the vibe coding tool from the makers of convex) should have positioned it. (and kind of do).
+This looks great! Can I export my end code / app and host it elsewhere easily? Where else would easily be able to host it?
+They say they use Convex for the backend, which means you could in principle run it on your own account or go through the hoops of self hosting convex infra
 I like this. Any chance you'll be bringing similar tactility (is that a word) to the frontend? Granular changes to components via prompts leaves a lot to be desired.
 Yes, more or less. I've been tinkering with what this might look like this summer, but haven't found a good solution. Seeing your "exploded view" of the backend resonated on that front.But instead of the nodes representing steps in a workflow, you'd have screens/views as nodes. Now, how the user would handle layout and components at that level, I'm not sure, but that's directionally what I'm asking about.I hope that makes (a little bit of) sense.
 Check out WeWeb, it gives you an AI-assisted editor that lets you do exactly what you're looking for.
-This looks great! Can I export my end code / app and host it elsewhere easily? Where else would easily be able to host it?
-They say they use Convex for the backend, which means you could in principle run it on your own account or go through the hoops of self hosting convex infra
 I've been playing around with vibeflow for a while, it's impressive how fast you can go from a prompt to a working full stack app. The visual workflow editor is a game changer.
 I built a small url shortener and also experimented with a map‑based mood tracker. what stood out to me is how quickly I could go from a prompt to a working frontend + backend without boilerplate.For me, the most useful next nodes would be:
 1) auth 
@@ -2400,114 +2503,6 @@ Colin Wells writes about history, culture, and religion. His books include Saili
             
             
         ]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[The Qweremin]]></title>
-            <link>https://www.linusakesson.net/qweremin/index.php</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45061702</guid>
-            <description><![CDATA[I invented a new instrument: The Qweremin is a qwerty theremin.]]></description>
-            <content:encoded><![CDATA[
-
-
-I invented a new instrument: The Qweremin is a qwerty theremin.
-
-
-
-
-
-Background
-
-In the summer of 2022 I built a C64-based theremin, described and explained here. The
-theremin, of course, is one of the oldest electronic instruments. Its main
-drawback—and strength—is that it's incredibly hard to master. The performer has
-ultimate control over volume and pitch, but it takes months of practice before
-you can play even a simple scale.
-
-Meanwhile, I've also developed a line of instruments featuring qwerty
-keyboards, where the keys are laid out as on a Type B chromatic button
-accordion. The earliest example is the Sixtyforgan, presented in spring 2021, but
-there's also Qwertuoso, the Commodordion, the Paulimba, and the C=TAR. For these instruments, the
-main challenge has been how to incorporate phrasing and other forms of musical
-expression; to move beyond the rudimentary note-on, note-off of an organ.
-
-The Qweremin represents the unification of these two worlds. On the one hand
-(pun intended) you have ultimate control over volume and expression, and on the
-other you can play quick melodies with large jumps, and even chords. It is my
-most expressive 8-bit instrument yet.
-
-The volume control
-
-As mentioned in the presentation video at the top of this page, the SID chip
-only offers a crude 4-bit master volume control. For greater precision you have
-to work with the envelope generators, but those always produce ADSR curves.
-What I did in the original theremin project was to hack together a feedback
-loop that would continuously monitor the current output level from one of the
-envelope generators: When the present level was lower than the desired volume,
-I would trigger a new note to enter the attack phase, and when the level was
-too high, I would release the note. In this way I could make the envelope
-generator hover around any desired volume.
-
-To make this work, I had to set the attack and release rates carefully. Too
-fast, and the volume would audibly oscillate back and forth between two levels.
-Too slow, and the volume changes would lag far behind the hand movements. I
-thought I had found a sweet spot, but it turned out I was being naïve.
-
-In 2023 I ran into Bass Cadet, a
-thereminist with a C64 background, at the Revision demo party. She had seen my
-video and was enthusiastic about some day being able to get her hands on (or
-near, technically speaking) a C64 theremin. It turned out that we were both
-planning to attend another party, X, later that year. And since I was going to
-bring my C64 anyway, it was a simple matter to throw the spoon and clamp into
-my luggage as well.
-
-Now, I always knew that my homemade C64 theremin could never compete with
-the precision and responsiveness of a professional-grade instrument, but it was
-nevertheless very instructive to get feedback from a real thereminist. I
-learned that the biggest problem was the slow response of the volume control
-antenna; it wouldn't react to sudden changes, which made it impossible to
-control the phrasing or “shape” of individual notes.
-
-Falling back on just using the master volume register made the instrument
-playable, but as expected you could hear the distinct levels. This is
-especially problematic towards the low end of the range: For instance, going
-from level 1 to level 2 doubles the amplitude of the sound, and
-that can be quite jarring in the middle of a pianissimo part.
-
-So once I had the idea to make a Qweremin, I knew I had to pay more
-attention to the snappiness of the volume control. And since I was already
-relying on external components (the 555 timers), it wasn't a big deal to
-add an external DAC. Then I ran into the noise issue described in the
-presentation video, and added a second DAC chip to compensate for it. I'm aware
-that there are dual-channel DAC chips on the market; I used two separate chips
-because that's what I happened to have at home.
-
-The C64 is still very much involved in the operation of the volume antenna.
-It needs to decode the pulses from the 555, convert that to a desired
-volume level, and pass it to the DAC chips over the user port.
-
-
-
-
-A touch of celebrity
-
-By sheer coincidence, in the same year that I brought my C64 theremin to X,
-the organizers had invited legendary game music composer Rob Hubbard as a guest
-of honour. I was waiting in the long line of people who wanted to exchange a
-few words with him when Mahoney, who happened to be standing nearby, had the
-excellent idea that I should ask Rob to sign the clamp of my C64
-theremin—something he gladly did!
-
-Posted Friday 29-Aug-2025 06:46
-
-Discuss this pageThere are no comments here yet.
-]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[Ford and the Birth of the Model T]]></title>
-            <link>https://www.construction-physics.com/p/ford-and-the-birth-of-the-model-t</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45058349</guid>
-            <description><![CDATA[Ford’s status as a large-volume car producer began with the predecessor to the Model T: the Model N, a four-cylinder, two-seater car initially priced at $500. At the time, the average car in the US cost more than $2,000, and it seemed nearly unimaginable that a car with the capabilities of the Model N could cost so littl]]></description>
-            <content:encoded><![CDATA[This is an excerpt from my forthcoming book, The Origins of Efficiency, out September 23rd.Ford’s status as a large-volume car producer began with the predecessor to the Model T: the Model N, a four-cylinder, two-seater car initially priced at $500. At the time, the average car in the US cost more than $2,000, and it seemed nearly unimaginable that a car with the capabilities of the Model N could cost so little. In 1906, the year the Model N was introduced, Ford sold 8,500 of them, making the automaker bigger than the next two biggest car producers, Cadillac and Rambler, combined.To produce such a huge volume of cars, Ford began to use many of the production methods it would develop more fully with the Model T. Many of the Model N’s parts were made of vanadium steel, a strong, lightweight, durable steel alloy. Vanadium steel allowed for a lighter car (the Model N weighed only 1,050 pounds), and was “machined readily.” This was important because Ford also made increasing use of advanced machine tools that allowed it to produce highly accurate interchangeable parts. In 1906, Ford advertised that it was “making 40,000 cylinders, 10,000 engines, 40,000 wheels, 20,000 axles, 10,000 bodies, 10,000 of every part that goes into the car…all exactly alike.” Only by producing interchangeable parts, Ford determined, could the company achieve high production volumes and low prices. Furthermore, Ford’s machine tools were arranged in order of assembly operations rather than by type, allowing parts to move from machine to machine with minimal handling and travel distance. It also made extensive use of production aids such as jigs, fixtures, and templates. These “farmer tools”—so called because they supposedly made it possible for unskilled farmers to do machining work—greatly simplified Ford’s machining operations.The Model N was so popular that demand exceeded capacity, which allowed Ford to plan production far in advance. This meant Ford could purchase parts and materials in large quantities at better prices and schedule regular deliveries, ensuring a steady, reliable delivery of material, which allowed it to maintain just a 10-day supply of parts on hand.But even as the Model N became Ford’s bestseller, the company was designing the car that would supersede it: the Model T. In addition to improving upon many aspects of the Model N— the Model T would be a five-seater, include a new transmission that made it easier to shift gears, and have a three-point suspension that made it better able to navigate America’s low-quality roads—the Model T’s design also involved significant process improvements. For one, it pushed the machining precision of the Model N even further. In his history of Ford, Douglas Brinkley notes that “in an industry previously unfettered by anything like exacting measurements, the typical tolerance on the Model T was 1/64th of an inch.” Indeed, outside the auto industry, some types of manufacturing were done without even the aid of dimensioned drawings. This precision machining was “the rock upon which mass production of the Model T was based.” Not only did a high level of precision facilitate manufacturing, it also made for a better product—one that was much more reliable than any other car on the market. Because parts were interchangeable, repairs were simpler. And the precision of the machining meant that unlike most other automakers, Ford didn’t need to test the engine before it was attached to the chassis, since “if parts were made correctly and put together correctly, the end product would be correct.” The Model T would ultimately cost around $100 a year to maintain, at a time when the maintenance of other cars cost $1,500 per year.At the time, most four-cylinder engines were cast either as four separate cylinders or two groups of two cylinders and then attached together, which required extra time and material. The Model T’s engine block, on the other hand, was cast as a single piece. Several components—the rear axle housing, transmission housing, and crankcase—were not made of the more customary cast steel but rather stamped steel, a then-novel technology for automobiles that was cheaper than casting. Like any new technology, these production methods required time and effort to implement—it took 11 months of development to figure out how to produce the drawn steel crankcase—but the manufacturing cost savings were worth the effort. Over time, more and more Model T parts would be made from pressed steel, though the transmission housing itself was later changed to cast aluminum.The Model T was not the cheapest car on the road when it was introduced—at $850, it cost several hundred dollars more than the Model N. But even when Ford later briefly raised the price to over $900, no other car offered so many features for the same price. Between October 1908, when the new model was announced, and September of the following year, Ford sold 10,607 Model Ts. By March, Ford had temporarily stopped allowing orders because it had filled its factory capacity until August.As production for the Model T began, Ford was already busy reworking and improving the production system. Originally, cars were transported by rail to Ford dealerships all over the country. But, realizing this wasted train space, Ford soon began to create local assembly plants. Model T parts would be shipped to these plants and then assembled into cars, dramatically lowering shipping costs. In his history of the company, Allan Nevins notes that “by shipping parts in a knocked-down state, [Ford] was able to load the components of twenty-six Model Ts into an ordinary freight car instead of the three or four complete cars that could otherwise be sent.” And while the Model T had originally come in several different colors, in 1912 Ford announced that the Model T would now come in a single color: black.The first Model Ts were assembled in Ford’s Piquette Avenue plant in Detroit, which was built in 1904. But in 1910 it moved production to the new, larger Highland Park factory, also in Michigan, which was considered to be the best designed factory in the world. At a time when electricity was still somewhat uncommon in manufacturing, electric motors drove mechanical belting and overhead cranes were used to move material. At the Piquette Avenue plant, material came in on the bottom floor and final assembly was done on the top floor. But at Highland Park, material came in on the top floor and gradually moved down to assembly on the ground floor. To facilitate the movement of material, thousands of holes were cut in the floor, which allowed parts to move down through the factory through chutes, conveyors, and tubes.At Piquette Avenue, machine tool use had been extensive, but the machinery was largely general-purpose. With the decision to focus on a single model and the subsequent enormous increase in production volume, Ford began to buy or create dozens of special-purpose machine tools designed specifically for the Model T, such as a machine for automatically painting wheels and another for drilling holes in a cylinder block. As with the farmer tools first introduced on the Model N, these special-purpose tools not only produced parts more cheaply but could also be operated by less-skilled machinists, reducing labor costs.It was only the enormous production volumes of the Model T that enabled Ford to make such extensive use of special-purpose machinery. Similarly, it was only by virtue of its large volumes that Ford could afford to purchase dedicated steel-stamping presses to churn out pressed-steel crankcases, which were cheaper and used less material than the cast iron employed by other manufacturers.Ford experimented with machinery continuously, and the factory was in a constant state of rearrangement as new machinery was brought online and old machinery was scrapped. In some cases, machines that were just a month old were replaced with newer, better ones. By 1914, Highland Park had 15,000 machine tools. As at other automakers, machinery was packed close together in the order that operations were performed. But Ford took this concept much further, sandwiching drilling machines and even carbonizing furnaces between heavy millers and press punches. Not only did this machine placement for material flow keep handling to a minimum, but the tight packing of machinery also prevented inventory from building up in the factory.Ford’s process improvements weren’t limited to new and better machine tools. The company constantly examined its operations to figure out how they could be done in fewer steps. In one case, a part being machined on a lathe required four thumbscrews to attach it to the lathe, each of which had to be twisted into place to position the part and untwisted to remove it. By designing a special spindle with an automatic clamp for the part, Ford reduced the time to perform the operation by 90 percent.The Model T itself was continuously redesigned to reduce costs. When the stamped-steel axle housing proved complex to manufacture, it was redesigned to be simpler. Brass carburetors and lamps were replaced by cheaper ones made of iron and steel. A water pump that was found to be extraneous was removed. As a result of these constant improvements, Ford was able to continuously drop the price. By 1911, the cost of a Touring model had fallen to $780; by 1913, it had dipped to $600. And as costs fell, sales rose. In 1911, Ford sold 78,000 Model Ts. In 1912, it sold 168,000. And in 1913, it sold 248,000.Then, in 1913, Ford began to install the system that would become synonymous with mass production: the assembly line. Though gravity slides and conveyors had existed prior to 1913, Ford hadn’t yet developed a systematic method for continuously moving the work to the worker during assembly. The first assembly line was installed in the flywheel magneto department. Previously, workers had stood at individual workbenches, each assembling an entire flywheel magneto. But on April 1, 1913, Ford replaced the workbenches with a single steel frame with sliding surfaces on top. Workers were instructed to stand in a designated spot and, rather than assemble an entire magneto, perform one small action, then slide the work down to the next worker, repeating the process over and over.The results spoke for themselves. Prior to the assembly line, it took a single worker an average of 20 minutes to assemble a flywheel magneto. With the assembly line, it took just over 13 minutes.Ford quickly found even more ways to improve the process. To prevent workers from having to bend over, the height of the line was raised several inches. Moving the work in a continuous chain allowed it to be synchronized, which sped up the slow workers and slowed down the fast ones to an optimal pace. Within a year, the assembly time for flywheel magnetos had fallen to five minutes.This experiment in magneto assembly was quickly replicated in other departments. In June 1913, Ford installed a transmission assembly line, bringing assembly time down from 18 minutes to nine. In November, the company installed a line for the entire engine, slashing assembly time from 594 minutes to 226 minutes. As with the flywheel magneto, further adjustments and refinements to the lines yielded even greater productivity gains. In August, Ford began to create an assembly line for the entire chassis. Its first attempt, using a rope and hand crank to pull along the car frames, dropped assembly time from 12.5 hours to just under six. By October, the line had been lengthened and assembly time had fallen to three hours. By April 1914, after months of experimentation, car assembly time had been cut down to 93 minutes.In addition to reducing assembly times, the assembly line decreased inventories. By moving the work continuously along the line, there was no opportunity for parts to accumulate in piles near workstations. The Highland Park facility kept enough parts on hand to produce 3,000 to 5,000 cars—just six to 10 days’ worth of production. This was only possible through careful control of material deliveries and precise timing of the different assembly lines.As the assembly lines were installed, Ford continued to make other process improvements. Operations were constantly redesigned to require fewer production steps. One new machine reduced the number of operations required to install the steering arm to the stub axle from three to one. An analysis of a piston rod assembly found that workers spent almost 50 percent of their time walking back and forth. When the operation was redesigned to reduce time spent moving about, productivity increased 50 percent. A redesigned foundry that used molds mounted to a continuously moving conveyor belt not only increased assembly speed but also allowed the use of less-skilled labor in its operation.Meanwhile, Ford continued to tweak the design of the Model T. The body was redesigned to be simpler and less expensive to produce. Costly forged parts were eliminated by combining them with other components. Fastener counts were reduced. By 1913, comparable cars to the Model T cost nearly twice as much as the Model T did. And the price continued to fall. By 1916, the cost had dropped to just $360—a two-thirds reduction in just six years.With the Model T, Ford didn’t just create a cheap, practical car. It built an efficiency engine. With high-precision machining, Ford was able to manufacture highly accurate parts that resulted in a better, more reliable car, required less work to assemble, and used less-skilled labor. This made the car inexpensive, which, along with its excellent design, resulted in sky-high demand. High demand and high production volume enabled Ford to make additional process improvements. It designed and deployed special-purpose machine tools—large fixed costs that were only practical at huge production volumes—which increased production rates and decreased labor costs. It set up dedicated assembly plants (also large fixed costs), which enabled substantial reductions in transportation costs. It built a new factory (another large fixed cost) specially designed to optimize the flow of production. It placed massive material orders, resulting in lower prices, lower inventory costs, and smoother material delivery, reducing variability and making maximum use of production facilities. And, as all these improvements drove down the cost of the car, demand for the Model T continued to rise, enabling Ford to improve its processes even more.More generally, the high production volumes of the Model T made any process improvement incredibly lucrative. Even a small change had a big impact when multiplied over hundreds of thousands of Model Ts. Consider, for instance, the effect of one minor improvement among many, the removal of a forged bracket:Presume that it took just one minute to install the forged brackets on each chassis. Ford produced about 200,000 cars in 1914. It would have taken 200,000 minutes, or better than 3,300 hours for the installation of these forgings. Each of these brackets was held in place with three screws, three nuts, and three cotter pins; that’s six screws and nuts per car—1,200,000 of each! This saving does not take into account the cotter keys nor the brackets themselves. Each bracket had four holes which had to be drilled— 1,600,000 holes—which took some time as well. If the screws alone were as cheap as ten for a penny, the savings on screws alone would have been $1,200!Since any production step would be repeated millions of times, it was worth carefully studying even the smallest step for possible improvements. This resulted in an environment of continuous improvement, where processes were constantly experimented on, tweaked, ripped out, and replaced with better ones. Ford could, and often did, experiment with and create designs for its own machine tools, only later having a tool builder supply them. And if new machines didn’t work properly, Ford could afford to abandon the experiment. In 1916, a custom-designed piston-making machine that cost $180,000 to produce—$5 million in 2023 dollars—was “thrown into the yard” after repeated failures and replaced with simple lathes.The ultimate example of this environment of constant tinkering is the assembly line, which took years of experimentation to fully work out and required restructuring almost all of Ford’s operations. By breaking down operations into a series of carefully sequenced steps and mechanically moving material through them, Ford was able to eliminate extraneous operations, reduce inventories, and increase production rates, enabling even lower costs and greater scale. This entire chain of improvements was itself made possible by the development of precision-machined parts.The Model T would change the world, both by making the car a ubiquitous feature of American life and, more subtly but no less significantly, showing what could be achieved with large-volume production and a cascading chain of improvements.The Origins of Efficiency is available for preorder at Amazon, Stripe Press, Barnes and Noble, and Bookshop. It will be out September 23rd.]]></content:encoded>
         </item>
     </channel>
 </rss>
