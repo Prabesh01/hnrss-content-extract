@@ -4,11 +4,865 @@
         <title>Hacker News: Front Page</title>
         <link>https://news.ycombinator.com/</link>
         <description>Hacker News RSS</description>
-        <lastBuildDate>Wed, 03 Sep 2025 07:08:35 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 03 Sep 2025 07:30:10 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>github.com/Prabesh01/hnrss-content-extract</generator>
         <language>en</language>
         <atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/frontpage.rss" rel="self" type="application/rss+xml"/>
+        <item>
+            <title><![CDATA[Kernel-hack-drill and exploiting CVE-2024-50264 in the Linux kernel]]></title>
+            <link>https://a13xp0p0v.github.io/2025/09/02/kernel-hack-drill-and-CVE-2024-50264.html</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45112996</guid>
+            <description><![CDATA[Some memory corruption bugs are much harder to exploit than others. They can involve race conditions, crash the system, and impose limitations that make a researcher's life difficult. Working with such fragile vulnerabilities demands significant time and effort. CVE-2024-50264 in the Linux kernel is one such hard bug, which received the Pwnie Award 2025 as the Best Privilege Escalation. In this article, I introduce my personal project kernel-hack-drill and show how it helped me to exploit CVE-2024-50264.]]></description>
+            <content:encoded><![CDATA[
+        
+
+  
+
+  
+    Some memory corruption bugs are much harder to exploit than others. They can involve race conditions, crash the system, and impose limitations that make a researcher's life difficult. Working with such fragile vulnerabilities demands significant time and effort. CVE-2024-50264 in the Linux kernel is one such hard bug, which received the Pwnie Award 2025 as the Best Privilege Escalation. In this article, I introduce my personal project kernel-hack-drill and show how it helped me to exploit CVE-2024-50264.
+
+Bug collision story
+
+I first found a bug in AF_VSOCK back in 2021 and published the article Four Bytes of Power: Exploiting CVE-2021-26708 in the Linux kernel. In April 2024, I was fuzzing this kernel subsystem with a customized syzkaller and found another crash in AF_VSOCK. I minimized the crash reproducer and disabled KASAN. This resulted in an immediate null-ptr-deref in a kernel worker (kworker). Convinced the path forward would be painful, I shelved the bug. This was a wrong decision.
+
+Later, in autumn 2024, I decided to look at this bug again and got promising results. Then, one calm evening, I realized I'd collided with Hyunwoo Kim (@v4bel) and Wongi Lee (@qwerty): they'd already disclosed the bug as CVE-2024-50264 and used it at kernelCTF. Their patch turned my PoC exploit into a null-ptr-deref:
+
+
+
+
+Anyone who has dealt with a bug collision can imagine what I felt. I was wondering whether to keep digging into this vulnerability or just give it up.
+
+Viktor Vasnetsov: Vityaz at the Crossroads (1882)
+
+
+The exploit strategy by @v4bel and @qwerty looked very complicated. I had other ideas, so I decided to continue my research. I chose Ubuntu Server 24.04 with a fresh OEM/HWE kernel (v6.11) as the target for my PoC exploit.
+
+CVE-2024-50264 analysis
+
+The vulnerability CVE-2024-50264 was introduced in August 2016 by commit 06a8fc78367d in Linux v4.8. It is a race condition in AF_VSOCK sockets that happens between the connect() system call and a POSIX signals, resulting in a use-after-free (UAF). An unprivileged user can trigger this bug without user namespaces, which makes it more dangerous.
+
+The kernel uses a freed virtio_vsock_sock object. Its size is 80 bytes, which is suitable for the kmalloc-96 slab cache. The memory corruption is a UAF write executed by a kernel worker.
+
+However, this vulnerability also brings a bunch of nasty limitations for exploitation. I can say that it's the worst bug to exploit I've ever seen. The Pwnie Award is well-deserved. I'll outline those constraints shortly.
+
+Reproducing the bug using an "immortal signal"
+
+First, an attacker should create a listening virtual socket (server vsock):
+int ret = -1;
+int vsock1 = 0;
+
+vsock1 = socket(AF_VSOCK, SOCK_STREAM, 0);
+if (vsock1 < 0)
+	err_exit("[-] creating vsock");
+
+ret = bind(vsock1, (struct sockaddr *)&addr, sizeof(struct sockaddr_vm));
+if (ret != 0)
+	err_exit("[-] binding vsock");
+
+ret = listen(vsock1, 0); /* backlog = 0 */
+if (ret != 0)
+	err_exit("[-] listening vsock");
+
+
+Then the attacker should try to open a connection from a client vsock:
+#define UAF_PORT 0x2712
+
+int vsock2 = 0;
+struct sockaddr_vm addr = {
+	.svm_family = AF_VSOCK,
+	.svm_port = UAF_PORT,
+	.svm_cid = VMADDR_CID_LOCAL
+};
+
+vsock2 = socket(AF_VSOCK, SOCK_STREAM, 0);
+if (vsock2 < 0)
+	err_exit("[-] creating vsock");
+
+ret = connect(vsock2, (struct sockaddr *)&addr, sizeof(struct sockaddr_vm));
+
+
+To trigger the bug, the attacker should interrupt this connect() system call with a POSIX signal. @v4bel & @qwerty used SIGKILL, but that kills the exploit process. My fuzzer stumbled on a cleaner trick that surprised me:
+
+struct sigevent sev = {};
+timer_t race_timer = 0;
+
+sev.sigev_notify = SIGEV_SIGNAL;
+sev.sigev_signo = 33;
+ret = timer_create(CLOCK_MONOTONIC, &sev, &race_timer);
+
+
+My fuzzer discovered that a timer can fire signal 33 and interrupt connect(). Signal 33 is special. The Native POSIX Threads Library (NPTL) keeps it for internal work and the operating system quietly shields applications from it. As man 7 nptl explains:
+
+
+  NPTL makes internal use of the first two real-time signals (signal numbers 32 and 33).
+One of these signals is used to support thread cancellation and POSIX timers (see timer_create(2));
+the other is used as part of a mechanism that ensures all threads in a process always have
+the same UIDs and GIDs, as required by POSIX. These signals cannot be used in applications.
+
+
+True, these signals cannot be used in applications, but they are perfect for my exploit 😉
+
+
+
+
+I use timer_settime() for race_timer, which lets me choose the exact moment signal 33 interrupts connect(). Moreover, the signal is invisible to the exploit process and doesn't kill it.
+
+About memory corruption
+
+The race condition succeeds when a signal interrupts the connect() system call while the vulnerable socket is in the TCP_ESTABLISHED state. The socket then drops into the TCP_CLOSING state:
+
+if (signal_pending(current)) {
+	err = sock_intr_errno(timeout);
+	sk->sk_state = sk->sk_state == TCP_ESTABLISHED ? TCP_CLOSING : TCP_CLOSE;
+	sock->state = SS_UNCONNECTED;
+	vsock_transport_cancel_pkt(vsk);
+	vsock_remove_connected(vsk);
+	goto out_wait;
+}
+
+
+The second attempt to connect the vulnerable vsock to the server vsock using a different svm_cid (VMADDR_CID_HYPERVISOR) provokes memory corruption.
+
+struct sockaddr_vm addr = {
+	.svm_family = AF_VSOCK,
+	.svm_port = UAF_PORT,
+	.svm_cid = VMADDR_CID_HYPERVISOR
+};
+
+/* this connect will schedule the kernel worker performing UAF */
+ret = connect(vsock2, (struct sockaddr *)&addr, sizeof(struct sockaddr_vm));
+
+
+Under the hood, the connect() system call executes vsock_assign_transport(). This function switches the virtual socket to the new svm_cid transport and frees the resources tied to the previous vsock transport:
+if (vsk->transport) {
+	if (vsk->transport == new_transport)
+		return 0;
+
+	/* transport->release() must be called with sock lock acquired.
+	 * This path can only be taken during vsock_connect(), where we
+	 * have already held the sock lock. In the other cases, this
+	 * function is called on a new socket which is not assigned to
+	 * any transport.
+	 */
+	vsk->transport->release(vsk);
+	vsock_deassign_transport(vsk);
+}
+
+
+This procedure closes the old vsock transport in virtio_transport_close() and frees the virtio_vsock_sock object in virtio_transport_destruct(). However, due to the erroneous TCP_CLOSING state of the socket, virtio_transport_close() initiates further communication. To handle that activity, the kernel schedules a kworker that eventually calls virtio_transport_space_update(), which operates on the freed structure:
+
+static bool virtio_transport_space_update(struct sock *sk, struct sk_buff *skb)
+{
+	struct virtio_vsock_hdr *hdr = virtio_vsock_hdr(skb);
+	struct vsock_sock *vsk = vsock_sk(sk);
+	struct virtio_vsock_sock *vvs = vsk->trans; /* ptr to freed object */
+	bool space_available;
+
+	if (!vvs)
+		return true;
+
+	spin_lock_bh(&vvs->tx_lock); /* proceed if 4 bytes are zero (UAF write non-zero to lock) */
+	vvs->peer_buf_alloc = le32_to_cpu(hdr->buf_alloc); /* UAF write 4 bytes */
+	vvs->peer_fwd_cnt = le32_to_cpu(hdr->fwd_cnt); /* UAF write 4 bytes */
+	space_available = virtio_transport_has_space(vsk); /* UAF read, not interesting */
+	spin_unlock_bh(&vvs->tx_lock); /* UAF write, restore 4 zero bytes */
+	return space_available;
+}
+
+
+The following diagram shows the layout of the UAF in the vulnerable object:
+
+
+
+
+Here in yellow I show the tx_lock field that must be zero. Otherwise, the kernel hangs while trying to acquire the spinlock. In red I show the peer_buf_alloc and peer_fwd_cnt fields that are overwritten after the object is freed. There is no pointer dereference in the freed object.
+
+The value written to virtio_vsock_sock.peer_buf_alloc can be controlled from the userspace:
+
+/* Increase the range for the value that we want to write during UAF: */
+uaf_val_limit = 0x1lu; /* can't be zero */
+setsockopt(vsock1, PF_VSOCK, SO_VM_SOCKETS_BUFFER_MIN_SIZE,
+           &uaf_val_limit, sizeof(uaf_val_limit));
+uaf_val_limit = 0xfffffffflu;
+setsockopt(vsock1, PF_VSOCK, SO_VM_SOCKETS_BUFFER_MAX_SIZE,
+           &uaf_val_limit, sizeof(uaf_val_limit));
+
+/* Set the 4-byte value that we want to write during UAF: */
+setsockopt(vsock1, PF_VSOCK, SO_VM_SOCKETS_BUFFER_SIZE,
+           &uaf_val, sizeof(uaf_val));
+
+
+The field virtio_vsock_sock.peer_fwd_cnt tracks how many bytes have been pushed through vsock using sendmsg()/recvmsg(). It is zero by default (four zero bytes).
+
+Not so fast. CVE-2024-50264 has limitations
+
+As I mentioned earlier, this vulnerability has a lot of nasty limitations for the exploitation:
+
+
+  The vulnerable virtio_vsock_sock client object is allocated together with the server object from the same slab cache. That disturbs cross-cache attacks.
+  Reproducing this race condition is very unstable.
+  The UAF write occurs in a kworker a few microseconds after kfree(), too quickly for typical cross-cache attacks.
+  A null-ptr-deref in the kworker follows the UAF write. That's why I shelved the bug at first.
+  Even if that kernel oops is avoided, another null-ptr-deref occurs in the kworker after VSOCK_CLOSE_TIMEOUT (eight seconds).
+  The kworker hangs in spin_lock_bh() if virtio_vsock_sock.tx_lock is not zero, as noted above.
+
+
+I uncovered each obstacle one by one while developing the PoC exploit for CVE-2024-50264. It remains the worst bug to exploit I've ever seen. I guess that's why it received the Pwnie Award 2025 as the Best Privilege Escalation.
+
+
+
+
+First thoughts on exploit strategy
+
+The exploit strategy by @v4bel and @qwerty was complex:
+
+
+  A large-scale BPF JIT spray that filled a significant portion of physical memory
+  The SLUBStick technique from Graz University of Technology, which allowed to:
+    
+      Determine the number of objects in the active slab using a timing side channel
+      Then, place the client and server virtio_vsock_sock objects in different slabs, landing one at the end of its slab and the other at the start of the next slab
+    
+  
+  The Dirty Pagetable technique, which allowed to use the UAF object for overwriting a page table entry (PTE)
+  Modifying a PTE to make it possibly point to a BPF JIT region
+  Inserting a privilege-escalation payload into the BPF code
+  Communicating via a socket to execute the privilege-escalation payload.
+
+
+
+
+
+I felt I could make the PoC exploit for CVE-2024-50264 much simpler. My first thought was to steer the UAF write into some victim object and build a useful exploit primitive around it.
+
+I decided not to search victim objects inside the kmalloc-96 slab cache. Ubuntu Server 24.04 ships with kconfig options that neutralize naive heap spraying for UAF exploitation:
+
+  CONFIG_SLAB_BUCKETS=y, which creates a set of separate slab caches for allocations with user-controlled data
+  CONFIG_RANDOM_KMALLOC_CACHES=y. Here's a quote from the kernel documentation about it:
+    
+      It is a hardening feature that creates multiple copies of slab caches for normal kmalloc allocation and makes kmalloc randomly pick one based on code address, which makes the attackers more difficult to spray vulnerable memory objects on the heap for the purpose of exploiting memory vulnerabilities.
+    
+  
+
+
+That's why I decided to perform the cross-cache attack anyway.
+
+The first victim object I decided to try was struct cred. Its size is 184 bytes, and the kernel allocates these objects in slabs of size 192 bytes. That would allow only two possible offsets of the UAF in the victim cred, because slabs for the vulnerable virtio_vsock_sock have size 96 bytes (half of 192). The diagram below shows how two vulnerable virtio_vsock_sock objects overlap the cred object. The memory corruption may happen on one of the virtio_vsock_sock objects.
+
+
+
+
+Unfortunately, struct cred reallocated at the place of the freed virtio_vsock_sock objects doesn't provide anything useful for the attacker:
+
+  If the UAF happened on the first virtio_vsock_sock, the kernel would hang in spin_lock_bh(), because cred has a non-null uid value at the place of virtio_vsock_sock.tx_lock.
+  If the UAF happened on the second virtio_vsock_sock, writing controlled data to virtio_vsock_sock.peer_buf_alloc would corrupt the cred.request_key_auth pointer. I had no idea how to use it without a prior infoleak.
+
+
+The cred object didn't work for me, so I started to search for the next candidate. My next victim object for the memory corruption was msg_msg. I like this object: I first used it for heap spraying in 2021 (you can find the details in the article "Four Bytes of Power: Exploiting CVE-2021-26708 in the Linux kernel").
+
+It was a novel approach back then. This time, I set out to create something new again.
+
+I chose a 96-byte msg_msg because the slab allocator would use slabs of the same size for this msg_msg and virtio_vsock_sock. That would allow the UAF write to land at a fixed offset in the victim msg_msg object. The following diagram shows what happens with the msg_msg object allocated at the place of the freed virtio_vsock_sock:
+
+
+
+
+The msg_msg.m_list.prev is the kernelspace pointer to the previous object in the linked list. This pointer is zero when msg_msg is created (see CONFIG_INIT_ON_ALLOC_DEFAULT_ON) and then it is initialized with a non-null value when msg_msg is inserted into the message queue. Unfortunately, this non-null pointer is interpreted as virtio_vsock_sock.tx_lock. That makes the virtio_transport_space_update() function hang while executing spin_lock_bh().
+
+To bypass this restriction, I needed the kernel to initialize msg_msg.m_list.prev after the UAF write. I looked for a way to postpone placing msg_msg in the message queue and eventually found the solution.
+
+msg_msg spray allowing m_list field corruption (novel technique)
+
+
+  I filled the message queue almost completely before sending the target msg_msg.
+    
+      The message queue size is MSGMNB=16384 bytes.
+      I sent 2 clogging messages of 8191 bytes each without calling the msgrcv() syscall.
+      Only 2 bytes were left in the queue.
+      I used mtype = 1 for these messages.
+    
+  
+  Then I performed spraying by calling msgsnd() for the target msg_msg objects.
+    
+      I called the msgsnd() syscall in separate pthreads and used mtype = 2 for these messages to distinguish them from the clogging messages.
+      The kernel allocates target msg_msg and then blocks msgsnd() in ipc/msg.c while it waits for space in the message queue:
+    
+
+     	if (msg_fits_inqueue(msq, msgsz))
+ 		break;
+    
+ 	/* queue full, wait: */
+ 	if (msgflg & IPC_NOWAIT) {
+ 		err = -EAGAIN;
+ 		goto out_unlock0;
+ 	}
+    
+ 	/* enqueue the sender and prepare to block */
+ 	ss_add(msq, &s, msgsz);
+    
+ 	if (!ipc_rcu_getref(&msq->q_perm)) {
+ 		err = -EIDRM;
+ 		goto out_unlock0;
+ 	}
+    
+ 	ipc_unlock_object(&msq->q_perm);
+ 	rcu_read_unlock();
+ 	schedule();
+
+
+    
+    
+  
+  
+    While the msgsnd() syscalls were waiting for space in the message queue, I performed the UAF write corrupting the m_list, m_type, and m_ts fields of one of the target msg_msg objects.
+  
+  
+    After the UAF write, I called msgrcv() for type 1 clogging messages.
+  
+  Then the blocked msgsnd() syscall woke up to add the sprayed msg_msg to the queue and the kernel fixed the corrupted m_list field:
+     	if (!pipelined_send(msq, msg, &wake_q)) {
+ 		/* no one is waiting for this message, enqueue it */
+ 		list_add_tail(&msg->m_list, &msq->q_messages);
+ 		msq->q_cbytes += msgsz;
+ 		msq->q_qnum++;
+ 		percpu_counter_add_local(&ns->percpu_msg_bytes, msgsz);
+ 		percpu_counter_add_local(&ns->percpu_msg_hdrs, 1);
+ 	}
+
+  
+
+
+Cool! This technique is also useful for blind overwriting of msg_msg using the out-of-bounds write. No kernel infoleak is needed. The kernel restores the corrupted m_list pointers. In my particular case, this approach allowed me to avoid virtio_transport_space_update() hanging in spin_lock_bh():
+
+
+
+
+To implement the UAF write into an msg_msg object, I needed to perform cross-cache attack turning virtio_vsock_sock into msg_msg. On Ubuntu Server 24.04, the virtio_vsock_sock objects live in one of 16 kmalloc-rnd-?-96 slab caches enabled by CONFIG_RANDOM_KMALLOC_CACHES. The msg_msg objects live in a dedicated msg_msg-96 slab cache enabled by CONFIG_SLAB_BUCKETS.
+
+To implement the cross-cache attack, I needed to learn how these attacks work on the latest Ubuntu kernel, but testing exploit primitives together with this crazy race condition was really painful. Then, I got an idea:
+
+
+  If an unstable race condition creates problems, let's use a testing ground for developing the exploit primitives!
+
+
+
+
+Back in 2017, I created a pet project for my students called kernel-hack-drill. It provides a test environment for learning and experimenting with Linux kernel exploits. I remembered it and decided to use kernel-hack-drill to develop the exploit primitives for CVE-2024-50264.
+
+kernel-hack-drill is an open-source project published under the GPL-3.0 license. It contains the following parts:
+
+  drill_mod.c is a small Linux kernel module that provides the /proc/drill_act file as a simple interface to userspace. This module contains vulnerabilities that you can control and experiment with.
+  drill.h is a header file describing the drill_mod.ko interface:
+    enum drill_act_t {
+	DRILL_ACT_NONE = 0,
+	DRILL_ACT_ALLOC = 1,
+	DRILL_ACT_CALLBACK = 2,
+	DRILL_ACT_SAVE_VAL = 3,
+	DRILL_ACT_FREE = 4,
+	DRILL_ACT_RESET = 5
+};
+  
+#define DRILL_ITEM_SIZE 95
+  
+struct drill_item_t {
+	unsigned long foobar;
+	void (*callback)(void);
+	char data[]; /* C99 flexible array */
+};
+  
+#define DRILL_N 10240
+
+  
+  drill_test.c is a userspace test for drill_mod.ko that provides the examples of using /proc/drill_act. This test doesn't provoke memory corruptions in drill_mod.ko and it passes if CONFIG_KASAN=y.
+  README.md includes a detailed step-by-step setup guide on how to use kernel-hack-drill (kudos to the contributors!).
+
+
+Fun fact: when I chose the name kernel-hack-drill for this project, I used the word drill to mean training or workout for Linux kernel security. My friends and students read it differently. They thought I meant something like this:
+
+
+
+
+The kernel-hack-drill project is a bit similar to KRWX, but much simpler. Moreover, it ships with ready-made PoC exploits:
+
+  drill_uaf_callback.c: a UAF exploit that invokes a callback inside a freed drill_item_t structure. It hijacks control flow and gains LPE.
+  drill_uaf_w_msg_msg.c: a UAF exploit that writes into a freed drill_item_t. It uses a cross-cache attack and overwrites msg_msg.m_ts enabling out-of-bounds reading of the kernel memory. I wrote this PoC while working on the bug described in this article.
+  drill_uaf_w_pipe_buffer.c: a UAF exploit that writes into a freed drill_item_t. It performs a cross-cache attack and overwrites pipe_buffer.flags to implement the Dirty Pipe technique and gain LPE. This PoC exploit was also developed during my experiments with CVE-2024-50264.
+
+
+Recent contributions added new variants (kudos to the contributors!):
+
+  drill_uaf_callback_rop_smep.c: an improved version of drill_uaf_callback.c that adds a ROP chain to bypass SMEP on x86_64.
+  drill_uaf_w_pte.c: a UAF exploit that writes to a freed drill_item_t. It performs a cross-allocator attack and overwrites a page table entry (PTE) to implement the Dirty Pagetable technique and gain LPE on x86_64.
+  drill_uaf_w_pud.c: an improved version of __drill_uaf_w_pte.c__ that overwrites a page upper directory (PUD) instead of a PTE and implements the Dirty Pagetable attack via huge pages.
+
+
+When I revisited kernel-hack-drill during my CVE-2024-50264 work, this spare-time project hadn't seen an update in years. But now kernel-hack-drill offers a solid set of resources that Linux kernel security researchers can explore.
+
+Experimenting with cross-cache attack using kernel-hack-drill
+
+My first step was to learn how cross-cache attacks behave on the latest Ubuntu kernel with slab allocator hardening turned on.
+
+I implemented a standard cross-cache attack in drill_uaf_w_msg_msg.c. You can see the full code in the repository, so I'll sketch the flow here. For background, I highly recommend Andrey Konovalov's talk SLUB Internals for Exploit Developers.
+
+To plan the attack, I pulled the needed info from /sys/kernel/slab. The slab caches that hold virtio_vsock_sock (80 bytes) or drill_item_t (95 bytes) each keep 120 slabs in per-CPU partial lists (cpu_partial=120) and 42 objects in each slab (objs_per_slab=42).
+
+The cross-cache attack algorithm:
+
+  Allocate objs_per_slab objects to create a fresh active slab. Active slab is the slab that will be used by the kernel for the next allocation.
+  Allocate objs_per_slab * cpu_partial objects. This creates the cpu_partial number of full slabs that will later populate the partial list at step 6.
+  Create a slab that contains the UAF object. Allocate objs_per_slab objects and keep a dangling reference to the vulnerable object in that slab.
+  Create a new active slab again: allocate objs_per_slab objects. This step is very important for keeping the cross-cache attack stable. Otherwise, the slab with the vulnerable object remains active and cannot be reclaimed by the page allocator.
+  Completely free the slab that holds the UAF object. To do that, free (objs_per_slab * 2 - 1) of the objects allocated just before the last one. The active slab now contains only the last object, and the slab with the UAF object becomes free and moves to the partial list.
+  Fill up the partial list: free one of each objs_per_slab objects in the reserved slabs from step 2. That makes the slab allocator clean up the partial list and move the free slab containing the UAF object to the page allocator.
+  Reclaim the page that contained the UAF object for another slab cache: spray the target msg_msg objects. As a result, one msg_msg is allocated where the vulnerable object (drill_item_t in my case) used to be.
+  Exploit the UAF! Overwrite msg_msg.m_ts to read kernel memory out of bounds.
+
+
+I've seen plenty of publications that cover cross-cache attack, but none of them explain how to debug it. I'll fill that gap.
+
+Let's examine the attack in drill_uaf_w_msg_msg.c. To watch it in action and debug it, make the following tweaks in your kernel sources:
+diff --git a/mm/slub.c b/mm/slub.c
+index be8b09e09d30..e45f055276d1 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -3180,6 +3180,7 @@ static void __put_partials(struct kmem_cache *s, struct slab *partial_slab)
+        while (slab_to_discard) {
+                slab = slab_to_discard;
+                slab_to_discard = slab_to_discard->next;
++               printk("__put_partials: cache 0x%lx slab 0x%lx\n", (unsigned long)s, (unsigned long)slab);
+ 
+                stat(s, DEACTIVATE_EMPTY);
+                discard_slab(s, slab);
+
+diff --git a/ipc/msgutil.c b/ipc/msgutil.c
+index c7be0c792647..21af92f531d6 100644
+--- a/ipc/msgutil.c
++++ b/ipc/msgutil.c
+@@ -64,6 +64,7 @@ static struct msg_msg *alloc_msg(size_t len)
+        msg = kmem_buckets_alloc(msg_buckets, sizeof(*msg) + alen, GFP_KERNEL);
+        if (msg == NULL)
+                return NULL;
++       printk("msg_msg 0x%lx\n", (unsigned long)msg);
+ 
+        msg->next = NULL;
+        msg->security = NULL;
+
+
+In __put_partials() I print the address of the slab that returns to the page allocator when discard_slab() runs. In alloc_msg() I print the kernel address of each newly allocated msg_msg object.
+
+When the cross-cache attack succeeds, the slab that held drill_item_t objects is handed back to the page allocator and then reused for msg_msg objects. Running the PoC exploit drill_uaf_w_msg_msg makes this visible, as we observe:
+
+  In the kernel log:
+    [   32.719582] drill: kmalloc'ed item 5123 (0xffff88800c960660, size 95)
+
+  
+  Then in stdout:
+    [+] done, current_n: 5124 (next for allocating)
+[!] obtain dangling reference from use-after-free bug
+[+] done, uaf_n: 5123
+
+  
+  Then in GDB (using with bata24/gef):
+    gef> slab-contains 0xffff88800c960660
+[+] Wait for memory scan
+slab: 0xffffea0000325800
+kmem_cache: 0xffff888003c45300
+base: 0xffff88800c960000
+name: kmalloc-rnd-05-96  size: 0x60  num_pages: 0x1
+
+  
+  Finally, in the kernel log:
+    [   36.778165] drill: free item 5123 (0xffff88800c960660)
+...
+[   36.807956] __put_partials: cache 0xffff888003c45300 slab 0xffffea0000325800
+...
+[   36.892053] msg_msg 0xffff88800c960660
+
+  
+
+
+We see the drill_item_t object 0xffff88800c960660 in slab 0xffffea0000325800 reallocated as msg_msg, which confirms that the cross-cache attack worked.
+
+After experimenting with kernel-hack-drill on Ubuntu Server 24.04, I found that CONFIG_RANDOM_KMALLOC_CACHES and CONFIG_SLAB_BUCKETS block naive UAF exploitation, yet they also make cross-cache attacks absolutely stable. So, in my humble opinion:
+
+
+
+
+It seems that, without a mitigation such as SLAB_VIRTUAL, the Linux kernel remains wide-open to cross-cache attacks.
+
+Adapting the cross-cache attack to CVE-2024-50264
+
+As noted in the limitations, the vulnerable virtio_vsock_sock client object is allocated together with the server object (Limitation #1). That hurts the exploit for two reasons:
+
+  On one hand, leaving the server vsock open stops the slab that holds the UAF object from being freed, which kills the cross-cache attack.
+  On the other hand, closing the server vsock disturbs the UAF itself.
+
+
+How to deal with it? @v4bel and @qwerty used the SLUBStick timing side channel to spot when the allocator switched to a new active slab. I went another way:
+
+  What if I hit the connect() syscall with a signal almost immediately?
+
+
+In short, I used one more race condition to exploit the main race condition – and it worked:
+
+  I sent the "immortal" signal 33 to the vulnerable connect() syscall after a 10000 ns timeout, far earlier than the delay needed to trigger the UAF.
+  Then I verified the early race condition:
+    
+      The connect() syscall must return "Interrupted system call"
+      Another testing client vsock should still connect to the server vsock without trouble
+    
+  
+
+
+I discovered that when both checks passed, only a single vulnerable virtio_vsock_sock for the client vsock was created. The interrupting signal arrived before the kernel could create the second virtio_vsock_sock for the server vsock. This bypassed Limitation #1 (paired-object creation). After that, I sent signal 33 again – this time after the normal timeout – to interrupt the vulnerable connect() a second time and provoke the UAF. The cross-cache attack against virtio_vsock_sock was unlocked!
+
+Looping this early race and checking its result was quick. Once the early race succeeded, the main race that triggers the UAF became more stable; I could now hit the UAF about once per second instead of once every several minutes, solving the instability noted in Limitation #2. My race condition "speedrun" also eased Limitation #5: I managed roughly five UAF writes before the kworker hit a null-ptr-deref at VSOCK_CLOSE_TIMEOUT (8 seconds).
+
+To address Limitation #4 (the immediate null-ptr-deref in the kworker after UAF), I tried one more race condition, similarly to @v4bel and @qwerty. Right after the UAF-triggering connect(), I called listen() on the vulnerable vsock. If listen() ran before the kworker, it changed the vsock state to TCP_LISTEN, preventing the crash. Unfortunately, this step remains the most unstable part of the whole exploit; the rest is far more stable.
+
+At that point my list of CVE-2024-50264 limitations looked like this:
+
+  The vulnerable virtio_vsock_sock client object is allocated together with the server object from the same slab cache. That disturbs cross-cache attacks.
+  Reproducing this race condition is very unstable.
+  The UAF write occurs in a kworker a few microseconds after kfree(), too quickly for typical cross-cache attacks.
+  A null-ptr-deref in the kworker follows the UAF write. That's why I shelved the bug at first.
+  Even if that kernel oops is avoided, another null-ptr-deref occurs in the kworker after VSOCK_CLOSE_TIMEOUT (eight seconds).
+  The kworker hangs in spin_lock_bh() if virtio_vsock_sock.tx_lock is not zero.
+
+
+With the early-signal trick in place, only two limitations were still blocking my exploit.
+
+Oh so slow! The cross-cache attack shows up late to the party
+
+As noted in Limitation #3, the UAF write in the kworker fires only a few μs after kfree() for the virtio_vsock_sock. A cross-cache attack needs much more time, so the UAF write lands on the original virtio_vsock_sock and never reaches the msg_msg.
+
+
+
+
+I didn't know how to make cross-cache procedure faster, but I knew how to slow down the attacked kernel code instead. That approach is described in Jann Horn's article Racing against the clock. It allowed to make my kworker slower than a sluggish cross-cache attack.
+
+The main idea is to hammer the kworker with a timerfd watched by a huge pile of epoll instances. Here is the short recipe (see Jann's article for full detail):
+
+  Call timerfd_create(CLOCK_MONOTONIC, 0).
+  Create 8 forks.
+  In each fork, call dup() for the timerfd 100 times.
+  In each fork, call epoll_create() 500 times.
+  For every epoll instance, use epoll_ctl() to add all duplicated file descriptors to the interest list – each epoll instance now monitors all available timerfd copies.
+  Finally, arm the timerfd so the interrupt hits the kworker at just the right moment:
+    timerfd_settime(timerfd, TFD_TIMER_CANCEL_ON_SET, &retard_tmo, NULL)
+
+  
+
+
+This procedure made my race-condition window around 80 times longer.
+
+I wanted some more time to complete the cross-cache attack with a guarantee, but ran into a limit not mentioned in the original write-up. If you exceed the limit in /proc/sys/fs/epoll/max_user_watches, epoll_ctl() fails. From man 7 epoll:
+
+  This specifies a limit on the total number of file descriptors that a user can register across all epoll instances on the system. The limit is per real user ID. Each registered file descriptor costs roughly 90 bytes on a 32-bit kernel, and roughly 160 bytes on a 64-bit kernel. Currently, the default value for max_user_watches is 1/25 (4%) of the available low memory, divided by the registration cost in bytes.
+
+
+On Ubuntu Server 24.04 with 2 GiB of RAM, /proc/sys/fs/epoll/max_user_watches is 431838, which is not huge. I could afford 8 forks × 500 epoll instances × 100 duplicated file descriptors, for a total of 400000 epoll watches.
+
+That was just enough to beat Limitation #3, and I finally got msg_msg data size corruption: the vsock UAF changed msg_msg.m_ts from 48 bytes to 8192 (MSGMAX). Now I could do out-of-bounds reading of the kernel memory using the msgrcv() syscall.
+
+Sorting the loot
+
+The corrupted msg_msg allowed me to read 8 KiB of data from the kernelspace.  I sorted this loot and found a promising infoleak: a kernel address 0xffffffff8233cfa0 [1]. This infoleak was quite stable and worked with high probability, so I decided to investigate it without doing any additional heap feng shui. GDB showed that it was a pointer to the socket_file_ops() kernel function. I was excited to discover that this function pointer is part of struct file, because the file kernel object also contains the f_cred pointer [2], which leaked as well.
+
+Here's how I examined the memory leaked by msg_msg at 0xffff88800e75d600:
+gef> p *((struct file *)(0xffff88800e75d600 + 96*26 + 64))
+$61 = {
+  f_count = {
+    counter = 0x0
+  },
+  f_lock = {
+    {
+      rlock = {
+        raw_lock = {
+          {
+            val = {
+              counter = 0x0
+            },
+            {
+              locked = 0x0,
+              pending = 0x0
+            },
+            {
+              locked_pending = 0x0,
+              tail = 0x0
+            }
+          }
+        }
+      }
+    }
+  },
+  f_mode = 0x82e0003,
+  f_op = 0xffffffff8233cfa0 <socket_file_ops>,    [1]
+  f_mapping = 0xffff88800ee66f60,
+  private_data = 0xffff88800ee66d80,
+  f_inode = 0xffff88800ee66e00,
+  f_flags = 0x2,
+  f_iocb_flags = 0x0,
+  f_cred = 0xffff888003b7ad00,                    [2]
+  f_path = {
+    mnt = 0xffff8880039cec20,
+    dentry = 0xffff888005b30b40
+  },
+  ...
+
+
+As a result, my PoC exploit obtained a pointer to struct cred, the structure that stores the current process credentials. The last piece needed for privilege escalation was arbitrary address writing. With that, I could overwrite the exploit process credentials and become root. That would be a data-only attack with no control-flow hijack.
+
+In search of arbitrary address writing primitive
+
+The most interesting and difficult part of the research began here. I was searching for a target kernel object for my UAF write, which could provide an arbitrary address writing exploit primitive. The search was exhausting. I've done the following:
+
+  Looked through dozens of kernel objects,
+  Read many kernel exploit write-ups,
+  Tried Kernel Exploitation Dashboard by Eduardo Vela and the KernelCTF team.
+
+
+One idea was to combine my limited UAF write with the Dirty Page Table attack (well described by Nicolas Wu). Tweaking page tables can let an attacker read and write data at arbitrary physical address.
+
+I could combine my UAF with a cross-cache attack (or more accurately, cross-allocator attack) to modify page tables. To overwrite kernel text or heap, though, I still needed to know the physical address of the target memory. Two options came to mind:
+
+  Bruteforcing physical addresses. Not practical here: I could trigger the UAF only about five times before the kworker crashed, nowhere near enough tries.
+  Using the KASLR infoleak from my msg_msg out-of-bounds read. I decided to try that.
+
+
+I ran a quick experiment to see how KASLR behaves on X86_64 with CONFIG_RANDOMIZE_BASE and CONFIG_RANDOMIZE_MEMORY enabled. Booting a virtual machine several times, I compared the virtual and physical addresses of kernel _text.
+
+VM run #1:
+gef> ksymaddr-remote
+[+] Wait for memory scan
+0xffffffff98400000 T _text
+
+gef> v2p 0xffffffff98400000
+Virt: 0xffffffff98400000 -> Phys: 0x57400000
+
+
+VM run #2:
+gef> ksymaddr-remote
+[+] Wait for memory scan
+0xffffffff81800000 T _text
+
+gef> v2p 0xffffffff81800000
+Virt: 0xffffffff81800000 -> Phys: 0x18600000
+
+
+Then I calculated the difference between the virtual and physical addresses:
+
+  VM run #1: 0xffffffff98400000 − 0x57400000 = 0xffffffff41000000
+  VM run #2: 0xffffffff81800000 − 0x18600000 = 0xffffffff69200000
+
+
+Because 0xffffffff41000000 is not equal to 0xffffffff69200000, leaking the virtual KASLR offset doesn't help against physical KASLR.
+
+
+
+
+Thereby to perform Dirty Page Table attack, I needed a way to leak a kernel physical address. Ideally I would do this by mixing some page-allocator feng shui with my out-of-bounds read. That felt messy, and I wanted a cleaner solution.
+
+I kept looking for a target kernel object for my UAF write, which could provide an arbitrary address writing and eventually focused on pipe_buffer.
+
+When a pipe is created with the pipe() system call, the kernel allocates an array of pipe_buffer structures. Each pipe_buffer item in this array corresponds to a memory page that holds data written to the pipe. The diagram below shows the internals of this object:
+
+
+
+
+This object looked like a good UAF target. I could make a pipe_buffer array the same size as virtio_vsock_sock by changing the capacity of the pipe: fcntl(pipe_fd[1], F_SETPIPE_SZ, PAGE_SIZE * 2). The kernel changes the array size to 2 * sizeof(struct pipe_buffer) = 80 bytes, exactly matching the virtio_vsock_sock size.
+
+In addition, 4 attacker-controlled bytes from the vsock UAF write at offset 24 can flip pipe_buffer.flags, just as in Max Kellermann's original Dirty Pipe attack.
+
+
+
+
+The original Dirty Pipe attack doesn't even need an infoleak and grants privilege escalation with a one-shot write. Impressed, I decided to experiment with pipe_buffer in my kernel-hack-drill.
+
+Experimenting with the Dirty Pipe attack
+
+First, I built a Dirty Pipe prototype in kernel-hack-drill; the PoC exploit drill_uaf_w_pipe_buffer.c is in the repository. It:
+
+  performs a cross-cache attack and reclaims the slab that held drill_item_t objects as a slab for pipe_buffer objects
+  exploits the UAF write to drill_item_t; the attacker-controlled bytes written to drill_item_t at offset 24, modify pipe_buffer.flags
+  implements the Dirty Pipe attack, achieving LPE in one shot without an infoleak, cool!
+
+
+To use this technique in my CVE-2024-50264 PoC exploit, I still had to bypass the last remaining Limitation #6: the kworker hangs before the UAF write if virtio_vsock_sock.tx_lock is non-zero. I managed to solve that by doing splice() from a regular file to the pipe, starting at offset zero:
+	loff_t file_offset = 0;
+	ssize_t bytes = 0;
+
+	/* N.B. splice modifies the file_offset value */
+	bytes = splice(temp_file_fd, &file_offset, pipe_fd[1], NULL, 1, 0);
+	if (bytes < 0)
+		err_exit("[-] splice");
+	if (bytes != 1)
+		err_exit("[-] splice short");
+
+
+In that case, the pipe_buffer.offset field remains zero, so the kworker does not hang while acquiring the spinlock:
+
+
+
+
+This seemed like a breakthrough – until I noticed that the UAF write also corrupted the pipe_buffer.ops function pointer by four zero bytes of peer_fwd_cnt. That unfortunate side effect provoked kernel crashes on every later operation involving pipe_buffer ☹️:
+
+
+
+
+This brought me to the following line of reasoning:
+
+  Completing the Dirty Pipe attack requires a working pipe_buffer with an unchanged ops pointer value.
+  Preserving 0xffffffff in the most significant bytes of the pipe_buffer.ops function pointer requires that same value in peer_fwd_cnt.
+  Setting peer_fwd_cnt in virtio_vsock_sock means sending data through the vsock.
+  Sending data through a vsock first needs a successful connect().
+  However, a successful connect() on the vulnerable vsock makes the UAF impossible ⛔.
+
+
+Alas!
+
+Pipe buffer entertainment
+
+So the original Dirty Pipe technique wouldn't fit my CVE-2024-50264 PoC exploit. But suddenly an idea struck me:
+
+  What if I create a pipe with capacity PAGE_SIZE * 4 forcing the kernel to allocate four pipe_buffer objects in kmalloc-192?
+
+
+In that case, the memory object overlapping looked like this: four pipe_buffer objects in one kmalloc-192 slab are allocated at the place of two virtio_vsock_sock objects in two kmalloc-96 slabs. The following diagram illustrates the overlap:
+
+
+
+
+Here, memory corruption can land on either of the two virtio_vsock_sock objects. I'll cover these cases one at a time.
+
+To avoid the kernel hang and crash when the UAF hits virtio_vsock_sock #1, I used two tricks:
+
+  Performed a splice() from a regular file to the pipe with a starting offset of zero. As mentioned earlier, this keeps the offset field of the first pipe_buffer at zero, so the kworker doesn't hang while acquiring the spinlock.
+  Discarded that first pipe_buffer before triggering the UAF, leaving its offset field untouched:
+     /* Remove the first pipe_buffer without changing the `pipe_buffer.offset` */
+ bytes = splice(pipe_fd[0], NULL, temp_pipe_fd[1], NULL, 1, 0);
+ if (bytes < 0)
+ 	err_exit("[-] splice");
+ if (bytes == 0)
+ 	err_exit("[-] splice short");
+
+ /*
+  * Let's read this byte and empty the first pipe_buffer.
+  * So if the UAF writing corrupts the first pipe_buffer,
+  * that will not crash the kernel. Cool!
+  */
+ bytes = read(temp_pipe_fd[0], pipe_data_to_read, 1); /* 1 spliced byte */
+ if (bytes < 0)
+ 	err_exit("[-] pipe read 1");
+ if (bytes != 1)
+ 	err_exit("[-] pipe read 1 short");
+
+    After this sequence of splice() and read(), the first pipe_buffer becomes inactive. Even if the subsequent UAF overwrites its ops pointer, later pipe operations won't dereference that corrupted pointer, so no kernel crash occurs.
+  
+
+
+I wanted to exploit the UAF on virtio_vsock_sock #2 to overwrite the fourth pipe_buffer. To prevent the kernel hang when the UAF hits this second virtio_vsock_sock, I called the same splice(temp_file_fd, &file_offset, pipe_fd[1], NULL, 1, 0) two more times. These syscalls initialized the second and third pipe_buffer objects, leaving their flags at zero, since this pipe operation doesn't set any PIPE_BUF_FLAG_* bits. Therefore, if the UAF occurs on the second virtio_vsock_sock, the spin_lock_bh() in virtio_transport_space_update() will not hang.
+
+These preparations of the pipe opened a door for corrupting the page pointer of the fourth pipe_buffer:
+
+
+
+
+kernel-hack-drill let me experiment with pipe_buffer objects. Without it, crafting this exploit primitive for the tricky CVE-2024-50264 would have been extremely hard.
+
+AARW and KASLR's last revenge
+
+In a pipe_buffer, the page pointer holds the address of a struct page inside the virtual memory map (vmemmap). vmemmap is an array of these structures that allows the kernel to address physical memory efficiently. It is mentioned in Documentation/arch/x86/x86_64/mm.rst:
+____________________________________________________________|___________________________________________________________
+                  |            |                  |         |
+ ffff800000000000 | -128    TB | ffff87ffffffffff |    8 TB | ... guard hole, also reserved for hypervisor
+ ffff880000000000 | -120    TB | ffff887fffffffff |  0.5 TB | LDT remap for PTI
+ ffff888000000000 | -119.5  TB | ffffc87fffffffff |   64 TB | direct mapping of all physical memory (page_offset_base)
+ ffffc88000000000 |  -55.5  TB | ffffc8ffffffffff |  0.5 TB | ... unused hole
+ ffffc90000000000 |  -55    TB | ffffe8ffffffffff |   32 TB | vmalloc/ioremap space (vmalloc_base)
+ ffffe90000000000 |  -23    TB | ffffe9ffffffffff |    1 TB | ... unused hole
+ ffffea0000000000 |  -22    TB | ffffeaffffffffff |    1 TB | virtual memory map (vmemmap_base)
+ ffffeb0000000000 |  -21    TB | ffffebffffffffff |    1 TB | ... unused hole
+ ffffec0000000000 |  -20    TB | fffffbffffffffff |   16 TB | KASAN shadow memory
+__________________|____________|__________________|_________|____________________________________________________________
+
+
+Hence, when I managed to perform a UAF write of controlled data to the pipe_buffer.page pointer, I gained arbitrary address reading and writing (AARW) via the pipe. However, I wasn't able to change the AARW target address many times, as I mentioned in Limitation #5, so I had to choose the target in vmemmap carefully.
+
+My first thought was to overwrite part of the kernel code. But with KASLR enabled, I didn't know the physical address of kernel _text and therefore couldn't determine its location inside vmemmap.
+
+That's why I decided to use the pipe AARW against struct cred in the kernel heap. As I described earlier, I leaked the virtual address of cred using my msg_msg out-of-bounds read. This virtual address looked like 0xffff888003b7ad00, and I understood it was from the direct mapping of all physical memory. So I used the following formula to calculate the offset of the corresponding struct page in vmemmap:
+#define STRUCT_PAGE_SZ 64lu
+#define PAGE_ADDR_OFFSET(addr) (((addr & 0x3ffffffflu) >> 12) * STRUCT_PAGE_SZ)
+uaf_val = PAGE_ADDR_OFFSET(cred_addr);
+
+
+The idea behind it is simple:
+
+  addr & 0x3ffffffflu gives the offset of the struct cred from the page_offset_base.
+  Right shift by 12 gives the number of the memory page containing struct cred.
+  Finally, multiplication by 64 (the size of struct page) gives the offset of the corresponding struct page in the vmemmap.
+
+
+This formula should be adapted if the system has more than 4 GiB of RAM. In that case, ZONE_NORMAL containing kernel allocations usually starts at address 0x100000000. Hence, to calculate the offset of the needed struct page, we should add (0x100000000 >> 12) * STRUCT_PAGE_SZ.
+
+Excellent, the described formula is independent of KASLR for physical addresses, so I could use it to calculate the four lower bytes of the target address for exploiting the pipe AARW against the struct cred. Why I needed only four lower bytes of pipe_buffer.page:
+
+  My UAF write to peer_buf_alloc performed partial overwriting of the first half of the pipe_buffer.page pointer, as I showed at the diagram above.
+  x86_64 is little-endian, so the first half of the pointer contains four lower bytes of the address.
+
+
+But when I tried this approach, KASLR carried out its last revenge. It randomized the vmemmap_base address, and the four lower bytes of the struct page pointers carried two random bits. Ouch!
+
+However, I decided to brute-force those two bits because I could achieve the UAF write around 5 times before the kworker got a null-ptr-deref after VSOCK_CLOSE_TIMEOUT (8 sec).
+
+
+
+
+I found that probing different values of pipe_buffer.page from userspace works perfectly well:
+
+  In case of fail, reading from the pipe simply returns Bad address.
+  In case of success, reading from the pipe gives struct cred contents.
+
+
+Great! I could finally determine a proper AARW target address, write to the pipe, overwrite euid and egid with 0, and get root. See the PoC exploit demo:
+
+
+  
+
+
+
+Conclusion
+
+Bug collisions are painful. Finishing the research anyway is rewarding. Let me quote my good friend:
+
+
+
+
+Working on this hard race condition with multiple limitations allowed me to discover new exploitation techniques and to use and improve my pet project kernel-hack-drill, which provides a testing environment for Linux kernel security researchers. You are welcome to try it and contribute.
+
+Thanks for reading!
+
+  
+
+
+      ]]></content:encoded>
+        </item>
+        <item>
+            <title><![CDATA[Lit: a library for building fast, lightweight web components]]></title>
+            <link>https://lit.dev</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45112720</guid>
+            <description><![CDATA[Simple. Fast. Web Components.]]></description>
+            <content:encoded><![CDATA[Simple. Fast. Web Components.SimpleSkip the boilerplateBuilding on top of the Web Components standards, Lit adds just what you need to be happy and productive: reactivity, declarative templates and a handful of thoughtful features to reduce boilerplate and make your job easier. Every Lit feature is carefully designed with web platform evolution in mind.FastTiny footprint, instant updatesWeighing in at around 5 KB (minified and compressed), Lit helps keep your bundle size small and your loading time short. And rendering is blazing fast, because Lit touches only the dynamic parts of your UI when updating — no need to rebuild a virtual tree and diff it with the DOM.Web ComponentsInteroperable & future-readyEvery Lit component is a native web component, with the superpower of interoperability. Web components work anywhere you use HTML, with any framework or none at all. This makes Lit ideal for building shareable components, design systems, or maintainable, future-ready sites and apps.import {html, css, LitElement} from 'lit';import {customElement, property} from 'lit/decorators.js';
+@customElement('simple-greeting')export class SimpleGreeting extends LitElement {  static styles = css`p { color: blue }`;
+  @property()  name = 'Somebody';
+  render() {    return html`<p>Hello, ${this.name}!</p>`;  }}import {html, css, LitElement} from 'lit';
+export class SimpleGreeting extends LitElement {  static styles = css`p { color: blue }`;
+  static properties = {    name: {type: String},  };
+  constructor() {    super();    this.name = 'Somebody';  }
+  render() {    return html`<p>Hello, ${this.name}!</p>`;  }}customElements.define('simple-greeting', SimpleGreeting);<simple-greeting name="World"></simple-greeting>Edit this example in the Lit PlaygroundCustom ElementsLit components are standard custom elements, so the browser treats them exactly like built-in elements. Use them in hand-written HTML or framework code, output them from your CMS or static site builder, even create instances in JavaScript — they just work!Scoped stylesLit scopes your styles by default, using Shadow DOM. This keeps your CSS selectors simple and ensures that your component’s styles don't affect — and aren't affected by — any other styles on the page.Reactive propertiesDeclare reactive properties to model your component’s API and internal state. A Lit component efficiently re-renders whenever a reactive property (or corresponding HTML attribute) changes.Declarative templatesLit templates, based on tagged template literals, are simple, expressive and fast, featuring HTML markup with native JavaScript expressions inline. No custom syntax to learn, no compilation required.Build anything with LitNeed to deliver interactive content or features that drop into any site, built on any stack? Because they're natively supported by browsers, web components are the perfect solution — and Lit makes them easy to build.A design system helps you create experiences that are consistently excellent and on brand. But what if your organization uses multiple frameworks? With Lit, you can build one set of components that works for every team.Use Lit components to progressively enhance a static site, or build an entire app. By embracing Web Components, Lit minimizes lock-in and promotes maintainability: update or migrate one component at a time, without disrupting product development.Explore LitTry our live tutorials — no installation neededTutorialsConnect with Lit and the web components communityStay up to date with new releases, learn more about how to use web components and share projects and feedback with our team. All community participation is subject to Lit’s Code of Conduct — be excellent to each other!Lit Discord Chat about Lit with the Lit community and dev teamBluesky Stay up to date with the latest newsGitHub File issues, read the code, and make contributionsStack Overflow Ask and answer questions about Lit]]></content:encoded>
+        </item>
         <item>
             <title><![CDATA[Finnish City Inaugurates 1 MW/100 MWh Sand Battery]]></title>
             <link>https://cleantechnica.com/2025/08/30/finnish-city-inaugurates-1-mw-100-mwh-sand-battery/</link>
@@ -1993,7 +2847,7 @@ That’s the “what” and “why” of world models. The “how,” though, is
             <link>https://news.ycombinator.com/item?id=45104974</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45104974</guid>
             <description><![CDATA[Hey HN! We’re Abhi, Venkat, Tom, and Nick and we are building Datafruit (https://datafruit.dev/), an AI DevOps agent. We’re like Devin for DevOps. You can ask Datafruit to check your cloud spend, look for loose security policies, make changes to your IaC, and it can reason across your deployment standards, design docs, and DevOps practices.]]></description>
-            <content:encoded><![CDATA[Launch HN: Datafruit (YC S25) – AI for DevOps55 points by nickpapciak 14 hours ago  | hide | past | favorite | 37 commentsHey HN! We’re Abhi, Venkat, Tom, and Nick and we are building Datafruit (https://datafruit.dev/), an AI DevOps agent. We’re like Devin for DevOps. You can ask Datafruit to check your cloud spend, look for loose security policies, make changes to your IaC, and it can reason across your deployment standards, design docs, and DevOps practices.Demo video: https://www.youtube.com/watch?v=2FitSggI7tg.Right now, we have two main methods to interact with Datafruit:(1) automated infrastructure audits— agents periodically scan your environment to find cost optimization opportunities, detect infrastructure drift, and validate your infra against compliance requirements.(2) chat interface (available as a web UI and through slack) — ask the agent questions for real-time insights, or assign tasks directly, such as investigating spend anomalies, reviewing security posture, or applying changes to IaC resources.Working at FAANG and various high-growth startups, we realized that infra work requires an enormous amount of context, often more than traditional software engineering. The business decisions, codebase, and cloud itself are all extremely important in any task that has been assigned. To maximize the success of the agents, we do a fair amount of context engineering. Not hallucinating is super important!One thing which has worked incredibly well for us is a multi-agent system where we have specialized sub-agents with access to specific tool calls and documentation for their specialty. Agents choose to “handoff” to each other when they feel like another agent would be more specialized for the task. However, all agents share the same context (https://cognition.ai/blog/dont-build-multi-agents). We’re pretty happy with this approach, and believe it could work in other disciplines which require high amounts of specialized expertise.Infrastructure is probably the most mission-critical part of any software organization, and needs extremely heavy guardrails to keep it safe. Language models are not yet at the point where they can be trusted to make changes (we’ve talked to a couple of startups where the Claude Code + AWS CLI combo has taken their infra down). Right now, Datafruit receives read-only access to your infrastructure and can only make changes through pull requests to your IaC repositories. The agent also operates in a sandboxed virtual environment so that it could not write cloud CLI commands if it wanted to!Where LLMs can add significant value is in reducing the constant operational inefficiencies that eat up cloud spend and delay deadlines—the small-but-urgent ops work. Once Datafruit indexes your environment, you can ask it to do things like:  "Grant @User write access to analytics S3 bucket for 24 hours"
+            <content:encoded><![CDATA[Launch HN: Datafruit (YC S25) – AI for DevOps58 points by nickpapciak 14 hours ago  | hide | past | favorite | 39 commentsHey HN! We’re Abhi, Venkat, Tom, and Nick and we are building Datafruit (https://datafruit.dev/), an AI DevOps agent. We’re like Devin for DevOps. You can ask Datafruit to check your cloud spend, look for loose security policies, make changes to your IaC, and it can reason across your deployment standards, design docs, and DevOps practices.Demo video: https://www.youtube.com/watch?v=2FitSggI7tg.Right now, we have two main methods to interact with Datafruit:(1) automated infrastructure audits— agents periodically scan your environment to find cost optimization opportunities, detect infrastructure drift, and validate your infra against compliance requirements.(2) chat interface (available as a web UI and through slack) — ask the agent questions for real-time insights, or assign tasks directly, such as investigating spend anomalies, reviewing security posture, or applying changes to IaC resources.Working at FAANG and various high-growth startups, we realized that infra work requires an enormous amount of context, often more than traditional software engineering. The business decisions, codebase, and cloud itself are all extremely important in any task that has been assigned. To maximize the success of the agents, we do a fair amount of context engineering. Not hallucinating is super important!One thing which has worked incredibly well for us is a multi-agent system where we have specialized sub-agents with access to specific tool calls and documentation for their specialty. Agents choose to “handoff” to each other when they feel like another agent would be more specialized for the task. However, all agents share the same context (https://cognition.ai/blog/dont-build-multi-agents). We’re pretty happy with this approach, and believe it could work in other disciplines which require high amounts of specialized expertise.Infrastructure is probably the most mission-critical part of any software organization, and needs extremely heavy guardrails to keep it safe. Language models are not yet at the point where they can be trusted to make changes (we’ve talked to a couple of startups where the Claude Code + AWS CLI combo has taken their infra down). Right now, Datafruit receives read-only access to your infrastructure and can only make changes through pull requests to your IaC repositories. The agent also operates in a sandboxed virtual environment so that it could not write cloud CLI commands if it wanted to!Where LLMs can add significant value is in reducing the constant operational inefficiencies that eat up cloud spend and delay deadlines—the small-but-urgent ops work. Once Datafruit indexes your environment, you can ask it to do things like:  "Grant @User write access to analytics S3 bucket for 24 hours"
     -> Creates temporary IAM role, sends least-privilege credentials, auto-revokes tomorrow
 
   "Find where this secret is used so I can rotate it without downtime"
@@ -2160,3662 +3014,6 @@ Columnist Takashi Matsuo argues that adults, not TV shows, should teach children
 
 
 ]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[The Little Book of Linear Algebra]]></title>
-            <link>https://github.com/the-litte-book-of/linear-algebra</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45103436</guid>
-            <description><![CDATA[There is hardly any theory which is more elementary than linear algebra, in spite of the fact that generations of professors and textbook writers have obscured its simplicity by preposterous calcul...]]></description>
-            <content:encoded><![CDATA[The Little Book of Linear Algebra
-A concise, beginner-friendly introduction to the core ideas of linear algebra.
-Formats
-
-Download PDF – print-ready version
-Download EPUB – e-reader friendly
-View LaTeX – Latex source
-
-Chapter 1. Vectors
-1.1 Scalars and Vectors
-A scalar is a single numerical quantity, most often taken from the real numbers, denoted by $\mathbb{R}$. Scalars are
-the fundamental building blocks of arithmetic: they can be added, subtracted, multiplied, and, except in the case of
-zero, divided. In linear algebra, scalars play the role of coefficients, scaling factors, and entries of larger
-structures such as vectors and matrices. They provide the weights by which more complex objects are measured and
-combined. A vector is an ordered collection of scalars, arranged either in a row or a column. When the scalars are real
-numbers, the vector is said to belong to real $n$-dimensional space, written
-$$
-\mathbb{R}^n = { (x_1, x_2, \dots, x_n) \mid x_i \in \mathbb{R} }.
-$$
-An element of $\mathbb{R}^n$ is called a vector of dimension $n$ or an n-vector. The number $n$ is called the
-dimension of the vector space. Thus $\mathbb{R}^2$ is the space of all ordered pairs of real numbers, $\mathbb{R}^3$ the
-space of all ordered triples, and so on.
-Example 1.1.1.
-
-A 2-dimensional vector: $(3, -1) \in \mathbb{R}^2$.
-A 3-dimensional vector: $(2, 0, 5) \in \mathbb{R}^3$.
-A 1-dimensional vector: $(7) \in \mathbb{R}^1$, which corresponds to the scalar $7$ itself.
-
-Vectors are often written vertically in column form, which emphasizes their role in matrix multiplication:
-$$
-\mathbf{v} = \begin{bmatrix} 2 \ 0 \ 5 \end{bmatrix} \in \mathbb{R}^3.
-$$
-The vertical layout makes the structure clearer when we consider linear combinations or multiply matrices by vectors.
-Geometric Interpretation
-In $\mathbb{R}^2$, a vector $(x_1, x_2)$ can be visualized as an arrow starting at the origin $(0,0)$ and ending at the
-point $(x_1, x_2)$. Its length corresponds to the distance from the origin, and its orientation gives a direction in the
-plane. In $\mathbb{R}^3$, the same picture extends into three dimensions: a vector is an arrow from the origin
-to $(x_1, x_2, x_3)$. Beyond three dimensions, direct visualization is no longer possible, but the algebraic rules of
-vectors remain identical. Even though we cannot draw a vector in $\mathbb{R}^{10}$, it behaves under addition, scaling,
-and transformation exactly as a 2- or 3-dimensional vector does. This abstract point of view is what allows linear
-algebra to apply to data science, physics, and machine learning, where data often lives in very high-dimensional spaces.
-Thus a vector may be regarded in three complementary ways:
-
-As a point in space, described by its coordinates.
-As a displacement or arrow, described by a direction and a length.
-As an abstract element of a vector space, whose properties follow algebraic rules independent of geometry.
-
-Notation
-
-Vectors are written in boldface lowercase letters: $\mathbf{v}, \mathbf{w}, \mathbf{x}$.
-The i-th entry of a vector $\mathbf{v}$ is written $v_i$, where indices begin at 1.
-The set of all n-dimensional vectors over $\mathbb{R}$ is denoted $\mathbb{R}^n$.
-Column vectors will be the default form unless otherwise stated.
-
-Why begin here?
-Scalars and vectors form the atoms of linear algebra. Every structure we will build-vector spaces, linear
-transformations, matrices, eigenvalues-relies on the basic notions of number and ordered collection of numbers. Once
-vectors are understood, we can define operations such as addition and scalar multiplication, then generalize to
-subspaces, bases, and coordinate systems. Eventually, this framework grows into the full theory of linear algebra, with
-powerful applications to geometry, computation, and data.
-Exercises 1.1
-
-Write three different vectors in $\mathbb{R}^2$ and sketch them as arrows from the origin. Identify their coordinates
-explicitly.
-Give an example of a vector in $\mathbb{R}^4$. Can you visualize it directly? Explain why high-dimensional
-visualization is challenging.
-Let $\mathbf{v} = (4, -3, 2)$. Write $\mathbf{v}$ in column form and state $v_1, v_2, v_3$.
-In what sense is the set $\mathbb{R}^1$ both a line and a vector space? Illustrate with examples.
-Consider the vector $\mathbf{u} = (1,1,\dots,1) \in \mathbb{R}^n$. What is special about this vector when $n$ is
-large? What might it represent in applications?
-
-1.2 Vector Addition and Scalar Multiplication
-Vectors in linear algebra are not static objects; their power comes from the operations we can perform on them. Two
-fundamental operations define the structure of vector spaces: addition and scalar multiplication. These operations
-satisfy simple but far-reaching rules that underpin the entire subject.
-Vector Addition
-Given two vectors of the same dimension, their sum is obtained by adding corresponding entries. Formally, if
-$$
-\mathbf{u} = (u_1, u_2, \dots, u_n), \quad
-\mathbf{v} = (v_1, v_2, \dots, v_n),
-$$
-then their sum is
-$$
-\mathbf{u} + \mathbf{v} = (u_1+v_1, u_2+v_2, \dots, u_n+v_n).
-$$
-Example 1.2.1.
-Let $\mathbf{u} = (2, -1, 3)$ and $\mathbf{v} = (4, 0, -5)$. Then
-$$
-\mathbf{u} + \mathbf{v} = (2+4, -1+0, 3+(-5)) = (6, -1, -2).
-$$
-Geometrically, vector addition corresponds to the parallelogram rule. If we draw both vectors as arrows from the
-origin, then placing the tail of one vector at the head of the other produces the sum. The diagonal of the parallelogram
-they form represents the resulting vector.
-Scalar Multiplication
-Multiplying a vector by a scalar stretches or shrinks the vector while preserving its direction, unless the scalar is
-negative, in which case the vector is also reversed. If $c \in \mathbb{R}$ and
-$$
-\mathbf{v} = (v_1, v_2, \dots, v_n),
-$$
-then
-$$
-c \mathbf{v} = (c v_1, c v_2, \dots, c v_n).
-$$
-Example 1.2.2.
-Let $\mathbf{v} = (3, -2)$ and $c = -2$. Then
-$$
-c\mathbf{v} = -2(3, -2) = (-6, 4).
-$$
-This corresponds to flipping the vector through the origin and doubling its length.
-Linear Combinations
-The interaction of addition and scalar multiplication allows us to form linear combinations. A linear combination of
-vectors $\mathbf{v}_1, \mathbf{v}_2, \dots, \mathbf{v}_k$ is any vector of the form
-$$
-c_1 \mathbf{v}_1 + c_2 \mathbf{v}_2 + \cdots + c_k \mathbf{v}_k, \quad c_i \in \mathbb{R}.
-$$
-Linear combinations are the mechanism by which we generate new vectors from existing ones. The span of a set of
-vectors-the collection of all their linear combinations-will later lead us to the idea of a subspace.
-Example 1.2.3.
-Let $\mathbf{v}_1 = (1,0)$ and $\mathbf{v}_2 = (0,1)$. Then any vector $(a,b)\in\mathbb{R}^2$ can be expressed as
-$$
-a\mathbf{v}_1 + b\mathbf{v}_2.
-$$
-Thus $(1,0)$ and $(0,1)$ form the basic building blocks of the plane.
-Notation
-
-Addition: $\mathbf{u} + \mathbf{v}$ means component-wise addition.
-Scalar multiplication: $c\mathbf{v}$ scales each entry of $\mathbf{v}$ by $c$.
-Linear combination: a sum of the form $c_1 \mathbf{v}_1 + \cdots + c_k \mathbf{v}_k$.
-
-Why this matters
-Vector addition and scalar multiplication are the defining operations of linear algebra. They give structure to vector
-spaces, allow us to describe geometric phenomena like translation and scaling, and provide the foundation for solving
-systems of equations. Everything that follows-basis, dimension, transformations-builds on these simple but profound
-rules.
-Exercises 1.2
-
-Compute $\mathbf{u} + \mathbf{v}$ where $\mathbf{u} = (1,2,3)$ and $\mathbf{v} = (4, -1, 0)$.
-Find $3\mathbf{v}$ where $\mathbf{v} = (-2,5)$. Sketch both vectors to illustrate the scaling.
-Show that $(5,7)$ can be written as a linear combination of $(1,0)$ and $(0,1)$.
-Write $(4,4)$ as a linear combination of $(1,1)$ and $(1,-1)$.
-Prove that if $\mathbf{u}, \mathbf{v} \in \mathbb{R}^n$,
-then $(c+d)(\mathbf{u}+\mathbf{v}) = c\mathbf{u} + c\mathbf{v} + d\mathbf{u} + d\mathbf{v}$ for
-scalars $c,d \in \mathbb{R}$.
-
-1.3 Dot Product, Norms, and Angles
-The dot product is the fundamental operation that links algebra and geometry in vector spaces. It allows us to measure
-lengths, compute angles, and determine orthogonality. From this single definition flow the notions of norm and
-angle, which give geometry to abstract vector spaces.
-The Dot Product
-For two vectors in $\mathbb{R}^n$, the dot product (also called the inner product) is defined by
-$$
-\mathbf{u} \cdot \mathbf{v} = u_1 v_1 + u_2 v_2 + \cdots + u_n v_n.
-$$
-Equivalently, in matrix notation:
-$$
-\mathbf{u} \cdot \mathbf{v} = \mathbf{u}^T \mathbf{v}.
-$$
-Example 1.3.1.
-Let $\mathbf{u} = (2, -1, 3)$ and $\mathbf{v} = (4, 0, -2)$. Then
-$$
-\mathbf{u} \cdot \mathbf{v} = 2\cdot 4 + (-1)\cdot 0 + 3\cdot (-2) = 8 - 6 = 2.
-$$
-The dot product outputs a single scalar, not another vector.
-Norms (Length of a Vector)
-The Euclidean norm of a vector is the square root of its dot product with itself:
-$$
-|\mathbf{v}| = \sqrt{\mathbf{v} \cdot \mathbf{v}} = \sqrt{v_1^2 + v_2^2 + \cdots + v_n^2}.
-$$
-This generalizes the Pythagorean theorem to arbitrary dimensions.
-Example 1.3.2.
-For $\mathbf{v} = (3, 4)$,
-$$
-|\mathbf{v}| = \sqrt{3^2 + 4^2} = \sqrt{25} = 5.
-$$
-This is exactly the length of the vector as an arrow in the plane.
-Angles Between Vectors
-The dot product also encodes the angle between two vectors. For nonzero vectors $\mathbf{u}, \mathbf{v}$,
-$$
-\mathbf{u} \cdot \mathbf{v} = |\mathbf{u}| , |\mathbf{v}| \cos \theta,
-$$
-where $\theta$ is the angle between them. Thus,
-$$
-\cos \theta = \frac{\mathbf{u} \cdot \mathbf{v}}{|\mathbf{u}||\mathbf{v}|}.
-$$
-Example 1.3.3.
-Let $\mathbf{u} = (1,0)$ and $\mathbf{v} = (0,1)$. Then
-$$
-\mathbf{u} \cdot \mathbf{v} = 0, \quad |\mathbf{u}| = 1, \quad |\mathbf{v}| = 1.
-$$
-Hence
-$$
-\cos \theta = \frac{0}{1\cdot 1} = 0 \quad \Rightarrow \quad \theta = \frac{\pi}{2}.
-$$
-The vectors are perpendicular.
-Orthogonality
-Two vectors are said to be orthogonal if their dot product is zero:
-$$
-\mathbf{u} \cdot \mathbf{v} = 0.
-$$
-Orthogonality generalizes the idea of perpendicularity from geometry to higher dimensions.
-Notation
-
-Dot product: $\mathbf{u} \cdot \mathbf{v}$.
-Norm (length): $|\mathbf{v}|$.
-Orthogonality: $\mathbf{u} \perp \mathbf{v}$ if $\mathbf{u} \cdot \mathbf{v} = 0$.
-
-Why this matters
-The dot product turns vector spaces into geometric objects: vectors gain lengths, angles, and notions of
-perpendicularity. This foundation will later support the study of orthogonal projections, Gram–Schmidt
-orthogonalization, eigenvectors, and least squares problems.
-Exercises 1.3
-
-Compute $\mathbf{u} \cdot \mathbf{v}$ for $\mathbf{u} = (1,2,3)$, $\mathbf{v} = (4,5,6)$.
-Find the norm of $\mathbf{v} = (2, -2, 1)$.
-Determine whether $\mathbf{u} = (1,1,0)$ and $\mathbf{v} = (1,-1,2)$ are orthogonal.
-Let $\mathbf{u} = (3,4)$, $\mathbf{v} = (4,3)$. Compute the angle between them.
-Prove that $|\mathbf{u} + \mathbf{v}|^2 = |\mathbf{u}|^2 + |\mathbf{v}|^2 + 2\mathbf{u}\cdot \mathbf{v}$. This
-identity is the algebraic version of the Law of Cosines.
-
-1.4 Orthogonality
-Orthogonality captures the notion of perpendicularity in vector spaces. It is one of the most important geometric ideas
-in linear algebra, allowing us to decompose vectors, define projections, and construct special bases with elegant
-properties.
-Definition
-Two vectors $\mathbf{u}, \mathbf{v} \in \mathbb{R}^n$ are said to be orthogonal if their dot product is zero:
-$$
-\mathbf{u} \cdot \mathbf{v} = 0.
-$$
-This condition ensures that the angle between them is $\pi/2$ radians (90 degrees).
-Example 1.4.1.
-In $\mathbb{R}^2$, the vectors $(1,2)$ and $(2,-1)$ are orthogonal since
-$$
-(1,2) \cdot (2,-1) = 1\cdot 2 + 2\cdot (-1) = 0.
-$$
-Orthogonal Sets
-A collection of vectors is called orthogonal if every distinct pair of vectors in the set is orthogonal. If, in
-addition, each vector has norm 1, the set is called orthonormal.
-Example 1.4.2.
-In $\mathbb{R}^3$, the standard basis vectors
-$$
-\mathbf{e}_1 = (1,0,0), \quad \mathbf{e}_2 = (0,1,0), \quad \mathbf{e}_3 = (0,0,1)
-$$
-form an orthonormal set: each has length 1, and their dot products vanish when the indices differ.
-Projections
-Orthogonality makes possible the decomposition of a vector into two components: one parallel to another vector, and one
-orthogonal to it. Given a nonzero vector $\mathbf{u}$ and any vector $\mathbf{v}$, the projection of $\mathbf{v}$
-onto $\mathbf{u}$ is
-$$
-\text{proj}_{\mathbf{u}}(\mathbf{v}) = \frac{\mathbf{u} \cdot \mathbf{v}}{\mathbf{u} \cdot \mathbf{u}} \mathbf{u}.
-$$
-The difference
-$$
-\mathbf{v} - \text{proj}_{\mathbf{u}}(\mathbf{v})
-$$
-is orthogonal to $\mathbf{u}$. Thus every vector can be decomposed uniquely into a parallel and perpendicular part with
-respect to another vector.
-Example 1.4.3.
-Let $\mathbf{u} = (1,0)$, $\mathbf{v} = (2,3)$. Then
-$$
-\text{proj}_{\mathbf{u}}(\mathbf{v}) = \frac{(1,0)\cdot(2,3)}{(1,0)\cdot(1,0)} (1,0)
-= \frac{2}{1}(1,0) = (2,0).
-$$
-Thus
-$$
-\mathbf{v} = (2,3) = (2,0) + (0,3),
-$$
-where $(2,0)$ is parallel to $(1,0)$ and $(0,3)$ is orthogonal to it.
-Orthogonal Decomposition
-In general, if $\mathbf{u} \neq \mathbf{0}$ and $\mathbf{v} \in \mathbb{R}^n$, then
-$$
-\mathbf{v} = \text{proj}{\mathbf{u}}(\mathbf{v}) + \big(\mathbf{v} - \text{proj}{\mathbf{u}}(\mathbf{v})\big),
-$$
-where the first term is parallel to $\mathbf{u}$ and the second term is orthogonal. This decomposition underlies methods
-such as least squares approximation and the Gram–Schmidt process.
-Notation
-
-
-$\mathbf{u} \perp \mathbf{v}$: vectors $\mathbf{u}$ and $\mathbf{v}$ are orthogonal.
-An orthogonal set: vectors pairwise orthogonal.
-An orthonormal set: pairwise orthogonal, each of norm 1.
-
-Why this matters
-Orthogonality gives structure to vector spaces. It provides a way to separate independent directions cleanly, simplify
-computations, and minimize errors in approximations. Many powerful algorithms in numerical linear algebra and data
-science (QR decomposition, least squares regression, PCA) rely on orthogonality.
-Exercises 1.4
-
-Verify that the vectors $(1,2,2)$ and $(2,0,-1)$ are orthogonal.
-Find the projection of $(3,4)$ onto $(1,1)$.
-Show that any two distinct standard basis vectors in $\mathbb{R}^n$ are orthogonal.
-Decompose $(5,2)$ into components parallel and orthogonal to $(2,1)$.
-Prove that if $\mathbf{u}, \mathbf{v}$ are orthogonal and nonzero,
-then $(\mathbf{u}+\mathbf{v})\cdot(\mathbf{u}-\mathbf{v}) = 0$.
-
-Chapter 2. Matrices
-2.1 Definition and Notation
-Matrices are the central objects of linear algebra, providing a compact way to represent and manipulate linear
-transformations, systems of equations, and structured data. A matrix is a rectangular array of numbers arranged in rows
-and columns.
-Formal Definition
-An $m \times n$ matrix is an array with $m$ rows and $n$ columns, written
-$$
-A =
-\begin{bmatrix}
-a_{11} & a_{12} & \cdots & a_{1n} \\
-a_{21} & a_{22} & \cdots & a_{2n} \\
-\vdots & \vdots & \ddots & \vdots \\
-a_{m1} & a_{m2} & \cdots & a_{mn}
-\end{bmatrix}.
-$$
-Each entry $a_{ij}$ is a scalar, located in the i-th row and j-th column. The size (or dimension) of the matrix is
-denoted by $m \times n$.
-
-If $m = n$, the matrix is square.
-If $m = 1$, the matrix is a row vector.
-If $n = 1$, the matrix is a column vector.
-
-Thus, vectors are simply special cases of matrices.
-Examples
-Example 2.1.1. A $2 \times 3$ matrix:
-$$
-A = \begin{bmatrix}
-1 & -2 & 4 \\
-0 & 3 & 5
-\end{bmatrix}.
-$$
-Here, $a_{12} = -2$, $a_{23} = 5$, and the matrix has 2 rows, 3 columns.
-Example 2.1.2. A $3 \times 3$ square matrix:
-$$
-B = \begin{bmatrix}
-2 & 0 & 1 \\
--1 & 3 & 4 \\
-0 & 5 & -2
-\end{bmatrix}.
-$$
-This will later serve as the representation of a linear transformation on $\mathbb{R}^3$.
-Indexing and Notation
-
-Matrices are denoted by uppercase bold letters: $A, B, C$.
-Entries are written as $a_{ij}$, with the row index first, column index second.
-The set of all real $m \times n$ matrices is denoted $\mathbb{R}^{m \times n}$.
-
-Thus, a matrix is a function $A: {1,\dots,m} \times {1,\dots,n} \to \mathbb{R}$, assigning a scalar to each row-column
-position.
-Why this matters
-Matrices generalize vectors and give us a language for describing linear operations systematically. They encode systems
-of equations, rotations, projections, and transformations of data. With matrices, algebra and geometry come together: a
-single compact object can represent both numerical data and functional rules.
-Exercises 2.1
-
-Write a $3 \times 2$ matrix of your choice and identify its entries $a_{ij}$.
-Is every vector a matrix? Is every matrix a vector? Explain.
-Which of the following are square
-matrices: $A \in \mathbb{R}^{4\times4}$, $B \in \mathbb{R}^{3\times5}$, $C \in \mathbb{R}^{1\times1}$?
-Let $D = \begin{bmatrix} 1 & 0 \ 0 & 1 \end{bmatrix}$. What kind of matrix is this?
-Consider the matrix $E = \begin{bmatrix} a & b \ c & d \end{bmatrix}$. Express $e_{11}, e_{12}, e_{21}, e_{22}$
-explicitly.
-
-2.2 Matrix Addition and Multiplication
-Once matrices are defined, the next step is to understand how they combine. Just as vectors gain meaning through
-addition and scalar multiplication, matrices become powerful through two operations: addition and multiplication.
-Matrix Addition
-Two matrices of the same size are added by adding corresponding entries. If
-$$
-A = [a_{ij}] \in \mathbb{R}^{m \times n}, \quad
-B = [b_{ij}] \in \mathbb{R}^{m \times n},
-$$
-then
-$$
-A + B = [a_{ij} + b_{ij}] \in \mathbb{R}^{m \times n}.
-$$
-Example 2.2.1.
-Let
-$$
-A = \begin{bmatrix}
-1 & 2 \\
-3 & 4
-\end{bmatrix}, \quad
-B = \begin{bmatrix}
--1 & 0 \\
-5 & 2
-\end{bmatrix}.
-$$
-Then
-$$
-A + B = \begin{bmatrix}
-1 + (-1) & 2 + 0 \
-3 + 5 & 4 + 2
-\end{bmatrix}
-\begin{bmatrix}
-0 & 2 \
-8 & 6
-\end{bmatrix}.
-$$
-Matrix addition is commutative ($A+B = B+A$) and associative ($(A+B)+C = A+(B+C)$). The zero matrix, with all entries 0,
-acts as the additive identity.
-Scalar Multiplication
-For a scalar $c \in \mathbb{R}$ and a matrix $A = [[a_{ij}]$, we define
-$$
-cA = [c \cdot a_{ij}].
-$$
-This stretches or shrinks all entries of the matrix uniformly.
-Example 2.2.2.
-If
-$$
-A = \begin{bmatrix}
-2 & -1 \\
-0 & 3
-\end{bmatrix}, \quad c = -2,
-$$
-then
-$$
-cA = \begin{bmatrix}
--4 & 2 \\
-0 & -6
-\end{bmatrix}.
-$$
-Matrix Multiplication
-The defining operation of matrices is multiplication. If
-$$
-A \in \mathbb{R}^{m \times n}, \quad B \in \mathbb{R}^{n \times p},
-$$
-then their product is the $m \times p$ matrix
-$$
-AB = C = [c_{ij}], \quad c_{ij} = \sum_{k=1}^n a_{ik} b_{kj}.
-$$
-Thus, the entry in the $i$-th row and $j$-th column of $AB$ is the dot product of the $i$-th row of $A$ with the $j$-th
-column of $B$.
-Example 2.2.3.
-Let
-$$
-A = \begin{bmatrix}
-1 & 2 \\
-0 & 3
-\end{bmatrix}, \quad
-B = \begin{bmatrix}
-4 & -1 \\
-2 & 5
-\end{bmatrix}.
-$$
-Then
-$$
-AB = \begin{bmatrix}
-1\cdot4 + 2\cdot2 & 1\cdot(-1) + 2\cdot5 \
-0\cdot4 + 3\cdot2 & 0\cdot(-1) + 3\cdot5
-\end{bmatrix}
-\begin{bmatrix}
-8 & 9 \
-6 & 15
-\end{bmatrix}.
-$$
-Notice that matrix multiplication is not commutative in general: $AB \neq BA$. Sometimes $BA$ may not even be defined if
-dimensions do not align.
-Geometric Meaning
-Matrix multiplication corresponds to the composition of linear transformations. If $A$ transforms vectors
-in $\mathbb{R}^n$ and $B$ transforms vectors in $\mathbb{R}^p$, then $AB$ represents applying $B$ first, then $A$. This
-makes matrices the algebraic language of transformations.
-Notation
-
-Matrix sum: $A+B$.
-Scalar multiple: $cA$.
-Product: $AB$, defined only when the number of columns of $A$ equals the number of rows of $B$.
-
-Why this matters
-Matrix multiplication is the core mechanism of linear algebra: it encodes how transformations combine, how systems of
-equations are solved, and how data flows in modern algorithms. Addition and scalar multiplication make matrices into a
-vector space, while multiplication gives them an algebraic structure rich enough to model geometry, computation, and
-networks.
-Exercises 2.2
-
-Compute $A+B$ for
-
-$$
-A = \begin{bmatrix} 2 & 3 \ -1 & 0 \end{bmatrix}, \quad
-B = \begin{bmatrix} 4 & -2 \ 5 & 7 \end{bmatrix}.
-$$
-
-Find $3A$ where
-
-$$
-A = \begin{bmatrix} 1 & -4 \ 2 & 6 \end{bmatrix}.
-$$
-
-Multiply
-
-$$
-A = \begin{bmatrix} 1 & 0 & 2 \ -1 & 3 & 1 \end{bmatrix}, \quad
-B = \begin{bmatrix} 2 & 1 \ 0 & -1 \ 3 & 4 \end{bmatrix}.
-$$
-
-Verify with an explicit example that $AB \neq BA$.
-Prove that matrix multiplication is distributive: $A(B+C) = AB + AC$.
-
-2.3 Transpose and Inverse
-Two special operations on matrices-the transpose and the inverse-give rise to deep algebraic and geometric properties.
-The transpose rearranges a matrix by flipping it across its main diagonal, while the inverse, when it exists, acts as
-the undo operation for matrix multiplication.
-The Transpose
-The transpose of an $m \times n$ matrix $A = [a_{ij}]$ is the $n \times m$ matrix $A^T = [a_{ji}]$, obtained by swapping
-rows and columns.
-Formally,
-$$
-(A^T){ij} = a{ji}.
-$$
-Example 2.3.1.
-If
-$$
-A = \begin{bmatrix}
-1 & 4 & -2 \\
-0 & 3 & 5
-\end{bmatrix},
-$$
-then
-$$
-A^T = \begin{bmatrix}
-1 & 0 \\
-4 & 3 \\
--2 & 5
-\end{bmatrix}.
-$$
-Properties of the Transpose.
-
-$ (A^T)^T = A$.
-$ (A+B)^T = A^T + B^T$.
-$ (cA)^T = cA^T$, for scalar $c$.
-$ (AB)^T = B^T A^T$.
-
-The last rule is crucial: the order reverses.
-The Inverse
-A square matrix $A \in \mathbb{R}^{n \times n}$ is said to be invertible (or nonsingular) if there exists another
-matrix $A^{-1}$ such that
-$$
-AA^{-1} = A^{-1}A = I_n,
-$$
-where $I_n$ is the $n \times n$ identity matrix. In this case, $A^{-1}$ is called the inverse of $A$.
-Not every matrix is invertible. A necessary condition is that $\det(A) \neq 0$, a fact that will be developed in Chapter
-6.
-Example 2.3.2.
-Let
-$$
-A = \begin{bmatrix}
-1 & 2 \\
-3 & 4
-\end{bmatrix}.
-$$
-Its determinant is $\det(A) = (1)(4) - (2)(3) = -2 \neq 0$. The inverse is
-$$
-A^{-1} = \frac{1}{\det(A)} \begin{bmatrix}
-4 & -2 \
--3 & 1
-\end{bmatrix}
-\begin{bmatrix}
--2 & 1 \
-1.5 & -0.5
-\end{bmatrix}.
-$$
-Verification:
-$$
-AA^{-1} = \begin{bmatrix}
-1 & 2 \
-3 & 4
-\end{bmatrix}
-\begin{bmatrix}
--2 & 1 \
-1.5 & -0.5
-\end{bmatrix}
-\begin{bmatrix}
-1 & 0 \
-0 & 1
-\end{bmatrix}.
-$$
-Geometric Meaning
-
-The transpose corresponds to reflecting a linear transformation across the diagonal. For vectors, it switches between
-row and column forms.
-The inverse, when it exists, corresponds to reversing a linear transformation. For example, if $A$ scales and rotates
-vectors, $A^{-1}$ rescales and rotates them back.
-
-Notation
-
-Transpose: $A^T$.
-Inverse: $A^{-1}$, defined only for invertible square matrices.
-Identity: $I_n$, acts as the multiplicative identity.
-
-Why this matters
-The transpose allows us to define symmetric and orthogonal matrices, central to geometry and numerical methods. The
-inverse underlies the solution of linear systems, encoding the idea of undoing a transformation. Together, these
-operations set the stage for determinants, eigenvalues, and orthogonalization.
-Exercises 2.3
-
-Compute the transpose of
-
-$$
-A = \begin{bmatrix} 2 & -1 & 3 \ 0 & 4 & 5 \end{bmatrix}.
-$$
-
-Verify that $(AB)^T = B^T A^T$ for
-
-$$
-A = \begin{bmatrix} 1 & 2 \ 0 & 1 \end{bmatrix}, \quad
-B = \begin{bmatrix} 3 & 4 \ 5 & 6 \end{bmatrix}.
-$$
-
-Determine whether
-
-$$
-C = \begin{bmatrix} 2 & 1 \ 4 & 2 \end{bmatrix}
-$$
-is invertible. If so, find $C^{-1}$.
-
-Find the inverse of
-
-$$
-D = \begin{bmatrix} 0 & 1 \ -1 & 0 \end{bmatrix},
-$$
-and explain its geometric action on vectors in the plane.
-
-Prove that if $A$ is invertible, then so is $A^T$, and $(A^T)^{-1} = (A^{-1})^T$.
-
-2.4 Special Matrices
-Certain matrices occur so frequently in theory and applications that they are given special names. Recognizing their
-properties allows us to simplify computations and understand the structure of linear transformations more clearly.
-The Identity Matrix
-The identity matrix $I_n$ is the $n \times n$ matrix with ones on the diagonal and zeros elsewhere:
-$$
-I_n = \begin{bmatrix}
-1 & 0 & \cdots & 0 \\
-0 & 1 & \cdots & 0 \\
-\vdots & \vdots & \ddots & \vdots \\
-0 & 0 & \cdots & 1
-\end{bmatrix}.
-$$
-It acts as the multiplicative identity:
-$$
-AI_n = I_nA = A, \quad \text{for all } A \in \mathbb{R}^{n \times n}.
-$$
-Geometrically, $I_n$ represents the transformation that leaves every vector unchanged.
-Diagonal Matrices
-A diagonal matrix has all off-diagonal entries zero:
-$$
-D = \begin{bmatrix}
-d_{11} & 0 & \cdots & 0 \\
-0 & d_{22} & \cdots & 0 \\
-\vdots & \vdots & \ddots & \vdots \\
-0 & 0 & \cdots & d_{nn}
-\end{bmatrix}.
-$$
-Multiplication by a diagonal matrix scales each coordinate independently:
-$$
-D\mathbf{x} = (d_{11}x_1, d_{22}x_2, \dots, d_{nn}x_n).
-$$
-Example 2.4.1.
-Let
-$$
-D = \begin{bmatrix} 2 & 0 & 0 \ 0 & 3 & 0 \ 0 & 0 & -1 \end{bmatrix}, \quad
-\mathbf{x} = \begin{bmatrix} 1 \ 4 \ -2 \end{bmatrix}.
-$$
-Then
-$$
-D\mathbf{x} = \begin{bmatrix} 2 \ 12 \ 2 \end{bmatrix}.
-$$
-Permutation Matrices
-A permutation matrix is obtained by permuting the rows of the identity matrix. Multiplying a vector by a permutation
-matrix reorders its coordinates.
-Example 2.4.2.
-Let
-$$
-P = \begin{bmatrix}
-0 & 1 & 0 \\
-1 & 0 & 0 \\
-0 & 0 & 1
-\end{bmatrix}.
-$$
-Then
-$$
-P\begin{bmatrix} a \ b \ c \end{bmatrix} =
-\begin{bmatrix} b \ a \ c \end{bmatrix}.
-$$
-Thus, $P$ swaps the first two coordinates.
-Permutation matrices are always invertible; their inverses are simply their transposes.
-Symmetric and Skew-Symmetric Matrices
-A matrix is symmetric if
-$$
-A^T = A,
-$$
-and skew-symmetric if
-$$
-A^T = -A.
-$$
-Symmetric matrices appear in quadratic forms and optimization, while skew-symmetric matrices describe rotations and
-cross products in geometry.
-Orthogonal Matrices
-A square matrix $Q$ is orthogonal if
-$$
-Q^T Q = QQ^T = I.
-$$
-Equivalently, the rows (and columns) of $Q$ form an orthonormal set. Orthogonal matrices preserve lengths and angles;
-they represent rotations and reflections.
-Example 2.4.3.
-The rotation matrix in the plane:
-$$
-R(\theta) = \begin{bmatrix}
-\cos\theta & -\sin\theta \\
-\sin\theta & \cos\theta
-\end{bmatrix}
-$$
-is orthogonal, since
-$$
-R(\theta)^T R(\theta) = I_2.
-$$
-Why this matters
-Special matrices serve as the building blocks of linear algebra. Identity matrices define the neutral element, diagonal
-matrices simplify computations, permutation matrices reorder data, symmetric and orthogonal matrices describe
-fundamental geometric structures. Much of modern applied mathematics reduces complex problems to operations involving
-these simple forms.
-Exercises 2.4
-
-Show that the product of two diagonal matrices is diagonal, and compute an example.
-Find the permutation matrix that cycles $(a,b,c)$ into $(b,c,a)$.
-Prove that every permutation matrix is invertible and its inverse is its transpose.
-Verify that
-
-$$
-Q = \begin{bmatrix} 0 & 1 \ -1 & 0 \end{bmatrix}
-$$
-is orthogonal. What geometric transformation does it represent?
-5. Determine whether
-$$
-A = \begin{bmatrix} 2 & 3 \ 3 & 2 \end{bmatrix}, \quad
-B = \begin{bmatrix} 0 & 5 \ -5 & 0 \end{bmatrix}
-$$
-are symmetric, skew-symmetric, or neither.
-Chapter 3. Systems of Linear Equations
-3.1 Linear Systems and Solutions
-One of the central motivations for linear algebra is solving systems of linear equations. These systems arise naturally
-in science, engineering, and data analysis whenever multiple constraints interact. Matrices provide a compact language
-for expressing and solving them.
-Linear Systems
-A linear system consists of equations where each unknown appears only to the first power and with no products between
-variables. A general system of $m$ equations in $n$ unknowns can be written as:
-$$
-\begin{aligned}
-a_{11}x_1 + a_{12}x_2 + \cdots + a_{1n}x_n &= b_1, \\
-a_{21}x_1 + a_{22}x_2 + \cdots + a_{2n}x_n &= b_2, \\
-&\vdots \\
-a_{m1}x_1 + a_{m2}x_2 + \cdots + a_{mn}x_n &= b_m.
-\end{aligned}
-$$
-Here the coefficients $a_{ij}$ and constants $b_i$ are scalars, and the unknowns are $x_1, x_2, \dots, x_n$.
-Matrix Form
-The system can be expressed compactly as:
-$$
-A\mathbf{x} = \mathbf{b},
-$$
-where
-
-
-$A \in \mathbb{R}^{m \times n}$ is the coefficient matrix $[a_{ij}]$,
-
-$\mathbf{x} \in \mathbb{R}^n$ is the column vector of unknowns,
-
-$\mathbf{b} \in \mathbb{R}^m$ is the column vector of constants.
-
-This formulation turns the problem of solving equations into analyzing the action of a matrix.
-Example 3.1.1.
-The system
-$$
-\begin{cases}
-x + 2y = 5, \\
-3x - y = 4
-\end{cases}
-$$
-can be written as
-$$
-\begin{bmatrix} 1 & 2 \ 3 & -1 \end{bmatrix}
-\begin{bmatrix} x \ y \end{bmatrix}
-\begin{bmatrix} 5 \ 4 \end{bmatrix}.
-$$
-Types of Solutions
-A linear system may have:
-
-
-No solution (inconsistent): The equations conflict.
-Example:
-$
-\begin{cases}
-x + y = 1 \
-x + y = 2
-\end{cases}
-$
-has no solution.
-
-
-Exactly one solution (unique): The system’s equations intersect at a single point.
-Example: The above system with coefficient matrix $
-\begin{bmatrix} 1 & 2 \ 3 & -1 \end{bmatrix}
-$ has a unique solution.
-
-
-Infinitely many solutions: The equations describe overlapping constraints (e.g., multiple equations representing the
-same line or plane).
-
-
-The nature of the solution depends on the rank of $A$ and its relation to the augmented matrix $(A|\mathbf{b})$, which
-we will study later.
-Geometric Interpretation
-
-In $\mathbb{R}^2$, each linear equation represents a line. Solving a system means finding intersection points of
-lines.
-In $\mathbb{R}^3$, each equation represents a plane. A system may have no solution (parallel planes), one solution (a
-unique intersection point), or infinitely many (a line of intersection).
-In higher dimensions, the picture generalizes: solutions form intersections of hyperplanes.
-
-Why this matters
-Linear systems are the practical foundation of linear algebra. They appear in balancing chemical reactions, circuit
-analysis, least-squares regression, optimization, and computer graphics. Understanding how to represent and classify
-their solutions is the first step toward systematic solution methods like Gaussian elimination.
-Exercises 3.1
-
-
-Write the following system in matrix form:
-$
-\begin{cases}
-2x + 3y - z = 7, \
-x - y + 4z = 1, \
-3x + 2y + z = 5
-\end{cases}
-$
-
-
-Determine whether the system
-$
-\begin{cases}
-x + y = 1, \
-2x + 2y = 2
-\end{cases}
-$
-has no solution, one solution, or infinitely many solutions.
-
-
-Geometrically interpret the system
-$
-\begin{cases}
-x + y = 3, \
-x - y = 1
-\end{cases}
-$
-in the plane.
-
-
-Solve the system
-$
-\begin{cases}
-2x + y = 1, \
-x - y = 4
-\end{cases}
-$
-and check your solution.
-
-
-In $\mathbb{R}^3$, describe the solution set of
-$
-\begin{cases}
-x + y + z = 0, \
-2x + 2y + 2z = 0
-\end{cases}
-$.
-What geometric object does it represent?
-
-
-3.2 Gaussian Elimination
-To solve linear systems efficiently, we use Gaussian elimination: a systematic method of transforming a system into a
-simpler equivalent one whose solutions are easier to see. The method relies on elementary row operations that preserve
-the solution set.
-Elementary Row Operations
-On an augmented matrix $(A|\mathbf{b})$, we are allowed three operations:
-
-Row swapping: interchange two rows.
-Row scaling: multiply a row by a nonzero scalar.
-Row replacement: replace one row by itself plus a multiple of another row.
-
-These operations correspond to re-expressing equations in different but equivalent forms.
-Row Echelon Form
-A matrix is in row echelon form (REF) if:
-
-All nonzero rows are above any zero rows.
-Each leading entry (the first nonzero number from the left in a row) is to the right of the leading entry in the row
-above.
-All entries below a leading entry are zero.
-
-Further, if each leading entry is 1 and is the only nonzero entry in its column, the matrix is in reduced row echelon
-form (RREF).
-Algorithm of Gaussian Elimination
-
-Write the augmented matrix for the system.
-Use row operations to create zeros below each pivot (the leading entry in a row).
-Continue column by column until the matrix is in echelon form.
-Solve by back substitution: starting from the last pivot equation and working upward.
-
-If we continue to RREF, the solution can be read off directly.
-Example
-Example 3.2.1. Solve
-$$
-\begin{cases}
-x + 2y - z = 3, \\
-2x + y + z = 7, \\
-3x - y + 2z = 4.
-\end{cases}
-$$
-Step 1. Augmented matrix
-$$
-\left[\begin{array}{ccc|c}
-1 & 2 & -1 & 3 \\
-2 & 1 & 1 & 7 \\
-3 & -1 & 2 & 4
-\end{array}\right].
-$$
-Step 2. Eliminate below the first pivot
-Subtract 2 times row 1 from row 2, and 3 times row 1 from row 3:
-$$
-\left[\begin{array}{ccc|c}
-1 & 2 & -1 & 3 \\
-0 & -3 & 3 & 1 \\
-0 & -7 & 5 & -5
-\end{array}\right].
-$$
-Step 3. Pivot in column 2
-Divide row 2 by -3:
-$$
-\left[\begin{array}{ccc|c}
-1 & 2 & -1 & 3 \\
-0 & 1 & -1 & -\tfrac{1}{3} \\
-0 & -7 & 5 & -5
-\end{array}\right].
-$$
-Add 7 times row 2 to row 3:
-$$
-\left[\begin{array}{ccc|c}
-1 & 2 & -1 & 3 \\
-0 & 1 & -1 & -\tfrac{1}{3} \\
-0 & 0 & -2 & -\tfrac{22}{3}
-\end{array}\right].
-$$
-Step 4. Pivot in column 3
-Divide row 3 by -2:
-$$
-\left[\begin{array}{ccc|c}
-1 & 2 & -1 & 3 \\
-0 & 1 & -1 & -\tfrac{1}{3} \\
-0 & 0 & 1 & \tfrac{11}{3}
-\end{array}\right].
-$$
-Step 5. Back substitution
-From the last row:
-$
-z = \tfrac{11}{3}.
-$
-Second row:
-$
-y - z = -\tfrac{1}{3} \implies y = -\tfrac{1}{3} + \tfrac{11}{3} = \tfrac{10}{3}.
-$
-First row:
-$
-x + 2y - z = 3 \implies x + 2\cdot\tfrac{10}{3} - \tfrac{11}{3} = 3.
-$
-So
-$
-x + \tfrac{20}{3} - \tfrac{11}{3} = 3 \implies x + 3 = 3 \implies x = 0.
-$
-Solution:
-$
-(x,y,z) = \big(0, \tfrac{10}{3}, \tfrac{11}{3}\big).
-$
-Why this matters
-Gaussian elimination is the foundation of computational linear algebra. It reduces complex systems to a form where
-solutions are visible, and it forms the basis for algorithms used in numerical analysis, scientific computing, and
-machine learning.
-Exercises 3.2
-
-
-Solve by Gaussian elimination:
-$
-\begin{cases}
-x + y = 2, \
-2x - y = 0.
-\end{cases}
-$
-
-
-Reduce the following augmented matrix to REF:
-$
-\left[\begin{array}{ccc|c}
-1 & 1 & 1 & 6 \
-2 & -1 & 3 & 14 \
-1 & 4 & -2 & -2
-\end{array}\right].
-$
-
-
-Show that Gaussian elimination always produces either:
-
-a unique solution,
-infinitely many solutions, or
-a contradiction (no solution).
-
-
-
-Use Gaussian elimination to find all solutions of
-$
-\begin{cases}
-x + y + z = 0, \
-2x + y + z = 1.
-\end{cases}
-$
-
-
-Explain why pivoting (choosing the largest available pivot element) is useful in numerical computation.
-
-
-3.3 Rank and Consistency
-Gaussian elimination not only provides solutions but also reveals the structure of a linear system. Two key ideas are
-the rank of a matrix and the consistency of a system. Rank measures the amount of independent information in the
-equations, while consistency determines whether the system has at least one solution.
-Rank of a Matrix
-The rank of a matrix is the number of leading pivots in its row echelon form. Equivalently, it is the maximum number of
-linearly independent rows or columns.
-Formally,
-$$
-\text{rank}(A) = \dim(\text{row space of } A) = \dim(\text{column space of } A).
-$$
-The rank tells us the effective dimension of the space spanned by the rows (or columns).
-Example 3.3.1.
-For
-$$
-A = \begin{bmatrix}
-1 & 2 & 3 \\
-2 & 4 & 6 \\
-3 & 6 & 9
-\end{bmatrix},
-$$
-row reduction gives
-$$
-\begin{bmatrix}
-1 & 2 & 3 \\
-0 & 0 & 0 \\
-0 & 0 & 0
-\end{bmatrix}.
-$$
-Thus, $\text{rank}(A) = 1$, since all rows are multiples of the first.
-Consistency of Linear Systems
-Consider the system $A\mathbf{x} = \mathbf{b}$.
-The system is consistent (has at least one solution) if and only if
-$$
-\text{rank}(A) = \text{rank}(A|\mathbf{b}),
-$$
-where $(A|\mathbf{b})$ is the augmented matrix.
-If the ranks differ, the system is inconsistent.
-
-If $\text{rank}(A) = \text{rank}(A|\mathbf{b}) = n$ (number of unknowns), the system has a unique solution.
-If $\text{rank}(A) = \text{rank}(A|\mathbf{b}) &lt; n$, the system has infinitely many solutions.
-
-Example
-Example 3.3.2.
-Consider
-$$
-\begin{cases}
-x + y + z = 1, \\
-2x + 2y + 2z = 2, \\
-x + y + z = 3.
-\end{cases}
-$$
-The augmented matrix is
-$$
-\left[\begin{array}{ccc|c}
-1 & 1 & 1 & 1 \\
-2 & 2 & 2 & 2 \\
-1 & 1 & 1 & 3
-\end{array}\right].
-$$
-Row reduction gives
-$$
-\left[\begin{array}{ccc|c}
-1 & 1 & 1 & 1 \\
-0 & 0 & 0 & 0 \\
-0 & 0 & 0 & 2
-\end{array}\right].
-$$
-Here, $\text{rank}(A) = 1$, but $\text{rank}(A|\mathbf{b}) = 2$. Since the ranks differ, the system is inconsistent: no
-solution exists.
-Example with Infinite Solutions
-Example 3.3.3.
-For
-$$
-\begin{cases}
-x + y = 2, \\
-2x + 2y = 4,
-\end{cases}
-$$
-the augmented matrix reduces to
-$$
-\left[\begin{array}{cc|c}
-1 & 1 & 2 \\
-0 & 0 & 0
-\end{array}\right].
-$$
-Here, $\text{rank}(A) = \text{rank}(A|\mathbf{b}) = 1 &lt; 2$. Thus, infinitely many solutions exist, forming a line.
-Why this matters
-Rank is a measure of independence: it tells us how many truly distinct equations or directions are present. Consistency
-explains when equations align versus when they contradict. These concepts connect linear systems to vector spaces and
-prepare for the ideas of dimension, basis, and the Rank–Nullity Theorem.
-Exercises 3.3
-
-Compute the rank of
-
-$$
-A = \begin{bmatrix}
-1 & 2 & 1 \\
-0 & 1 & -1 \\
-2 & 5 & -1
-\end{bmatrix}.
-$$
-
-Determine whether the system
-
-$$
-\begin{cases}
-x + y + z = 1, \\
-2x + 3y + z = 2, \\
-3x + 5y + 2z = 3
-\end{cases}
-$$
-is consistent.
-
-
-Show that the rank of the identity matrix $I_n$ is $n$.
-
-
-Give an example of a system in $\mathbb{R}^3$ with infinitely many solutions, and explain why it satisfies the rank
-condition.
-
-
-Prove that for any matrix $A \in \mathbb{R}^{m \times n}$,
-$
-\text{rank}(A) \leq \min(m,n).
-$
-
-
-3.4 Homogeneous Systems
-A homogeneous system is a linear system in which all constant terms are zero:
-$$
-A\mathbf{x} = \mathbf{0},
-$$
-where $A \in \mathbb{R}^{m \times n}$, and $\mathbf{0}$ is the zero vector in $\mathbb{R}^m$.
-The Trivial Solution
-Every homogeneous system has at least one solution:
-$$
-\mathbf{x} = \mathbf{0}.
-$$
-This is called the trivial solution. The interesting question is whether nontrivial solutions (nonzero vectors) exist.
-Existence of Nontrivial Solutions
-Nontrivial solutions exist precisely when the number of unknowns exceeds the rank of the coefficient matrix:
-$$
-\text{rank}(A) < n.
-$$
-In this case, there are infinitely many solutions, forming a subspace of $\mathbb{R}^n$. The dimension of this solution
-space is
-$$
-\dim(\text{null}(A)) = n - \text{rank}(A),
-$$
-where null(A) is the set of all solutions to $A\mathbf{x} = 0$. This set is called the null space or kernel of $A$.
-Example
-Example 3.4.1.
-Consider
-$$
-\begin{cases}
-x + y + z = 0, \\
-2x + y - z = 0.
-\end{cases}
-$$
-The augmented matrix is
-$$
-\left[\begin{array}{ccc|c}
-1 & 1 & 1 & 0 \\
-2 & 1 & -1 & 0
-\end{array}\right].
-$$
-Row reduction:
-$$
-\left[\begin{array}{ccc|c}
-1 & 1 & 1 & 0 \\
-0 & -1 & -3 & 0
-\end{array}\right]
-\quad\to\quad
-\left[\begin{array}{ccc|c}
-1 & 1 & 1 & 0 \\
-0 & 1 & 3 & 0
-\end{array}\right].
-$$
-So the system is equivalent to:
-$$
-\begin{cases}
-x + y + z = 0, \\
-y + 3z = 0.
-\end{cases}
-$$
-From the second equation, $y = -3z$. Substituting into the first:
-$
-x - 3z + z = 0 \implies x = 2z.
-$
-Thus solutions are:
-$$
-(x,y,z) = z(2, -3, 1), \quad z \in \mathbb{R}.
-$$
-The null space is the line spanned by the vector $(2, -3, 1)$.
-Geometric Interpretation
-The solution set of a homogeneous system is always a subspace of $\mathbb{R}^n$.
-
-If $\text{rank}(A) = n$, the only solution is the zero vector.
-If $\text{rank}(A) = n-1$, the solution set is a line through the origin.
-If $\text{rank}(A) = n-2$, the solution set is a plane through the origin.
-
-More generally, the null space has dimension $n - \text{rank}(A)$, known as the nullity.
-Why this matters
-Homogeneous systems are central to understanding vector spaces, subspaces, and dimension. They lead directly to the
-concepts of kernel, null space, and linear dependence. In applications, homogeneous systems appear in equilibrium
-problems, eigenvalue equations, and computer graphics transformations.
-Exercises 3.4
-
-Solve the homogeneous system
-
-$$
-\begin{cases}
-x + 2y - z = 0, \\
-2x + 4y - 2z = 0.
-\end{cases}
-$$
-What is the dimension of its solution space?
-
-Find all solutions of
-
-$$
-\begin{cases}
-x - y + z = 0, \\
-2x + y - z = 0.
-\end{cases}
-$$
-
-
-Show that the solution set of any homogeneous system is a subspace of $\mathbb{R}^n$.
-
-
-Suppose $A$ is a $3 \times 3$ matrix with $\text{rank}(A) = 2$. What is the dimension of the null space of $A$?
-
-
-For
-
-
-$$
-A = \begin{bmatrix} 1 & 2 & -1 \ 0 & 1 & 3 \end{bmatrix},
-$$
-compute a basis for the null space of $A$.
-Chapter 4. Vector Spaces
-4.1 Definition of a Vector Space
-Up to now we have studied vectors and matrices concretely in $\mathbb{R}^n$. The next step is to move beyond coordinates
-and define vector spaces in full generality. A vector space is an abstract setting where the familiar rules of addition
-and scalar multiplication hold, regardless of whether the elements are geometric vectors, polynomials, functions, or
-other objects.
-Formal Definition
-A vector space over the real numbers $\mathbb{R}$ is a set $V$ equipped with two operations:
-
-Vector addition: For any $\mathbf{u}, \mathbf{v} \in V$, there is a vector $\mathbf{u} + \mathbf{v} \in V$.
-Scalar multiplication: For any scalar $c \in \mathbb{R}$ and any $\mathbf{v} \in V$, there is a
-vector $c\mathbf{v} \in V$.
-
-These operations must satisfy the following axioms (for all $\mathbf{u}, \mathbf{v}, \mathbf{w} \in V$ and all
-scalars $a,b \in \mathbb{R}$):
-
-Commutativity of addition: $\mathbf{u} + \mathbf{v} = \mathbf{v} + \mathbf{u}$.
-Associativity of addition: $(\mathbf{u} + \mathbf{v}) + \mathbf{w} = \mathbf{u} + (\mathbf{v} + \mathbf{w})$.
-Additive identity: There exists a zero vector $\mathbf{0} \in V$ such that $\mathbf{v} + \mathbf{0} = \mathbf{v}$.
-Additive inverses: For each $\mathbf{v} \in V$, there exists $(-\mathbf{v} \in V$ such
-that $\mathbf{v} + (-\mathbf{v}) = \mathbf{0}$.
-Compatibility of scalar multiplication: $a(b\mathbf{v}) = (ab)\mathbf{v}$.
-Identity element of scalars: $1 \cdot \mathbf{v} = \mathbf{v}$.
-Distributivity over vector addition: $a(\mathbf{u} + \mathbf{v}) = a\mathbf{u} + a\mathbf{v}$.
-Distributivity over scalar addition: $(a+b)\mathbf{v} = a\mathbf{v} + b\mathbf{v}$.
-
-If a set $V$ with operations satisfies all eight axioms, we call it a vector space.
-Examples
-Example 4.1.1. Standard Euclidean space
-$\mathbb{R}^n$ with ordinary addition and scalar multiplication is a vector space. This is the model case from which the
-axioms are abstracted.
-Example 4.1.2. Polynomials
-The set of all polynomials with real coefficients, denoted $\mathbb{R}[x]$, forms a vector space. Addition and scalar
-multiplication are defined term by term.
-Example 4.1.3. Functions
-The set of all real-valued functions on an interval, e.g. $f: [0,1] \to \mathbb{R}$, forms a vector space, since
-functions can be added and scaled pointwise.
-Non-Examples
-Not every set with operations qualifies. For instance, the set of positive real numbers under usual addition is not a
-vector space, because additive inverses (negative numbers) are missing. The axioms must all hold.
-Geometric Interpretation
-In familiar cases like $\mathbb{R}^2$ or $\mathbb{R}^3$, vector spaces provide the stage for geometry: vectors can be
-added, scaled, and combined to form lines, planes, and higher-dimensional structures. In abstract settings like function
-spaces, the same algebraic rules let us apply geometric intuition to infinite-dimensional problems.
-Why this matters
-The concept of vector space unifies seemingly different mathematical objects under a single framework. Whether dealing
-with forces in physics, signals in engineering, or data in machine learning, the common language of vector spaces allows
-us to use the same techniques everywhere.
-Exercises 4.1
-
-Verify that $\mathbb{R}^2$ with standard addition and scalar multiplication satisfies all eight vector space axioms.
-Show that the set of integers $\mathbb{Z}$ with ordinary operations is not a vector space over $\mathbb{R}$. Which
-axiom fails?
-Consider the set of all polynomials of degree at most 3. Show it forms a vector space over $\mathbb{R}$. What is its
-dimension?
-Give an example of a vector space where the vectors are not geometric objects.
-Prove that in any vector space, the zero vector is unique.
-
-4.2 Subspaces
-A subspace is a smaller vector space living inside a larger one. Just as lines and planes naturally sit inside
-three-dimensional space, subspaces generalize these ideas to higher dimensions and more abstract settings.
-Definition
-Let $V$ be a vector space. A subset $W \subseteq V$ is called a subspace of $V$ if:
-
-
-$\mathbf{0} \in W$ (contains the zero vector),
-For all $\mathbf{u}, \mathbf{v} \in W$, the sum $\mathbf{u} + \mathbf{v} \in W$ (closed under addition),
-For all scalars $c \in \mathbb{R}$ and vectors $\mathbf{v} \in W$, the product $c\mathbf{v} \in W$ (closed under
-scalar multiplication).
-
-If these hold, then $W$ is itself a vector space with the inherited operations.
-Examples
-Example 4.2.1. Line through the origin in $\mathbb{R}^2$
-The set
-$$
-W = { (t, 2t) \mid t \in \mathbb{R} }
-$$
-is a subspace of $\mathbb{R}^2$. It contains the zero vector, is closed under addition, and is closed under scalar
-multiplication.
-Example 4.2.2. The x–y plane in $\mathbb{R}^3$
-The set
-$$
-W = { (x, y, 0) \mid x,y \in \mathbb{R} }
-$$
-is a subspace of $\mathbb{R}^3$. It is the collection of all vectors lying in the plane through the origin parallel to
-the x–y plane.
-Example 4.2.3. Null space of a matrix
-For a matrix $A \in \mathbb{R}^{m \times n}$, the null space
-$$
-{ \mathbf{x} \in \mathbb{R}^n \mid A\mathbf{x} = \mathbf{0} }
-$$
-is a subspace of $\mathbb{R}^n$. This subspace represents all solutions to the homogeneous system.
-Non-Examples
-Not every subset is a subspace.
-
-The set ${ (x,y) \in \mathbb{R}^2 \mid x \geq 0 }$ is not a subspace: it is not closed under scalar multiplication (a
-negative scalar breaks the condition).
-Any line in $\mathbb{R}^2$ that does not pass through the origin is not a subspace, because it does not
-contain $\mathbf{0}$.
-
-Geometric Interpretation
-Subspaces are the linear structures inside vector spaces.
-
-In $\mathbb{R}^2$, the subspaces are: the zero vector, any line through the origin, or the entire plane.
-In $\mathbb{R}^3$, the subspaces are: the zero vector, any line through the origin, any plane through the origin, or
-the entire space.
-In higher dimensions, the same principle applies: subspaces are the flat linear pieces through the origin.
-
-Why this matters
-Subspaces capture the essential structure of linear problems. Column spaces, row spaces, and null spaces are all
-subspaces. Much of linear algebra consists of understanding how these subspaces intersect, span, and complement each
-other.
-Exercises 4.2
-
-Prove that the set $W = { (x,0) \mid x \in \mathbb{R} } \subseteq \mathbb{R}^2$ is a subspace.
-Show that the line ${ (1+t, 2t) \mid t \in \mathbb{R} }$ is not a subspace of $\mathbb{R}^2$. Which condition fails?
-Determine whether the set of all vectors $(x,y,z) \in \mathbb{R}^3$ satisfying $x+y+z=0$ is a subspace.
-For the matrix
-
-$$
-A = \begin{bmatrix} 1 & 2 & 3 \ 4 & 5 & 6 \end{bmatrix},
-$$
-describe the null space of $A$ as a subspace of $\mathbb{R}^3$.
-5. List all possible subspaces of $\mathbb{R}^2$.
-4.3 Span, Basis, Dimension
-The ideas of span, basis, and dimension provide the language for describing the size and structure of subspaces.
-Together, they tell us how a vector space is generated, how many building blocks it requires, and how those blocks can
-be chosen.
-Span
-Given a set of vectors ${\mathbf{v}_1, \mathbf{v}_2, \dots, \mathbf{v}_k} \subseteq V$, the span is the collection of
-all linear combinations:
-$$
-\text{span}{\mathbf{v}_1, \dots, \mathbf{v}_k} = { c_1\mathbf{v}_1 + \cdots + c_k\mathbf{v}_k \mid c_i \in \mathbb{R} }.
-$$
-The span is always a subspace of $V$, namely the smallest subspace containing those vectors.
-Example 4.3.1.
-In $\mathbb{R}^2$, $ \text{span}{(1,0)} = {(x,0) \mid x \in \mathbb{R}},$ the x-axis.
-Similarly, $\text{span}{(1,0),(0,1)} = \mathbb{R}^2.$
-Basis
-A basis of a vector space $V$ is a set of vectors that:
-
-Span $V$.
-Are linearly independent (no vector in the set is a linear combination of the others).
-
-If either condition fails, the set is not a basis.
-Example 4.3.2.
-In $\mathbb{R}^3$, the standard unit vectors
-$$
-\mathbf{e}_1 = (1,0,0), \quad \mathbf{e}_2 = (0,1,0), \quad \mathbf{e}_3 = (0,0,1)
-$$
-form a basis. Every vector $(x,y,z)$ can be uniquely written as
-$$
-x\mathbf{e}_1 + y\mathbf{e}_2 + z\mathbf{e}_3.
-$$
-Dimension
-The dimension of a vector space $V$, written $\dim(V)$, is the number of vectors in any basis of $V$. This number is
-well-defined: all bases of a vector space have the same cardinality.
-Examples 4.3.3.
-
-
-$\dim(\mathbb{R}^2) = 2$, with basis $(1,0), (0,1)$.
-
-$\dim(\mathbb{R}^3) = 3$, with basis $(1,0,0), (0,1,0), (0,0,1)$.
-The set of polynomials of degree at most 3 has dimension 4, with basis $(1, x, x^2, x^3)$.
-
-Geometric Interpretation
-
-The span is like the reach of a set of vectors.
-A basis is the minimal set of directions needed to reach everything in the space.
-The dimension is the count of those independent directions.
-
-Lines, planes, and higher-dimensional flats can all be described in terms of span, basis, and dimension.
-Why this matters
-These concepts classify vector spaces and subspaces in terms of size and structure. Many theorems in linear algebra-such
-as the Rank–Nullity Theorem-are consequences of understanding span, basis, and dimension. In practical terms, bases are
-how we encode data in coordinates, and dimension tells us how much freedom a system truly has.
-Exercises 4.3
-
-Show that $(1,0,0)$, $(0,1,0)$, $(1,1,0)$ span the $xy$-plane in $\mathbb{R}^3$. Are they a basis?
-Find a basis for the line ${(2t,-3t,t) : t \in \mathbb{R}}$ in $\mathbb{R}^3$.
-Determine the dimension of the subspace of $\mathbb{R}^3$ defined by $x+y+z=0$.
-Prove that any two different bases of $\mathbb{R}^n$ must contain exactly $n$ vectors.
-Give a basis for the set of polynomials of degree $\leq 2$. What is its dimension?
-
-4.4 Coordinates
-Once a basis for a vector space is chosen, every vector can be expressed uniquely as a linear combination of the basis
-vectors. The coefficients in this combination are called the coordinates of the vector relative to that basis.
-Coordinates allow us to move between the abstract world of vector spaces and the concrete world of numbers.
-Coordinates Relative to a Basis
-Let $V$ be a vector space, and let
-$$
-\mathcal{B} = {\mathbf{v}_1, \mathbf{v}_2, \dots, \mathbf{v}_n}
-$$
-be an ordered basis for $V$. Every vector $\mathbf{u} \in V$ can be written uniquely as
-$$
-\mathbf{u} = c_1 \mathbf{v}_1 + c_2 \mathbf{v}_2 + \cdots + c_n \mathbf{v}_n.
-$$
-The scalars $(c_1, c_2, \dots, c_n)$ are the coordinates of $\mathbf{u}$ relative to $\mathcal{B}$, written
-$$
-[\mathbf{u}]_{\mathcal{B}} = \begin{bmatrix} c_1 \ c_2 \ \vdots \ c_n \end{bmatrix}.
-$$
-Example in $\mathbb{R}^2$
-
-Example 4.4.1.
-Let the basis be
-$$
-\mathcal{B} = { (1,1), (1,-1) }.
-$$
-To find the coordinates of $\mathbf{u} = (3,1)$ relative to $\mathcal{B}$, solve
-$$
-(3,1) = c_1(1,1) + c_2(1,-1).
-$$
-This gives the system
-$$
-\begin{cases}
-c_1 + c_2 = 3, \\
-c_1 - c_2 = 1.
-\end{cases}
-$$
-Adding: $2c_1 = 4 \implies c_1 = 2$. Then $c_2 = 1$.
-So,
-$$
-[\mathbf{u}]_{\mathcal{B}} = \begin{bmatrix} 2 \ 1 \end{bmatrix}.
-$$
-Standard Coordinates
-In $\mathbb{R}^n$, the standard basis is
-$$
-\mathbf{e}_1 = (1,0,\dots,0), \quad \mathbf{e}_2 = (0,1,0,\dots,0), \dots, \mathbf{e}_n = (0,\dots,0,1).
-$$
-Relative to this basis, the coordinates of a vector are simply its entries. Thus, column vectors are coordinate
-representations by default.
-Change of Basis
-If $\mathcal{B} = {\mathbf{v}_1, \dots, \mathbf{v}_n}$ is a basis of $\mathbb{R}^n$, the change of basis matrix is
-$$
-P = \begin{bmatrix} \mathbf{v}_1 & \mathbf{v}_2 & \cdots & \mathbf{v}_n \end{bmatrix},
-$$
-with basis vectors as columns. For any vector $\mathbf{u}$,
-$$
-\mathbf{u} = P[\mathbf{u}]{\mathcal{B}}, \qquad [\mathbf{u}]{\mathcal{B}} = P^{-1}\mathbf{u}.
-$$
-Thus, switching between bases reduces to matrix multiplication.
-Geometric Interpretation
-Coordinates are the address of a vector relative to a chosen set of directions. Different bases are like different
-coordinate systems: Cartesian, rotated, skewed, or scaled. The same vector may look very different numerically depending
-on the basis, but its geometric identity is unchanged.
-Why this matters
-Coordinates turn abstract vectors into concrete numerical data. Changing basis is the algebraic language for rotations
-of axes, diagonalization of matrices, and principal component analysis in data science. Mastery of coordinates is
-essential for moving fluidly between geometry, algebra, and computation.
-Exercises 4.4
-
-Express $(4,2)$ in terms of the basis $(1,1), (1,-1)$.
-Find the coordinates of $(1,2,3)$ relative to the standard basis of $\mathbb{R}^3$.
-If $\mathcal{B} = {(2,0), (0,3)}$, compute $[ (4,6) ]_{\mathcal{B}}$.
-Construct the change of basis matrix from the standard basis of $\mathbb{R}^2$ to $\mathcal{B} = {(1,1), (1,-1)}$.
-Prove that coordinate representation with respect to a basis is unique.
-
-Chapter 5. Linear Transformations
-5.1 Functions that Preserve Linearity
-A central theme of linear algebra is understanding linear transformations: functions between vector spaces that preserve
-their algebraic structure. These transformations generalize the idea of matrix multiplication and capture the essence of
-linear behavior.
-Definition
-Let $V$ and $W$ be vector spaces over $\mathbb{R}$. A function
-$$
-T : V \to W
-$$
-is called a linear transformation (or linear map) if for all vectors $\mathbf{u}, \mathbf{v} \in V$ and all
-scalars $c \in \mathbb{R}$:
-
-
-Additivity:
-$$
-T(\mathbf{u} + \mathbf{v}) = T(\mathbf{u}) + T(\mathbf{v}),
-$$
-
-
-Homogeneity:
-$$
-T(c\mathbf{u}) = cT(\mathbf{u}).
-$$
-
-
-If both conditions hold, then $T$ automatically respects linear combinations:
-$$
-T(c_1\mathbf{v}_1 + \cdots + c_k\mathbf{v}_k) = c_1 T(\mathbf{v}_1) + \cdots + c_k T(\mathbf{v}_k).
-$$
-Examples
-Example 5.1.1. Scaling in $\mathbb{R}^2$.
-Let $T:\mathbb{R}^2 \to \mathbb{R}^2$ be defined by
-$$
-T(x,y) = (2x, 2y).
-$$
-This doubles the length of every vector, preserving direction. It is linear.
-Example 5.1.2. Rotation.
-Let $R_\theta: \mathbb{R}^2 \to \mathbb{R}^2$ be
-$$
-R_\theta(x,y) = (x\cos\theta - y\sin\theta, ; x\sin\theta + y\cos\theta).
-$$
-This rotates vectors by angle $\theta$. It satisfies additivity and homogeneity, hence is linear.
-Example 5.1.3. Differentiation.
-Let $D: \mathbb{R}[x] \to \mathbb{R}[x]$ be differentiation: $D(p(x)) = p'(x)$. Since derivatives respect addition and
-scalar multiples, differentiation is a linear transformation.
-Non-Example
-The map $S:\mathbb{R}^2 \to \mathbb{R}^2$ defined by
-$$
-S(x,y) = (x^2, y^2)
-$$
-is not linear, because $S(\mathbf{u} + \mathbf{v}) \neq S(\mathbf{u}) + S(\mathbf{v})$ in general.
-Geometric Interpretation
-Linear transformations are exactly those that preserve the origin, lines through the origin, and proportions along those
-lines. They include familiar operations: scaling, rotations, reflections, shears, and projections. Nonlinear
-transformations bend or curve space, breaking these properties.
-Why this matters
-Linear transformations unify geometry, algebra, and computation. They explain how matrices act on vectors, how data can
-be rotated or projected, and how systems evolve under linear rules. Much of linear algebra is devoted to understanding
-these transformations, their representations, and their invariants.
-Exercises 5.1
-
-
-Verify that $T(x,y) = (3x-y, 2y)$ is a linear transformation on $\mathbb{R}^2$.
-
-
-Show that $T(x,y) = (x+1, y)$ is not linear. Which axiom fails?
-
-
-Prove that if $T$ and $S$ are linear transformations, then so is $T+S$.
-
-
-Give an example of a linear transformation from $\mathbb{R}^3$ to $\mathbb{R}^2$.
-
-
-Let $T:\mathbb{R}[x] \to \mathbb{R}[x]$ be integration:
-$$
-T(p(x)) = \int_0^x p(t),dt.
-$$
-Prove that $T$ is a linear transformation.
-
-
-5.2 Matrix Representation of Linear Maps
-Every linear transformation between finite-dimensional vector spaces can be represented by a matrix. This correspondence
-is one of the central insights of linear algebra: it lets us use the tools of matrix arithmetic to study abstract
-transformations.
-From Linear Map to Matrix
-Let $T: \mathbb{R}^n \to \mathbb{R}^m$ be a linear transformation. Choose the standard
-basis ${ \mathbf{e}_1, \dots, \mathbf{e}_n }$ of $\mathbb{R}^n$, where $\mathbf{e}_i$ has a 1 in the $i$-th position
-and 0 elsewhere.
-The action of $T$ on each basis vector determines the entire transformation:
-$$
-T(\mathbf{e}j) = \begin{bmatrix} a{1j} \ a_{2j} \ \vdots \ a_{mj} \end{bmatrix}.
-$$
-Placing these outputs as columns gives the matrix of $T$:
-$$
-[T] = A = \begin{bmatrix}
-a_{11} & a_{12} & \cdots & a_{1n} \\
-a_{21} & a_{22} & \cdots & a_{2n} \\
-\vdots & \vdots & \ddots & \vdots \\
-a_{m1} & a_{m2} & \cdots & a_{mn}
-\end{bmatrix}.
-$$
-Then for any vector $\mathbf{x} \in \mathbb{R}^n$:
-$$
-T(\mathbf{x}) = A\mathbf{x}.
-$$
-Examples
-Example 5.2.1. Scaling in $\mathbb{R}^2$.
-Let $T(x,y) = (2x, 3y)$. Then
-$$
-T(\mathbf{e}_1) = (2,0), \quad T(\mathbf{e}_2) = (0,3).
-$$
-So the matrix is
-$$
-[T] = \begin{bmatrix}
-2 & 0 \\
-0 & 3
-\end{bmatrix}.
-$$
-Example 5.2.2. Rotation in the plane.
-The rotation transformation $R_\theta(x,y) = (x\cos\theta - y\sin\theta, ; x\sin\theta + y\cos\theta)$ has matrix
-$$
-[R_\theta] = \begin{bmatrix}
-\cos\theta & -\sin\theta \\
-\sin\theta & \cos\theta
-\end{bmatrix}.
-$$
-Example 5.2.3. Projection onto the x-axis.
-The map $P(x,y) = (x,0)$ corresponds to
-$$
-[P] = \begin{bmatrix}
-1 & 0 \\
-0 & 0
-\end{bmatrix}.
-$$
-Change of Basis
-Matrix representations depend on the chosen basis. If $\mathcal{B}$ and $\mathcal{C}$ are bases of $\mathbb{R}^n$
-and $\mathbb{R}^m$, then the matrix of $T: \mathbb{R}^n \to \mathbb{R}^m$ with respect to these bases is obtained by
-expressing $T(\mathbf{v}_j)$ in terms of $\mathcal{C}$ for each $\mathbf{v}_j \in \mathcal{B}$. Changing bases
-corresponds to conjugating the matrix by the appropriate change-of-basis matrices.
-Geometric Interpretation
-Matrices are not just convenient notation-they are linear maps once a basis is fixed. Every rotation, reflection,
-projection, shear, or scaling corresponds to multiplying by a specific matrix. Thus, studying linear transformations
-reduces to studying their matrices.
-Why this matters
-Matrix representations make linear transformations computable. They connect abstract definitions to explicit
-calculations, enabling algorithms for solving systems, finding eigenvalues, and performing decompositions. Applications
-from graphics to machine learning depend on this translation.
-Exercises 5.2
-
-Find the matrix representation of $T:\mathbb{R}^2 \to \mathbb{R}^2$, $T(x,y) = (x+y, x-y)$.
-Determine the matrix of the linear transformation $T:\mathbb{R}^3 \to \mathbb{R}^2$, $T(x,y,z) = (x+z, y-2z)$.
-What matrix represents reflection across the line $y=x$ in $\mathbb{R}^2$?
-Show that the matrix of the identity transformation on $\mathbb{R}^n$ is $I_n$.
-For the differentiation map $D:\mathbb{R}_2[x] \to \mathbb{R}_1[x]$, where $\mathbb{R}_k[x]$ is the space of
-polynomials of degree at most $k$, find the matrix of $D$ relative to the bases ${1,x,x^2}$ and ${1,x}$.
-
-5.3 Kernel and Image
-To understand a linear transformation deeply, we must examine what it kills and what it produces. These ideas are
-captured by the kernel and the image, two fundamental subspaces associated with any linear map.
-The Kernel
-The kernel (or null space) of a linear transformation $T: V \to W$ is the set of all vectors in $V$ that map to the zero
-vector in $W$:
-$$
-\ker(T) = { \mathbf{v} \in V \mid T(\mathbf{v}) = \mathbf{0} }.
-$$
-The kernel is always a subspace of $V$. It measures the degeneracy of the transformation-directions that collapse to
-nothing.
-Example 5.3.1.
-Let $T:\mathbb{R}^3 \to \mathbb{R}^2$ be defined by
-$$
-T(x,y,z) = (x+y, y+z).
-$$
-In matrix form,
-$$
-[T] = \begin{bmatrix}
-1 & 1 & 0 \\
-0 & 1 & 1
-\end{bmatrix}.
-$$
-To find the kernel, solve
-$$
-\begin{bmatrix}
-1 & 1 & 0 \\
-0 & 1 & 1
-\end{bmatrix}
-\begin{bmatrix} x \ y \ z \end{bmatrix}
-= \begin{bmatrix} 0 \ 0 \end{bmatrix}.
-$$
-This gives the equations $x + y = 0$, $y + z = 0$. Hence $x = -y, z = -y$. The kernel is
-$$
-\ker(T) = { (-t, t, -t) \mid t \in \mathbb{R} },
-$$
-a line in $\mathbb{R}^3$.
-The Image
-The image (or range) of a linear transformation $T: V \to W$ is the set of all outputs:
-$$
-\text{im}(T) = { T(\mathbf{v}) \mid \mathbf{v} \in V } \subseteq W.
-$$
-Equivalently, it is the span of the columns of the representing matrix. The image is always a subspace of $W$.
-Example 5.3.2.
-For the same transformation as above,
-$$
-[T] = \begin{bmatrix}
-1 & 1 & 0 \\
-0 & 1 & 1
-\end{bmatrix},
-$$
-the columns are $(1,0)$, $(1,1)$, and $(0,1)$. Since $(1,1) = (1,0) + (0,1)$, the image is
-$$
-\text{im}(T) = \text{span}{ (1,0), (0,1) } = \mathbb{R}^2.
-$$
-Dimension Formula (Rank–Nullity Theorem)
-For a linear transformation $T: V \to W$ with $V$ finite-dimensional,
-$$
-\dim(\ker(T)) + \dim(\text{im}(T)) = \dim(V).
-$$
-This fundamental result connects the lost directions (kernel) with the achieved directions (image).
-Geometric Interpretation
-
-The kernel describes how the transformation flattens space (e.g., projecting a 3D object onto a plane).
-The image describes the target subspace reached by the transformation.
-The rank–nullity theorem quantifies the tradeoff: the more dimensions collapse, the fewer remain in the image.
-
-Why this matters
-Kernel and image capture the essence of a linear map. They classify transformations, explain when systems have unique or
-infinite solutions, and form the backbone of important results like the Rank–Nullity Theorem, diagonalization, and
-spectral theory.
-Exercises 5.3
-
-Find the kernel and image of $T:\mathbb{R}^2 \to \mathbb{R}^2$, $T(x,y) = (x-y, x+y)$.
-Let $A = \begin{bmatrix} 1 & 2 & 3 \ 0 & 1 & 4 \end{bmatrix}$. Find bases for $\ker(A)$ and $\text{im}(A)$.
-For the projection map $P(x,y,z) = (x,y,0)$, describe the kernel and image.
-Prove that $\ker(T)$ and $\text{im}(T)$ are always subspaces.
-Verify the Rank–Nullity Theorem for the transformation in Example 5.3.1.
-
-5.4 Change of Basis
-Linear transformations can look very different depending on the coordinate system we use. The process of rewriting
-vectors and transformations relative to a new basis is called a change of basis. This concept lies at the heart of
-diagonalization, orthogonalization, and many computational techniques.
-Coordinate Change
-Suppose $V$ is an $n$-dimensional vector space, and let $\mathcal{B} = {\mathbf{v}_1, \dots, \mathbf{v}n}$ be a
-basis. Every vector $\mathbf{x} \in V$ has a coordinate vector $[\mathbf{x}]{\mathcal{B}} \in \mathbb{R}^n$.
-If $P$ is the change-of-basis matrix from $\mathcal{B}$ to the standard basis, then
-$$
-\mathbf{x} = P [\mathbf{x}]_{\mathcal{B}}.
-$$
-Equivalently,
-$$
-[\mathbf{x}]_{\mathcal{B}} = P^{-1} \mathbf{x}.
-$$
-Here, $P$ has the basis vectors of $\mathcal{B}$ as its columns:
-$$
-P = \begin{bmatrix}
-\mathbf{v}_1 & \mathbf{v}_2 & \cdots & \mathbf{v}_n
-\end{bmatrix}.
-$$
-Transformation of Matrices
-Let $T: V \to V$ be a linear transformation. Suppose its matrix in the standard basis is $A$. In the
-basis $\mathcal{B}$, the representing matrix becomes
-$$
-[T]_{\mathcal{B}} = P^{-1} A P.
-$$
-Thus, changing basis corresponds to a similarity transformation of the matrix.
-Example
-Example 5.4.1.
-Let $T:\mathbb{R}^2 \to \mathbb{R}^2$ be given by
-$$
-T(x,y) = (3x + y, x + y).
-$$
-In the standard basis, its matrix is
-$$
-A = \begin{bmatrix}
-3 & 1 \\
-1 & 1
-\end{bmatrix}.
-$$
-Now consider the basis $\mathcal{B} = { (1,1), (1,-1) }$. The change-of-basis matrix is
-$$
-P = \begin{bmatrix}
-1 & 1 \\
-1 & -1
-\end{bmatrix}.
-$$
-Then
-$$
-[T]_{\mathcal{B}} = P^{-1} A P.
-$$
-Computing gives
-$$
-[T]_{\mathcal{B}} =
-\begin{bmatrix}
-4 & 0 \\
-0 & 0
-\end{bmatrix}.
-$$
-In this new basis, the transformation is diagonal: one direction is scaled by 4, the other collapsed to 0.
-Geometric Interpretation
-Change of basis is like rotating or skewing your coordinate grid. The underlying transformation does not change, but its
-description in numbers becomes simpler or more complicated depending on the basis. Finding a basis that simplifies a
-transformation (often a diagonal basis) is a key theme in linear algebra.
-Why this matters
-Change of basis connects the abstract notion of similarity to practical computation. It is the tool that allows us to
-diagonalize matrices, compute eigenvalues, and simplify complex transformations. In applications, it corresponds to
-choosing a more natural coordinate system-whether in geometry, physics, or machine learning.
-Exercises 5.4
-
-Let $A = \begin{bmatrix} 2 & 1 \ 0 & 2 \end{bmatrix}$. Compute its representation in the basis ${(1,0),(1,1)}$.
-Find the change-of-basis matrix from the standard basis of $\mathbb{R}^2$ to ${(2,1),(1,1)}$.
-Prove that similar matrices (related by $P^{-1}AP$) represent the same linear transformation under different bases.
-Diagonalize the matrix $A = \begin{bmatrix} 1 & 0 \ 0 & -1 \end{bmatrix}$ in the basis ${(1,1),(1,-1)}$.
-In $\mathbb{R}^3$, let $\mathcal{B} = {(1,0,0),(1,1,0),(1,1,1)}$. Construct the change-of-basis matrix $P$ and
-compute $P^{-1}$.
-
-Chapter 6. Determinants
-6.1 Motivation and Geometric Meaning
-Determinants are numerical values associated with square matrices. At first they may appear as a complicated formula,
-but their importance comes from what they measure: determinants encode scaling, orientation, and invertibility of linear
-transformations. They bridge algebra and geometry.
-Determinants of $2 \times 2$ Matrices
-For a $2 \times 2$ matrix
-$$
-A = \begin{bmatrix} a & b \ c & d \end{bmatrix},
-$$
-the determinant is defined as
-$$
-\det(A) = ad - bc.
-$$
-Geometric meaning: If $A$ represents a linear transformation of the plane, then $|\det(A)|$ is the area scaling factor.
-For example, if $\det(A) = 2$, areas of shapes are doubled. If $\det(A) = 0$, the transformation collapses the plane to
-a line: all area is lost.
-Determinants of $3 \times 3$ Matrices
-For
-$$
-A = \begin{bmatrix}
-a & b & c \\
-d & e & f \\
-g & h & i
-\end{bmatrix},
-$$
-the determinant can be computed as
-$$
-\det(A) = a(ei - fh) - b(di - fg) + c(dh - eg).
-$$
-Geometric meaning: In $\mathbb{R}^3$, $|\det(A)|$ is the volume scaling factor. If $\det(A) &lt; 0$, orientation is
-reversed (a handedness flip), such as turning a right-handed coordinate system into a left-handed one.
-General Case
-For $A \in \mathbb{R}^{n \times n}$, the determinant is a scalar that measures how the linear transformation given
-by $A$ scales n-dimensional volume.
-
-If $\det(A) = 0$: the transformation squashes space into a lower dimension, so $A$ is not invertible.
-If $\det(A) &gt; 0$: volume is scaled by $\det(A)$, orientation preserved.
-If $\det(A) &lt; 0$: volume is scaled by $|\det(A)|$, orientation reversed.
-
-Visual Examples
-
-
-Shear in $\mathbb{R}^2$:
-$A = \begin{bmatrix} 1 & 1 \ 0 & 1 \end{bmatrix}$.
-Then $\det(A) = 1$. The transformation slants the unit square into a parallelogram but preserves area.
-
-
-Projection in $\mathbb{R}^2$:
-$A = \begin{bmatrix} 1 & 0 \ 0 & 0 \end{bmatrix}$.
-Then $\det(A) = 0$. The unit square collapses into a line segment: area vanishes.
-
-
-Rotation in $\mathbb{R}^2$:
-$R_\theta = \begin{bmatrix} \cos\theta & -\sin\theta \ \sin\theta & \cos\theta \end{bmatrix}$.
-Then $\det(R_\theta) = 1$. Rotations preserve area and orientation.
-
-
-Why this matters
-The determinant is not just a formula-it is a measure of transformation. It tells us whether a matrix is invertible, how
-it distorts space, and whether it flips orientation. This geometric insight makes the determinant indispensable in
-analysis, geometry, and applied mathematics.
-Exercises 6.1
-
-Compute the determinant of $\begin{bmatrix} 2 & 3 \ 1 & 4 \end{bmatrix}$. What area scaling factor does it
-represent?
-Find the determinant of the shear matrix $\begin{bmatrix} 1 & 2 \ 0 & 1 \end{bmatrix}$. What happens to the area of
-the unit square?
-For the $3 \times 3$ matrix
-$\begin{bmatrix} 1 & 0 & 0 \ 0 & 2 & 0 \ 0 & 0 & 3 \end{bmatrix}$, compute the determinant. How does it scale
-volume in $\mathbb{R}^3$?
-Show that any rotation matrix in $\mathbb{R}^2$ has determinant $1$.
-Give an example of a $2 \times 2$ matrix with determinant $-1$. What geometric action does it represent?
-
-6.2 Properties of Determinants
-Beyond their geometric meaning, determinants satisfy a collection of algebraic rules that make them powerful tools in
-linear algebra. These properties allow us to compute efficiently, test invertibility, and understand how determinants
-behave under matrix operations.
-Basic Properties
-Let $A, B \in \mathbb{R}^{n \times n}$, and let $c \in \mathbb{R}$. Then:
-
-
-Identity:
-$$
-\det(I_n) = 1.
-$$
-
-
-Triangular matrices:
-If $A$ is upper or lower triangular, then
-$$
-\det(A) = a_{11} a_{22} \cdots a_{nn}.
-$$
-
-
-Row/column swap:
-Interchanging two rows (or columns) multiplies the determinant by $-1$.
-
-
-Row/column scaling:
-Multiplying a row (or column) by a scalar $c$ multiplies the determinant by $c$.
-
-
-Row/column addition:
-Adding a multiple of one row to another does not change the determinant.
-
-
-Transpose:
-$$
-\det(A^T) = \det(A).
-$$
-
-
-Multiplicativity:
-$$
-\det(AB) = \det(A)\det(B).
-$$
-
-
-Invertibility:
-$A$ is invertible if and only if $\det(A) \neq 0$.
-
-
-Example Computations
-Example 6.2.1.
-For
-$$
-A = \begin{bmatrix} 2 & 0 & 0 \ 1 & 3 & 0 \ -1 & 4 & 5 \end{bmatrix},
-$$
-$A$ is lower triangular, so
-$$
-\det(A) = 2 \cdot 3 \cdot 5 = 30.
-$$
-Example 6.2.2.
-Let
-$$
-B = \begin{bmatrix} 1 & 2 \ 3 & 4 \end{bmatrix}, \quad
-C = \begin{bmatrix} 0 & 1 \ 1 & 0 \end{bmatrix}.
-$$
-Then
-$$
-\det(B) = 1\cdot 4 - 2\cdot 3 = -2, \quad \det(C) = -1.
-$$
-Since $CB$ is obtained by swapping rows of $B$,
-$$
-\det(CB) = -\det(B) = 2.
-$$
-This matches the multiplicativity rule: $\det(CB) = \det(C)\det(B) = (-1)(-2) = 2.$
-Geometric Insights
-
-Row swaps: flipping orientation of space.
-Scaling a row: stretching space in one direction.
-Row replacement: sliding hyperplanes without altering volume.
-Multiplicativity: performing two transformations multiplies their scaling factors.
-
-These properties make determinants both computationally manageable and geometrically interpretable.
-Why this matters
-Determinant properties connect computation with geometry and theory. They explain why Gaussian elimination works, why
-invertibility is equivalent to nonzero determinant, and why determinants naturally arise in areas like volume
-computation, eigenvalue theory, and differential equations.
-Exercises 6.2
-
-
-Compute the determinant of
-$$
-A = \begin{bmatrix} 1 & 2 & 3 \ 0 & 1 & 4 \ 0 & 0 & 2 \end{bmatrix}.
-$$
-
-
-Show that if two rows of a square matrix are identical, then its determinant is zero.
-
-
-Verify $\det(A^T) = \det(A)$ for
-$$
-A = \begin{bmatrix} 2 & -1 \ 3 & 4 \end{bmatrix}.
-$$
-
-
-If $A$ is invertible, prove that
-$$
-\det(A^{-1}) = \frac{1}{\det(A)}.
-$$
-
-
-Suppose $A$ is a $3\times 3$ matrix with $\det(A) = 5$. What is $\det(2A)$?
-
-
-6.3 Cofactor Expansion
-While determinants of small matrices can be computed directly from formulas, larger matrices require a systematic
-method. The cofactor expansion (also known as Laplace expansion) provides a recursive way to compute determinants by
-breaking them into smaller ones.
-Minors and Cofactors
-For an $n \times n$ matrix $A = [a_{ij}]$:
-
-The minor $M_{ij}$ is the determinant of the $(n-1) \times (n-1)$ matrix obtained by deleting the $i$-th row and $j$
--th column of $A$.
-The cofactor $C_{ij}$ is defined by
-
-$$
-C_{ij} = (-1)^{i+j} M_{ij}.
-$$
-The sign factor $(-1)^{i+j}$ alternates in a checkerboard pattern:
-$$
-\begin{bmatrix}
-
-& - & + & - & \cdots \
-
-
-& + & - & + & \cdots \
-
-
-& - & + & - & \cdots \
-\vdots & \vdots & \vdots & \vdots & \ddots
-\end{bmatrix}.
-$$
-
-Cofactor Expansion Formula
-The determinant of $A$ can be computed by expanding along any row or any column:
-$$
-\det(A) = \sum_{j=1}^n a_{ij} C_{ij} \quad \text{(expansion along row (i))},
-$$
-$$
-\det(A) = \sum_{i=1}^n a_{ij} C_{ij} \quad \text{(expansion along column (j))}.
-$$
-Example
-Example 6.3.1.
-Compute
-$$
-A = \begin{bmatrix}
-1 & 2 & 3 \\
-0 & 4 & 5 \\
-1 & 0 & 6
-\end{bmatrix}.
-$$
-Expand along the first row:
-$$
-\det(A) = 1 \cdot C_{11} + 2 \cdot C_{12} + 3 \cdot C_{13}.
-$$
-
-For $C_{11}$:
-$M_{11} = \det \begin{bmatrix} 4 & 5 \ 0 & 6 \end{bmatrix} = 24$, so $C_{11} = (+1)(24) = 24$.
-For $C_{12}$:
-$M_{12} = \det \begin{bmatrix} 0 & 5 \ 1 & 6 \end{bmatrix} = 0 - 5 = -5$, so $C_{12} = (-1)(-5) = 5$.
-For $C_{13}$:
-$M_{13} = \det \begin{bmatrix} 0 & 4 \ 1 & 0 \end{bmatrix} = 0 - 4 = -4$, so $C_{13} = (+1)(-4) = -4$.
-
-Thus,
-$$
-\det(A) = 1(24) + 2(5) + 3(-4) = 24 + 10 - 12 = 22.
-$$
-Properties of Cofactor Expansion
-
-Expansion along any row or column yields the same result.
-The cofactor expansion provides a recursive definition of determinant: a determinant of size $n$ is expressed in
-terms of determinants of size $n-1$.
-Cofactors are fundamental in constructing the adjugate matrix, which gives a formula for inverses:
-
-$$
-A^{-1} = \frac{1}{\det(A)} , \text{adj}(A), \quad \text{where adj}(A) = [C_{ji}].
-$$
-Geometric Interpretation
-Cofactor expansion breaks down the determinant into contributions from sub-volumes defined by fixing one row or column
-at a time. Each cofactor measures how that row/column influences the overall volume scaling.
-Why this matters
-Cofactor expansion generalizes the small-matrix formulas and provides a conceptual definition of determinants. While not
-the most efficient way to compute determinants for large matrices, it is essential for theory, proofs, and connections
-to adjugates, Cramer’s rule, and classical geometry.
-Exercises 6.3
-
-
-Compute the determinant of
-$$
-\begin{bmatrix}
-2 & 0 & 1 \
-3 & -1 & 4 \
-1 & 2 & 0
-\end{bmatrix}
-$$
-by cofactor expansion along the first column.
-
-
-Verify that expanding along the second row of Example 6.3.1 gives the same determinant.
-
-
-Prove that expansion along any row gives the same value.
-
-
-Show that if a row of a matrix is zero, then its determinant is zero.
-
-
-Use cofactor expansion to prove that $\det(A) = \det(A^T)$.
-
-
-6.4 Applications (Volume, Invertibility Test)
-Determinants are not merely algebraic curiosities; they have concrete geometric and computational uses. Two of the most
-important applications are measuring volumes and testing invertibility of matrices.
-Determinants as Volume Scalers
-Given vectors $\mathbf{v}_1, \mathbf{v}_2, \dots, \mathbf{v}_n \in \mathbb{R}^n$, arrange them as columns of a matrix:
-$$
-A = \begin{bmatrix}
-| & | & & | \\
-\mathbf{v}_1 & \mathbf{v}_2 & \cdots & \mathbf{v}_n \\
-| & | & & |
-\end{bmatrix}.
-$$
-Then $|\det(A)|$ equals the volume of the parallelepiped spanned by these vectors.
-
-In $\mathbb{R}^2$, $|\det(A)|$ gives the area of the parallelogram spanned by $\mathbf{v}_1, \mathbf{v}_2$.
-In $\mathbb{R}^3$, $|\det(A)|$ gives the volume of the parallelepiped spanned
-by $\mathbf{v}_1, \mathbf{v}_2, \mathbf{v}_3$.
-In higher dimensions, it generalizes to $n$-dimensional volume (hypervolume).
-
-Example 6.4.1.
-Let
-$$
-\mathbf{v}_1 = (1,0,0), \quad \mathbf{v}_2 = (1,1,0), \quad \mathbf{v}_3 = (1,1,1).
-$$
-Then
-$$
-A = \begin{bmatrix}
-1 & 1 & 1 \\
-0 & 1 & 1 \\
-0 & 0 & 1
-\end{bmatrix}, \quad \det(A) = 1.
-$$
-So the parallelepiped has volume $1$, even though the vectors are not orthogonal.
-Invertibility Test
-A square matrix $A$ is invertible if and only if $\det(A) \neq 0$.
-
-If $\det(A) = 0$: the transformation collapses space into a lower dimension (area/volume is zero). No inverse exists.
-If $\det(A) \neq 0$: the transformation scales volume by $|\det(A)|$, and is reversible.
-
-Example 6.4.2.
-The matrix
-$$
-B = \begin{bmatrix} 2 & 4 \ 1 & 2 \end{bmatrix}
-$$
-has determinant $\det(B) = 2 \cdot 2 - 4 \cdot 1 = 0$.
-Thus, $B$ is not invertible. Geometrically, the two column vectors are collinear, spanning only a line
-in $\mathbb{R}^2$.
-Cramer’s Rule
-Determinants also provide an explicit formula for solving systems of linear equations when the matrix is invertible.
-For $A\mathbf{x} = \mathbf{b}$ with $A \in \mathbb{R}^{n \times n}$:
-$$
-x_i = \frac{\det(A_i)}{\det(A)},
-$$
-where $A_i$ is obtained by replacing the $i$-th column of $A$ with $\mathbf{b}$.
-While inefficient computationally, Cramer’s rule highlights the determinant’s role in solutions and uniqueness.
-Orientation
-The sign of $\det(A)$ indicates whether a transformation preserves or reverses orientation. For example, a reflection in
-the plane has determinant $-1$, flipping handedness.
-Why this matters
-Determinants condense key information: they measure scaling, test invertibility, and track orientation. These insights
-are indispensable in geometry (areas and volumes), analysis (Jacobian determinants in calculus), and computation (
-solving systems and checking singularity).
-Exercises 6.4
-
-
-Compute the area of the parallelogram spanned by $(2,1)$ and $(1,3)$.
-
-
-Find the volume of the parallelepiped spanned by $(1,0,0), (1,1,0), (1,1,1)$.
-
-
-Determine whether the matrix $\begin{bmatrix} 1 & 2 \ 3 & 6 \end{bmatrix}$ is invertible. Justify using
-determinants.
-
-
-Use Cramer’s rule to solve
-$$
-\begin{cases}
-x + y = 3, \
-2x - y = 0.
-\end{cases}
-$$
-
-
-Explain geometrically why a determinant of zero implies no inverse exists.
-
-
-Chapter 7. Inner Product Spaces
-7.1 Inner Products and Norms
-To extend the geometric ideas of length, distance, and angle beyond $\mathbb{R}^2$ and $\mathbb{R}^3$, we introduce
-inner products. Inner products provide a way of measuring similarity between vectors, while norms derived from them
-measure length. These concepts are the foundation of geometry inside vector spaces.
-Inner Product
-An inner product on a real vector space $V$ is a function
-$$
-\langle \cdot, \cdot \rangle : V \times V \to \mathbb{R}
-$$
-that assigns to each pair of vectors $(\mathbf{u}, \mathbf{v})$ a real number, subject to the following properties:
-
-
-Symmetry:
-$\langle \mathbf{u}, \mathbf{v} \rangle = \langle \mathbf{v}, \mathbf{u} \rangle.$
-
-
-Linearity in the first argument:
-$\langle a\mathbf{u} + b\mathbf{w}, \mathbf{v} \rangle = a \langle \mathbf{u}, \mathbf{v} \rangle + b \langle \mathbf{w}, \mathbf{v} \rangle.$
-
-
-Positive-definiteness:
-$\langle \mathbf{v}, \mathbf{v} \rangle \geq 0$, and equality holds if and only if $\mathbf{v} = \mathbf{0}$.
-
-
-The standard inner product on $\mathbb{R}^n$ is the dot product:
-$$
-\langle \mathbf{u}, \mathbf{v} \rangle = u_1 v_1 + u_2 v_2 + \cdots + u_n v_n.
-$$
-Norms
-The norm of a vector is its length, defined in terms of the inner product:
-$$
-|\mathbf{v}| = \sqrt{\langle \mathbf{v}, \mathbf{v} \rangle}.
-$$
-For the dot product in $\mathbb{R}^n$:
-$$
-|(x_1, x_2, \dots, x_n)| = \sqrt{x_1^2 + x_2^2 + \cdots + x_n^2}.
-$$
-Angles Between Vectors
-The inner product allows us to define the angle $\theta$ between two nonzero vectors $\mathbf{u}, \mathbf{v}$ by
-$$
-\cos \theta = \frac{\langle \mathbf{u}, \mathbf{v} \rangle}{|\mathbf{u}| , |\mathbf{v}|}.
-$$
-Thus, two vectors are orthogonal if $\langle \mathbf{u}, \mathbf{v} \rangle = 0$.
-Examples
-Example 7.1.1.
-In $\mathbb{R}^2$, with $\mathbf{u} = (1,2)$, $\mathbf{v} = (3,4)$:
-$$
-\langle \mathbf{u}, \mathbf{v} \rangle = 1\cdot 3 + 2\cdot 4 = 11.
-$$
-$$
-|\mathbf{u}| = \sqrt{1^2 + 2^2} = \sqrt{5}, \quad |\mathbf{v}| = \sqrt{3^2 + 4^2} = 5.
-$$
-So,
-$$
-\cos \theta = \frac{11}{\sqrt{5}\cdot 5}.
-$$
-Example 7.1.2.
-In the function space $C[0,1]$, the inner product
-$$
-\langle f, g \rangle = \int_0^1 f(x) g(x), dx
-$$
-defines a length
-$$
-|f| = \sqrt{\int_0^1 f(x)^2 dx}.
-$$
-This generalizes geometry to infinite-dimensional spaces.
-Geometric Interpretation
-
-Inner product: measures similarity between vectors.
-Norm: length of a vector.
-Angle: measure of alignment between two directions.
-
-These concepts unify algebraic operations with geometric intuition.
-Why this matters
-Inner products and norms allow us to extend geometry into abstract vector spaces. They form the basis of orthogonality,
-projections, Fourier series, least squares approximation, and many applications in physics and machine learning.
-Exercises 7.1
-
-
-Compute $\langle (2,-1,3), (1,4,0) \rangle$. Then find the angle between them.
-
-
-Show that $|(x,y)| = \sqrt{x^2+y^2}$ satisfies the properties of a norm.
-
-
-In $\mathbb{R}^3$, verify that $(1,1,0)$ and $(1,-1,0)$ are orthogonal.
-
-
-In $C[0,1]$, compute $\langle f,g \rangle$ for $f(x)=x$, $g(x)=1$.
-
-
-Prove the Cauchy–Schwarz inequality:
-$$
-|\langle \mathbf{u}, \mathbf{v} \rangle| \leq |\mathbf{u}| , |\mathbf{v}|.
-$$
-
-
-7.2 Orthogonal Projections
-One of the most useful applications of inner products is the notion of orthogonal projection. Projection allows us to
-approximate a vector by another lying in a subspace, minimizing error in the sense of distance. This idea underpins
-geometry, statistics, and numerical analysis.
-Projection onto a Line
-Let $\mathbf{u} \in \mathbb{R}^n$ be a nonzero vector. The line spanned by $\mathbf{u}$ is
-$$
-L = { c\mathbf{u} \mid c \in \mathbb{R} }.
-$$
-Given a vector $\mathbf{v}$, the projection of $\mathbf{v}$ onto $\mathbf{u}$ is the vector in $L$ closest
-to $\mathbf{v}$. Geometrically, it is the shadow of $\mathbf{v}$ on the line.
-The formula is
-$$
-\text{proj}_{\mathbf{u}}(\mathbf{v}) = \frac{\langle \mathbf{v}, \mathbf{u} \rangle}{\langle \mathbf{u}, \mathbf{u} \rangle} , \mathbf{u}.
-$$
-The error vector $\mathbf{v} - \text{proj}_{\mathbf{u}}(\mathbf{v})$ is orthogonal to $\mathbf{u}$.
-Example 7.2.1
-Let $\mathbf{u} = (1,2)$, $\mathbf{v} = (3,1)$.
-$$
-\langle \mathbf{v}, \mathbf{u} \rangle = 3\cdot 1 + 1\cdot 2 = 5, \quad
-\langle \mathbf{u}, \mathbf{u} \rangle = 1^2 + 2^2 = 5.
-$$
-So
-$$
-\text{proj}_{\mathbf{u}}(\mathbf{v}) = \frac{5}{5}(1,2) = (1,2).
-$$
-The error vector is $(3,1) - (1,2) = (2,-1)$, which is orthogonal to $(1,2)$.
-Projection onto a Subspace
-Suppose $W \subseteq \mathbb{R}^n$ is a subspace with orthonormal basis ${ \mathbf{w}_1, \dots, \mathbf{w}_k }$. The
-projection of a vector $\mathbf{v}$ onto $W$ is
-$$
-\text{proj}_{W}(\mathbf{v}) = \langle \mathbf{v}, \mathbf{w}_1 \rangle \mathbf{w}_1 + \cdots + \langle \mathbf{v}, \mathbf{w}_k \rangle \mathbf{w}_k.
-$$
-This is the unique vector in $W$ closest to $\mathbf{v}$. The difference $\mathbf{v} - \text{proj}_{W}(\mathbf{v})$ is
-orthogonal to all of $W$.
-Least Squares Approximation
-Orthogonal projection explains the method of least squares. To solve an overdetermined
-system $A\mathbf{x} \approx \mathbf{b}$, we seek the $\mathbf{x}$ that makes $A\mathbf{x}$ the projection
-of $\mathbf{b}$ onto the column space of $A$. This gives the normal equations
-$$
-A^T A \mathbf{x} = A^T \mathbf{b}.
-$$
-Thus, least squares is just projection in disguise.
-Geometric Interpretation
-
-Projection finds the closest point in a subspace to a given vector.
-It minimizes distance (error) in the sense of Euclidean norm.
-Orthogonality ensures the error vector points directly away from the subspace.
-
-Why this matters
-Orthogonal projection is central in both pure and applied mathematics. It underlies the geometry of subspaces, the
-theory of Fourier series, regression in statistics, and approximation methods in numerical linear algebra. Whenever we
-fit data with a simpler model, projection is at work.
-Exercises 7.2
-
-Compute the projection of $(2,3)$ onto the vector $(1,1)$.
-Show that $\mathbf{v} - \text{proj}_{\mathbf{u}}(\mathbf{v})$ is orthogonal to $\mathbf{u}$.
-Let $W = \text{span}{(1,0,0), (0,1,0)} \subseteq \mathbb{R}^3$. Find the projection of $(1,2,3)$ onto $W$.
-Explain why least squares fitting corresponds to projection onto the column space of $A$.
-Prove that projection onto a subspace $W$ is unique: there is exactly one closest vector in $W$ to a
-given $\mathbf{v}$.
-
-7.3 Gram–Schmidt Process
-The Gram–Schmidt process is a systematic way to turn any linearly independent set of vectors into an orthonormal basis.
-This is especially useful because orthonormal bases simplify computations: inner products become simple coordinate
-comparisons, and projections take clean forms.
-The Idea
-Given a linearly independent set of vectors ${\mathbf{v}_1, \mathbf{v}_2, \dots, \mathbf{v}_n}$ in an inner product
-space, we want to construct an orthonormal set ${\mathbf{u}_1, \mathbf{u}_2, \dots, \mathbf{u}_n}$ that spans the same
-subspace.
-We proceed step by step:
-
-Start with $\mathbf{v}_1$, normalize it to get $\mathbf{u}_1$.
-Subtract from $\mathbf{v}_2$ its projection onto $\mathbf{u}_1$, leaving a vector orthogonal to $\mathbf{u}_1$.
-Normalize to get $\mathbf{u}_2$.
-For each $\mathbf{v}_k$, subtract projections onto all previously
-constructed $\mathbf{u}1, \dots, \mathbf{u}{k-1}$, then normalize.
-
-The Algorithm
-For $k = 1, 2, \dots, n$:
-$$
-\mathbf{w}_k = \mathbf{v}k - \sum{j=1}^{k-1} \langle \mathbf{v}_k, \mathbf{u}_j \rangle \mathbf{u}_j,
-$$
-$$
-\mathbf{u}_k = \frac{\mathbf{w}_k}{|\mathbf{w}_k|}.
-$$
-The result ${\mathbf{u}_1, \dots, \mathbf{u}_n}$ is an orthonormal basis of the span of the original vectors.
-Example 7.3.1
-Take $\mathbf{v}_1 = (1,1,0), \ \mathbf{v}_2 = (1,0,1), \ \mathbf{v}_3 = (0,1,1)$ in $\mathbb{R}^3$.
-
-Normalize $\mathbf{v}_1$:
-
-$$
-\mathbf{u}_1 = \frac{1}{\sqrt{2}}(1,1,0).
-$$
-
-Subtract projection of $\mathbf{v}_2$ on $\mathbf{u}_1$:
-
-$$
-\mathbf{w}_2 = \mathbf{v}_2 - \langle \mathbf{v}_2,\mathbf{u}_1 \rangle \mathbf{u}_1.
-$$
-$$
-\langle \mathbf{v}_2,\mathbf{u}_1 \rangle = \frac{1}{\sqrt{2}}(1\cdot 1 + 0\cdot 1 + 1\cdot 0) = \tfrac{1}{\sqrt{2}}.
-$$
-So
-$$
-\mathbf{w}_2 = (1,0,1) - \tfrac{1}{\sqrt{2}}\cdot \tfrac{1}{\sqrt{2}}(1,1,0)
-= (1,0,1) - \tfrac{1}{2}(1,1,0)
-= \left(\tfrac{1}{2}, -\tfrac{1}{2}, 1\right).
-$$
-Normalize:
-$$
-\mathbf{u}_2 = \frac{1}{\sqrt{\tfrac{1}{4}+\tfrac{1}{4}+1}} \left(\tfrac{1}{2}, -\tfrac{1}{2}, 1\right)
-= \frac{1}{\sqrt{\tfrac{3}{2}}}\left(\tfrac{1}{2}, -\tfrac{1}{2}, 1\right).
-$$
-
-Subtract projections from $\mathbf{v}_3$:
-
-$$
-\mathbf{w}_3 = \mathbf{v}_3 - \langle \mathbf{v}_3,\mathbf{u}_1 \rangle \mathbf{u}_1 - \langle \mathbf{v}_3,\mathbf{u}_2 \rangle \mathbf{u}_2.
-$$
-After computing, normalize to obtain $\mathbf{u}_3$.
-The result is an orthonormal basis of the span of ${\mathbf{v}_1,\mathbf{v}_2,\mathbf{v}_3}$.
-Geometric Interpretation
-Gram–Schmidt is like straightening out a set of vectors: you start with the original directions and adjust each new
-vector to be perpendicular to all previous ones. Then you scale to unit length. The process ensures orthogonality while
-preserving the span.
-Why this matters
-Orthonormal bases simplify inner products, projections, and computations in general. They make coordinate systems easier
-to work with and are crucial in numerical methods, QR decomposition, Fourier analysis, and statistics (orthogonal
-polynomials, principal component analysis).
-Exercises 7.3
-
-Apply Gram–Schmidt to $(1,0), (1,1)$ in $\mathbb{R}^2$.
-Orthogonalize $(1,1,1), (1,0,1)$ in $\mathbb{R}^3$.
-Prove that each step of Gram–Schmidt yields a vector orthogonal to all previous ones.
-Show that Gram–Schmidt preserves the span of the original vectors.
-Explain how Gram–Schmidt leads to the QR decomposition of a matrix.
-
-7.4 Orthonormal Bases
-An orthonormal basis is a basis of a vector space in which all vectors are both orthogonal to each other and have unit
-length. Such bases are the most convenient possible coordinate systems: computations involving inner products,
-projections, and norms become exceptionally simple.
-Definition
-A set of vectors ${\mathbf{u}_1, \mathbf{u}_2, \dots, \mathbf{u}_n}$ in an inner product space $V$ is called an
-orthonormal basis if
-
-
-$\langle \mathbf{u}_i, \mathbf{u}_j \rangle = 0$ whenever $i \neq j$ (orthogonality),
-
-$|\mathbf{u}_i| = 1$ for all $i$ (normalization),
-The set spans $V$.
-
-Examples
-Example 7.4.1. In $\mathbb{R}^2$, the standard basis
-$$
-\mathbf{e}_1 = (1,0), \quad \mathbf{e}_2 = (0,1)
-$$
-is orthonormal under the dot product.
-Example 7.4.2. In $\mathbb{R}^3$, the standard basis
-$$
-\mathbf{e}_1 = (1,0,0), \quad \mathbf{e}_2 = (0,1,0), \quad \mathbf{e}_3 = (0,0,1)
-$$
-is orthonormal.
-Example 7.4.3. Fourier basis on functions:
-$$
-{1, \cos x, \sin x, \cos 2x, \sin 2x, \dots}
-$$
-is an orthogonal set in the space of square-integrable functions on $[-\pi,\pi]$ with inner product
-$$
-\langle f,g \rangle = \int_{-\pi}^{\pi} f(x) g(x), dx.
-$$
-After normalization, it becomes an orthonormal basis.
-Properties
-
-
-Coordinate simplicity: If ${\mathbf{u}_1,\dots,\mathbf{u}_n}$ is an orthonormal basis of $V$, then any
-vector $\mathbf{v}\in V$ has coordinates
-$$
-[\mathbf{v}] = \begin{bmatrix} \langle \mathbf{v}, \mathbf{u}_1 \rangle \ \vdots \ \langle \mathbf{v}, \mathbf{u}_n \rangle \end{bmatrix}.
-$$
-That is, coordinates are just inner products.
-
-
-Parseval’s identity:
-For any $\mathbf{v} \in V$,
-$$
-|\mathbf{v}|^2 = \sum_{i=1}^n |\langle \mathbf{v}, \mathbf{u}_i \rangle|^2.
-$$
-
-
-Projections:
-The orthogonal projection onto the span of ${\mathbf{u}_1,\dots,\mathbf{u}_k}$ is
-$$
-\text{proj}(\mathbf{v}) = \sum_{i=1}^k \langle \mathbf{v}, \mathbf{u}_i \rangle \mathbf{u}_i.
-$$
-
-
-Constructing Orthonormal Bases
-
-Start with any linearly independent set, then apply the Gram–Schmidt process to obtain an orthonormal set spanning the
-same subspace.
-In practice, orthonormal bases are often chosen for numerical stability and simplicity of computation.
-
-Geometric Interpretation
-An orthonormal basis is like a perfectly aligned and equally scaled coordinate system. Distances and angles are computed
-directly using coordinates without correction factors. They are the ideal rulers of linear algebra.
-Why this matters
-Orthonormal bases simplify every aspect of linear algebra: solving systems, computing projections, expanding functions,
-diagonalizing symmetric matrices, and working with Fourier series. In data science, principal component analysis
-produces orthonormal directions capturing maximum variance.
-Exercises 7.4
-
-Verify that $(1/\sqrt{2})(1,1)$ and $(1/\sqrt{2})(1,-1)$ form an orthonormal basis of $\mathbb{R}^2$.
-Express $(3,4)$ in terms of the orthonormal basis ${(1/\sqrt{2})(1,1), (1/\sqrt{2})(1,-1)}$.
-Prove Parseval’s identity for $\mathbb{R}^n$ with the dot product.
-Find an orthonormal basis for the plane $x+y+z=0$ in $\mathbb{R}^3$.
-Explain why orthonormal bases are numerically more stable than arbitrary bases in computations.
-
-Chapter 8. Eigenvalues and eigenvectors
-8.1 Definitions and Intuition
-The concepts of eigenvalues and eigenvectors reveal the most fundamental behavior of linear transformations. They
-identify the special directions in which a transformation acts by simple stretching or compressing, without rotation or
-distortion.
-Definition
-Let $T: V \to V$ be a linear transformation on a vector space $V$. A nonzero vector $\mathbf{v} \in V$ is called an
-eigenvector of $T$ if
-$$
-T(\mathbf{v}) = \lambda \mathbf{v}
-$$
-for some scalar $\lambda \in \mathbb{R}$ (or $\mathbb{C}$). The scalar $\lambda$ is the eigenvalue corresponding
-to $\mathbf{v}$.
-Equivalently, if $A$ is the matrix of $T$, then eigenvalues and eigenvectors satisfy
-$$
-A\mathbf{v} = \lambda \mathbf{v}.
-$$
-Basic Examples
-Example 8.1.1.
-Let
-$$
-A = \begin{bmatrix} 2 & 0 \ 0 & 3 \end{bmatrix}.
-$$
-Then
-$$
-A(1,0)^T = 2(1,0)^T, \quad A(0,1)^T = 3(0,1)^T.
-$$
-So $(1,0)$ is an eigenvector with eigenvalue $2$, and $(0,1)$ is an eigenvector with eigenvalue $3$.
-Example 8.1.2.
-Rotation matrix in $\mathbb{R}^2$:
-$$
-R_\theta = \begin{bmatrix} \cos\theta & -\sin\theta \ \sin\theta & \cos\theta \end{bmatrix}.
-$$
-If $\theta \neq 0, \pi$, $R_\theta$ has no real eigenvalues: every vector is rotated, not scaled. Over $\mathbb{C}$,
-however, it has eigenvalues $e^{i\theta}, e^{-i\theta}$.
-Algebraic Formulation
-Eigenvalues arise from solving the characteristic equation:
-$$
-\det(A - \lambda I) = 0.
-$$
-This polynomial in $\lambda$ is the characteristic polynomial. Its roots are the eigenvalues.
-Geometric Intuition
-
-Eigenvectors are directions that remain unchanged in orientation under a transformation; only their length is scaled.
-Eigenvalues tell us the scaling factor along those directions.
-If a matrix has many independent eigenvectors, it can often be simplified (diagonalized) by changing basis.
-
-Applications in Geometry and Science
-
-Stretching along principal axes of an ellipse (quadratic forms).
-Stable directions of dynamical systems.
-Principal components in statistics and machine learning.
-Quantum mechanics, where observables correspond to operators with eigenvalues.
-
-Why this matters
-Eigenvalues and eigenvectors are a bridge between algebra and geometry. They provide a lens for understanding linear
-transformations in their simplest form. Nearly every application of linear algebra-differential equations, statistics,
-physics, computer science-relies on eigen-analysis.
-Exercises 8.1
-
-Find the eigenvalues and eigenvectors of
-$\begin{bmatrix} 4 & 0 \ 0 & -1 \end{bmatrix}$.
-Show that every scalar multiple of an eigenvector is again an eigenvector for the same eigenvalue.
-Verify that the rotation matrix $R_\theta$ has no real eigenvalues unless $\theta = 0$ or $\pi$.
-Compute the characteristic polynomial of
-$\begin{bmatrix} 1 & 2 \ 2 & 1 \end{bmatrix}$.
-Explain geometrically what eigenvectors and eigenvalues represent for the shear matrix
-$\begin{bmatrix} 1 & 1 \ 0 & 1 \end{bmatrix}$.
-
-8.2 Diagonalization
-A central goal in linear algebra is to simplify the action of a matrix by choosing a good basis. Diagonalization is the
-process of rewriting a matrix so that it acts by simple scaling along independent directions. This makes computations
-such as powers, exponentials, and solving differential equations far easier.
-Definition
-A square matrix $A \in \mathbb{R}^{n \times n}$ is diagonalizable if there exists an invertible matrix $P$ such that
-$$
-P^{-1} A P = D,
-$$
-where $D$ is a diagonal matrix.
-The diagonal entries of $D$ are eigenvalues of $A$, and the columns of $P$ are the corresponding eigenvectors.
-When is a Matrix Diagonalizable?
-
-A matrix is diagonalizable if it has $n$ linearly independent eigenvectors.
-Equivalently, the sum of the dimensions of its eigenspaces equals $n$.
-Symmetric matrices (over $\mathbb{R}$) are always diagonalizable, with an orthonormal basis of eigenvectors.
-
-Example 8.2.1
-Let
-$$
-A = \begin{bmatrix} 4 & 1 \ 0 & 2 \end{bmatrix}.
-$$
-
-Characteristic polynomial:
-
-$$
-\det(A - \lambda I) = (4-\lambda)(2-\lambda).
-$$
-So eigenvalues are $\lambda_1 = 4$, $\lambda_2 = 2$.
-
-Eigenvectors:
-
-
-For $\lambda = 4$, solve $(A-4I)\mathbf{v}=0$:
-$\begin{bmatrix} 0 & 1 \ 0 & -2 \end{bmatrix}\mathbf{v} = 0$, giving $\mathbf{v}_1 = (1,0)$.
-For $\lambda = 2$: $(A-2I)\mathbf{v}=0$, giving $\mathbf{v}_2 = (1,-2)$.
-
-
-Construct $P = \begin{bmatrix} 1 & 1 \ 0 & -2 \end{bmatrix}$. Then
-
-$$
-P^{-1} A P = \begin{bmatrix} 4 & 0 \ 0 & 2 \end{bmatrix}.
-$$
-Thus, $A$ is diagonalizable.
-Why Diagonalize?
-
-
-Computing powers:
-If $A = P D P^{-1}$, then
-$$
-A^k = P D^k P^{-1}.
-$$
-Since $D$ is diagonal, $D^k$ is easy to compute.
-
-
-Matrix exponentials:
-$e^A = P e^D P^{-1}$, useful in solving differential equations.
-
-
-Understanding geometry:
-Diagonalization reveals the directions along which a transformation stretches or compresses space independently.
-
-
-Non-Diagonalizable Example
-Not all matrices can be diagonalized.
-$$
-A = \begin{bmatrix} 1 & 1 \ 0 & 1 \end{bmatrix}
-$$
-has only one eigenvalue $\lambda = 1$, with eigenspace dimension 1. Since $n=2$ but we only have 1 independent
-eigenvector, $A$ is not diagonalizable.
-Geometric Interpretation
-Diagonalization means we have found a basis of eigenvectors. In this basis, the matrix acts by simple scaling along each
-coordinate axis. It transforms complicated motion into independent 1D motions.
-Why this matters
-Diagonalization is a cornerstone of linear algebra. It simplifies computation, reveals structure, and is the starting
-point for the spectral theorem, Jordan form, and many applications in physics, engineering, and data science.
-Exercises 8.2
-
-
-Diagonalize
-$$
-A = \begin{bmatrix} 2 & 0 \ 0 & 3 \end{bmatrix}.
-$$
-
-
-Determine whether
-$$
-A = \begin{bmatrix} 1 & 1 \ 0 & 1 \end{bmatrix}
-$$
-is diagonalizable. Why or why not?
-
-
-Find $A^5$ for
-$$
-A = \begin{bmatrix} 4 & 1 \ 0 & 2 \end{bmatrix}
-$$
-using diagonalization.
-
-
-Show that any $n \times n$ matrix with $n$ distinct eigenvalues is diagonalizable.
-
-
-Explain why real symmetric matrices are always diagonalizable.
-
-
-8.3 Characteristic Polynomials
-The key to finding eigenvalues is the characteristic polynomial of a matrix. This polynomial encodes the values
-of $\lambda$ for which the matrix $A - \lambda I$ fails to be invertible.
-Definition
-For an $n \times n$ matrix $A$, the characteristic polynomial is
-$$
-p_A(\lambda) = \det(A - \lambda I).
-$$
-The roots of $p_A(\lambda)$ are the eigenvalues of $A$.
-Examples
-Example 8.3.1.
-Let
-$$
-A = \begin{bmatrix} 2 & 1 \ 1 & 2 \end{bmatrix}.
-$$
-Then
-$$
-p_A(\lambda) = \det!\begin{bmatrix} 2-\lambda & 1 \ 1 & 2-\lambda \end{bmatrix}
-= (2-\lambda)^2 - 1 = \lambda^2 - 4\lambda + 3.
-$$
-Thus eigenvalues are $\lambda = 1, 3$.
-Example 8.3.2.
-For
-$$
-A = \begin{bmatrix} 0 & -1 \ 1 & 0 \end{bmatrix}
-$$
-(rotation by 90°),
-$$
-p_A(\lambda) = \det!\begin{bmatrix} -\lambda & -1 \ 1 & -\lambda \end{bmatrix}
-= \lambda^2 + 1.
-$$
-Eigenvalues are $\lambda = \pm i$. No real eigenvalues exist, consistent with pure rotation.
-Example 8.3.3.
-For a triangular matrix
-$$
-A = \begin{bmatrix} 2 & 1 & 0 \ 0 & 3 & 5 \ 0 & 0 & 4 \end{bmatrix},
-$$
-the determinant is simply the product of diagonal entries minus $\lambda$:
-$$
-p_A(\lambda) = (2-\lambda)(3-\lambda)(4-\lambda).
-$$
-So eigenvalues are $2, 3, 4$.
-Properties
-
-
-The characteristic polynomial of an $n \times n$ matrix has degree $n$.
-
-
-The sum of the eigenvalues (counted with multiplicity) equals the trace of $A$:
-$$
-\text{tr}(A) = \lambda_1 + \cdots + \lambda_n.
-$$
-
-
-The product of the eigenvalues equals the determinant of $A$:
-$$
-\det(A) = \lambda_1 \cdots \lambda_n.
-$$
-
-
-Similar matrices have the same characteristic polynomial, hence the same eigenvalues.
-
-
-Geometric Interpretation
-The characteristic polynomial captures when $A - \lambda I$ collapses space: its determinant is zero precisely when the
-transformation $A - \lambda I$ is singular. Thus, eigenvalues mark the critical scalings where the matrix loses
-invertibility.
-Why this matters
-Characteristic polynomials provide the computational tool to extract eigenvalues. They connect matrix invariants (trace
-and determinant) with geometry, and form the foundation for diagonalization, spectral theorems, and stability analysis
-in dynamical systems.
-Exercises 8.3
-
-
-Compute the characteristic polynomial of
-$$
-A = \begin{bmatrix} 4 & 2 \ 1 & 3 \end{bmatrix}.
-$$
-
-
-Verify that the sum of the eigenvalues of
-$\begin{bmatrix} 5 & 0 \ 0 & -2 \end{bmatrix}$
-equals its trace, and their product equals its determinant.
-
-
-Show that for any triangular matrix, the eigenvalues are just the diagonal entries.
-
-
-Prove that if $A$ and $B$ are similar matrices, then $p_A(\lambda) = p_B(\lambda)$.
-
-
-Compute the characteristic polynomial of
-$\begin{bmatrix} 1 & 1 & 0 \ 0 & 1 & 1 \ 0 & 0 & 1 \end{bmatrix}$.
-
-
-8.4 Applications (Differential Equations, Markov Chains)
-Eigenvalues and eigenvectors are not only central to the theory of linear algebra-they are indispensable tools across
-mathematics and applied science. Two classic applications are solving systems of differential equations and analyzing
-Markov chains.
-Linear Differential Equations
-Consider the system
-$$
-\frac{d\mathbf{x}}{dt} = A \mathbf{x},
-$$
-where $A$ is an $n \times n$ matrix and $\mathbf{x}(t)$ is a vector-valued function.
-If $\mathbf{v}$ is an eigenvector of $A$ with eigenvalue $\lambda$, then the function
-$$
-\mathbf{x}(t) = e^{\lambda t}\mathbf{v}
-$$
-is a solution.
-
-
-Eigenvalues determine the growth or decay rate:
-
-If $\lambda &lt; 0$, solutions decay (stable).
-If $\lambda &gt; 0$, solutions grow (unstable).
-If $\lambda$ is complex, oscillations occur.
-
-
-
-By combining eigenvector solutions, we can solve general initial conditions.
-Example 8.4.1.
-Let
-$$
-A = \begin{bmatrix} 2 & 0 \ 0 & -1 \end{bmatrix}.
-$$
-Then eigenvalues are $2, -1$ with eigenvectors $(1,0)$, $(0,1)$. Solutions are
-$$
-\mathbf{x}(t) = c_1 e^{2t}(1,0) + c_2 e^{-t}(0,1).
-$$
-Thus one component grows exponentially, the other decays.
-Markov Chains
-A Markov chain is described by a stochastic matrix $P$, where each column sums to 1 and entries are nonnegative.
-If $\mathbf{x}_k$ represents the probability distribution after $k$ steps, then
-$$
-\mathbf{x}_{k+1} = P \mathbf{x}_k.
-$$
-Iterating gives
-$$
-\mathbf{x}_k = P^k \mathbf{x}_0.
-$$
-Understanding long-term behavior reduces to analyzing powers of $P$.
-
-The eigenvalue $\lambda = 1$ always exists. Its eigenvector gives the steady-state distribution.
-All other eigenvalues satisfy $|\lambda| \leq 1$. Their influence decays as $k \to \infty$.
-
-Example 8.4.2.
-Consider
-$$
-P = \begin{bmatrix} 0.9 & 0.5 \ 0.1 & 0.5 \end{bmatrix}.
-$$
-Eigenvalues are $\lambda_1 = 1$, $\lambda_2 = 0.4$. The eigenvector for $\lambda = 1$ is proportional to $(5,1)$.
-Normalizing gives the steady state
-$$
-\pi = \left(\tfrac{5}{6}, \tfrac{1}{6}\right).
-$$
-Thus, regardless of the starting distribution, the chain converges to $\pi$.
-Geometric Interpretation
-
-In differential equations, eigenvalues determine the time evolution: exponential growth, decay, or oscillation.
-In Markov chains, eigenvalues determine the long-term equilibrium of stochastic processes.
-
-Why this matters
-Eigenvalue methods turn complex iterative or dynamical systems into tractable problems. In physics, engineering, and
-finance, they describe stability and resonance. In computer science and statistics, they power algorithms from Google’s
-PageRank to modern machine learning.
-Exercises 8.4
-
-
-Solve $\tfrac{d}{dt}\mathbf{x} = \begin{bmatrix} 3 & 0 \ 0 & -2 \end{bmatrix}\mathbf{x}$.
-
-
-Show that if $A$ has a complex eigenvalue $\alpha \pm i\beta$, then solutions
-of $\tfrac{d}{dt}\mathbf{x} = A\mathbf{x}$ involve oscillations of frequency $\beta$.
-
-
-Find the steady-state distribution of
-$$
-P = \begin{bmatrix} 0.7 & 0.2 \ 0.3 & 0.8 \end{bmatrix}.
-$$
-
-
-Prove that for any stochastic matrix $P$, $1$ is always an eigenvalue.
-
-
-Explain why all eigenvalues of a stochastic matrix satisfy $|\lambda| \leq 1$.
-
-
-Chapter 9. Quadratic Forms and Spectral Theorems
-9.1 Quadratic Forms
-A quadratic form is a polynomial of degree two in several variables, expressed neatly using matrices. Quadratic forms
-appear throughout mathematics: in optimization, geometry of conic sections, statistics (variance), and physics (energy
-functions).
-Definition
-Let $A$ be an $n \times n$ symmetric matrix and $\mathbf{x} \in \mathbb{R}^n$. The quadratic form associated with $A$ is
-$$
-Q(\mathbf{x}) = \mathbf{x}^T A \mathbf{x}.
-$$
-Expanded,
-$$
-Q(\mathbf{x}) = \sum_{i=1}^n \sum_{j=1}^n a_{ij} x_i x_j.
-$$
-Because $A$ is symmetric ($a_{ij} = a_{ji}$), the cross-terms can be grouped naturally.
-Examples
-Example 9.1.1.
-For
-$$
-A = \begin{bmatrix} 2 & 1 \ 1 & 3 \end{bmatrix}, \quad \mathbf{x} = \begin{bmatrix} x \ y \end{bmatrix},
-$$
-$$
-Q(x,y) = \begin{bmatrix} x & y \end{bmatrix}
-\begin{bmatrix} 2 & 1 \ 1 & 3 \end{bmatrix}
-\begin{bmatrix} x \ y \end{bmatrix}
-= 2x^2 + 2xy + 3y^2.
-$$
-Example 9.1.2.
-The quadratic form
-$$
-Q(x,y) = x^2 + y^2
-$$
-corresponds to the matrix $A = I_2$. It measures squared Euclidean distance from the origin.
-Example 9.1.3.
-The conic section equation
-$$
-4x^2 + 2xy + 5y^2 = 1
-$$
-is described by the quadratic form $\mathbf{x}^T A \mathbf{x} = 1$ with
-$$
-A = \begin{bmatrix} 4 & 1 \ 1 & 5 \end{bmatrix}.
-$$
-Diagonalization of Quadratic Forms
-By choosing a new basis consisting of eigenvectors of $A$, we can rewrite the quadratic form without cross terms.
-If $A = PDP^{-1}$ with $D$ diagonal, then
-$$
-Q(\mathbf{x}) = \mathbf{x}^T A \mathbf{x} = (P^{-1}\mathbf{x})^T D (P^{-1}\mathbf{x}).
-$$
-Thus quadratic forms can always be expressed as a sum of weighted squares:
-$$
-Q(\mathbf{y}) = \lambda_1 y_1^2 + \cdots + \lambda_n y_n^2,
-$$
-where $\lambda_i$ are the eigenvalues of $A$.
-Geometric Interpretation
-Quadratic forms describe geometric shapes:
-
-In 2D: ellipses, parabolas, hyperbolas.
-In 3D: ellipsoids, paraboloids, hyperboloids.
-In higher dimensions: generalizations of ellipsoids.
-
-Diagonalization aligns the coordinate axes with the principal axes of the shape.
-Why this matters
-Quadratic forms unify geometry and algebra. They are central in optimization (minimizing energy functions), statistics (
-covariance matrices and variance), mechanics (kinetic energy), and numerical analysis. Understanding quadratic forms
-leads directly to the spectral theorem.
-Exercises 9.1
-
-Write the quadratic form $Q(x,y) = 3x^2 + 4xy + y^2$ as $\mathbf{x}^T A \mathbf{x}$ for some symmetric matrix $A$.
-For $A = \begin{bmatrix} 1 & 2 \ 2 & 1 \end{bmatrix}$, compute $Q(x,y)$ explicitly.
-Diagonalize the quadratic form $Q(x,y) = 2x^2 + 2xy + 3y^2$.
-Identify the conic section given by $Q(x,y) = x^2 - y^2$.
-Show that if $A$ is symmetric, quadratic forms defined by $A$ and $A^T$ are identical.
-
-9.2 Positive Definite Matrices
-Quadratic forms are especially important when their associated matrices are positive definite, since these guarantee
-positivity of energy, distance, or variance. Positive definiteness is a cornerstone in optimization, numerical analysis,
-and statistics.
-Definition
-A symmetric matrix $A \in \mathbb{R}^{n \times n}$ is called:
-
-
-Positive definite if
-$$
-\mathbf{x}^T A \mathbf{x} > 0 \quad \text{for all nonzero } \mathbf{x} \in \mathbb{R}^n.
-$$
-
-
-Positive semidefinite if
-$$
-\mathbf{x}^T A \mathbf{x} \geq 0 \quad \text{for all } \mathbf{x}.
-$$
-
-
-Similarly, negative definite (always < 0) and indefinite (can be both < 0 and > 0) matrices are defined.
-Examples
-Example 9.2.1.
-$$
-A = \begin{bmatrix} 2 & 0 \ 0 & 3 \end{bmatrix}
-$$
-is positive definite, since
-$$
-Q(x,y) = 2x^2 + 3y^2 > 0
-$$
-for all $(x,y) \neq (0,0)$.
-Example 9.2.2.
-$$
-A = \begin{bmatrix} 1 & 2 \ 2 & 1 \end{bmatrix}
-$$
-has quadratic form
-$$
-Q(x,y) = x^2 + 4xy + y^2.
-$$
-This matrix is not positive definite, since $Q(1,-1) = -2 &lt; 0$.
-Characterizations
-For a symmetric matrix $A$:
-
-
-Eigenvalue test: $A$ is positive definite if and only if all eigenvalues of $A$ are positive.
-
-
-Principal minors test (Sylvester’s criterion): $A$ is positive definite if and only if all leading principal minors (
-determinants of top-left $k \times k$ submatrices) are positive.
-
-
-Cholesky factorization: $A$ is positive definite if and only if it can be written as
-$$
-A = R^T R,
-$$
-where $R$ is an upper triangular matrix with positive diagonal entries.
-
-
-Geometric Interpretation
-
-Positive definite matrices correspond to quadratic forms that define ellipsoids centered at the origin.
-Positive semidefinite matrices define flattened ellipsoids (possibly degenerate).
-Indefinite matrices define hyperbolas or saddle-shaped surfaces.
-
-Applications
-
-Optimization: Hessians of convex functions are positive semidefinite; strict convexity corresponds to positive
-definite Hessians.
-Statistics: Covariance matrices are positive semidefinite.
-Numerical methods: Cholesky decomposition is widely used to solve systems with positive definite matrices efficiently.
-
-Why this matters
-Positive definiteness provides stability and guarantees in mathematics and computation. It ensures energy functions are
-bounded below, optimization problems have unique solutions, and statistical models are meaningful.
-Exercises 9.2
-
-
-Use Sylvester’s criterion to check whether
-$$
-A = \begin{bmatrix} 2 & -1 \ -1 & 2 \end{bmatrix}
-$$
-is positive definite.
-
-
-Determine whether
-$$
-A = \begin{bmatrix} 0 & 1 \ 1 & 0 \end{bmatrix}
-$$
-is positive definite, semidefinite, or indefinite.
-
-
-Find the eigenvalues of
-$$
-A = \begin{bmatrix} 4 & 2 \ 2 & 3 \end{bmatrix},
-$$
-and use them to classify definiteness.
-
-
-Prove that all diagonal matrices with positive entries are positive definite.
-
-
-Show that if $A$ is positive definite, then so is $P^T A P$ for any invertible matrix $P$.
-
-
-9.3 Spectral Theorem
-The spectral theorem is one of the most powerful results in linear algebra. It states that symmetric matrices can always
-be diagonalized by an orthogonal basis of eigenvectors. This links algebra (eigenvalues), geometry (orthogonal
-directions), and applications (stability, optimization, statistics).
-Statement of the Spectral Theorem
-If $A \in \mathbb{R}^{n \times n}$ is symmetric ($A^T = A$), then:
-
-
-All eigenvalues of $A$ are real.
-
-
-There exists an orthonormal basis of $\mathbb{R}^n$ consisting of eigenvectors of $A$.
-
-
-Thus, $A$ can be written as
-$$
-A = Q \Lambda Q^T,
-$$
-where $Q$ is an orthogonal matrix ($Q^T Q = I$) and $\Lambda$ is diagonal with eigenvalues of $A$ on the diagonal.
-
-
-Consequences
-
-Symmetric matrices are always diagonalizable, and the diagonalization is numerically stable.
-Quadratic forms $\mathbf{x}^T A \mathbf{x}$ can be expressed in terms of eigenvalues and eigenvectors, showing
-ellipsoids aligned with eigen-directions.
-Positive definiteness can be checked by confirming that all eigenvalues are positive.
-
-Example 9.3.1
-Let
-$$
-A = \begin{bmatrix} 2 & 1 \ 1 & 2 \end{bmatrix}.
-$$
-
-Characteristic polynomial:
-
-$$
-p(\lambda) = (2-\lambda)^2 - 1 = \lambda^2 - 4\lambda + 3.
-$$
-Eigenvalues: $\lambda_1 = 1, \ \lambda_2 = 3$.
-
-Eigenvectors:
-
-
-For $\lambda=1$: solve $(A-I)\mathbf{v} = 0$, giving $(1,-1)$.
-For $\lambda=3$: solve $(A-3I)\mathbf{v} = 0$, giving $(1,1)$.
-
-
-Normalize eigenvectors:
-
-$$
-\mathbf{u}_1 = \tfrac{1}{\sqrt{2}}(1,-1), \quad \mathbf{u}_2 = \tfrac{1}{\sqrt{2}}(1,1).
-$$
-
-Then
-
-$$
-Q = \begin{bmatrix} \tfrac{1}{\sqrt{2}} & \tfrac{1}{\sqrt{2}} [6pt] -\tfrac{1}{\sqrt{2}} & \tfrac{1}{\sqrt{2}} \end{bmatrix}, \quad
-\Lambda = \begin{bmatrix} 1 & 0 \ 0 & 3 \end{bmatrix}.
-$$
-So
-$$
-A = Q \Lambda Q^T.
-$$
-Geometric Interpretation
-The spectral theorem says every symmetric matrix acts like independent scaling along orthogonal directions. In geometry,
-this corresponds to stretching space along perpendicular axes.
-
-Ellipses, ellipsoids, and quadratic surfaces can be fully understood via eigenvalues and eigenvectors.
-Orthogonality ensures directions remain perpendicular after transformation.
-
-Applications
-
-Optimization: The spectral theorem underlies classification of critical points via eigenvalues of the Hessian.
-PCA (Principal Component Analysis): Data covariance matrices are symmetric, and PCA finds orthogonal directions of
-maximum variance.
-Differential equations & physics: Symmetric operators correspond to measurable quantities with real eigenvalues (
-stability, energy).
-
-Why this matters
-The spectral theorem guarantees that symmetric matrices are as simple as possible: they can always be analyzed in terms
-of real, orthogonal eigenvectors. This provides both deep theoretical insight and powerful computational tools.
-Exercises 9.3
-
-
-Diagonalize
-$$
-A = \begin{bmatrix} 4 & 2 \ 2 & 3 \end{bmatrix}
-$$
-using the spectral theorem.
-
-
-Prove that all eigenvalues of a real symmetric matrix are real.
-
-
-Show that eigenvectors corresponding to distinct eigenvalues of a symmetric matrix are orthogonal.
-
-
-Explain geometrically how the spectral theorem describes ellipsoids defined by quadratic forms.
-
-
-Apply the spectral theorem to the covariance matrix
-$$
-\Sigma = \begin{bmatrix} 2 & 1 \ 1 & 2 \end{bmatrix},
-$$
-and interpret the eigenvectors as principal directions of variance.
-
-
-9.4 Principal Component Analysis (PCA)
-Principal Component Analysis (PCA) is a widely used technique in data science, machine learning, and statistics. At its
-core, PCA is an application of the spectral theorem to covariance matrices: it finds orthogonal directions (principal
-components) that capture the maximum variance in data.
-The Idea
-Given a dataset of vectors $\mathbf{x}_1, \mathbf{x}_2, \dots, \mathbf{x}_m \in \mathbb{R}^n$:
-
-
-Center the data by subtracting the mean vector $\bar{\mathbf{x}}$.
-
-
-Form the covariance matrix
-$$
-\Sigma = \frac{1}{m} \sum_{i=1}^m (\mathbf{x}_i - \bar{\mathbf{x}})(\mathbf{x}_i - \bar{\mathbf{x}})^T.
-$$
-
-
-Apply the spectral theorem: $\Sigma = Q \Lambda Q^T$.
-
-Columns of $Q$ are orthonormal eigenvectors (principal directions).
-Eigenvalues in $\Lambda$ measure variance explained by each direction.
-
-
-
-The first principal component is the eigenvector corresponding to the largest eigenvalue; it is the direction of maximum
-variance.
-Example 9.4.1
-Suppose we have two-dimensional data points roughly aligned along the line $y = x$. The covariance matrix is
-approximately
-$$
-\Sigma = \begin{bmatrix} 2 & 1.9 \ 1.9 & 2 \end{bmatrix}.
-$$
-Eigenvalues are about $3.9$ and $0.1$. The eigenvector for $\lambda = 3.9$ is approximately $(1,1)/\sqrt{2}$.
-
-First principal component: the line $y = x$.
-Most variance lies along this direction.
-Second component is nearly orthogonal ($y = -x$), but variance there is tiny.
-
-Thus PCA reduces the data to essentially one dimension.
-Applications of PCA
-
-Dimensionality reduction: Represent data with fewer features while retaining most variance.
-Noise reduction: Small eigenvalues correspond to noise; discarding them filters data.
-Visualization: Projecting high-dimensional data onto top 2 or 3 principal components reveals structure.
-Compression: PCA is used in image and signal compression.
-
-Connection to the Spectral Theorem
-The covariance matrix $\Sigma$ is always symmetric and positive semidefinite. Hence by the spectral theorem, it has an
-orthonormal basis of eigenvectors and nonnegative real eigenvalues. PCA is nothing more than re-expressing data in this
-eigenbasis.
-Why this matters
-PCA demonstrates how abstract linear algebra directly powers modern applications. Eigenvalues and eigenvectors give a
-practical method for simplifying data, revealing patterns, and reducing complexity. It is one of the most important
-algorithms derived from the spectral theorem.
-Exercises 9.4
-
-Show that the covariance matrix is symmetric and positive semidefinite.
-Compute the covariance matrix of the dataset $(1,2), (2,3), (3,4)$, and find its eigenvalues and eigenvectors.
-Explain why the first principal component captures the maximum variance.
-In image compression, explain how PCA can reduce storage by keeping only the top $k$ principal components.
-Prove that the sum of the eigenvalues of the covariance matrix equals the total variance of the dataset.
-
-Chapter 10. Linear Algebra in Practice
-10.1 Computer Graphics (Rotations, Projections)
-Linear algebra is the language of modern computer graphics. Every image rendered on a screen, every 3D model rotated or
-projected, is ultimately the result of applying matrices to vectors. Rotations, reflections, scalings, and projections
-are all linear transformations, making matrices the natural tool for manipulating geometry.
-Rotations in 2D
-A counterclockwise rotation by an angle $\theta$ in the plane is represented by
-$$
-R_\theta =
-\begin{bmatrix}
-\cos\theta & -\sin\theta \\
-\sin\theta & \cos\theta
-\end{bmatrix}.
-$$
-For any vector $\mathbf{v} \in \mathbb{R}^2$, the rotated vector is
-$$
-\mathbf{v}' = R_\theta \mathbf{v}.
-$$
-This preserves lengths and angles, since $R_\theta$ is orthogonal with determinant $1$.
-Rotations in 3D
-In three dimensions, rotations are represented by $3 \times 3$ orthogonal matrices with determinant $1$. For example, a
-rotation about the $z$-axis is
-$$
-R_z(\theta) =
-\begin{bmatrix}
-\cos\theta & -\sin\theta & 0 \\
-\sin\theta & \cos\theta & 0 \\
-0 & 0 & 1
-\end{bmatrix}.
-$$
-Similar formulas exist for rotations about the $x$- and $y$-axes.
-More general 3D rotations can be described by axis–angle representation or quaternions, but the underlying idea is still
-linear transformations represented by matrices.
-Projections
-To display 3D objects on a 2D screen, we use projections:
-
-
-Orthogonal projection: drops the $z$-coordinate, mapping $(x,y,z) \mapsto (x,y)$.
-$$
-P = \begin{bmatrix}
-1 & 0 & 0 \
-0 & 1 & 0
-\end{bmatrix}.
-$$
-
-
-Perspective projection: mimics the effect of a camera. A point $(x,y,z)$ projects to
-$$
-\left(\frac{x}{z}, \frac{y}{z}\right),
-$$
-capturing how distant objects appear smaller.
-
-
-These operations are linear (orthogonal projection) or nearly linear (perspective projection becomes linear in
-homogeneous coordinates).
-Homogeneous Coordinates
-To unify translations and projections with linear transformations, computer graphics uses homogeneous coordinates. A 3D
-point $(x,y,z)$ is represented as a 4D vector $(x,y,z,1)$. Transformations are then $4 \times 4$ matrices, which can
-represent rotations, scalings, and translations in a single framework.
-Example: Translation by $(a,b,c)$:
-$$
-T = \begin{bmatrix}
-1 & 0 & 0 & a \\
-0 & 1 & 0 & b \\
-0 & 0 & 1 & c \\
-0 & 0 & 0 & 1
-\end{bmatrix}.
-$$
-Geometric Interpretation
-
-Rotations preserve shape and size, only changing orientation.
-Projections reduce dimension: from 3D world space to 2D screen space.
-Homogeneous coordinates allow us to combine multiple transformations (rotation + translation + projection) into a
-single matrix multiplication.
-
-Why this matters
-Linear algebra enables all real-time graphics: video games, simulations, CAD software, and movie effects. By chaining
-simple matrix operations, complex transformations are applied efficiently to millions of points per second.
-Exercises 10.1
-
-Write the rotation matrix for a 90° counterclockwise rotation in $\mathbb{R}^2$. Apply it to $(1,0)$.
-Rotate the point $(1,1,0)$ about the $z$-axis by 180°.
-Show that the determinant of any 2D or 3D rotation matrix is 1.
-Derive the orthogonal projection matrix from $\mathbb{R}^3$ to the $xy$-plane.
-Explain how homogeneous coordinates allow translations to be represented as matrix multiplications.
-
-10.2 Data Science (Dimensionality Reduction, Least Squares)
-Linear algebra provides the foundation for many data science techniques. Two of the most important are dimensionality
-reduction, where high-dimensional datasets are compressed while preserving essential information, and the least squares
-method, which underlies regression and model fitting.
-Dimensionality Reduction
-High-dimensional data often contains redundancy: many features are correlated, meaning the data essentially lies near a
-lower-dimensional subspace. Dimensionality reduction identifies these subspaces.
-
-
-PCA (Principal Component Analysis):
-As introduced earlier, PCA diagonalizes the covariance matrix of the data.
-
-Eigenvectors (principal components) define orthogonal directions of maximum variance.
-Eigenvalues measure how much variance lies along each direction.
-Keeping only the top $k$ components reduces data from $n$-dimensional space to $k$-dimensional space while
-retaining most variability.
-
-
-
-Example 10.2.1. A dataset of 1000 images, each with 1024 pixels, may have most variance captured by just 50 eigenvectors
-of the covariance matrix. Projecting onto these components compresses the data while preserving essential features.
-Least Squares
-Often, we have more equations than unknowns-an overdetermined system:
-$$
-A\mathbf{x} \approx \mathbf{b}, \quad A \in \mathbb{R}^{m \times n}, \ m > n.
-$$
-An exact solution may not exist. Instead, we seek $\mathbf{x}$ that minimizes the error
-$$
-|A\mathbf{x} - \mathbf{b}|^2.
-$$
-This leads to the normal equations:
-$$
-A^T A \mathbf{x} = A^T \mathbf{b}.
-$$
-The solution is the orthogonal projection of $\mathbf{b}$ onto the column space of $A$.
-Example 10.2.2
-Fit a line $y = mx + c$ to data points $(x_i, y_i)$.
-Matrix form:
-$$
-A = \begin{bmatrix}
-x_1 & 1 \\
-x_2 & 1 \\
-\vdots & \vdots \\
-x_m & 1
-\end{bmatrix},
-\quad
-\mathbf{b} = \begin{bmatrix} y_1 \ y_2 \ \vdots \ y_m \end{bmatrix},
-\quad
-\mathbf{x} = \begin{bmatrix} m \ c \end{bmatrix}.
-$$
-Solve $A^T A \mathbf{x} = A^T \mathbf{b}$. This yields the best-fit line in the least squares sense.
-Geometric Interpretation
-
-Dimensionality reduction: Find the best subspace capturing most variance.
-Least squares: Project the target vector onto the subspace spanned by predictors.
-
-Both are projection problems, solved using inner products and orthogonality.
-Why this matters
-Dimensionality reduction makes large datasets tractable, filters noise, and reveals structure. Least squares fitting
-powers regression, statistics, and machine learning. Both rely directly on eigenvalues, eigenvectors, and
-projections-core tools of linear algebra.
-Exercises 10.2
-
-Explain why PCA reduces noise in datasets by discarding small eigenvalue components.
-Compute the least squares solution to fitting a line through $(0,0), (1,1), (2,2)$.
-Show that the least squares solution is unique if and only if $A^T A$ is invertible.
-Prove that the least squares solution minimizes the squared error by projection arguments.
-Apply PCA to the data points $(1,0), (2,1), (3,2)$ and find the first principal component.
-
-10.3 Networks and Markov Chains
-Graphs and networks provide a natural setting where linear algebra comes to life. From modeling flows and connectivity
-to predicting long-term behavior, matrices translate network structure into algebraic form. Markov chains, already
-introduced in Section 8.4, are a central example of networks evolving over time.
-Adjacency Matrices
-A network (graph) with $n$ nodes can be represented by an adjacency matrix $A \in \mathbb{R}^{n \times n}$:
-$$
-A_{ij} =
-\begin{cases}
-1 & \text{if there is an edge from node (i) to node (j)} \\
-0 & \text{otherwise.}
-\end{cases}
-$$
-For weighted graphs, entries may be positive weights instead of $0/1$.
-
-The number of walks of length $k$ from node $i$ to node $j$ is given by the entry $(A^k)_{ij}$.
-Powers of adjacency matrices thus encode connectivity over time.
-
-Laplacian Matrices
-Another important matrix is the graph Laplacian:
-$$
-L = D - A,
-$$
-where $D$ is the diagonal degree matrix ($D_{ii} = \text{degree}(i)$).
-
-
-$L$ is symmetric and positive semidefinite.
-The smallest eigenvalue is always $0$, with eigenvector $(1,1,\dots,1)$.
-The multiplicity of eigenvalue $0$ equals the number of connected components in the graph.
-
-This connection between eigenvalues and connectivity forms the basis of spectral graph theory.
-Markov Chains on Graphs
-A Markov chain can be viewed as a random walk on a graph. If $P$ is the transition matrix where $P_{ij}$ is the
-probability of moving from node $i$ to node $j$, then
-$$
-\mathbf{x}_{k+1} = P \mathbf{x}_k
-$$
-describes the distribution of positions after $k$ steps.
-
-The steady-state distribution is given by the eigenvector of $P$ with eigenvalue $1$.
-The speed of convergence depends on the gap between the largest eigenvalue (which is always $1$) and the second
-largest eigenvalue.
-
-Example 10.3.1
-Consider a simple 3-node cycle graph:
-$$
-P = \begin{bmatrix}
-0 & 1 & 0 \\
-0 & 0 & 1 \\
-1 & 0 & 0
-\end{bmatrix}.
-$$
-This Markov chain cycles deterministically among the nodes. Eigenvalues are the cube roots of
-unity: $1, e^{2\pi i/3}, e^{4\pi i/3}$. The eigenvalue $1$ corresponds to the steady state, which is the uniform
-distribution $(1/3,1/3,1/3)$.
-Applications
-
-Search engines: Google’s PageRank algorithm models the web as a Markov chain, where steady-state probabilities rank
-pages.
-Network analysis: Eigenvalues of adjacency or Laplacian matrices reveal communities, bottlenecks, and robustness.
-Epidemiology and information flow: Random walks model how diseases or ideas spread through networks.
-
-Why this matters
-Linear algebra transforms network problems into matrix problems. Eigenvalues and eigenvectors reveal connectivity, flow,
-stability, and long-term dynamics. Networks are everywhere-social media, biology, finance, and the internet-so these
-tools are indispensable.
-Exercises 10.3
-
-
-Write the adjacency matrix of a square graph with 4 nodes. Compute $A^2$ and interpret the entries.
-
-
-Show that the Laplacian of a connected graph has exactly one zero eigenvalue.
-
-
-Find the steady-state distribution of the Markov chain with
-$$
-P = \begin{bmatrix} 0.5 & 0.5 \ 0.4 & 0.6 \end{bmatrix}.
-$$
-
-
-Explain how eigenvalues of the Laplacian can detect disconnected components of a graph.
-
-
-Describe how PageRank modifies the transition matrix of the web graph to ensure a unique steady-state distribution.
-
-
-10.4 Machine Learning Connections
-Modern machine learning is built on linear algebra. From the representation of data as matrices to the optimization of
-large-scale models, nearly every step relies on concepts such as vector spaces, projections, eigenvalues, and matrix
-decompositions.
-Data as Matrices
-A dataset with $m$ examples and $n$ features is represented as a matrix $X \in \mathbb{R}^{m \times n}$:
-$$
-X =
-\begin{bmatrix}
-
-& \mathbf{x}_1^T & - \
-& \mathbf{x}_2^T & - \
-& \vdots & \
-& \mathbf{x}_m^T & -
-\end{bmatrix},
-$$
-
-where each row $\mathbf{x}_i \in \mathbb{R}^n$ is a feature vector. Linear algebra provides tools to analyze, compress,
-and transform this data.
-Linear Models
-At the heart of machine learning are linear predictors:
-$$
-\hat{y} = X\mathbf{w},
-$$
-where $\mathbf{w}$ is the weight vector. Training often involves solving a least squares problem or a regularized
-variant such as ridge regression:
-$$
-\min_{\mathbf{w}} |X\mathbf{w} - \mathbf{y}|^2 + \lambda |\mathbf{w}|^2.
-$$
-This is solved efficiently using matrix factorizations.
-Singular Value Decomposition (SVD)
-The SVD of a matrix $X$ is
-$$
-X = U \Sigma V^T,
-$$
-where $U, V$ are orthogonal and $\Sigma$ is diagonal with nonnegative entries (singular values).
-
-Singular values measure the importance of directions in feature space.
-SVD is used for dimensionality reduction (low-rank approximations), topic modeling, and recommender systems.
-
-Eigenvalues in Machine Learning
-
-PCA (Principal Component Analysis): diagonalization of the covariance matrix identifies directions of maximal
-variance.
-Spectral clustering: uses eigenvectors of the Laplacian to group data points into clusters.
-Stability analysis: eigenvalues of Hessian matrices determine whether optimization converges to a minimum.
-
-Neural Networks
-Even deep learning, though nonlinear, uses linear algebra at its core:
-
-Each layer is a matrix multiplication followed by a nonlinear activation.
-Training requires computing gradients, which are expressed in terms of matrix calculus.
-Backpropagation is essentially repeated applications of the chain rule with linear algebra.
-
-Why this matters
-Machine learning models often involve datasets with millions of features and parameters. Linear algebra provides the
-algorithms and abstractions that make training and inference possible. Without it, large-scale computation in AI would
-be intractable.
-Exercises 10.4
-
-
-Show that ridge regression leads to the normal equations
-$$
-(X^T X + \lambda I)\mathbf{w} = X^T \mathbf{y}.
-$$
-
-
-Explain how SVD can be used to compress an image represented as a matrix of pixel intensities.
-
-
-For a covariance matrix $\Sigma$, show why its eigenvalues represent variances along principal components.
-
-
-Give an example of how eigenvectors of the Laplacian matrix can be used for clustering a small graph.
-
-
-In a neural network with one hidden layer, write the forward pass in matrix form.
-
-
-]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[Take something you don’t like and try to like it]]></title>
-            <link>https://dynomight.net/liking/</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45102512</guid>
-            <description><![CDATA[it offers lessons on your nature]]></description>
-            <content:encoded><![CDATA[
-    Here’s one possible hobby:
-
-
-  Take something you don’t like.
-  Try to like it.
-
-
-It could be food or music or people or just the general situation you’re in. I recommend this hobby, partly because it’s nice to enjoy things, but mostly as an instrument for probing human nature.
-
-1.
-
-I was in Paris once. By coincidence, I wandered past a bunch of places that were playing Michael Jackson. I thought to myself, “Huh. The French sure do like Michael Jackson.” Gradually I decided, “You know what? They’re right! Michael Jackson is good.” Later, I saw a guy driving around blasting Billy Jean while hanging a hand outside his car with a sparkly white Michael Jackson glove. Again, I thought, “Huh.” That day was June 25, 2009.
-
-2.
-
-I don’t like cooked spinach. But if I eat some and try to forget that I hate it, it seems OK. Why?
-
-Well, as a child, I was subjected to some misguided spinach-related parental interventions. (“You cannot leave this table until you’ve finished this extremely small portion”, etc.) I hated this, but looking back, it wasn’t the innate qualities of spinach the bothered me, so much as that being forced to put something inside my body felt like a violation of my autonomy.
-
-When I encountered spinach as an adult, instead of tasting a vegetable, I tasted a grueling battle of will. Spinach was dangerous—if I liked it, that would teach my parents that they were right to control my diet.
-
-So I tried telling myself little stories: I’m hiking in the mountains in Japan when suddenly the temperature drops, and it starts pouring rain. Freezing and desperate, I spot a monastery and knock on the door. The monks warm me up and offer me hōrensō no ohitashi, made from some exotic vegetable I’ve never seen before. Presumably, I’d think it was amazing.
-
-I can’t fully access that mind-space. But just knowing it exists seems to make a big difference. Using similar techniques, I’ve successfully made myself like (or less dislike) white wine, disco, yoga, non-spicy food, Ezra Klein, Pearl Jam, and Studio Ghibli movies.
-
-Lesson: Sometimes we dislike things simply because we have a concept of ourselves as not liking them.
-
-3.
-
-Meanwhile, I’ve failed to make myself like country music. I mean, I like A Boy Named Sue. Who doesn’t? But what about Stand By Your Man or Dust on the Bottle? I listen to these, and I appreciate what they’re doing. I admire that they aren’t entirely oriented around the concerns of teenagers. But I can’t seem to actually enjoy them.
-
-Of course, it seems unlikely that this is unrelated to the fact that no one in my peer group thinks country music is cool. On the other hand, I’m constantly annoyed that my opinions aren’t more unique or interesting. And I subscribe to the idea that what’s really cool is to be a cultural omnivore who appreciates everything.
-
-It doesn’t matter. I still can’t like country music. I think the problem is that I don’t actually want to like country music. I only want to want to like country music. The cultural programming is in too deep.
-
-Lesson: Certain levels of the subconscious are easier to screw around with than others.
-
-4.
-
-For years, a friend and I would go on week-long hikes. Before we started, we’d go make our own trail mix, and I’d always insist on adding raisins. Each year, my friend would object more loudly that I don’t actually like raisins. But I do like raisins. So I’d scoff. But after several cycles, I had to admit that while I “liked raisins”, there never came a time that I actually wanted to eat raisins, ever.
-
-Related: Once every year or two, I’ll have a rough day, and I’ll say to myself, “OK, screw it. Liking Oasis is the lamest thing that has ever been done by anyone. But the dirty truth is that I love Oasis. So I will listen to Oasis and thereby be comforted.” Then I listen to Oasis, and it just isn’t that good.
-
-Lesson: You can have an incorrect concept of self.
-
-5.
-
-I don’t like this about myself, but I’m a huge snob regarding television. I believe TV can be true art, as high as any other form. (How does My Brilliant Friend only have an 89 on Metacritic?) But even after pretentiously filtering for critical acclaim, I usually feel that most shows are slop and can’t watch them.
-
-At first glance, this seems just like country music—I don’t like it because of status-driven memetic desire or whatever. But there’s a difference. Not liking country music is fine (neurotic self-flagellation aside) because there’s an infinite amount of other music. But not liking most TV is really annoying, because often I want to watch TV, but can’t find anything acceptable.
-
-I see three possible explanations:
-
-
-  
-    Almost all TV is, in fact, bad.
-  
-  
-    Lots of TV is fine, but just doesn’t appeal to me.
-  
-  
-    Lots of TV is fine, but it’s hard to tell yourself stories where you’re hiking in the mountains and a bunch of Japanese monks show you, like, Big Bang Theory.
-  
-
-
-Whatever it is, it seems hard to change.
-
-Lesson: Some things are hard to change.
-
-6.
-
-On planes, the captain will often invite you to, “sit back and enjoy the ride”. This is confusing. Enjoy the ride? Enjoy being trapped in a pressurized tube and jostled by all the passengers lining up to relieve themselves because your company decided to cram in a few more seats instead of having an adequate number of toilets? Aren’t flights supposed to be endured?
-
-At the same time, those invitations seem like a glimpse of a parallel universe. Are there members of my species who sit back and enjoy flights?
-
-I have no hard data. But it’s a good heuristic that there are people “who actually X” for approximately all values of X. If one in nine people enjoy going to the dentist, surely at least that many enjoy being on planes.
-
-What I think the captain is trying to say is, “While you can’t always control your situation, you have tremendous power over how you experience that situation. You may find a cramped flight to be a torture. But the torture happens inside your head. Some people like your situation. You too, perhaps could like it.”
-
-That’s an important message. Though one imagines that giving it as an in-flight announcement would cause more confusion, not less. So the captain does what they can.
-
-  ]]></content:encoded>
         </item>
     </channel>
 </rss>
