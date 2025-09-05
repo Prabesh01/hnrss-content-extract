@@ -4,11 +4,709 @@
         <title>Hacker News: Front Page</title>
         <link>https://news.ycombinator.com/</link>
         <description>Hacker News RSS</description>
-        <lastBuildDate>Fri, 05 Sep 2025 00:40:12 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 05 Sep 2025 02:12:53 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>github.com/Prabesh01/hnrss-content-extract</generator>
         <language>en</language>
         <atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/frontpage.rss" rel="self" type="application/rss+xml"/>
+        <item>
+            <title><![CDATA[Fil's Unbelievable Garbage Collector]]></title>
+            <link>https://fil-c.org/fugc</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45133938</guid>
+            <description><![CDATA[Fil-C uses a parallel concurrent on-the-fly grey-stack Dijkstra accurate non-moving garbage collector called FUGC (Fil's Unbelievable Garbage Collector). You can find the source code for the collector itself in fugc.c, though be warned, that code cannot possibly work without lots of support logic in the rest of the runtime and in the compiler.]]></description>
+            <content:encoded><![CDATA[
+        
+        
+Fil's Unbelievable Garbage Collector
+
+Fil-C uses a parallel concurrent on-the-fly grey-stack Dijkstra accurate non-moving garbage collector called FUGC (Fil's Unbelievable Garbage Collector). You can find the source code for the collector itself in fugc.c, though be warned, that code cannot possibly work without lots of support logic in the rest of the runtime and in the compiler.
+
+Let's break down FUGC's features:
+
+
+Parallel: marking and sweeping happen in multiple threads, in parallel. The more cores you have, the
+faster the collector finishes.
+Concurrent: marking and sweeping happen on some threads other than the mutator threads (i.e. your
+program's threads). Mutator threads don't have to stop and wait for the collector. The interaction
+between the collector thread and mutator threads is mostly non-blocking (locking is only used on
+allocation slow paths).
+On-the-fly: there is no global stop-the-world, but instead we use
+"soft handshakes" (aka "ragged safepoints"). This means that the GC may ask threads to do some work (like scan stack), but threads do this
+asynchronously, on their own time, without waiting for the collector or other threads. The only "pause"
+threads experience is the callback executed in response to the soft handshake, which does work bounded
+by that thread's stack height. That "pause" is usually shorter than the slowest path you might take
+through a typical malloc implementation.
+Grey-stack: the collector assumes it must rescan thread stacks to fixpoint. That is, GC starts with
+a soft handshake to scan stack, and then marks in a loop. If this
+loop runs out of work, then FUGC does another soft handshake. If that reveals more objects, then
+concurrent marking resumes. This prevents us from having a load barrier (no instrumentation runs
+when loading a pointer from the heap into a local variable). Only a store barrier is
+necessary, and that barrier is very simple. This fixpoint converges super quickly because all newly
+allocated objects during GC are pre-marked.
+Dijkstra: storing a pointer field in an object that's in the heap or in a global variable while FUGC
+is in its marking phase causes the newly pointed-to object to get marked. This is called a Dijkstra
+barrier and it is a kind of store barrier. Due to the grey stack, there is no load barrier like
+in the classic Dijkstra collector. The FUGC store
+barrier uses a compare-and-swap with relaxed memory ordering on the slowest path (if the GC is running
+and the object being stored was not already marked).
+Accurate: the GC accurately (aka precisely, aka exactly) finds all pointers to objects, nothing more,
+nothing less. llvm::FilPizlonator ensures that the runtime always knows where the root pointers are
+on the stack and in globals. The Fil-C runtime has a clever API and Ruby code generator for tracking
+pointers in low-level code that interacts with pizlonated code. All objects know where their outgoing
+pointers are - they can only be in the InvisiCap auxiliary allocation.
+Non-moving: the GC doesn't move objects. This makes concurrency easy to implement and avoids
+a lot of synchronization between mutator and collector. However, FUGC will "move" pointers to free
+objects (it will repoint the capability pointer to the free singleton so it doesn't have to mark the
+freed allocation).
+
+
+This makes FUGC an advancing wavefront garbage collector. Advancing wavefront means that the
+mutator cannot create new work for the collector by modifying the heap. Once an
+object is marked, it'll stay marked for that GC cycle. It's also an incremental update collector, since
+some objects that would have been live at the start of GC might get freed if they become free during the
+collection cycle.
+
+FUGC relies on safepoints, which comprise:
+
+
+Pollchecks emitted by the compiler. The llvm::FilPizlonator compiler pass emits pollchecks often enough that only a
+bounded amount of progress is possible before a pollcheck happens. The fast path of a pollcheck is
+just a load-and-branch. The slow path runs a pollcheck callback, which does work for FUGC.
+Soft handshakes, which request that a pollcheck callback is run on all threads and then waits for
+this to happen.
+Enter/exit functionality. This is for allowing threads to block in syscalls or long-running
+runtime functions without executing pollchecks. Threads that are in the exited state will have
+pollcheck callbacks executed by the collector itself (when it does the soft handshake). The only
+way for a Fil-C program to block is either by looping while entered (which means executing a
+pollcheck at least once per loop iteration, often more) or by calling into the runtime and then
+exiting.
+
+
+Safepointing is essential for supporting threading (Fil-C supports pthreads just fine) while avoiding
+a large class of race conditions. For example, safepointing means that it's safe to load a pointer from
+the heap and then use it; the GC cannot possibly delete that memory until the next pollcheck or exit.
+So, the compiler and runtime just have to ensure that the pointer becomes tracked for stack scanning at
+some point between when it's loaded and when the next pollcheck/exit happens, and only if the pointer is
+still live at that point.
+
+The safepointing functionality also supports stop-the-world, which is currently used to implement
+fork(2) and for debugging FUGC (if you set the FUGC_STW environment variable to 1 then the
+collector will stop the world and this is useful for triaging GC bugs; if the bug reproduces in STW
+then it means it's not due to issues with the store barrier). The safepoint infrastructure also allows
+safe signal delivery; Fil-C makes it possible to use signal handling in a practical way. Safepointing is
+a common feature of virtual machines that support multiple threads and accurate garbage collection,
+though usually, they are only used to stop the world rather than to request asynchronous activity from all
+threads. See here for a write-up about
+how OpenJDK does it. The Fil-C implementation is in filc_runtime.c.
+
+Here's the basic flow of the FUGC collector loop:
+
+
+Wait for the GC trigger.
+Turn on the store barrier, then soft handshake with a no-op callback.
+Turn on black allocation (new objects get allocated marked), then soft handshake with a callback
+that resets thread-local caches.
+Mark global roots.
+Soft handshake with a callback that requests stack scan and another reset of thread-local caches.
+If all collector mark stacks are empty after this, go to step 7.
+Tracing: for each object in the mark stack, mark its outgoing references (which may grow the mark
+stack). Do this until the mark stack is empty. Then go to step 5.
+Turn off the store barrier and prepare for sweeping, then soft handshake to reset thread-local
+caches again.
+Perform the sweep. During the sweep, objects are allocated black if they happen to be allocated out
+of not-yet-swept pages, or white if they are allocated out of alraedy-swept pages.
+Victory! Go back to step 1.
+
+
+If you're familiar with the literature, FUGC is sort of like the DLG (Doligez-Leroy-Gonthier) collector
+(published in two
+papers because they
+had a serious bug in the first one), except it uses the Dijkstra barrier and a grey stack, which
+simplifies everything but isn't as academically pure (FUGC fixpoints, theirs doesn't). I first came
+up with the grey-stack Dijkstra approach when working on
+Fiji VM's CMR and
+Schism garbage collectors. The main
+advantage of FUGC over DLG is that it has a simpler (cheaper) store barrier and it's a slightly more
+intuitive algorithm. While the fixpoint seems like a disadvantage, in practice it converges after a few
+iterations.
+
+Additionally, FUGC relies on a sweeping algorithm based on bitvector SIMD. This makes sweeping insanely
+fast compared to marking. This is made thanks to the
+Verse heap config
+that I added to
+libpas. FUGC
+typically spends <5% of its time sweeping.
+
+Bonus Features
+
+FUGC supports a most of C-style, Java-style, and JavaScript-style memory management. Let's break down what that means.
+
+Freeing Objects
+
+If you call free, the runtime will flag the object as free and all subsequent accesses to the object will trap. Additionally, FUGC will not scan outgoing references from the object (since they cannot be accessed anymore).
+
+Also, FUGC will redirect all capability pointers (lowers in InvisiCaps jargon) to free objects to point at the free singleton object instead. This allows freed object memory to really be reclaimed.
+
+This means that freeing objects can be used to prevent GC-induced leaks. Surprisingly, a program that works fine with malloc/free (no leaks, no crashes) that gets converted to GC the naive way (malloc allocates from the GC and free is a no-op) may end up leaking due to dangling pointers that the program never accesses. Those dangling pointers will be treated as live by the GC. In FUGC, if you freed those pointers, then FUGC will really kill them.
+
+Finalizers
+
+FUGC supports finalizer queues using the zgc_finq API in stdfil.h. This feature allows you to implement finalizers in the style of Java, except that you get to set up your own finalizer queues and choose which thread processes them.
+
+Weak References
+
+FUGC supports weak references using the zweak API in stdfil.h. Weak references work just like the weak references in Java, except there are no reference queues. Also, Fil-C 
+
+Weak Maps
+
+FUGC supports weak maps using the zweak_map API in stdfil.h. This API works almost exactly like the JavaScript WeakMap, except that Fil-C's weak maps allow you to iterate all of their elements and get a count of elements.
+
+Conclusion
+
+FUGC allows Fil-C to give the strongest possible guarantees on misuse of free:
+
+
+Freeing an object and then accessing it is guaranteed to result in a trap. Unlike tag-based approaches, which will trap on use after free until until memory reclamation is forced, FUGC means you will trap even after memory is reclaimed (due to lower repointing to the free singleton).
+Freeing an object twice is guaranteed to result in a trap.
+Failing to free an object means the object gets reclaimed for you.
+
+        
+    ]]></content:encoded>
+        </item>
+        <item>
+            <title><![CDATA[Forking Chrome to render in a terminal (2023)]]></title>
+            <link>https://fathy.fr/carbonyl</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45133935</guid>
+            <description><![CDATA[January 27, 2023]]></description>
+            <content:encoded><![CDATA[
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+January 27, 2023
+
+
+I wrote about forking Chrome to turn HTML to SVG two months ago, today we're going to do something similar by making it render into a terminal.
+Let me introduce you to the Carbonyl web browser!
+Drawing
+There isn't much you can draw in a terminal, you're guaranteed to be able to render monospace characters in a fixed grid, and that's it. Escape sequences exist to perform actions like moving the cursor, changing the text color, or mouse tracking. Some came from the days of physical terminals like the DEC VT100, others came from the xterm project.Assuming a popular terminal emulator, we can:
+Move the cursor
+Write Unicode characters
+Set a character's background and foreground color
+Use a 6x6x6 RGB palette, or 24 bits RGB if COLORTERM is set the truecolor
+One of the unicode characters we can render is the lower half block element U+2584: ▄. Knowing that cells generally have an aspect ratio of 1:2, we can render perfectly square pixels by setting the background color to the top pixel color, and the foregound color to the bottom pixel color.
+
+Let's hook html2svg's output into a Rust program:
+fn move_cursor((x, y): (usize, usize)) {
+    println!("\x1b[{};{}H", y + 1, x + 1)
+}
+
+fn set_foreground((r, g, b): (u8, u8, u8)) {
+    println!("\x1b[38;2;{};{};{}m", r, g, b)
+}
+
+fn set_background((r, g, b): (u8, u8, u8)) {
+    println!("\x1b[48;2;{};{};{}m", r, g, b)
+}
+
+fn print_pixels_pair(
+    top: (u8, u8, u8),
+    bottom: (u8, u8, u8),
+    cursor: (usize, usize)
+) {
+    move_cursor(cursor);
+    set_background(top);
+    set_foreground(bottom);
+    println!("▄");
+}
+
+
+Not bad. To render text, we need to create a new Skia device using C++, lets call it TextCaptureDevice. We'll make it call a draw_text function written in Rust. Just like in html2svg, we need to convert glyph IDs into unicode characters.
+class TextCaptureDevice: public SkClipStackDevice {
+  void onDrawGlyphRunList(SkCanvas*,
+                          const sktext::GlyphRunList& glyphRunList,
+                          const SkPaint&,
+                          const SkPaint& paint) override {
+    // Get the text position
+    auto position = localToDevice().mapRect(glyphRunList.origin());
+
+    for (auto& glyphRun : glyphRunList) {
+      auto runSize = glyphRun.runSize();
+      SkAutoSTArray<64, SkUnichar> unichars(runSize);
+
+      // Convert glyph IDs to Unicode characters
+      SkFontPriv::GlyphsToUnichars(glyphRun.font(),
+                                  glyphRun.glyphsIDs().data(),
+                                  runSize,
+                                  unichars.get());
+
+      // Draw that text on the terminal
+      draw_text(unichars.data(), runSize, position, paint.getColor());
+    }
+  }
+}
+
+
+Better! But the text is scrambled at the center. Our TextCaptureDevice does not account for occlusion, drawing a rectangle does not clear the text behind it.
+
+Let's add some code to the drawRect and drawRRect methods to clear the text if we're filling with a solid color:
+void drawRRect(const SkRRect& rect, const SkPaint& paint) override {
+    drawRect(rect.rect(), paint);
+}
+
+void drawRect(const SkRect& rect, const SkPaint& paint) override {
+    if (
+        paint.getStyle() == SkPaint::Style::kFill_Style &&
+        paint.getAlphaf() == 1.0
+    ) {
+        clear_text(localToDevice().mapRect(rect));
+    }
+}
+
+
+The gray background behind text elements is caused by the software rasterizer rendering text in our bitmap. Let's remove it:
+void SkBitmapDevice::onDrawGlyphRunList(SkCanvas* canvas,
+                                        const sktext::GlyphRunList& glyphRunList,
+                                        const SkPaint& initialPaint,
+                                        const SkPaint& drawingPaint) {
+-    SkASSERT(!glyphRunList.hasRSXForm());
+-    LOOP_TILER( drawGlyphRunList(canvas, &fGlyphPainter, glyphRunList, drawingPaint), nullptr )
+}
+
+
+That was the easy part, let's handle inputs!
+Input
+fn report_mouse_move((x, y): (usize, usize)) {
+    write!(get_stdin(), "\x1b[<35;{};{}M", y + 1, x + 1)
+}
+fn report_mouse_down((x, y): (usize, usize)) {
+    write!(get_stdin(), "\x1b[<0;{};{}M", y + 1, x + 1)
+}
+fn report_mouse_up((x, y): (usize, usize)) {
+    write!(get_stdin(), "\x1b[<0;{};{}m", y + 1, x + 1)
+}
+Some sequences exist to get a terminal emulator to track and report mouse events. For example, if you print \x1b[?1003h, the terminal should start sending events using this format:
+These are similar to the sequences we use for styling our output. The \x1b[ prefix is called the Control Sequence Introducer.
+carbonyl::browser->BrowserMainThread()->PostTask(
+    FROM_HERE,
+    base::BindOnce(
+        &HeadlessBrowserImpl::OnMouseDownInput,
+        x,
+        y
+    )
+);
+We need to notify the browser to wrap this up, but there is a catch: we
+need to block a thread to read stdin, but the browser methods should be
+called from the main thread. Thankfully, messages passing is available
+almost everywhere through the
+TaskRunner
+class.
+Google recommending me Chrome, lolfor &key in input {
+    sequence = match sequence {
+        Sequence::Char => match key {
+            0x1b => Sequence::Escape,
+            0x03 => emit!(Event::Exit),
+            key => emit!(Event::KeyPress { key }),
+        },
+        Sequence::Escape => match key {
+            b'[' => Sequence::Control,
+            b'P' => Sequence::DeviceControl(DeviceControl::new()),
+            0x1b =>
+                emit!(Event::KeyPress { key: 0x1b }; continue),
+            key => {
+                emit!(Event::KeyPress { key: 0x1b });
+                emit!(Event::KeyPress { key })
+            }
+        },
+        Sequence::Control => match key {
+            b'<' => Sequence::Mouse(Mouse::new()),
+            b'A' => emit!(Event::KeyPress { key: 0x26 }),
+            b'B' => emit!(Event::KeyPress { key: 0x28 }),
+            b'C' => emit!(Event::KeyPress { key: 0x27 }),
+            b'D' => emit!(Event::KeyPress { key: 0x25 }),
+            _ => Sequence::Char,
+        },
+        Sequence::Mouse(ref mut mouse) => parse!(mouse, key),
+        Sequence::DeviceControl(ref mut dcs) => parse!(dcs, key),
+    }
+}
+
+Pipe
+We have something that sorts of work, at the cost of a steady 400% CPU usage, and that's not counting iTerm2 which uses ~200%. We've got a few problems:
+
+We need too much resources to render at 5 FPS
+We render every time, even when nothing changes
+We print all characters even if they didn't change on an individual level
+
+Modern browsers employ a multi-process architecture to improve security. It separates websites into different processes, reducing the potential damage caused by vulnerabilities. The renderer process is running in an OS-level sandboxed environment that blocks certain system calls, such as file-system access. The GPU process, is also considered unprivileged and cannot reach renderer process in order to protect against vulnerabilities in GPU APIs such as WebGL. In contrast, the browser process, considered privileged, can communicate freely with any process.
+Google ChromeBrowser ProcessGoogle Chrome Helper (Renderer)mouseMove(250, 250)mouseDown(250, 250)glBindBuffer()glDrawArray()👀Eyes🧠Brain🤌HandsRender ProcessmechanicalenergyelectromagneticenergyGitHubsuperintelligent ants risks - Google SearchGoogle Chrome Helper (Renderer)Render ProcessGoogle Chrome Helper (Renderer)Render Processdiy ant farm keyboard - YouTubeGoogle Chrome Helper (GPU)GPU Process
+Renderer process(main)Browser processRenderer process(iframe)1. Get captureGPU processdoing this 60 times a second isn't very efficientCapturePaintPreview is great for html2svg, but it's not designed for real-time rendering. It's using IPC calls to correctly support out-of-process iframes, making roundtrips between the browser, GPU, and renderer processes. It downloads hardware accelerated images from the GPU, explaining the surprising memory bandwidth usage. We can disable the fetching, and even disable hardware acceleration, but we still have an expensive IPC machinery holding us back.Software rendering is still very common, it even used to be the default if you can believe it. It was fairly easy back in the single-process days, but nowadays shared memory regions are configured to efficiently render using multiple processes. If we can get our pixels into one of these memory regions, we would just have to notify our browser process using a simple IPC message.
+void LayeredWindowUpdater::OnAllocatedSharedMemory(
+    const gfx::Size& pixel_size,
+    base::UnsafeSharedMemoryRegion region
+) {
+    if (region.IsValid())
+        shm_mapping_ = region.Map();
+}
+
+void LayeredWindowUpdater::Draw(
+    const gfx::Rect& damage_rect,
+    DrawCallback draw_callback
+) {
+    carbonyl_draw_bitmap(
+        shm_mapping_.GetMemoryAs<uint8_t>(),
+        shm_mapping_.size()
+    );
+
+    std::move(draw_callback).Run();
+}
+
+
+We solved the bitmap problem, now how can we extract text data? This data lives in the renderer process, but our windowing code lives in the browser process. We need to make the renderer interact with the browser process.
+Mojo
+// Our C++ bindings will be in the carbonyl::mojom namespace
+module carbonyl.mojom;
+
+// Import existing bindings to common structures
+import "ui/gfx/geometry/mojom/geometry.mojom";
+import "skia/public/mojom/skcolor.mojom";
+
+// Define a structure to hold text to render
+struct TextData {
+    // An UTF-8 string with the contents
+    string contents;
+    // Bounds, size only defined for clearing
+    gfx.mojom.RectF bounds;
+    // Color of the text
+    skia.mojom.SkColor color;
+};
+
+// The browser process runs this service
+interface CarbonylRenderService {
+    // The renderer process calls this method
+    DrawText(array<TextData> data);
+};
+Mojo is a library for inter-process communication. It defines an IDL for serializing data which supports native handles (i.e. file descriptors, shared memory regions, callbacks), and can be used to generate C++, Java (Android), and JavaScript (DevTools) bindings. It's extensively documented, and fairly simple to use.We'll start by making an interface CarbonylRenderService that runs on the browser process, with a method DrawText called from the renderer process.
+This .mojom code generates C++ temporary files which we can then include to write the implementation code.
+Mojo receivers such as our service are part of the native handles we can send between processes, to register the implementation we just need to add it to the BrowserInterfaceBroker, which will get called by the renderer through BrowserInterfaceBrokerProxy:
+map->Add<carbonyl::mojom::CarbonylRenderService>(
+    base::BindRepeating(&RenderFrameHostImpl::GetCarbonylRenderService,
+                        base::Unretained(host)));
+
+GetBrowserInterfaceBroker().GetInterface(
+  std::move(carbonyl_render_service_receiver_)
+);
+
+Now, we need to get our text data without any expensive round-trip. Blink has a GetPaintRecord() method to get the latest paint data for a page, but it's not behind a public API, which we need because our code runs in the content renderer. Ideally we should hook into the compositor (cc), but it's way more involved. It's dirty but we can workaround this by casting to the private blink::WebViewImpl:
+auto* view = static_cast<blink::WebViewImpl*>(GetWebFrame()->View());
+
+view->MainFrameImpl()->GetFrame()->View()->GetPaintRecord().Playback(&canvas);
+carbonyl_render_service_->DrawText(std::move(data));
+
+Surprise after the first run: the text content doesn't follow the bitmap. Aaah, scrolling and animating is done on the compositor thread, which frees the main thread and makes everything smoother. Let's procastinate doing things right by adding --disable-threaded-scrolling --disable-threaded-animation to the command line arguments.
+Threaded compositing enabledThreaded compositing disabled
+Pretty smooth, it'll be even smoother when threaded compositing is fixed! And we've fixed our biggest problem: we don't use any CPU when idling, and scrolling consumes ~15%.
+Layout
+auto font = state.StyleBuilder().GetFontDescription();
+
+font.SetStretch(ExtraExpandedWidthValue());
+font.SetKerning(FontDescription::kNoneKerning);
+font.SetComputedSize(11.75 / 7.0);
+font.SetGenericFamily(FontDescription::kMonospaceFamily);
+font.SetIsAbsoluteSize(true);
+state.StyleBuilder().SetFontDescription(font);
+state.StyleBuilder().SetLineHeight(Length::Fixed(14.0 / 7.0));
+Thing is, we can only render one font-size, but Blink doesn't know that. This causes the layout to be messed up, with text chunks overlapping or overly spaced. This is especially visible on websites with a lot of textual content and links like Wikipedia.Another dirty - yet effective - hack we can use is forcing a monospaced font on every element. We can do that by adding some code to StyleResolver::ResolveStyle.
+
+
+LoDPI
+// static
+float Display::GetForcedDeviceScaleFactor() {
+    return 1.0 / 7.0;
+}
+
+// static
+bool Display::HasForceDeviceScaleFactor() {
+    return true;
+}
+One expensive step in our rendering pipeline is downscaling: we need to resize the framebuffer from its virtual space to its physical space. What we're doing is kind of the opposite of HiDPI rendering, whose most common ratio is 2, which means 1 pixel on the web equals 4 pixels on the screen. Our ratio is 1 / 7 which means 49 pixels on the web renders to 1 block on our terminal.The annoying thing about HiDPI is that it can make rendering ~4x slower, whereas Carbonyl LoDPI® makes rendering run ~49x faster. We just need to force our scaling into the Display class.
+Color
+I looked for examples of RGB color conversion to xterm-256 but the code I found was either wrong or slow because it did a nearest neighbor search. We're going to do it for every pixel so it should run fast.
+The formula for the conversion is fairly simple, assuming color values between 0 and 1: 16 + r * 5 * 36 + g * 5 * 6 + b * 5.
+pub fn to_xterm(&self) -> u8 {
+    let r = (self.r as f32 - (95.0 - 40.0)).max(0.0) / 40.0;
+    let g = (self.g as f32 - (95.0 - 40.0)).max(0.0) / 40.0;
+    let b = (self.b as f32 - (95.0 - 40.0)).max(0.0) / 40.0;
+
+    (16.0 +
+        r.round() * 36.0 +
+        g.round() * 6.0 +
+        b.round()) as u8
+}
+The twist that most code online gets wrong is that the 6 color levels are not linear: 0, 95, 135, 175, 215, 255; there is a 95 gap between the first and second values, and 40 for the rest.It makes sense to limit the dark range, color differences are more visible with bright colors. For us, it means that we can convert a value between 0 and 255 using max(0, color - 95 - 40) / 40.
+
+
+pub fn to_xterm(&self) -> u8 {
+    if self.max_val() - self.min_val() < 8 {
+        match self.r {
+            0..=4 => 16,
+            5..=8 => 232,
+            238..=246 => 255,
+            247..=255 => 231,
+            r => 232 + (r - 8) / 10,
+        }
+    } else {
+        let scale = 5.0 / 200.0;
+
+        (16.0
+            + self
+                .cast::<f32>()
+                .mul_add(scale, scale * -55.0)
+                .max(0.0)
+                .round()
+                .dot((36.0, 6.0, 1.0))) as u8
+    }
+}
+The conversion itself can be thought of as a dot product of (r, g, b) and (36, 6, 1). We can move the substraction to an mul_add call to help the compiler use a fused multiply-add instruction.The last step is grayscale: our xterm profile offers 256 colors, there are the 216 colors from the RGB cube (6 * 6 * 6), the 16 configurable system colors, and 24 gray levels which go from rgb(8,8,8) to rgb(238,238,238).To find out if a color is on a grayscale, we can substract its minimal value to its maximum value and check if it's under a threshold, let's say 8.
+
+We still have one tiny problem: how can you detect if a terminal supports true-color
+or 256 colors? A quick Google search leads us to the COLORTERM environment variable,
+which is 24bit or truecolor if true-color is supported. But that won't work in
+Docker or SSH, which are our primary targets.
+self.sequence = match self.sequence {
+    // ^[P1$r0;48:2:1:13:37:42m^[\    Code => match key {
+        b'0' | b'1' => Type(key),
+        _ => control_flow!(break)?,
+    },
+    // ^[P1$r0;48:2:1:13:37:42m^[\    Type(code) => match key {
+        b'$' => Status(StatusParser::new(code)),
+        b'+' => Resource(ResourceParser::new(code)),
+        _ => control_flow!(break)?,
+    },
+    // ^[P1$r0;48:2:1:13:37:42m^[\    Status(ref mut status) => return status.parse(key),
+    Resource(ref mut resource) => return resource.parse(key),
+};
+self.sequence = match self.sequence {
+    // ^[P1$r0;48:2:1:13:37:42m^[\    Start => match key {
+        b'r' => Value,
+        _ => control_flow!(break)?,
+    },
+    // ^[P1$r0;48:2:1:13:37:42m^[\    Value => match key {
+        // ^[P1$r0;48:2:1:13:37:42m^[\        0x1b => self.terminate(),
+        // ^[P1$r0;48:2:1:13:37:42m^[\        b';' => self.push_value(),
+        // ^[P1$r0;48:2:1:13:37:42m^[\        char => self.push_char(char),
+    },
+    // ^[P1$r0;48:2:1:13:37:42m^[\    Terminator => control_flow!(break self.parse_event(key))?,
+};
+A trick we can use is a DCS (Device Control Sequence) to fetch a setting value, like the current background color. If we set an RGB value and get an RGB value back, we can enable true-color.You can try it by running the following on your terminal:$ printf "\e[48;2;13;37;42m\eP\$qm\e\\"; cat
+
+\e: start escape sequence
+
+[: introduce control sequence
+48: set foreground
+2: using an RGB color
+13: R is 13
+37: G is 37
+42: B is 42
+m: select graphic rendition
+
+
+\e: start escape sequence
+
+P: introduce device control sequence
+$: enter status mode
+q: query current setting
+m: select graphic rendition
+
+
+If the commands are supported, you should get the following output with a dark turquoise background: ^[P1$r0;48:2:1:13:37:42m^[\ This is what the terminal emulator sends to stdin, and what we can parse to toggle true-color on.
+Title
+niceA few xterm sequences allow setting the terminal window title, we could use that to display the current page title.fn set_title(title: &str) {
+    // Set icon name and window title to string
+    println!("\x1b]0;{}\x07", title);
+    // Set icon name to string
+    println!("\x1b]1;{}\x07", title);
+    // Set window title to string
+    println!("\x1b]2;{}\x07", title);
+}
+To get notified when the title changes, we can simply implement WebContentsObserver::TitleWasSet():void HeadlessWebContentsImpl::TitleWasSet(content::NavigationEntry* entry) {
+    carbonyl::Renderer::Main()->SetTitle(
+        base::UTF16ToUTF8(entry->GetTitleForDisplay())
+    );
+}
+
+Final thoughts
+That's all for today folks, check out Carbonyl on GitHub!
+This was my first Rust project and I finally get the hype now. What a cool language!
+Stay tuned
+The post for next month will be a visual introduction to Fourier Analysis. After that, we'll look into a speculative JS VM in Rust.
+Use the RSS feed to stay tuned, you can also watch the website repo for releases on GitHub.
+Discuss
+Discuss on HN - Discuss on r/programming]]></content:encoded>
+        </item>
+        <item>
+            <title><![CDATA[Coalition for Metabolic Health Launches with $50M]]></title>
+            <link>https://coalitionformetabolichealth.org/news/coalition-for-metabolic-health-launches-as-part-of-50-million-investment-to-tackle-americas-health-crisis/</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45133869</guid>
+            <description><![CDATA[WASHINGTON (September 4) – Launched with seed funding from the Baszucki family’s $50 million commitment to improve metabolic health, the]]></description>
+            <content:encoded><![CDATA[
+					WASHINGTON (September 4) – Launched with seed funding from the Baszucki family’s $50 million commitment to improve metabolic health, the Coalition for Metabolic Health (CMH) — an independent alliance of leading scientists, clinicians, and advocates — will put the issue at the center of America’s fight against chronic disease.
+
+
+
+CMH was conceived by Jan Ellison Baszucki, best-selling author and co-founder of Baszucki Group and Metabolic Mind, and her husband, David Baszucki, founder and CEO of Roblox.
+
+
+
+“Poor metabolic health is fueling America’s health crises in adults and children alike, from diabetes and obesity to depression and anxiety,” said Jan Ellison Baszucki, CMH’s board chair. “For the first time, leading researchers, clinicians, advocates, and policymakers are joining forces to make metabolic health a focus of medical practice. We are committed to making proven dietary and lifestyle interventions — like those that helped our son reclaim his health — a standard aspect of medical care to reverse the course of America’s physical and mental health crises.”
+
+
+
+Chronic disease is the leading cause of death in the United States, with six in 10 Americans living with at least one such condition. More than 90% of Americans have some form of metabolic dysfunction — when the body’s ability to convert food into energy is impaired — a key driver of obesity, diabetes, heart disease, Alzheimer’s, depression, and more.
+
+
+
+CMH aims to:
+
+
+
+
+Drive policy change to align federal nutrition guidelines, research priorities, health screenings, and insurance coverage with metabolic health science.
+
+
+
+Support independent, unbiased research to advance the understanding of metabolism’s impact on disease prevention and treatment, and to deliver trusted nutritional guidance to healthcare providers and the public.
+
+
+
+
+
+Advocate for and educate healthcare providers, policymakers, and the public on the role of metabolic health in preventing and reversing chronic disease.
+
+
+
+Integrate therapeutic nutrition into routine medical care through partnerships with policymakers, health systems, employers, and insurers.
+
+
+
+
+“This coalition of experts has an opportunity to be a critical force driving positive change for millions of Americans,” said David Baszucki, CMH’s co-founder. “At Roblox, we’ve seen firsthand how offering employee benefits that include tools for improving metabolic health can make a difference — and I believe this model can help guide broader change.”
+
+
+
+Drawing on decades of evidence and clinical practice, CMH seeks to shape policy, public awareness, and medical practice so that dietary therapies proven to stabilize blood sugar and improve insulin sensitivity — including low-carbohydrate and ketogenic approaches — become accessible to more people living with or at risk for chronic disease.
+
+
+
+“Mainstream medicine has deprioritized important advances in nutrition science for too long,” said Dr. Bret Scher, CMH’s founding medical director. “By aligning policy and practice with a better understanding of nutrition science and metabolic health, we can change the trajectory of chronic disease in America.”
+
+
+
+CMH’s medical and scientific advisory committee features leaders in community mental health, obesity medicine, cardiology, endocrinology, psychiatry, gastroenterology, obstetrics, internal medicine, and nutrition science, including:
+
+
+
+
+Bret Scher, M.D., cardiologist and lipidologist; medical director of Baszucki Group and Metabolic Mind.
+
+
+
+
+
+Matt Bernstein, M.D., psychiatrist; lecturer in psychiatry, Harvard Medical School; chief medical officer, Ellenhorn; chief medical officer and CEO, Accord Mental Health.
+
+
+
+Benjamin Bikman, Ph.D., professor, Department of Cell Biology and Physiology, Brigham Young University.
+
+
+
+Mark Cucuzzella, M.D., physician, family medicine and obesity medicine; professor, West Virginia University School of Medicine.
+
+
+
+Dominic D’Agostino, Ph.D., associate professor, Department of Molecular Pharmacology and Physiology, University of South Florida Morsani College of Medicine.
+
+
+
+Elizabeth Errico, founder and executive director, Children’s Mental Health Resource Center.
+
+
+
+Karen Jerome-Zapadka, M.D., physician; gastroenterologist; obesity medicine specialist; founder and medical director, Trajectory Health Partners.
+
+
+
+Tro Kalayjian, D.O., physician, internal medicine and obesity medicine; founder, Toward Health.
+
+
+
+Andrew Koutnik, Ph.D., research faculty, Institute for Sport Science & Medicine, Florida State University.
+
+
+
+David Ludwig, M.D., Ph.D., endocrinologist; professor of nutrition, Harvard T.H. Chan School of Public Health; professor of pediatrics, Harvard Medical School; researcher, Boston Children’s Hospital.
+
+
+
+Andrea Salcedo, D.O., assistant professor of obstetrics and gynecology, Loma Linda University School of Medicine.
+
+
+
+Jeff Volek, Ph.D., professor, Department of Human Sciences, The Ohio State University.
+
+
+
+
+For more information and to sign up for our monthly newsletter, visit coalitionformetabolichealth.org.
+
+
+
+###
+
+
+
+About the Coalition for Metabolic Health
+
+
+
+The Coalition for Metabolic Health (CMH) is a national alliance of researchers, clinicians, philanthropists, nonprofits, business leaders, and advocates ushering in a new era in healthcare by making metabolic health mainstream.
+
+
+
+MEDIA CONTACT:
+
+
+
+Ellie Pickel
+
+
+
+ellie@keybridge.biz
+
+
+
+(202) 816-4555
+									]]></content:encoded>
+        </item>
+        <item>
+            <title><![CDATA[Evolving the OCaml Programming Language (2025) [pdf]]]></title>
+            <link>https://kcsrk.info/slides/Evolution_Ashoka_2025.pdf</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45133652</guid>
+        </item>
         <item>
             <title><![CDATA[Updating restrictions of sales to unsupported regions]]></title>
             <link>https://www.anthropic.com/news/updating-restrictions-of-sales-to-unsupported-regions</link>
@@ -50,11 +748,6 @@
    plotters' control after 1990.  AT&T sold its Unix operation to Novell
    around the same time Linux and other free-Unix
    distributions were beginning to make noise.]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[Is the decline of reading making politics dumber?]]></title>
-            <link>https://www.economist.com/culture/2025/09/04/is-the-decline-of-reading-making-politics-dumber</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45133222</guid>
         </item>
         <item>
             <title><![CDATA[I ditched Spotify and set up my own music stack]]></title>
@@ -1987,88 +2680,6 @@ Great way to teach about elderly behavior. I�ve been using this suit for a whi
 
 
 For many years ourage simulation suitGERT has been byfar the most popularproduct worldwide.The EuropeanCompetence Centrefor Accessibility hascertified our agesimulation suit GERT.]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[How we built an interpreter for Swift]]></title>
-            <link>https://www.bitrig.app/blog/swift-interpreter</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45129160</guid>
-            <description><![CDATA[Build apps for your phone, on your phone.]]></description>
-            <content:encoded><![CDATA[Bitrig dynamically generates and runs Swift apps on your phone. Normally this would require compiling and signing with Xcode, and you can’t do that on an iPhone.
-To make it possible to instantly run your app, we built a Swift interpreter. But it’s an unusual interpreter, since it interprets from Swift… to Swift. One of the top questions we’ve gotten is how it’s implemented, so we wanted to share how it works. To make this more accessible and interesting, we simplified some of the more esoteric details. But we hope you’ll come away with a high-level picture of how the interpreter works.
-The Swift project helpfully provides a way to reuse all of the parsing logic from the compiler: SwiftSyntax. This made our job a lot easier. We can easily take some Swift code and get a parsed tree out of it, which we can use to evaluate and call into to get dynamic runtime values. Let’s dig deeper.
-We can start with generating the simplest kind of runtime values. For any literals (strings, floating point numbers, integers, and booleans), we can create corresponding Swift instances (String, Double, Int, Bool) to represent them. Since we’re not compiling this, we don’t know ahead of time what all the types will be, so we need to type erase all instances. Let’s make an enum to represent these runtime interpreter values (since we'll have multiple kinds soon):
-enum InterpreterValue {
-    case nativeValue(Any)
-}
-
-Next, we'll expand our interpreter runtime values to be able to represent developer-defined types, too. Let’s say we have a struct with two fields: a string and an integer. We’ll store it as a type that has a dictionary mapping from the property name to the runtime value. When an initializer gets called, we simply need to map the arguments to the property names and populate the dictionary.
-enum InterpreterValue {
-    case nativeValue(Any)
-    case customInstance(CustomInstance)
-}
-struct CustomInstance {
-    var type: InterpreterType
-    var values: [String: InterpreterValue]
-}
-
-But, what happens when we want to call an API that comes from a framework, like SwiftUI? For example, let’s say we have a call to Text("Hello World"). We don’t want to rewrite all of the APIs, the whole benefit of making a native app is being able to call into those implementations! Well, those APIs are available for us to call into since the interpreter is also written in Swift (naturally!). We just need to change from a dynamic call to a compiled one. We can do that by pre-compiling a call to the Text initializer that can take dynamic arguments. Something like this:
-func evaluateTextInitializer(arguments: [Argument]) -> Text {
-  Text(arguments.first?.value.stringValue ?? "")
-}
-
-But of course, we need more than just the Text initializer, so we'll generalize this to any initializer we might be called with:
-func evaluateInitializer(type: String, arguments: [Argument]) -> Any? {
-  if type == "Text" {
-    return Text(arguments.first?.value.stringValue ?? "")
-  } else if type == "Image" {
-    return Image(arguments.first?.value.stringValue ?? "")
-  ...
-}
-
-We can follow this same pattern for all other API types: function calls, properties, subscripts, etc. The difficult part is that there are a lot of APIs. It’s not practical to hand-write code to call into all of them, but fortunately there is a structured list of all of them: the .swiftinterface file for each framework. We can parse those files to get a list of all of the APIs we need and then generate the necessary code to call into them.
-One interesting thing about taking this approach to its most extreme is that even very basic operations that you might expect any interpreter to implement, like basic numeric operations, can still call into their framework implementations. So this kind of interpreter doesn’t know how to calculate or evaluate anything itself, and is really more of a glorified foreign function interface, but from dynamic Swift to compiled Swift.
-One last important challenge is how to make custom types conform to framework protocols. For example, how do we make a custom SwiftUI View? Well, at runtime, we need a concrete type that conforms to the desired protocol. To do this, we can make stub types that conform to the protocol, but instead of having any logic of their own, simply call out to the interpreter to implement any requirements. Let’s look at Shape, a simple example:
-struct ShapeStub: Shape {
-    var interpreter: Interpreter
-    var instance: CustomInstance
-
-    var layoutDirectionBehavior: LayoutDirectionBehavior {
-        instance.instanceMemberProperty("layoutDirectionBehavior", interpreter: interpreter).layoutDirectionBehaviorValue
-    }
-    func path(in rect: CGRect) -> Path {
-        let arguments = [Argument(label: "in", value: rect)]
-        return instance.instanceFunction("path", arguments: arguments, interpreter: interpreter).pathValue
-    }
-}
-
-Coming back to View, this works the same way, with a little extra complexity because of the associated type that we have to type erase:
-struct ViewStub: View {
-    var interpreter: Interpreter
-    var instance: CustomInstance
-
-    var body: AnyView {
-        instance.instanceMemberProperty("body", interpreter: interpreter).viewValue
-            .map { AnyView($0) }
-  }
-}
-
-And now we can make views that have dynamic implementations!
-That’s a broad survey of how the interpreter is implemented. If you want to try it out in practice, download Bitrig!
-If there’s more you want to know about the interpreter, or Bitrig as a whole, let us know!]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[Stripe Launches L1 Blockchain: Tempo]]></title>
-            <link>https://tempo.xyz</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45129085</guid>
-            <description><![CDATA[A neutral, permissionless blockchain optimized for payment processing, enabling efficient transactions with predictable low fees and stablecoin interoperability.]]></description>
-            <content:encoded><![CDATA[Why create anew blockchain?Stablecoins enable instant, borderless, programmable transactions, but current blockchain infrastructure isn’t designed for them: existing systems are either fully general or trading-focused. Tempo is a blockchain designed and built for real-world payments.Optimized forreal-world flowsTempo was started by Stripe and Paradigm, with design input from Anthropic, Coupang, Deutsche Bank, DoorDash, Lead Bank, Mercury, Nubank, OpenAI, Revolut, Shopify, Standard Chartered, Visa, and more.If you’re a company with large, real-world economic flows and would like to help shape the future of Tempo, get in touch.Partner with usTransform how your business  moves money01 :: Purpose-built payments capabilitiesOptimize your financial flows with embedded payment features, including memo fields and batch transfers.02 :: Speed and reliabilityProcess over 100,000 transactions per second (TPS) with sub-second finality, enabling real-time payments at a global scale.03 :: Predictable low feesTransform your cost structure with near-zero transaction fees that are highly predictable and can be paid in any stablecoin.04 :: Built-in privacy measuresProtect your users by keeping important transaction details private while maintaining compliance standards.Performant and scalable for any payments use case01 :: RemittancesSend money across borders instantly, securely, and at a fraction of traditional costs.02 :: Global payoutsPay anyone, anywhere, in any currency—without banking delays or fees.03 :: Embedded financeBuild compliant, programmable payments—in any stablecoin—directly into your products.04 :: MicrotransactionsEnable sub-cent payments for digital goods and on-demand services.05 :: Agentic commerceFacilitate low-cost, instant payments for agents to autonomously execute transactions.06 :: Tokenized depositsMove customer funds onchain for instant settlement and efficient interbank transfers.Technicalfeatures01 :: Fee flexibilityPay transaction fees in any stablecoin.02 :: Dedicated payments laneTransfer funds cheaply and reliably in blockspace that’s isolated from other activity.03 :: Stablecoin interoperabilitySwap stablecoins, including custom-issued ones, natively with low fees.04 :: Batch transfersSend multiple transactions onchain at once with native account abstraction.05 :: Blocklists / allowlistsMeet compliance standards by setting user-level permissions for transactions.06 :: Memo fieldsSpeed up reconciliation with offchain transactions by adding context that’s compatible with ISO 20022 standards.Frequentlyasked questions01 :: How is Tempo different from other blockchains?Tempo is an EVM-compatible L1 blockchain, purpose-built for payments. It doesn’t displace other general-purpose blockchains; rather, it incorporates design choices that meet the needs of high-volume payment use cases. These include predictable low fees in a dedicated payments lane, stablecoin neutrality, a built-in stablecoin exchange, high throughput, low latency, private transactions, payment memos compatible with standards like ISO 20022, compliance hooks, and more.02 :: Who can build on Tempo?Tempo is a neutral, permissionless blockchain open for anyone to build on. We’re currently collaborating with global partners to test various use cases, including cross-border payouts, B2B payments, remittances, and ecommerce. Interested in working with Tempo? Request access to our private testnet here.03 :: When will Tempo launch?We’re providing select partners with priority access to our testnet now. Contact us here if you’re interested.04 :: Who will run validator nodes?A diverse group of independent entities, including some of Tempo’s design partners, will run validator nodes initially before we transition to a permissionless model.]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[Launch HN: Slashy (YC S25) – AI that connects to apps and does tasks]]></title>
-            <link>https://news.ycombinator.com/item?id=45129031</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45129031</guid>
-            <description><![CDATA[Hi HN! – We’re Pranjali, Dhruv and Harsha, building Slashy (https://www.slashy.ai). We’re building a general agent that connects to apps and can read data across them and perform actions via custom tools, semantic search, and personalized memory. Here’s a demo: https://www.youtube.com/watch?v=OeApHMHhccA.]]></description>
-            <content:encoded><![CDATA[Launch HN: Slashy (YC S25) – AI that connects to apps and does tasks54 points by hgaddipa001 8 hours ago  | hide | past | favorite | 86 commentsHi HN! – We’re Pranjali, Dhruv and Harsha, building Slashy (https://www.slashy.ai). We’re building a general agent that connects to apps and can read data across them and perform actions via custom tools, semantic search, and personalized memory. Here’s a demo: https://www.youtube.com/watch?v=OeApHMHhccA.While working on a previous startup, we realized we were spending more time doing busywork in apps than actually building product. We lost hundreds of hours scraping LinkedIn profiles, updating spreadsheets, updating investor reports, and communicating across multiple Slack channels. Our breaking point happened after I checked my screen time and realized I spent 4 hours a day in Gmail. We decided that we could create more value solving this than by working on the original startup (a code generation agent similar to Lovable).Slashy is an AI agent that uses direct tool calls to services such as Gmail, Calendar, Notion, Sheets and more. We built all of our tools in-house since we found that most MCPs are low quality and add an unnecessary layer of abstraction. Through these tools, the agent is able to semantically search across your apps, get relevant information, and perform actions (e.g. send emails, create calendar events, etc). This solves the problem of context-switching and copy-pasting information from an app back and forth into ChatGPT.Slashy integrates to 15 different services so far (G-Suite, Slack, Notion, Dropbox, Airtable, Outlook, Phone, Linear, Hubspot, and more). We use a single agent architecture (as we found this reduces hallucinations), and use our own custom tools—doing so allows the model to have higher quality as we can design them to work in a general agent structure, for example we use markdown for Slack/Notion instead of their native text structure.So what makes Slashy different from the 100 other general agents?- It Actually Takes Action: Unlike ChatGPT or Claude that just give you information, Slashy researches companies, creates Google Docs with findings, adds contacts to your CRM, schedules follow-ups, and sends personalized emails – all in one workflow.- Cross-Tool Context: Most automation tools work in silos (one of the biggest problems with MCP). Slashy understands your data across platforms. It can read your previous Slack conversations about a prospect, check your calendar for availability, research their company online, and draft a personalized email. What powers this is our own semantic search functionality.- User Action Graphs: Our agent over time has memory not just of past conversations, but also forms user actions graphs to know what actions are expected based on previous user conversations.- No Technical Setup Required: While Zapier requires building complex flows and fails silently, Slashy works through natural language. Just describe what you want automated.- Custom UI: For our tool calls we design custom UI for each of them to make the UX more natural.Here are some examples of workflows people use us for:▪ "Every day look at my calendar and send me a notion doc with in-depth backgrounds on everyone I’m meeting"▪ "Find the emails of everyone who reacted to my latest LinkedIn post and send personalized outreach"▪ "Can you make me an investor pitch deck with market research, competitive analysis, and financial projections"▪ "Doing a full Nvidia Discounted Cash Flow (DCF) analysis"Slashy.ai is live with a free tier (100 daily credits) along with 500 credits for any new account. You can immediately try out workflows like the ones above and we have a special code for HN (HACKERNEWS at checkout).Hope you all enjoy Slashy as much as we do :)]]></content:encoded>
         </item>
     </channel>
 </rss>
