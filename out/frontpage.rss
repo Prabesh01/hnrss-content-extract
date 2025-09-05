@@ -4,162 +4,1643 @@
         <title>Hacker News: Front Page</title>
         <link>https://news.ycombinator.com/</link>
         <description>Hacker News RSS</description>
-        <lastBuildDate>Fri, 05 Sep 2025 15:32:18 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 05 Sep 2025 15:51:24 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>github.com/Prabesh01/hnrss-content-extract</generator>
         <language>en</language>
         <atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/frontpage.rss" rel="self" type="application/rss+xml"/>
         <item>
+            <title><![CDATA[Protobuffers Are Wrong]]></title>
+            <link>https://reasonablypolymorphic.com/blog/protos-are-wrong/</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45139656</guid>
+            <description><![CDATA[I’ve spent a good deal of my professional life arguing against using protobuffers. They’re clearly written by amateurs, unbelievably ad-hoc, mired in gotchas, tricky to compile, and solve a problem that nobody but Google really has. If these problems of protobuffers remained quarantined in serialization abstractions, my complaints would end there. But unfortunately, the bad design of protobuffers is so persuasive that these problems manage to leak their way into your code as well.]]></description>
+            <content:encoded><![CDATA[
+    I’ve spent a good deal of my professional life arguing against using protobuffers. They’re clearly written by amateurs, unbelievably ad-hoc, mired in gotchas, tricky to compile, and solve a problem that nobody but Google really has. If these problems of protobuffers remained quarantined in serialization abstractions, my complaints would end there. But unfortunately, the bad design of protobuffers is so persuasive that these problems manage to leak their way into your code as well.
+Ad-Hoc and Built By Amateurs
+Stop. Put away your email client that is half-way through writing me about how “Google is filled with the world’s best engineers,” and that “anything they build is, by definition, not built by amateurs.” I don’t want to hear it.
+Let’s just get this out of the way. Full disclosure: I used to work at Google. It was the first (but unfortunately, not the last) place I ever used protobuffers. All of the problems I want to talk about today exist inside of Google’s codebase; it’s not just a matter of “using protobuffers wrong” or some such nonsense like that.
+By far, the biggest problem with protobuffers is their terrible type-system. Fans of Java should feel right at home with protobuffers, but unfortunately, literally nobody considers Java to have a well-designed type-system. The dynamic typing guys complain about it being too stifling, while the static typing guys like me complain about it being too stifling without giving you any of the things you actually want in a type-system. Lose lose.
+The ad-hoc-ness and the built-by-amateurs-itude go hand-in-hand. So much of the protobuffer spec feels bolted on as an afterthought that it clearly was bolted on as an afterthought. Many of its restrictions will make you stop, scratch your head and ask “wat?” But these are just symptoms of the deeper answer, which is this:
+Protobuffers were obviously built by amateurs because they offer bad solutions to widely-known and already-solved problems.
+No Compositionality
+Protobuffers offer several “features”, but none of them see to work with one another. For example, look at the list of orthogonal-yet-constrained typing features that I found by skimming the documentation.
+
+oneof fields can’t be repeated.
+map<k,v> fields have dedicated syntax for their keys and values, but this isn’t used for any other types.
+Despite map fields being able to be parameterized, no user-defined types can be. This means you’ll be stuck hand-rolling your own specializations of common data structures.
+map fields cannot be repeated.
+map keys can be strings, but can not be bytes. They also can’t be enums, even though enums are considered to be equivalent to integers everywhere else in the protobuffer spec.
+map values cannot be other maps.
+
+This insane list of restrictions is the result of unprincipled design choices and bolting on features after the fact. For example, oneof fields can’t be repeated because rather than resulting in a coproduct type, instead the code generator will give you a product of mutually-exclusive optional fields. Such a transformation is only valid for a singular field (and, as we’ll see later, not even then.)
+The restriction behind map fields being unable to be repeated is related, but shows off a different limitation of the type-system. Behind the scenes, a map<k,v> is desugared into something spiritually similar to repeated Pair<k,v>. And because repeated is a magical language keyword rather than a type in its own right, it doesn’t compose with itself.
+Your guess is as good as mine for why an enum can’t be used as a map key.
+What’s so frustrating about all of this is a little understanding of how modern type-systems work would be enough to drastically simplify the protobuffer spec and simultaneously remove all of the arbitrary restrictions.
+The solution is as follows:
+
+Make all fields in a message required. This makes messages product types.
+Promote oneof fields to instead be standalone data types. These are coproduct types.
+Give the ability to parameterize product and coproduct types by other types.
+
+That’s it! These three features are all you need in order to define any possible piece of data. With these simpler pieces, we can re-implement the rest of the protobuffer spec in terms of them.
+For example, we can rebuild optional fields:
+product Unit {
+  // no fields
+}
+
+coproduct Optional<t> {
+  t    value = 0;
+  Unit unset = 1;
+}
+Building repeated fields is simple too:
+coproduct List<t> {
+  Unit empty = 0;
+  Pair<t, List<t>> cons = 1;
+}
+Of course, the actual serialization logic is allowed to do something smarter than pushing linked-lists across the network—after all, implementations and semantics don’t need to align one-to-one.
+Questionable Choices
+In the vein of Java, protobuffers make the distinction between scalar types and message types. Scalars correspond more-or-less to machine primitives—things like int32, bool and string. Messages, on the other hand, are everything else. All library- and user-defined types are messages.
+The two varieties of types have completely different semantics, of course.
+Fields with scalar types are always present. Even if you don’t set them. Did I mention that (at least in proto31) all protobuffers can be zero-initialized with absolutely no data in them? Scalar fields get false-y values—uint32 is initialized to 0 for example, and string is initialized as "".
+It’s impossible to differentiate a field that was missing in a protobuffer from one that was assigned to the default value. Presumably this decision is in place in order to allow for an optimization of not needing to send default scalar values over the wire. Presumably, though the encoding guide makes no mention of this optimization being performed, so your guess is as good as mine.
+As we’ll see when we discuss protobuffers’ claim to being god’s gift to backwards- and forwards-compatible APIs, this inability to distinguish between unset and default values is a nightmare. Especially if indeed it’s a design decision made in order to save one bit (set or not) per field.
+Contrast this behavior against message types. While scalar fields are dumb, the behavior for message fields is outright insane. Internally, message fields are either there or they’re not—but their behavior is crazy. Some pseudocode for their accessor is worth a thousand words. Pretend this is Java or something similar:
+private Foo m_foo;
+
+public Foo foo {
+  // only if `foo` is used as an expression
+  get {
+    if (m_foo != null)
+      return m_foo;
+    else
+      return new Foo();
+  }
+
+  // instead if `foo` is used as an lvalue
+  mutable get {
+    if (m_foo = null)
+      m_foo = new Foo();
+    return m_foo;
+  }
+}
+The idea is that if the foo field is unset, you’ll see a default-initialized copy whenever you ask for it, but won’t actually modify its container. But if you modify foo, it will modify its parent as well! All of this just to avoid using a Maybe Foo type and the associated “headaches” of the nuance behind needing to figure out what an unset value should mean.
+This behavior is especially egregious, because it breaks a law! We’d expect the assignment msg.foo = msg.foo; to be a no-op. Instead the implementation will actually silently change msg to have a zero-initialized copy of foo if it previously didn’t have one.
+Unlike scalar fields, at least it’s possible to detect if a message field is unset. Language bindings for protobuffers offer something along the lines of a generated bool has_foo() method. In the frequent case of copying a message field from one proto to another, iff it was present, you’ll need to write the following code:
+if (src.has_foo(src)) {
+  dst.set_foo(src.foo());
+}
+Notice that, at least in statically-typed languages, this pattern cannot be abstracted due to the nominal relationship between the methods foo(), set_foo() and has_foo(). Because all of these functions are their own identifiers, we have no means of programmatically generating them, save for a preprocessor macro:
+#define COPY_IFF_SET(src, dst, field) \
+if (src.has_##field(src)) { \
+  dst.set_##field(src.field()); \
+}
+(but preprocessor macros are verboten by the Google style guide.)
+If instead all optional fields were implemented as Maybes, you’d get abstract-able, referentially transparent call-sites for free.
+To change tack, let’s talk about another questionable decision. While you can define oneof fields in protobuffers, their semantics are not of coproduct types! Rookie mistake my dudes! What you get instead is an optional field for each case of the oneof, and magic code in the setters that will just unset any other case if this one is set.
+At first glance, this seems like it should be semantically equivalent to having a proper union type. But instead it is an accursed, unutterable source of bugs! When this behavior teams up with the law-breaking implementation of msg.foo = msg.foo;, it allows this benign-looking assignment to silently delete arbitrary amounts of data!
+What this means at the end of the day is that oneof fields do not form law-abiding Prisms, nor do messages form law-abiding Lenses. Which is to say good luck trying to write bug-free, non-trivial manipulations of protobuffers. It is literally impossible to write generic, bug-free, polymorphic code over protobuffers.
+That’s not the sort of thing anybody likes to hear, let alone those of us who have grown to love parametric polymorphism—which gives us the exact opposite promise.
+The Lie of Backwards- and Forwards-Compatibility
+One of the frequently cited killer features of protobuffers is their “hassle-free ability to write backwards- and forwards-compatible APIs.” This is the claim that has been pulled over your eyes to blind you from the truth.
+What protobuffers are is permissive. They manage to not shit the bed when receiving messages from the past or from the future because they make absolutely no promises about what your data will look like. Everything is optional! But if you need it anyway, protobuffers will happily cook up and serve you something that typechecks, regardless of whether or not it’s meaningful.
+This means that protobuffers achieve their promised time-traveling compatibility guarantees by silently doing the wrong thing by default. Of course, the cautious programmer can (and should) write code that performs sanity checks on received protobuffers. But if at every use-site you need to write defensive checks ensuring your data is sane, maybe that just means your deserialization step was too permissive. All you’ve managed to do is decentralize sanity-checking logic from a well-defined boundary and push the responsibility of doing it throughout your entire codebase.
+One possible argument here is that protobuffers will hold onto any information present in a message that they don’t understand. In principle this means that it’s nondestructive to route a message through an intermediary that doesn’t understand this version of its schema. Surely that’s a win, isn’t it?
+Granted, on paper it’s a cool feature. But I’ve never once seen an application that will actually preserve that property. With the one exception of routing software, nothing wants to inspect only some bits of a message and then forward it on unchanged. The vast majority of programs that operate on protobuffers will decode one, transform it into another, and send it somewhere else. Alas, these transformations are bespoke and coded by hand. And hand-coded transformations from one protobuffer to another don’t preserve unknown fields between the two, because it’s literally meaningless.
+This pervasive attitude towards protobuffers always being compatible rears its head in other ugly ways. Style guides for protobuffers actively advocate against DRY and suggest inlining definitions whenever possible. The reasoning behind this is that it allows you to evolve messages separately if these definitions diverge in the future. To emphasize that point, the suggestion is to fly in the face of 60 years’ worth of good programming practice just in case maybe one day in the future you need to change something.
+At the root of the problem is that Google conflates the meaning of data with its physical representation. When you’re at Google scale, this sort of thing probably makes sense. After all, they have an internal tool that allows you to compare the finances behind programmer hours vs network utilization vs the cost to store \(x\) bytes vs all sorts of other things. Unlike most companies in the tech space, paying engineers is one of Google’s smallest expenses. Financially it makes sense for them to waste programmers’ time in order to shave off a few bytes.
+Outside of the top five tech companies, none of us is within five orders of magnitude of being Google scale. Your startup cannot afford to waste engineer hours on shaving off bytes. But shaving off bytes and wasting programmers’ time in the process is exactly what protobuffers are optimized for.
+Let’s face it. You are not Google scale and you never will be. Stop cargo-culting technology just because “Google uses it” and therefore “it’s an industry best-practice.”
+Protobuffers Contaminate Codebases
+If it were possible to restrict protobuffer usage to network-boundaries I wouldn’t be nearly as hard on it as a technology. Unfortunately, while there are a few solutions in principle, none of them is good enough to actually be used in real software.
+Protobuffers correspond to the data you want to send over the wire, which is often related but not identical to the actual data the application would like to work with. This puts us in the uncomfortable position of needing to choose between one of three bad alternatives:
+
+Maintain a separate type that describes the data you actually want, and ensure that the two evolve simultaneously.
+Pack rich data into the wire format for application use.
+Derive rich information every time you need it from a terse wire format.
+
+Option 1 is clearly the “right” solution, but its untenable with protobuffers. The language isn’t powerful enough to encode types that can perform double-duty as both wire and application formats. Which means you’d need to write a completely separate datatype, evolve it synchronously with the protobuffer, and explicitly write serialization code between the two. Seeing as most people seem to use protobuffers in order to not write serialization code, this is obviously never going to happen.
+Instead, code that uses protobuffers allows them to proliferate throughout the codebase. True story, my main project at Google was a compiler that took “programs” written in one variety of protobuffer, and spit out an equivalent “program” in another. Both the input and output formats were expressive enough that maintaining proper parallel C++ versions of them could never possibly work. As a result, my code was unable to take advantage of any of the rich techniques we’ve discovered for writing compilers, because protobuffer data (and resulting code-gen) is simply too rigid to do anything interesting.
+The result is that a thing that could have been 50 lines of recursion schemes was instead 10,000 lines of ad-hoc buffer-shuffling. The code I wanted to write was literally impossible when constrained by having protobuffers in the mix.
+While this is an anecdote, it’s not in isolation. By virtue of their rigid code-generation, manifestations of protobuffers in languages are never idiomatic, nor can they be made to be—short of rewriting the code-generator.
+But even then, you still have the problem of needing to embed a shitty type-system into the targeted language. Because most of protobuffers’ features are ill-conceived, these unsavory properties leak into our codebases. It means we’re forced to not only implement, but also use these bad ideas in any project which hopes to interface with protobuffers.
+While it’s easy to implement inane things out of a solid foundation, going the other direction is challenging at best and the dark path of Eldrich madness at worst.
+In short, abandon all hope ye who introduce protobuffers into your projects.
+
+
+
+To this day, there’s a raging debate inside Google itself about proto2 and whether fields should ever be marked as required. Manifestos with both titles “optional considered harmful” and “required considered harmful.” Good luck sorting that out.↩︎
+
+
+
+
+    
+        ←
+    
+    
+        →
+    
+
+
+]]></content:encoded>
+        </item>
+        <item>
+            <title><![CDATA[A computer upgrade has shut down BART]]></title>
+            <link>https://www.bart.gov/news/articles/2025/news20250905</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45139270</guid>
+            <content:encoded><![CDATA[
+
+    
+
+  
+    
+        
+    
+
+
+
+
+      
+    
+  
+
+  
+
+        
+        
+                      
+    Main navigation
+    
+
+              
+
+              
+        
+                                
+          
+            Schedules
+                      
+
+                                            
+                              
+        
+                                
+          
+            Schedules
+                      
+
+                            
+          
+                                
+          
+            Real Time Departures
+                      
+
+                            
+          
+                                
+          
+            Line Schedule Timetables
+                      
+
+                            
+          
+                                
+          
+            Caltrain Transfer Timetables
+                      
+
+                            
+          
+                                
+          
+            Trip Planner
+                      
+
+                            
+          
+                                
+          
+            Alerts and Advisories
+                      
+
+                            
+          
+                                
+          
+            Early Bird Express
+                      
+
+                            
+          
+                                
+          
+            Capitol Corridor Transfer Timetables
+                      
+
+                            
+          
+                                
+          
+            Weather Guide
+                      
+
+                            
+              
+  
+                                  
+
+
+
+
+  
+  
+  
+
+                              
+                  
+          
+                                
+          
+            Stations
+                      
+
+                                            
+                              
+        
+                                
+          
+            Stations
+                      
+
+                            
+          
+                                
+          
+            System Map
+                      
+
+                            
+          
+                                
+          
+            Elevator Status
+                      
+
+                            
+          
+                                
+          
+            Escalator Status
+                      
+
+                            
+              
+  
+                                  
+
+
+
+
+  
+  
+  
+
+                              
+                  
+          
+                                
+          
+            Using BART
+                      
+
+                                            
+                              
+        
+                                
+          
+            Using BART
+                      
+
+                            
+          
+                                
+          
+            BART Apps
+                      
+
+                            
+          
+                                
+          
+            Parking
+                      
+
+                                            
+                              
+        
+                                
+          
+            Parking Overview
+                      
+
+                            
+          
+                                
+          
+            Parking Citations
+                      
+
+                            
+          
+                                
+          
+            Carpool to BART
+                      
+
+                            
+          
+                                
+          
+            Electric Vehicle (EV)
+                      
+
+                            
+          
+                                
+          
+            Parking Pricing
+                      
+
+                            
+          
+                                
+          
+            Parking FAQ
+                      
+
+                            
+          
+                                
+          
+            Pay By App
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            Airport Connections
+                      
+
+                                            
+                              
+        
+                                
+          
+            San Francisco International Airport (SFO)
+                      
+
+                            
+          
+                                
+          
+            Oakland International Airport (OAK)
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            Transit Connections
+                      
+
+                            
+          
+                                
+          
+            Bikes on BART
+                      
+
+                                            
+                              
+        
+                                
+          
+            Bikes on BART
+                      
+
+                            
+          
+                                
+          
+            Bike FAQ
+                      
+
+                            
+          
+                                
+          
+            Bike Rules
+                      
+
+                            
+          
+                                
+          
+            Bike Task Force
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            Holiday Schedule
+                      
+
+                            
+          
+                                
+          
+            Social Resources
+                      
+
+                            
+          
+                                
+          
+             Electric Personal Assistive Mobility Devices Program (EPAMD)
+                      
+
+                            
+          
+                                
+          
+            Accessibility
+                      
+
+                                            
+                              
+        
+                                
+          
+            Accessibility Overview
+                      
+
+                            
+          
+                                
+          
+            Elevator Status
+                      
+
+                            
+          
+                                
+          
+            Paratransit
+                      
+
+                            
+          
+                                
+          
+            Regional Transit Connection (RTC) Card
+                      
+
+                            
+          
+                                
+          
+            BART Accessibility Task Force
+                      
+
+                            
+          
+                                
+          
+            Accessibility Contacts
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            FAQs
+                      
+
+                            
+          
+                                
+          
+            Lost & Found
+                      
+
+                            
+          
+                                
+          
+            Safety & Security
+                      
+
+                                            
+                              
+        
+                                
+          
+            Security on BART
+                      
+
+                            
+          
+                                
+          
+            Addressing Gender Based Violence
+                      
+
+                            
+          
+                                
+          
+            Injury Prevention
+                      
+
+                            
+          
+                                
+          
+            Public Safety Power Shutoffs (PSPS)
+                      
+
+                            
+          
+                                
+          
+            Earthquake Safety
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            Title VI
+                      
+
+                            
+          
+                                
+          
+            Service Animals/Pets
+                      
+
+                            
+          
+                                
+          
+            Wireless Connections
+                      
+
+                            
+          
+                                
+          
+            Brochures
+                      
+
+                            
+          
+                                
+          
+            Restrooms at BART
+                      
+
+                            
+          
+                                
+          
+            Safe & Clean Plan
+                      
+
+                            
+              
+  
+                                  
+
+
+
+
+  
+  
+  
+    Bikes are Welcome
+    Just follow a few simple rules when taking your bike on BART
+    Read More
+  
+
+                              
+                  
+          
+                                
+          
+            Fares
+                      
+
+                                            
+                              
+        
+                                
+          
+            Fares and Pay by Phone
+                      
+
+                            
+          
+                                
+          
+            Clipper Customer Service
+                      
+
+                            
+          
+                                
+          
+            Purchasing and Group Sales
+                      
+
+                            
+          
+                                
+          
+            Discounts
+                      
+
+                            
+          
+                                
+          
+            Tax Benefits
+                      
+
+                            
+          
+                                
+          
+            Fare Calculator
+                      
+
+                            
+          
+                                
+          
+            Refunds
+                      
+
+                            
+              
+  
+                                  
+
+
+
+
+  
+  
+  
+
+                              
+                  
+          
+                                
+          
+            News
+                      
+
+                                            
+                              
+        
+                                
+          
+            News
+                      
+
+                            
+          
+                                
+          
+            Fun Stuff
+                      
+
+                                            
+                              
+        
+                                
+          
+            Fun Stuff
+                      
+
+                            
+          
+                                
+          
+            The Machines of BART
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            Podcasts
+                      
+
+                            
+          
+                                
+          
+            Media Resources
+                      
+
+                            
+          
+                                
+          
+            News Alerts
+                      
+
+                                            
+                              
+        
+                                
+          
+            Email and Text Subscriptions
+                      
+
+                            
+          
+                                
+          
+            Real Time Departure
+                      
+
+                            
+          
+                                
+          
+            Active Service Alert
+                      
+
+                            
+          
+                                
+          
+            BART Apps
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            RSS Feeds
+                      
+
+                            
+          
+                                
+          
+            BARTable
+                      
+
+                            
+          
+                                
+          
+            BART TV
+                      
+
+                            
+              
+  
+                                  
+
+
+
+
+  
+  
+  
+    News Alerts
+    Stay up-to-date with News Alerts sent by email or text
+    Sign Up
+  
+
+                              
+                  
+          
+                                
+          
+            About
+                      
+
+                                            
+                              
+        
+                                
+          
+            About
+                      
+
+                            
+          
+                                
+          
+            Board of Directors
+                      
+
+                                            
+                              
+        
+                                
+          
+            Board of Directors
+                      
+
+                            
+          
+                                
+          
+            Agenda & Minutes
+                      
+
+                            
+          
+                                
+          
+            Advisory Committees
+                      
+
+                            
+          
+                                
+          
+            Meeting Video
+                      
+
+                            
+          
+                                
+          
+            Meeting Notices Via Email
+                      
+
+                            
+          
+                                
+          
+            2020 Board Meeting Schedule (PDF)
+                      
+
+                            
+          
+                                
+          
+            Public Participation at Meetings (PDF)
+                      
+
+                            
+          
+                                
+          
+            Board Adopted Policies
+                      
+
+                            
+          
+                                
+          
+            Director Elections
+                      
+
+                            
+          
+                                
+          
+            Legislative Advocacy
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            General Manager
+                      
+
+                            
+          
+                                
+          
+            Financials
+                      
+
+                                            
+                              
+        
+                                
+          
+            Budget Archive
+                      
+
+                            
+          
+                                
+          
+            Financial Crisis
+                      
+
+                            
+          
+                                
+          
+            BART Grants
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            Reports
+                      
+
+                            
+          
+                                
+          
+            Inspector General
+                      
+
+                                            
+                              
+        
+                                
+          
+            Inspector General
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            Facts & History
+                      
+
+                                            
+                              
+        
+                                
+          
+            Facts & History
+                      
+
+                            
+          
+                                
+          
+            Historical Films
+                      
+
+                            
+          
+                                
+          
+            Historical Timeline (PDF)
+                      
+
+                            
+          
+                                
+          
+            System Facts
+                      
+
+                            
+          
+                                
+          
+            Car Types
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            Projects & Plans
+                      
+
+                                            
+                              
+        
+                                
+          
+            Projects & Plans
+                      
+
+                            
+          
+                                
+          
+            System Rebuilding
+                      
+
+                            
+          
+                                
+          
+            New BART Train Cars
+                      
+
+                            
+          
+                                
+          
+            Train Control Modernization
+                      
+
+                            
+          
+                                
+          
+            Hayward Maintenance Complex
+                      
+
+                            
+          
+                                
+          
+            Planning
+                      
+
+                            
+          
+                                
+          
+            Station Modernization
+                      
+
+                            
+          
+                                
+          
+            Transit-Oriented Development (TOD)
+                      
+
+                            
+          
+                                
+          
+            Earthquake Safety
+                      
+
+                            
+          
+                                
+          
+            Silicon Valley Extension
+                      
+
+                            
+          
+                                
+          
+            Transbay Capacity Relief
+                      
+
+                            
+          
+                                
+          
+            New Fare Gates
+                      
+
+                            
+          
+                                
+          
+            Legacy Fleet Decommissioning
+                      
+
+                            
+          
+                                
+          
+            Future Irvington Station
+                      
+
+                            
+          
+                                
+          
+            Role In The Region
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            BART Police
+                      
+
+                                            
+                              
+        
+                                
+          
+            BART Police
+                      
+
+                            
+          
+                                
+          
+            People of BART PD
+                      
+
+                            
+          
+                                
+          
+            Latest News
+                      
+
+                            
+          
+                                
+          
+            Know Your Zone
+                      
+
+                            
+          
+                                
+          
+            BART Watch App
+                      
+
+                            
+          
+                                
+          
+            Employment
+                      
+
+                            
+          
+                                
+          
+            How To
+                      
+
+                            
+          
+                                
+          
+            Policy & Reports
+                      
+
+                            
+          
+                                
+          
+            Proof of Payment
+                      
+
+                            
+          
+                                
+          
+            Contact BART Police
+                      
+
+                            
+          
+                                
+          
+            Reforms to Date
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            Office of the Independent Police Auditor
+                      
+
+                                            
+                              
+        
+                                
+          
+            Office Of The Independent Police Auditor
+                      
+
+                            
+          
+                                
+          
+            OIPA Recommendations
+                      
+
+                            
+          
+                                
+          
+            Monthly & Annual Reports
+                      
+
+                            
+          
+                                
+          
+            Community Outreach
+                      
+
+                            
+          
+                                
+          
+            Resources
+                      
+
+                            
+          
+                                
+          
+            FAQ's
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            Police Civilian Review Board
+                      
+
+                            
+          
+                                
+          
+            Doing Business
+                      
+
+                                            
+                              
+        
+                                
+          
+            Doing Business
+                      
+
+                            
+          
+                                
+          
+            Procurement
+                      
+
+                            
+          
+                                
+          
+            Office of Civil Rights
+                      
+
+                            
+          
+                                
+          
+            Insurance
+                      
+
+                            
+          
+                                
+          
+            Permits
+                      
+
+                            
+          
+                                
+          
+            Advertising Opportunities
+                      
+
+                            
+          
+                                
+          
+            Transit-Oriented Development
+                      
+
+                            
+          
+                                
+          
+            Standard Specifications
+                      
+
+                            
+          
+                                
+          
+            Accounts Payable
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            Careers
+                      
+
+                                            
+                              
+        
+                                
+          
+            Careers Overview
+                      
+
+                            
+          
+                                
+          
+            Job Descriptions
+                      
+
+                            
+          
+                                
+          
+            Salary Schedule
+                      
+
+                            
+          
+                                
+          
+            Careers FAQs
+                      
+
+                            
+          
+                                
+          
+            Collective Bargaining Agreements
+                      
+
+                            
+          
+                                
+          
+            Workforce Development
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            Sustainability
+                      
+
+                                            
+                              
+        
+                                
+          
+            Sustainability
+                      
+
+                            
+          
+                                
+          
+            Policy & Reports
+                      
+
+                            
+          
+                                
+          
+            Energy at BART
+                      
+
+                            
+          
+                                
+          
+            Electric Vehicle Charging at BART
+                      
+
+                            
+          
+                                
+          
+            Water at BART
+                      
+
+                            
+          
+                                
+          
+            Rider Feedback
+                      
+
+                            
+              
+  
+                              
+                  
+          
+                                
+          
+            Developer Program
+                      
+
+                            
+          
+                                
+          
+            BART Merch
+                      
+
+                            
+          
+                                
+          
+            BART’s Impact
+                      
+
+                            
+              
+  
+                                  
+
+
+
+
+  
+  
+  
+    BART Career Opportunities
+    Explore the latest jobs listings on our Career page
+    View the Listings
+  
+
+                              
+                  
+          
+                                
+          
+            Contact
+                      
+
+                            
+              
+  
+
+
+      
+
+
+
+
+
+
+
+    
+    
+  
+
+    
+  
+
+    
+
+
+  
+
+  
+
+    
+  
+    
+      
+
+      
+          
+09.05.25
+
+      
+
+            
+        
+  
+  
+            
+          
+A computer equipment problem following network upgrade work is preventing the start of service this morning. Seek alternative means of transportation. bart.gov/alternatives provides options without BART service.
+
+      
+
+        
+          
+
+
+
+
+      
+
+      
+
+          
+
+  
+
+
+  
+                  
+    
+  
+
+  
+
+]]></content:encoded>
+        </item>
+        <item>
             <title><![CDATA[1TB Raspberry Pi SSD on sale now for $70]]></title>
             <link>https://www.raspberrypi.com/news/1tb-raspberry-pi-ssd-on-sale-now-for-70/</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45138932</guid>
-        </item>
-        <item>
-            <title><![CDATA[US economy added just 22,000 jobs in August, unemployment highest in 4 yrs]]></title>
-            <link>https://www.cnn.com/2025/09/05/economy/us-jobs-report-august-final</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45138703</guid>
-            <description><![CDATA[The US job market is stalling out.]]></description>
-            <content:encoded><![CDATA[
-                  
-
-
-    
-            The US job market is stalling out.
-    
-
-    
-            Job growth slowed to a crawl in August, and the unemployment rate rose to its highest level in nearly four years, indicating the US labor market is growing stagnant.
-    
-
-    
-            The economy added just 22,000 jobs last month and the unemployment rate rose to 4.3% from 4.2%, according to the Bureau of Labor Statistics.
-    
-
-    
-            August’s job report also included a downward revision to June, which showed the US economy lost 13,000 jobs that month. It’s the first negative employment month since December 2020, and it brings to an end what was the second-longest period of employment expansion on record.
-    
-
-    
-            “The Great American jobs machine has stalled,” Christopher Rupkey, chief economist at FwdBonds, wrote in commentary issued Friday.
-    
-
-    
-            July’s job gains were revised up slightly to 79,000 from 73,000, according to the report.
-    
-
-    
-            Economists were expecting that the economy added 76,500 jobs last month and that the unemployment rate rose to 4.3%, according to FactSet.
-    
-
-    
-            The Dow rose 119 points, or 0.26%, Friday morning. The S&P 500 rose 0.41% and the tech-heavy Nasdaq gained 0.63%, after the weaker-than-expected jobs data boosted expectations that the Federal Reserve will cut interest rates in September to stimulate the economy.
-    
-
-  
-
-    
-            Through August, monthly job gains average 74,750, BLS data shows. Excluding the pandemic, that’s the slowest average monthly gain for that January to August time frame since 2010, when the United States was still licking its wounds from the Great Recession.
-    
-
-  
-
-
-
-
-
-    
-            “The addition of just 22,000 jobs in August, along with net downward revisions of previous months, shows an economy straining under the immense economic uncertainty and significant policy changes of 2025,” Laura Ullrich, Indeed’s director of economic research for North America, wrote Friday.
-    
-
-    
-            Uncertainty has swelled since the beginning of the year in large part around how President Donald Trump’s sweeping policies on tariffs, immigration and federal spending would shake out through the economy.
-    
-
-    
-            Hiring efforts, already stymied in part by still-high interest rates, have been largely shelved due to the unknowns.
-    
-
-    
-            “They don’t know where things are going, whether it’s through tariffs or other dynamics – interest rates still aren’t coming down – so I think a lot of companies are just saying, ‘not now,’” Ron Hetrick, senior labor economist at employment analytics company Lightcast, told CNN in an interview. “I think there’s somebody probably out there who’d like to hire, but not in this environment.”
-    
-
-    
-            “They’re waiting for more certainty to occur,” he said.
-    
-
-  
-
-    
-            The low-hire, low-fire environment is leaving workers and job hunters with few opportunities.
-    
-
-    
-            And more workers are seeking those opportunities, as labor market re-entrants helped to lift the unemployment rate last month.
-    
-
-    
-            The labor force, which shrank for three months in a row, increased by 436,000 people in August, according to BLS data. The labor force participation rate moved higher as well, ticking up to 62.3% from 62.2%.
-    
-
-    
-            While the majority of those labor force gains were from those classified as employed, the increase in those unemployed was largely attributed to those who re-entered the labor market and are searching for jobs.
-    
-
-    
-            “In fact, the median time looking for work slipped to a three-month low, a bright spot in a generally weak jobs report,” Jennifer Timmerman, senior investment strategy analyst at Wells Fargo Investment Institute, wrote in a note to investors Friday.
-    
-
-  
-
-
-
-
-
-    
-            A low-churn labor market puts the US labor market — and the broader economy — at greater risk, economists warn.
-    
-
-    
-            The limited job gains also are coming from practically a single source, exacerbating those concerns.
-    
-
-    
-            The US job market is being propped up primarily by ongoing employment gains in the health care industry. That sector, which has attributed for the lion’s share of overall job growth this year, added 46,800 jobs in August.
-    
-
-    
-            That sector, however, accounts for just 15% of total employment, meaning many people are left on the sidelines.
-    
-
-    
-            “For 85% of workers, they’re not seeing a lot of the jobs added,” Kory Kantenga, LinkedIn’s head of economics Americas, told CNN this week.
-    
-
-    
-            And wage gains are increasingly growing softer. The annual growth rate of average hourly earnings slowed to 3.7% in August, from 3.9% in July.
-    
-
-    
-            Without broader-based employment growth, the labor market is more vulnerable to shocks, he said.
-    
-
-    
-            “If anything happens to that industry, you could easily see job growth fall off a cliff.”
-    
-
-    
-            Warning signs have been flashing for months that the job market has been losing steam. That became starkly clearer in July, when weak job growth and larger-than-typical downward revisions spurred the unprecedented firing of BLS Commissioner Erika McEntarfer by President Donald Trump who claimed, without evidence, that the disappointing data must have been “rigged.”
-    
-
-    
-            Other labor market data released so far this week further confirmed that the labor market has cooled down considerably: Private-sector hiring slowed sharply; initial jobless claims hit a nearly three-month high; layoff announcements picked up; and, for the first time in four years, the number of available jobs was lower than the number of job seekers.
-    
-
-  
-  CNN’s John Towfighi contributed reporting.
-
-
-              ]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[Development Speed Has Never Been a Bottleneck]]></title>
@@ -2985,13 +4466,6 @@ signalsandthreads.com. Thanks for joining us. See you next time.
             <content:encoded><![CDATA[→日本語で読むWelcome to “Interviews with Demosceners”! This time, we welcome Japanese demoscener 0b5vr, who mainly creates 64K and 4K intros.For many, 0b5vr is best remembered for his 64K demo “0b5vr GLSL Techno Live Set”, released at Revision 2023. In this interview, he talks about how this piece was created, as well as his recent live music performance.He also talks about trends around the Japanese demoscene, like music production with GLSL, machine live, and generative VJ. I also took the chance to ask how he feels about sceners like me—that is, people who know nothing about programming or technology! Happy reading!Note: If you don’t know what demoscene is, you may want to start from here!First of all, could you introduce yourself?I’m 0b5vr, and I don’t belong to any particular group. I mainly work on 64k intros and 4k intros/exegfx using WebGL. I also compete in Shader Jam and perform live coding and VJ sets at club events and similar venues.Your demo “0b5vr GLSL Techno Live Set” had a strong impact on me. I was curious about this. It says “Live Set,” but was released in the 64K category. What is this exactly? Is this live coding?0b5vr GLSL Techno Live Set (“0mix”) is indeed a 64K intro demo. Just like any other 64K intro, this audiovisual piece is generated from a 64KB file―an HTML file, in this case.That said, as described in the title, its format is “Live Set.” It can be somewhat tricky, because it looks like a recorded video of a live performance at an event, but it’s actually a 64K intro.Hmm… I’m still not sure if I understood correctly. Could you elaborate a bit more?0mix was inspired by three different scenes: techno demos, live coding, and 64K intros.Let me start with techno demos. There are many techno-themed demos in the history of the demoscene. If you look at the demos such as “Medium” by Einklang.net, “X-MIX 2004: Ion Traxx” by Kewlers & mfx, and “Emix” by Epoch, they use multiple tracks mixed together like a DJ set, rather than a single techno soundtrack. They also use VJ-style visuals to create an atmosphere similar to a club event. Emix has black-and-white visuals with unique textures that fit perfectly with cold, mechanical techno, and it’s one of my favorites.Next is live coding. Live coding is a live performance where visuals and music are generated with programming in real time. On the screen, you’ll see the visuals and sound waveforms being generated alongside the code you’re writing. This highlights that the artwork is generated by code. In the demoscene, live coding sessions focus mostly on visuals in GLSL (eg, Shader Showdown, Shader Jam). But in live coding events like Algorave and Eulerroom, music live coding is as popular as, or even more popular than, visual coding. From what I see, Tidal Cycles and Sonic Pi are the most commonly used tools in those environments. (Reference video)Finally, there’s the 64K intro. It’s a category where you create visuals and audio with an executable file of just 64KB. This is the most challenging category since every element has to be procedurally generated within the intro. Most 64K creators build their own engines and tools from scratch. This category requires a broad range of knowledge and skills including modeling, animation, rendering, post-processing, music, and compression.If I managed to merge all three inspirations and create a 64K techno demo with music generated by live coding, I knew I could present it to demosceners and other creators around the scene with confidence. I came up with the idea about a year before Revision 2023. Over the course of that year, I refined a demo engine, built a live coding environment, composed music, and created visual assets almost entirely on my own. Here’s the working environment for 0mix. The top screen shows the preview, timeline, etc., while the bottom screen is the code editor. Basically, I spend most of the time in the code editor. So, you climbed the highest mountain by yourself. What was the process like?It was extremely tough and painful to spend a year working on a challenging 64K project by myself. My advice is to collaborate with others. At the very least, you should find someone you can discuss the progress with. It was indeed fun to surprise many friends at demoparties, but at the end of the day, completing the project is more important.You entered 64K compo, but it ended up being released in the PC Demo compo. Did that bother you?It’s true that 0mix was released in the PC Demo Compo at Revision 2023. That was because it was the only entry in the PC 64K intro, which wasn’t enough to hold a separate compo. So the two compos were merged. The same thing happened at Revision 2022. PC 64K intro compo was incorporated into the 8K intro compo because there were only two entries. Nevertheless, I’ve always pursued uncompromising quality, so I was down with it. Along with the works of other demo groups (such as Fairlight, mfx, and Still), I think I could contribute to making that compo interesting.Ah, you’re right. That felt like a never-ending compo!There were so many entries for Revision 2023, and from the chat I got the impression that many participants and viewers were exhausted after the compo. Still, it was a great compo. All of the top works featured demoscene-style visuals built with their own engines, and their narratives were also impressive. So I’m happy with my result. When there’s a big entry in the compo I’m in, I feel more accomplished because it means I helped make that compo exciting together with those great pieces.That’s right, I remember some big names rushing in at the end. Nevertheless, this demo stood out for its originality.Thank you. Revision has an award called “Crowd Favorite” where viewers can vote for their favorite demo in any category, and 0mix received first prize. 0mix is a piece that reflects what I love, so I felt happy that everyone else enjoyed it, too.photo provided by 0b5vrCongratulations! It was indeed a cool demo.Oh, I have a question for you. How do you feel about the code constantly shown in 0mix? What kind of impression does it give you?  (Interviewer’s note: I’m not from the programming field. I’m the type of person who chooses a laptop by its color.)Maybe it’s more like a design or typography? It says “live coding,” so I figured this code is for its visuals, but I have absolutely no idea if the code itself is cool or not. If I didn’t know what live coding is, I’d probably just look at it as part of the design, just like seeing the typography in a language I don’t understand.Ah, that’s interesting! Actually, the code displayed on the screen is not for visuals but for music. I use a programming language called GLSL, which is normally used to generate visuals. But 0mix is a live performance-themed demo where I use GLSL for music, and that’s why it’s called “GLSL Techno Live.” If you look at the code closely, you’ll see the parts for instruments, like “KICK,” “HIHAT,” and “BASS.” And by adding and subtracting these elements, I shaped the flow of music.Ohh, so that was code for music! But even after knowing this fact, my impression of this piece hasn’t really changed. I guess that shows I interpreted the code as part of the design. Is it okay if a viewer like me sees it that way? (laughs)In my post about this production on Scrapbox, I wrote, “for viewers without coding knowledge, it feels like music-making magic. And for viewers who know programming languages and environments, it’s a hint to guess the next move.” So I expected that some people would see it as part of the design.To reveal a bit more about my understanding, now I do understand that “demo is generated from an executable file” and that “a 64K piece has a 64KB file.” But I still don’t see things like “this is real-time rendering, so it’s more impressive than live-action” or “it’s great quality considering this is 64KB.” Basically, I watch demos like I watch music videos, and the only thing that matters to me is whether I find it cool or not.Ryoji Ikeda has a work that presents data including planets and genes using 5×5 pixel fonts. Of course, only experts can truly understand such data, so most of us simply enjoy the visual design that comes out of it. Even if we try to find deeper meaning in it, we probably just end up saying something like, “Wow, the world is huge.” I’ve read that Ikeda actually intended for viewers to see it that way.Oh, then I’m actually one of his intended viewers. When I first saw his installation video, I knew him as a musician, so I thought, “Wow, that’s his MV? Cool! Very futuristic!” I later realized that it wasn’t just design. It’s nice to know that creators and demosceners expected viewers like me, and personally, I feel relieved. I’d always thought they might be annoyed to hear a clueless person like me commenting on their piece. (laughs)To me, how others first got interested in a piece or in the culture is as fascinating as the motives behind its creation. So I do appreciate sceners who are not from the tech side!Thank you! That’s really nice and reassuring to hear! OK, let’s go back to that music code. You wrote in your post on Scrapbox that you put a lot of time and effort into the music.Actually, I had never really made this type of techno music before, so I watched a lot of live performances of this style and tutorials on YouTube. I also bought and tried hardware for “machine live” performances, like the Elektron Syntakt and Dirtywave M8, for research.What is “machine live”?“Machine live” is a type of music performance similar to live coding. Performers use music equipment like grooveboxes and modular synths in real-time to control the sound during the performance. What you can do depends on the features of the equipment, so performers always have to be aware of limitations—something somewhat similar to the demoscene. It’s a fascinating culture. There’s even a “DAWless Live” category where you perform without using a DAW, the standard PC-based music production system. For 0mix, I drew a lot of inspiration from the philosophy and methods of machine live and applied them to GLSL live coding. (Reference video)I just watched the reference video you sent me. Does everyone in this scene really use that much gear?Of course not. Not everyone uses this much equipment, or equipment of this size, for live performance. Lately, it seems like the palm-sized Dirtywave M8 is trending for live sets. The Dirtywave M8 uses a tracker-style UI, and it’s fun to compose with. Plus, it fits well with the demoscene aesthetic.I did a lot of research on machine live and live coding performances, and this gave me ideas about how to create sound and how to evolve live performance. But that only covered the technical side. When it comes to making techno, especially abstract sounds, I had to learn through trial and error and trust my feelings. Even after I learned how to make sounds on standard hardware or software, GLSL follows a completely different set of rules, and I had to be really fired up to tackle it.I heard that you did a live performance recently. What kind of event was it?I performed a live coding set at “draw(tokyo); #2” in March 2025. “draw(); ” is a club event focused on audiovisuals, especially live coding and generative VJ (the so-called “gene-kei” performances). It takes place from time to time in VRChat and at physical venues.At draw(tokyo); #2, I performed using Wavenerd, my custom GLSL live coding environment. For my 40-minute live set, I mainly used techno patterns created for 0mix. It was a really memorable experience, since it was my first time doing a live music performance with Wavenerd. I’d love to do more live performances in the future.The “Wavenerd” system I used for my live coding performance at draw(tokyo); #2. Since we were chroma keying with VJ visuals, the background is blue. The performers are always lit up in blue.When a coder does a live music performance, aren’t you too busy typing code in front of the PC to even look at the audience’s reaction?During the performances, I rewrite parts of prewritten code, so I don’t need to constantly keep typing. But I’m busy adding and removing parts, changing parameters, and doing some DJ-style mixing, so basically I completely zone in on the screen. That said, I can still see the audience’s reactions to some extent, and I felt really happy when they reacted at the moments I expected.Do you know who the primary audience is? I guess this kind of live performance requires some knowledge to really enjoy it.I still don’t know what kind of audience it attracts. From what I saw, I got the impression that many of them are interested in musical experiences and visual production at least. But I’m not sure how many are interested in coding, or actually create things with code. How technical it should get, how strictly you stick to the technical restrictions, and how much you make the audience dance—I think performers are expected to balance these elements well. Probably, this is something gene-kei performers constantly have to tackle. In fact, quite a few performers change their set depending on the tone of the event.Did you have VJs for your live performance?Yes, I asked fellow demosceners, ukonpower and Renard, and they generated visuals that matched the techno. I just told them, “I’m going to do 0mix,” and they both knew what it meant, so everything went very smoothly. (laughs) They created visuals in my style, but their own personalities also shone through. It was really cool.Oh, that’s really cool!  According to your discography, you also have 4K as well as 64K works. Is there a reason for that? For the 4K intros I’ve released lately, I can usually create them in one or two weeks. But 64K is my soul, so I want to keep making 64K intros. The thing is, 64K requires hundreds of times more work than 4K. So, when I don’t have the time or motivation but still want to contribute to a demoparty, I just make a 4K intro.I must say that the production environment for 4K intros is well-supported in the current demoscene. Recently I’ve been using 0x4015’s minimalGL. With this demotool, I can easily create 4K intros just by writing GLSL. That being said, I wouldn’t recommend it to everyone, because you also have to write the music in GLSL.In 2023, I released a 4K intro called “Architectural Shapeshifter” with Renard. For this piece, Renard was in charge of the concept and visuals, while I was in charge of the music and direction. We used minimalGL for this piece as well. It was the first time for Renard to create a 4K intro, but he was able to create it easily. We collaborated by tweaking the source code on GitHub and communicating via Discord. We exchanged ideas and suggestions on each other’s code, and it turned out to be a very efficient workflow.There are many coders who can write GLSL in Japan, but not many of them take on 4K. So I’d love to collaborate more using minimalGL.What’s hot in the Japanese demoscene these days? What category is popular? I noticed there was a demoparty called SESSIONS in Japan last year.It seems like a lot of people are coming into the demoscene from shader culture centered around VRChat. The people I got to know at demoparties like SESSIONS were mostly active in VRChat. In particular, the event draw(); seems to have a strong influence, and many of the people who got interested in live coding or generative VJ through draw();’s audiovisual experience also developed an interest in the demoscene.Live coding and generative VJ becoming a gateway into the demoscene sounds like a new path to me.Yes, indeed. draw();’s main crew, Saina-san, purposefully aims for a crossover with demoscene culture, like SESSIONS, and this accelerates the influx. We’re really grateful for that.I’m sure a person like that is supporting the demoscene in Japan and around the world.  OK, let’s go back to the production. Is there anything you do in everyday life to get inspired for your creations?I check Pouet and Demozoo as much as possible to stay in the know about recent demoscene productions. If I ever stopped checking Pouet and Demozoo, I think that would be the end of me as a demoscener.I also try to take in other cultures as well. Recently, I’ve been fascinated by the flashy audiovisual productions in pachinko and pachislot machines. They use dazzling visuals and music to stir up the spirit of gambling. These productions thoroughly pursue how to exploit the human reward system, all within machines that operate under very strict legal restrictions. In a way, I think this represents the highest peak of visual entertainment.I also go for walks frequently. Especially walking around Tokyo late at night gives me a strong sense of urban life and social activity, and it inspires me a lot. “Domain“, a 64K intro I released at Tokyo Demo Fest 2021, was heavily inspired by night Tokyo. I find the concept of the night city very interesting, and I’d like to explore it further.Which areas do you usually walk around?I mainly walk around downtown. I can feel the rhythm of social activity through people’s movements, clothing, and buildings. It’s also very fun to walk around residential areas. When I imagine that this is someone’s everyday life, I can sense their presence through the scenery.Do you have anything you always keep in mind when you create, like a routine or your own personal rule?For my demo source code, I use Git for version control and share as much of the code as possible on GitHub. Basically, I publish my source code under the Creative Commons BY-NC 4.0 license, and users can adapt and use it freely for non-profit purposes. By publishing my source code, I allow other people to refer to my production methods. In fact, I’ve often heard that people have made demos based on my code. Getting more chances to discover other demosceners’ great works is valuable for me too, so I’ll continue to publish my source code.Also, when I do version control on Git, I try to write commit logs—comments you can add to each version—as detailed as possible. Commit logs explain which part of the code I changed, and they also serve as a kind of production journal. In addition to information like what type of change I made and for what purpose, they help me recall my state of mind or what I was thinking during the creative process.For programmers, is it a hassle to write detailed commit logs?Commit logs aren’t considered a direct contribution to a program, just like READMEs or documentation. So, engineers who want to focus on coding and dislike communicating often don’t write them at all. Usually, detailed commit logs are recommended when you work with other people on business projects. However, even for a one-off piece of code written by a single person, I think we should consider how detailed we make the commit logs, because someone else—or even yourself—may end up reading them like archaeology.Archaeology… that’s interesting.  Okay, let me go to the classic question: your favorite demo, a memorable demo, or a demo that changed your life… anything. Tell us about a demo, or demos that are special to you.As I mentioned, “Emix” by Epoch is the demo I like the most. From the theme of each effect to the color grading, glitch effects, music, and direction, this piece defined what a demo should have, for me. Other pieces that helped define my standards include “cdak” by Quite & Orange, “Transformer 3” by Limp Ninja, and “Clean Slate” by Conspiracy. I put them together in my Pouet playlist “0b5vr’s bible”, if you’re interested.Among many other forms of self-expression, why did you choose the demoscene? Or are you trapped by this culture? Tell me what’s so attractive about it.The demoscene is a creative activity free from art as a capital asset or from commercial value. We mostly create and present pieces in a format that has little value in today’s society, and we purely inspire one another’s technical curiosity and the craving for expression. Also, the demoscene ecosystem is cooperative. Anyone can access demotools, ask questions to veterans, and start creating a piece. I respect the works, workflows, and ideas of active demosceners in the community, and that’s what motivates me to create something that earns their recognition.On the other hand, due to the methods used in the demoscene, a lot of pieces look similar, and that’s clearly a weak point of the scene. If I only keep exploring the demoscene, I can’t expand my range of expression. As a creator, I think it’s important to look at various cultures and absorb many different methods of expression. The easy exchange of fresh inspiration is one of the features of the demoscene, so I’d like to take in many forms of expression both inside and outside the scene, and keep inspiring each other.Is there anything you want to do in the future?What I want to do most is live music performance using GLSL, as I mentioned. Seemingly, this format of live music with GLSL is currently performed only by me and “Rakuto-ice” san. So I want to perform more to develop my style further, and I hope more people will enjoy it.And of course, I want to create demos like 64K, but right now I don’t have enough motivation or ideas. To find more motivation and inspiration, I think it’s about time I formed a demogroup.Sounds like there’s much to look forward to!  Finally, your message for demosceners and demo fans out there, please.For those of you who are not yet demosceners:  I’ve seen many people who have an interest in the demoscene but also fears about the culture itself. And it’s not just Japanese people, people in other countries have reacted that way too. Please don’t be afraid of us. If you are interested in creating something with a computer and having fun at a demoparty, then you are a demoscener. Whether you already have a medium of expression or not, if you join the party, you may naturally feel inspired to think, “I want to express myself too.” Demoparties like Tokyo Demo Fest, SESSIONS, and Revision have various compos, including simple programs, illustration, photography, music, along with the demo compo. Of course, if you want to create a demo, fellow creators will help you. We demosceners hope you will have fun in this scene.For those who are already demosceners (including me):  Make 64K!Thank you very much for answering my question, 0b5vr!0b5vr’s works can be found on Pouet and Demozoo. Also, be sure to check his essay on the production of 0mix on Scrapbox, where he goes deeper into his thoughts on the demoscene and the creative process.Thank you very much for reading this to the end!—————-In case you’re wondering what “demo” or “demoscene” is, better check out the well-made documentary called Moleman2.  (and the director, M. Szilárd Matusik’s interview can be read in here.) #1: q from nonoil/gorakubu is here.  #2: Gargaj from Conspiracy, Ümlaüt Design is here.  #3: Preacher from Brainstorm, Traction is here.  #4: Zavie from Ctrl-Alt-Test is here.  #5: Smash from Fairlight is here.  #6: Gloom from Excess, Dead Roman is here.  #7: kioku from System K is here.  #8: kb from Farbrausch is here.  #9: iq from RGBA is here. #10: Navis from Andromeda Software Development is here. #11: Pixtur from Still, LKCC is here. #12: Cryptic from Approximate is here. #13: 0x4015 aka Yosshin is here. #14: Flopine from Cookie Collective is here.  #15: noby from Epoch, Prismbeings is here.Why I’m interested in demoscene is explained in this article. And for some of my other posts related to “demo and “demoscene” culture is here.]]></content:encoded>
         </item>
         <item>
-            <title><![CDATA[Swimming in Tech Debt]]></title>
-            <link>https://helpthisbook.com/lou-franco/swimming-in-tech-debt</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45135263</guid>
-            <description><![CDATA[Read "Swimming in Tech Debt" by Lou Franco on Help This Book]]></description>
-            <content:encoded><![CDATA[Swimming in Tech Debt - Help This Book]]></content:encoded>
-        </item>
-        <item>
             <title><![CDATA[Fil's Unbelievable Garbage Collector]]></title>
             <link>https://fil-c.org/fugc</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45133938</guid>
@@ -3154,390 +4628,6 @@ Failing to free an object means the object gets reclaimed for you.
 
         
     ]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[Forking Chrome to render in a terminal (2023)]]></title>
-            <link>https://fathy.fr/carbonyl</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45133935</guid>
-            <description><![CDATA[January 27, 2023]]></description>
-            <content:encoded><![CDATA[
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-January 27, 2023
-
-
-I wrote about forking Chrome to turn HTML to SVG two months ago, today we're going to do something similar by making it render into a terminal.
-Let me introduce you to the Carbonyl web browser!
-Drawing
-There isn't much you can draw in a terminal, you're guaranteed to be able to render monospace characters in a fixed grid, and that's it. Escape sequences exist to perform actions like moving the cursor, changing the text color, or mouse tracking. Some came from the days of physical terminals like the DEC VT100, others came from the xterm project.Assuming a popular terminal emulator, we can:
-Move the cursor
-Write Unicode characters
-Set a character's background and foreground color
-Use a 6x6x6 RGB palette, or 24 bits RGB if COLORTERM is set the truecolor
-One of the unicode characters we can render is the lower half block element U+2584: ▄. Knowing that cells generally have an aspect ratio of 1:2, we can render perfectly square pixels by setting the background color to the top pixel color, and the foregound color to the bottom pixel color.
-
-Let's hook html2svg's output into a Rust program:
-fn move_cursor((x, y): (usize, usize)) {
-    println!("\x1b[{};{}H", y + 1, x + 1)
-}
-
-fn set_foreground((r, g, b): (u8, u8, u8)) {
-    println!("\x1b[38;2;{};{};{}m", r, g, b)
-}
-
-fn set_background((r, g, b): (u8, u8, u8)) {
-    println!("\x1b[48;2;{};{};{}m", r, g, b)
-}
-
-fn print_pixels_pair(
-    top: (u8, u8, u8),
-    bottom: (u8, u8, u8),
-    cursor: (usize, usize)
-) {
-    move_cursor(cursor);
-    set_background(top);
-    set_foreground(bottom);
-    println!("▄");
-}
-
-
-Not bad. To render text, we need to create a new Skia device using C++, lets call it TextCaptureDevice. We'll make it call a draw_text function written in Rust. Just like in html2svg, we need to convert glyph IDs into unicode characters.
-class TextCaptureDevice: public SkClipStackDevice {
-  void onDrawGlyphRunList(SkCanvas*,
-                          const sktext::GlyphRunList& glyphRunList,
-                          const SkPaint&,
-                          const SkPaint& paint) override {
-    // Get the text position
-    auto position = localToDevice().mapRect(glyphRunList.origin());
-
-    for (auto& glyphRun : glyphRunList) {
-      auto runSize = glyphRun.runSize();
-      SkAutoSTArray<64, SkUnichar> unichars(runSize);
-
-      // Convert glyph IDs to Unicode characters
-      SkFontPriv::GlyphsToUnichars(glyphRun.font(),
-                                  glyphRun.glyphsIDs().data(),
-                                  runSize,
-                                  unichars.get());
-
-      // Draw that text on the terminal
-      draw_text(unichars.data(), runSize, position, paint.getColor());
-    }
-  }
-}
-
-
-Better! But the text is scrambled at the center. Our TextCaptureDevice does not account for occlusion, drawing a rectangle does not clear the text behind it.
-
-Let's add some code to the drawRect and drawRRect methods to clear the text if we're filling with a solid color:
-void drawRRect(const SkRRect& rect, const SkPaint& paint) override {
-    drawRect(rect.rect(), paint);
-}
-
-void drawRect(const SkRect& rect, const SkPaint& paint) override {
-    if (
-        paint.getStyle() == SkPaint::Style::kFill_Style &&
-        paint.getAlphaf() == 1.0
-    ) {
-        clear_text(localToDevice().mapRect(rect));
-    }
-}
-
-
-The gray background behind text elements is caused by the software rasterizer rendering text in our bitmap. Let's remove it:
-void SkBitmapDevice::onDrawGlyphRunList(SkCanvas* canvas,
-                                        const sktext::GlyphRunList& glyphRunList,
-                                        const SkPaint& initialPaint,
-                                        const SkPaint& drawingPaint) {
--    SkASSERT(!glyphRunList.hasRSXForm());
--    LOOP_TILER( drawGlyphRunList(canvas, &fGlyphPainter, glyphRunList, drawingPaint), nullptr )
-}
-
-
-That was the easy part, let's handle inputs!
-Input
-fn report_mouse_move((x, y): (usize, usize)) {
-    write!(get_stdin(), "\x1b[<35;{};{}M", y + 1, x + 1)
-}
-fn report_mouse_down((x, y): (usize, usize)) {
-    write!(get_stdin(), "\x1b[<0;{};{}M", y + 1, x + 1)
-}
-fn report_mouse_up((x, y): (usize, usize)) {
-    write!(get_stdin(), "\x1b[<0;{};{}m", y + 1, x + 1)
-}
-Some sequences exist to get a terminal emulator to track and report mouse events. For example, if you print \x1b[?1003h, the terminal should start sending events using this format:
-These are similar to the sequences we use for styling our output. The \x1b[ prefix is called the Control Sequence Introducer.
-carbonyl::browser->BrowserMainThread()->PostTask(
-    FROM_HERE,
-    base::BindOnce(
-        &HeadlessBrowserImpl::OnMouseDownInput,
-        x,
-        y
-    )
-);
-We need to notify the browser to wrap this up, but there is a catch: we
-need to block a thread to read stdin, but the browser methods should be
-called from the main thread. Thankfully, messages passing is available
-almost everywhere through the
-TaskRunner
-class.
-Google recommending me Chrome, lolfor &key in input {
-    sequence = match sequence {
-        Sequence::Char => match key {
-            0x1b => Sequence::Escape,
-            0x03 => emit!(Event::Exit),
-            key => emit!(Event::KeyPress { key }),
-        },
-        Sequence::Escape => match key {
-            b'[' => Sequence::Control,
-            b'P' => Sequence::DeviceControl(DeviceControl::new()),
-            0x1b =>
-                emit!(Event::KeyPress { key: 0x1b }; continue),
-            key => {
-                emit!(Event::KeyPress { key: 0x1b });
-                emit!(Event::KeyPress { key })
-            }
-        },
-        Sequence::Control => match key {
-            b'<' => Sequence::Mouse(Mouse::new()),
-            b'A' => emit!(Event::KeyPress { key: 0x26 }),
-            b'B' => emit!(Event::KeyPress { key: 0x28 }),
-            b'C' => emit!(Event::KeyPress { key: 0x27 }),
-            b'D' => emit!(Event::KeyPress { key: 0x25 }),
-            _ => Sequence::Char,
-        },
-        Sequence::Mouse(ref mut mouse) => parse!(mouse, key),
-        Sequence::DeviceControl(ref mut dcs) => parse!(dcs, key),
-    }
-}
-
-Pipe
-We have something that sorts of work, at the cost of a steady 400% CPU usage, and that's not counting iTerm2 which uses ~200%. We've got a few problems:
-
-We need too much resources to render at 5 FPS
-We render every time, even when nothing changes
-We print all characters even if they didn't change on an individual level
-
-Modern browsers employ a multi-process architecture to improve security. It separates websites into different processes, reducing the potential damage caused by vulnerabilities. The renderer process is running in an OS-level sandboxed environment that blocks certain system calls, such as file-system access. The GPU process, is also considered unprivileged and cannot reach renderer process in order to protect against vulnerabilities in GPU APIs such as WebGL. In contrast, the browser process, considered privileged, can communicate freely with any process.
-Google ChromeBrowser ProcessGoogle Chrome Helper (Renderer)mouseMove(250, 250)mouseDown(250, 250)glBindBuffer()glDrawArray()👀Eyes🧠Brain🤌HandsRender ProcessmechanicalenergyelectromagneticenergyGitHubsuperintelligent ants risks - Google SearchGoogle Chrome Helper (Renderer)Render ProcessGoogle Chrome Helper (Renderer)Render Processdiy ant farm keyboard - YouTubeGoogle Chrome Helper (GPU)GPU Process
-Renderer process(main)Browser processRenderer process(iframe)1. Get captureGPU processdoing this 60 times a second isn't very efficientCapturePaintPreview is great for html2svg, but it's not designed for real-time rendering. It's using IPC calls to correctly support out-of-process iframes, making roundtrips between the browser, GPU, and renderer processes. It downloads hardware accelerated images from the GPU, explaining the surprising memory bandwidth usage. We can disable the fetching, and even disable hardware acceleration, but we still have an expensive IPC machinery holding us back.Software rendering is still very common, it even used to be the default if you can believe it. It was fairly easy back in the single-process days, but nowadays shared memory regions are configured to efficiently render using multiple processes. If we can get our pixels into one of these memory regions, we would just have to notify our browser process using a simple IPC message.
-void LayeredWindowUpdater::OnAllocatedSharedMemory(
-    const gfx::Size& pixel_size,
-    base::UnsafeSharedMemoryRegion region
-) {
-    if (region.IsValid())
-        shm_mapping_ = region.Map();
-}
-
-void LayeredWindowUpdater::Draw(
-    const gfx::Rect& damage_rect,
-    DrawCallback draw_callback
-) {
-    carbonyl_draw_bitmap(
-        shm_mapping_.GetMemoryAs<uint8_t>(),
-        shm_mapping_.size()
-    );
-
-    std::move(draw_callback).Run();
-}
-
-
-We solved the bitmap problem, now how can we extract text data? This data lives in the renderer process, but our windowing code lives in the browser process. We need to make the renderer interact with the browser process.
-Mojo
-// Our C++ bindings will be in the carbonyl::mojom namespace
-module carbonyl.mojom;
-
-// Import existing bindings to common structures
-import "ui/gfx/geometry/mojom/geometry.mojom";
-import "skia/public/mojom/skcolor.mojom";
-
-// Define a structure to hold text to render
-struct TextData {
-    // An UTF-8 string with the contents
-    string contents;
-    // Bounds, size only defined for clearing
-    gfx.mojom.RectF bounds;
-    // Color of the text
-    skia.mojom.SkColor color;
-};
-
-// The browser process runs this service
-interface CarbonylRenderService {
-    // The renderer process calls this method
-    DrawText(array<TextData> data);
-};
-Mojo is a library for inter-process communication. It defines an IDL for serializing data which supports native handles (i.e. file descriptors, shared memory regions, callbacks), and can be used to generate C++, Java (Android), and JavaScript (DevTools) bindings. It's extensively documented, and fairly simple to use.We'll start by making an interface CarbonylRenderService that runs on the browser process, with a method DrawText called from the renderer process.
-This .mojom code generates C++ temporary files which we can then include to write the implementation code.
-Mojo receivers such as our service are part of the native handles we can send between processes, to register the implementation we just need to add it to the BrowserInterfaceBroker, which will get called by the renderer through BrowserInterfaceBrokerProxy:
-map->Add<carbonyl::mojom::CarbonylRenderService>(
-    base::BindRepeating(&RenderFrameHostImpl::GetCarbonylRenderService,
-                        base::Unretained(host)));
-
-GetBrowserInterfaceBroker().GetInterface(
-  std::move(carbonyl_render_service_receiver_)
-);
-
-Now, we need to get our text data without any expensive round-trip. Blink has a GetPaintRecord() method to get the latest paint data for a page, but it's not behind a public API, which we need because our code runs in the content renderer. Ideally we should hook into the compositor (cc), but it's way more involved. It's dirty but we can workaround this by casting to the private blink::WebViewImpl:
-auto* view = static_cast<blink::WebViewImpl*>(GetWebFrame()->View());
-
-view->MainFrameImpl()->GetFrame()->View()->GetPaintRecord().Playback(&canvas);
-carbonyl_render_service_->DrawText(std::move(data));
-
-Surprise after the first run: the text content doesn't follow the bitmap. Aaah, scrolling and animating is done on the compositor thread, which frees the main thread and makes everything smoother. Let's procastinate doing things right by adding --disable-threaded-scrolling --disable-threaded-animation to the command line arguments.
-Threaded compositing enabledThreaded compositing disabled
-Pretty smooth, it'll be even smoother when threaded compositing is fixed! And we've fixed our biggest problem: we don't use any CPU when idling, and scrolling consumes ~15%.
-Layout
-auto font = state.StyleBuilder().GetFontDescription();
-
-font.SetStretch(ExtraExpandedWidthValue());
-font.SetKerning(FontDescription::kNoneKerning);
-font.SetComputedSize(11.75 / 7.0);
-font.SetGenericFamily(FontDescription::kMonospaceFamily);
-font.SetIsAbsoluteSize(true);
-state.StyleBuilder().SetFontDescription(font);
-state.StyleBuilder().SetLineHeight(Length::Fixed(14.0 / 7.0));
-Thing is, we can only render one font-size, but Blink doesn't know that. This causes the layout to be messed up, with text chunks overlapping or overly spaced. This is especially visible on websites with a lot of textual content and links like Wikipedia.Another dirty - yet effective - hack we can use is forcing a monospaced font on every element. We can do that by adding some code to StyleResolver::ResolveStyle.
-
-
-LoDPI
-// static
-float Display::GetForcedDeviceScaleFactor() {
-    return 1.0 / 7.0;
-}
-
-// static
-bool Display::HasForceDeviceScaleFactor() {
-    return true;
-}
-One expensive step in our rendering pipeline is downscaling: we need to resize the framebuffer from its virtual space to its physical space. What we're doing is kind of the opposite of HiDPI rendering, whose most common ratio is 2, which means 1 pixel on the web equals 4 pixels on the screen. Our ratio is 1 / 7 which means 49 pixels on the web renders to 1 block on our terminal.The annoying thing about HiDPI is that it can make rendering ~4x slower, whereas Carbonyl LoDPI® makes rendering run ~49x faster. We just need to force our scaling into the Display class.
-Color
-I looked for examples of RGB color conversion to xterm-256 but the code I found was either wrong or slow because it did a nearest neighbor search. We're going to do it for every pixel so it should run fast.
-The formula for the conversion is fairly simple, assuming color values between 0 and 1: 16 + r * 5 * 36 + g * 5 * 6 + b * 5.
-pub fn to_xterm(&self) -> u8 {
-    let r = (self.r as f32 - (95.0 - 40.0)).max(0.0) / 40.0;
-    let g = (self.g as f32 - (95.0 - 40.0)).max(0.0) / 40.0;
-    let b = (self.b as f32 - (95.0 - 40.0)).max(0.0) / 40.0;
-
-    (16.0 +
-        r.round() * 36.0 +
-        g.round() * 6.0 +
-        b.round()) as u8
-}
-The twist that most code online gets wrong is that the 6 color levels are not linear: 0, 95, 135, 175, 215, 255; there is a 95 gap between the first and second values, and 40 for the rest.It makes sense to limit the dark range, color differences are more visible with bright colors. For us, it means that we can convert a value between 0 and 255 using max(0, color - 95 - 40) / 40.
-
-
-pub fn to_xterm(&self) -> u8 {
-    if self.max_val() - self.min_val() < 8 {
-        match self.r {
-            0..=4 => 16,
-            5..=8 => 232,
-            238..=246 => 255,
-            247..=255 => 231,
-            r => 232 + (r - 8) / 10,
-        }
-    } else {
-        let scale = 5.0 / 200.0;
-
-        (16.0
-            + self
-                .cast::<f32>()
-                .mul_add(scale, scale * -55.0)
-                .max(0.0)
-                .round()
-                .dot((36.0, 6.0, 1.0))) as u8
-    }
-}
-The conversion itself can be thought of as a dot product of (r, g, b) and (36, 6, 1). We can move the substraction to an mul_add call to help the compiler use a fused multiply-add instruction.The last step is grayscale: our xterm profile offers 256 colors, there are the 216 colors from the RGB cube (6 * 6 * 6), the 16 configurable system colors, and 24 gray levels which go from rgb(8,8,8) to rgb(238,238,238).To find out if a color is on a grayscale, we can substract its minimal value to its maximum value and check if it's under a threshold, let's say 8.
-
-We still have one tiny problem: how can you detect if a terminal supports true-color
-or 256 colors? A quick Google search leads us to the COLORTERM environment variable,
-which is 24bit or truecolor if true-color is supported. But that won't work in
-Docker or SSH, which are our primary targets.
-self.sequence = match self.sequence {
-    // ^[P1$r0;48:2:1:13:37:42m^[\    Code => match key {
-        b'0' | b'1' => Type(key),
-        _ => control_flow!(break)?,
-    },
-    // ^[P1$r0;48:2:1:13:37:42m^[\    Type(code) => match key {
-        b'$' => Status(StatusParser::new(code)),
-        b'+' => Resource(ResourceParser::new(code)),
-        _ => control_flow!(break)?,
-    },
-    // ^[P1$r0;48:2:1:13:37:42m^[\    Status(ref mut status) => return status.parse(key),
-    Resource(ref mut resource) => return resource.parse(key),
-};
-self.sequence = match self.sequence {
-    // ^[P1$r0;48:2:1:13:37:42m^[\    Start => match key {
-        b'r' => Value,
-        _ => control_flow!(break)?,
-    },
-    // ^[P1$r0;48:2:1:13:37:42m^[\    Value => match key {
-        // ^[P1$r0;48:2:1:13:37:42m^[\        0x1b => self.terminate(),
-        // ^[P1$r0;48:2:1:13:37:42m^[\        b';' => self.push_value(),
-        // ^[P1$r0;48:2:1:13:37:42m^[\        char => self.push_char(char),
-    },
-    // ^[P1$r0;48:2:1:13:37:42m^[\    Terminator => control_flow!(break self.parse_event(key))?,
-};
-A trick we can use is a DCS (Device Control Sequence) to fetch a setting value, like the current background color. If we set an RGB value and get an RGB value back, we can enable true-color.You can try it by running the following on your terminal:$ printf "\e[48;2;13;37;42m\eP\$qm\e\\"; cat
-
-\e: start escape sequence
-
-[: introduce control sequence
-48: set foreground
-2: using an RGB color
-13: R is 13
-37: G is 37
-42: B is 42
-m: select graphic rendition
-
-
-\e: start escape sequence
-
-P: introduce device control sequence
-$: enter status mode
-q: query current setting
-m: select graphic rendition
-
-
-If the commands are supported, you should get the following output with a dark turquoise background: ^[P1$r0;48:2:1:13:37:42m^[\ This is what the terminal emulator sends to stdin, and what we can parse to toggle true-color on.
-Title
-niceA few xterm sequences allow setting the terminal window title, we could use that to display the current page title.fn set_title(title: &str) {
-    // Set icon name and window title to string
-    println!("\x1b]0;{}\x07", title);
-    // Set icon name to string
-    println!("\x1b]1;{}\x07", title);
-    // Set window title to string
-    println!("\x1b]2;{}\x07", title);
-}
-To get notified when the title changes, we can simply implement WebContentsObserver::TitleWasSet():void HeadlessWebContentsImpl::TitleWasSet(content::NavigationEntry* entry) {
-    carbonyl::Renderer::Main()->SetTitle(
-        base::UTF16ToUTF8(entry->GetTitleForDisplay())
-    );
-}
-
-Final thoughts
-That's all for today folks, check out Carbonyl on GitHub!
-This was my first Rust project and I finally get the hype now. What a cool language!
-Stay tuned
-The post for next month will be a visual introduction to Fourier Analysis. After that, we'll look into a speculative JS VM in Rust.
-Use the RSS feed to stay tuned, you can also watch the website repo for releases on GitHub.
-Discuss
-Discuss on HN - Discuss on r/programming]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[Evolving the OCaml Programming Language (2025) [pdf]]]></title>
@@ -4722,6 +5812,143 @@ application file formats for future projects.
 This page last modified on  2025-05-12 11:56:41 UTC 
 
 ]]></content:encoded>
+        </item>
+        <item>
+            <title><![CDATA[Classic 8×8-pixel B&W Mac patterns]]></title>
+            <link>https://www.pauladamsmith.com/blog/2025/09/classic-mac-patterns.html</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45131538</guid>
+            <description><![CDATA[TL;DR: I made a website for the original classic Mac patterns I was working on something and thought it would be fun to use one of the classic Mac black-and-white patterns in the project. I'm talking about the original 8×8-pixel ones that were in the...]]></description>
+            <content:encoded><![CDATA[
+        
+TL;DR: I made a website for the original classic Mac patterns
+I was working on something and thought it would be fun to use one of the
+classic Mac black-and-white patterns in the project. I'm talking about the
+original 8×8-pixel ones that were in the original Control Panel for setting the
+desktop background and in MacPaint as fill patterns.
+
+
+Screenshots via to Marcin's awesome interactive
+history
+I figured there'd must be clean, pixel-perfect GIFs or PNGs of them somewhere
+on the web. And perhaps there are, but after poking around a bit, I ran out of
+energy for that, but by then had a head of steam for extracting the patterns en
+masse from the original source, somehow. Then I could produce whatever format I
+needed for them.
+There are 38 patterns, introduced in the original System 1.0 in the 1984 debut
+of the Macintosh. They were unchanged in later versions, so I decided to get
+them from a System 6 disk, since that's a little easier with access to utility
+programs.
+Preparation
+
+Download Mini vMac.
+Acquire "old world" Mac ROMs.
+Download a System 6 startup disk image.
+Download ExportFl disk image.
+Download sitPack disk image.
+Install "The Unarchiver" (brew install --cask the-unarchiver)
+Install the Xcode command-line tools.
+
+Extraction process
+Start System 6 (drag the ROM onto the Mini vMac icon, then drag the System 6
+disk onto the window when you see the flashing floppy disk). Mount the ExportFl
+and sitPack disks by dragging their files and dropping on the classic Mac
+desktop.
+In emulation
+Double-click sitPack to launch the program. Command-O to open, then navigate to
+the startup disk by clicking "Drive". Scroll to find "System Folder" and
+double-click on it. Scroll to the bottom, select "System" and click "Open". Save
+the output file as "System.sit" in the top-level of the startup disk. Quit
+sitPack back to the Finder.
+Start the ExportFl program. Command-O or pick "Open" from the "File" menu. Find
+the "System.sit" created in the last step and click "Open". A regular file save
+dialog will appear on the modern Mac, pick a location and save the file.
+On the modern Mac
+Drag the "System.sit" file onto The Unarchiver, or open the file from within it.
+This will produce a file called "System" (with no extension).
+Run DeRez (part of the Xcode developer command-line tools) on the System file.
+I first added /Library/Developer/CommandLineTools/usr/bin to my $PATH, then
+ran:
+$ DeRez -only PAT\# System > patterns.r
+
+
+This produces a text representation of the PAT# resource in the System file.
+It's a series of bytes that comprise 38 8×8 patterns meant for QuickDraw
+commands. There's a leading big-endian unsigned 16-bit number (0026) to indicate the number of 8-byte patterns to follow.
+data 'PAT#' (0, purgeable) {
+	$"0026 FFFF FFFF FFFF FFFF DDFF 77FF DDFF"
+	$"77FF DD77 DD77 DD77 DD77 AA55 AA55 AA55"
+	$"AA55 55FF 55FF 55FF 55FF AAAA AAAA AAAA"
+	$"AAAA EEDD BB77 EEDD BB77 8888 8888 8888"
+	$"8888 B130 031B D8C0 0C8D 8010 0220 0108"
+	$"4004 FF88 8888 FF88 8888 FF80 8080 FF08"
+	$"0808 8000 0000 0000 0000 8040 2000 0204"
+	$"0800 8244 3944 8201 0101 F874 2247 8F17"
+	$"2271 55A0 4040 550A 0404 2050 8888 8888"
+	$"0502 BF00 BFBF B0B0 B0B0 0000 0000 0000"
+	$"0000 8000 0800 8000 0800 8800 2200 8800"
+	$"2200 8822 8822 8822 8822 AA00 AA00 AA00"
+	$"AA00 FF00 FF00 FF00 FF00 1122 4488 1122"
+	$"4488 FF00 0000 FF00 0000 0102 0408 1020"
+	$"4080 AA00 8000 8800 8000 FF80 8080 8080"
+	$"8080 081C 22C1 8001 0204 8814 2241 8800"
+	$"AA00 40A0 0000 040A 0000 0384 4830 0C02"
+	$"0101 8080 413E 0808 14E3 1020 54AA FF02"
+	$"0408 7789 8F8F 7798 F8F8 0008 142A 552A"
+	$"1408"
+};
+
+It would have been simple enough to
+parse this text, but I had Claude quickly make a Python
+program
+to do so and output them in .pbm format, which is part of the Netpbm image
+format class. This is a simple image format that is text-based, a '1' or a
+'0' indicating a black or white pixel in a row and column.
+For example, this subway tile pattern  is represented like
+this in .pbm:
+P1
+8 8
+1 1 1 1 1 1 1 1
+1 0 0 0 0 0 0 0
+1 0 0 0 0 0 0 0
+1 0 0 0 0 0 0 0
+1 1 1 1 1 1 1 1
+0 0 0 0 1 0 0 0
+0 0 0 0 1 0 0 0
+0 0 0 0 1 0 0 0
+
+From here, I can generate image files for the patterns in any format and
+resolution I want, using ImageMagick or similar. It's important when scaling the
+patterns to use -filter point, so that ImageMagick doesn't try to interpolate
+the pixels it needs to fill in, which would lead to blurry results.
+
+Why do all this?
+It's nostalgic, I have a fondness for these old patterns and the original B&W
+Mac aesthetic, it reminds me of playing games like Dark Castle and Glider,
+messing around with HyperCard, and using Tex-Edit and hoarding early shareware
+programs.
+The whole point of the above is to get a copy of the System file out with the
+resource fork intact, that's
+where the desktop patterns live.
+According to old classic Mac
+manuals,
+the patterns were QuickDraw bit-pattern resources, a simple bitmap of 8 bits
+per row packed into 8 bytes (columns). It was fast for QuickDraw to copy them
+over an area of the screen. For example the following pattern was used for the
+default gray desktop pattern on black-and-white Mac screens.
+
+I could have extracted all 38 patterns other ways: I could have screenshotted
+each one, I could have looked at each one and hand-written .pbm files, both of
+which would have been tedious and error-prone.
+Ultimately, I wanted to extract the exact original data from the source (or
+close enough copy thereof) and have the patterns in a format I considered
+archival for this limited purpose (.pbm files are trivial to parse and
+manipulate).
+Head over to my pattern site to get the patterns for yourself.
+(Credit for replica Geneva 9pt and Chicago 12pt fonts)
+
+
+        
+    ]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[LLM Visualization]]></title>
