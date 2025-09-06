@@ -4,7 +4,7 @@
         <title>Hacker News: Front Page</title>
         <link>https://news.ycombinator.com/</link>
         <description>Hacker News RSS</description>
-        <lastBuildDate>Sat, 06 Sep 2025 02:09:11 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 06 Sep 2025 03:04:33 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>github.com/Prabesh01/hnrss-content-extract</generator>
         <language>en</language>
@@ -13,394 +13,16 @@
             <title><![CDATA[Developing a Space Flight Simulator in Clojure]]></title>
             <link>https://www.wedesoft.de/software/2025/09/05/clojure-game/</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45145794</guid>
-            <description><![CDATA[Developing a Space Flight Simulator in Clojure]]></description>
-            <content:encoded><![CDATA[
-  
-  05 Sep 2025    
-
-In 2017 I discovered the free of charge Orbiter 2016 space flight simulator which was proprietary at the time and it inspired me to develop a space flight simulator myself.
-I prototyped some rigid body physics in C and later in GNU Guile and also prototyped loading and rendering of Wavefront OBJ files.
-I used GNU Guile (a Scheme implementation) because it has a good native interface and of course it has hygienic macros.
-Eventually I got interested in Clojure because unlike GNU Guile it has multi-methods as well as fast hash maps and vectors.
-I finally decided to develop the game for real in Clojure.
-I have been developing a space flight simulator in Clojure for almost 5 years now.
-While using Clojure I have come to appreciate the immutable values and safe parallelism using atoms, agents, and refs.
-
-In the beginning I decided to work on the hard parts first, which for me were 3D rendering of a planet, an atmosphere, shadows, and volumetric clouds.
-I read the OpenGL Superbible to get an understanding on what functionality OpenGL provides.
-When Orbiter was eventually open sourced and released unter MIT license here, I inspected the source code and discovered that about 90% of the code is graphics-related.
-So starting with the graphics problems was not a bad decision.
-
-Software dependencies
-
-The following software is used for development.
-The software libraries run on both GNU/Linux and Microsoft Windows.
-
-
-  Clojure the programming language
-  LWJGL provides Java wrappers for various libraries
-    
-      lwjgl-opengl for 3D graphics
-      lwjgl-glfw for windowing and input devices
-      lwjgl-nuklear for graphical user interfaces
-      lwjgl-stb for image I/O and using truetype fonts
-      lwjgl-assimp to load glTF 3D models with animation data
-    
-  
-  Jolt Physics to simulate wheeled vehicles and collisions with meshes
-  Fastmath for fast matrix and vector math as well as spline interpolation
-  Comb for templating shader code
-  Instaparse to parse NASA Planetary Constant Kernel (PCK) files
-  Gloss to parse NASA Double Precision Array Files (DAF)
-  Coffi as a foreign function interface
-  core.memoize for least recently used caching of function results
-  Apache Commons Compress to read map tiles from tar files
-  Malli to add schemas to functions
-  Immuconf to load the configuration file
-  Progrock a progress bar for long running builds
-  Claypoole to implement parallel for loops
-  tools.build to build the project
-  clj-async-profiler Clojure profiler creating flame graphs
-  slf4j-timbre Java logging implementation for Clojure
-
-
-The deps.edn file contains operating system dependent LWJGL bindings.
-For example on GNU/Linux the deps.edn file contains the following:
-
-{:deps {; ...
-        org.lwjgl/lwjgl {:mvn/version "3.3.6"}
-        org.lwjgl/lwjgl$natives-linux {:mvn/version "3.3.6"}
-        org.lwjgl/lwjgl-opengl {:mvn/version "3.3.6"}
-        org.lwjgl/lwjgl-opengl$natives-linux {:mvn/version "3.3.6"}
-        org.lwjgl/lwjgl-glfw {:mvn/version "3.3.6"}
-        org.lwjgl/lwjgl-glfw$natives-linux {:mvn/version "3.3.6"}
-        org.lwjgl/lwjgl-nuklear {:mvn/version "3.3.6"}
-        org.lwjgl/lwjgl-nuklear$natives-linux {:mvn/version "3.3.6"}
-        org.lwjgl/lwjgl-stb {:mvn/version "3.3.6"}
-        org.lwjgl/lwjgl-stb$natives-linux {:mvn/version "3.3.6"}
-        org.lwjgl/lwjgl-assimp {:mvn/version "3.3.6"}
-        org.lwjgl/lwjgl-assimp$natives-linux {:mvn/version "3.3.6"}}
-        ; ...
-        }
-
-In order to manage the different dependencies for Microsoft Windows, a separate Git branch is maintained.
-
-Atmosphere rendering
-
-
-    
-
-For the atmosphere, Bruneton’s precomputed atmospheric scattering was used.
-The implementation uses a 2D transmittance table, a 2D surface scattering table, a 4D Rayleigh scattering, and a 4D Mie scattering table.
-The tables are computed using several iterations of numerical integration.
-Higher order functions for integration over a sphere and over a line segment were implemented in Clojure.
-Integration over a ray in 3D space (using fastmath vectors) was implemented as follows for example:
-
-(defn integral-ray
-  "Integrate given function over a ray in 3D space"
-  {:malli/schema [:=> [:cat ray N :double [:=> [:cat [:vector :double]] :some]] :some]}
-  [{::keys [origin direction]} steps distance fun]
-  (let [stepsize      (/ distance steps)
-        samples       (mapv #(* (+ 0.5 %) stepsize) (range steps))
-        interpolate   (fn interpolate [s] (add origin (mult direction s)))
-        direction-len (mag direction)]
-    (reduce add (mapv #(-> % interpolate fun (mult (* stepsize direction-len))) samples))))
-
-Precomputing the atmospheric tables takes several hours even though pmap was used.
-When sampling the multi-dimensional functions, pmap was used as a top-level loop and map was used for interior loops.
-Using java.nio.ByteBuffer the floating point values were converted to a byte array and then written to disk using a clojure.java.io/output-stream:
-
-(defn floats->bytes
-  "Convert float array to byte buffer"
-  [^floats float-data]
-  (let [n           (count float-data)
-        byte-buffer (.order (ByteBuffer/allocate (* n 4)) ByteOrder/LITTLE_ENDIAN)]
-    (.put (.asFloatBuffer byte-buffer) float-data)
-    (.array byte-buffer)))
-
-(defn spit-bytes
-  "Write bytes to a file"
-  {:malli/schema [:=> [:cat non-empty-string bytes?] :nil]}
-  [^String file-name ^bytes byte-data]
-  (with-open [out (io/output-stream file-name)]
-    (.write out byte-data)))
-
-(defn spit-floats
-  "Write floating point numbers to a file"
-  {:malli/schema [:=> [:cat non-empty-string seqable?] :nil]}
-  [^String file-name ^floats float-data]
-  (spit-bytes file-name (floats->bytes float-data)))
-
-When launching the game, the lookup tables get loaded and copied into OpenGL textures.
-Shader functions are used to lookup and interpolate values from the tables.
-When rendering the planet surface or the space craft, the atmosphere essentially gets superimposed using ray tracing.
-After rendering the planet, a background quad is rendered to display the remaining part of the atmosphere above the horizon.
-
-Templating OpenGL shaders
-
-It is possible to make programming with OpenGL shaders more flexible by using a templating library such as Comb.
-The following shader defines multiple octaves of noise on a base noise function:
-
-#version 410 core
-
-float <%= base-function %>(vec3 idx);
-
-float <%= method-name %>(vec3 idx)
-{
-  float result = 0.0;
-<% (doseq [multiplier octaves] %>
-  result += <%= multiplier %> * <%= base-function %>(idx);
-  idx *= 2;
-<% ) %>
-  return result;
-}
-
-One can then for example define the function fbm_noise using octaves of the base function noise as follows:
-
-(def noise-octaves
-  "Shader function to sum octaves of noise"
-  (template/fn [method-name base-function octaves] (slurp "resources/shaders/core/noise-octaves.glsl")))
-
-; ...
-
-(def fbm-noise-shader (noise-octaves "fbm_noise" "noise" [0.57 0.28 0.15]))
-
-Planet rendering
-
-
-    
-
-To render the planet, NASA Bluemarble data, NASA Blackmarble data, and NASA Elevation data was used.
-The images were converted to a multi resolution pyramid of map tiles.
-The following functions were implemented for color map tiles and for elevation tiles:
-
-
-  a function to load and cache map tiles of given 2D tile index and level of detail
-  a function to extract a pixel from a map tile
-  a function to extract the pixel for a specific longitude and latitude
-
-
-The functions for extracting a pixel for given longitude and latitude then were used to generate a cube map with a quad tree of tiles for each face.
-For each tile, the following files were generated:
-
-
-  A daytime texture
-  A night time texture
-  An image of 3D vectors defining a surface mesh
-  A water mask
-  A normal map
-
-
-Altogether 655350 files were generated.
-Because the Steam ContentBuilder does not support a large number of files, each row of tile data was aggregated into a tar file.
-The Apache Commons Compress library allows you to open a tar file to get a list of entries and then perform random access on the contents of the tar file.
-A Clojure LRU cache was used to maintain a cache of open tar files for improved performance.
-
-At run time, a future is created, which returns an updated tile tree, a list of tiles to drop, and a path list of the tiles to load into OpenGL.
-When the future is realized, the main thread deletes the OpenGL textures from the drop list, and then uses the path list to get the new loaded images from the tile tree, load them into OpenGL textures, and create an updated tile tree with the new OpenGL textures added.
-The following functions to manipulate quad trees were implemented to realize this:
-
-(defn quadtree-add
-  "Add tiles to quad tree"
-  {:malli/schema [:=> [:cat [:maybe :map] [:sequential [:vector :keyword]] [:sequential :map]] [:maybe :map]]}
-  [tree paths tiles]
-  (reduce (fn add-title-to-quadtree [tree [path tile]] (assoc-in tree path tile)) tree (mapv vector paths tiles)))
-
-(defn quadtree-extract
-  "Extract a list of tiles from quad tree"
-  {:malli/schema [:=> [:cat [:maybe :map] [:sequential [:vector :keyword]]] [:vector :map]]}
-  [tree paths]
-  (mapv (partial get-in tree) paths))
-
-(defn quadtree-drop
-  "Drop tiles specified by path list from quad tree"
-  {:malli/schema [:=> [:cat [:maybe :map] [:sequential [:vector :keyword]]] [:maybe :map]]}
-  [tree paths]
-  (reduce dissoc-in tree paths))
-
-(defn quadtree-update
-  "Update tiles with specified paths using a function with optional arguments from lists"
-  {:malli/schema [:=> [:cat [:maybe :map] [:sequential [:vector :keyword]] fn? [:* :any]] [:maybe :map]]}
-  [tree paths fun & arglists]
-  (reduce (fn update-tile-in-quadtree
-            [tree [path & args]]
-            (apply update-in tree path fun args)) tree (apply map list paths arglists)))
-
-Other topics
-
-Solar system
-
-The astronomy code for getting the position and orientation of planets was implemented according to the Skyfield Python library.
-The Python library in turn is based on the SPICE toolkit of the NASA JPL.
-The JPL basically provides sequences of Chebyshev polynomials to interpolate positions of Moon and planets as well as the orientation of the Moon as binary files.
-Reference coordinate systems and orientations of other bodies are provided in text files which consist of human and machine readable sections.
-The binary files were parsed using Gloss (see Wiki for some examples) and the text files using Instaparse.
-
-Jolt bindings
-
-The required Jolt functions for wheeled vehicle dynamics and collisions with meshes were wrapped in C functions and compiled into a shared library.
-The Coffi Clojure library (which is a wrapper for Java’s new Foreign Function & Memory API) was used to make the C functions and data types usable in Clojure.
-
-For example the following code implements a call to the C function add_force:
-
-(defcfn add-force
-  "Apply a force in the next physics update"
-  add_force [::mem/int ::vec3] ::mem/void)
-
-Here ::vec3 refers to a custom composite type defined using basic types.
-The memory layout, serialisation, and deserialisation for ::vec3 are defined as follows:
-
-(def vec3-struct
-  [::mem/struct
-   [[:x ::mem/double]
-    [:y ::mem/double]
-    [:z ::mem/double]]])
-
-
-(defmethod mem/c-layout ::vec3
-  [_vec3]
-  (mem/c-layout vec3-struct))
-
-
-(defmethod mem/serialize-into ::vec3
-  [obj _vec3 segment arena]
-  (mem/serialize-into {:x (obj 0) :y (obj 1) :z (obj 2)} vec3-struct segment arena))
-
-
-(defmethod mem/deserialize-from ::vec3
-  [segment _vec3]
-  (let [result (mem/deserialize-from segment vec3-struct)]
-    (vec3 (:x result) (:y result) (:z result))))
-
-Performance
-
-The clj-async-profiler was used to create flame graphs visualising the performance of the game.
-In order to get reflection warnings for Java calls without sufficient type declarations, *unchecked-math* was set to :warn-on-boxed.
-
-(set! *unchecked-math* :warn-on-boxed)
-
-Furthermore to discover missing declarations of numerical types, *warn-on-reflection* was set to true.
-
-(set! *warn-on-reflection* true)
-
-To reduce garbage collector pauses, the ZGC low-latency garbage collector for the JVM was used.
-The following section in deps.edn ensures that the ZGC garbage collector is used when running the project with clj -M:run:
-
-{:deps {; ...
-        }
- :aliases {:run {:jvm-opts ["-Xms2g" "-Xmx4g" "--enable-native-access=ALL-UNNAMED" "-XX:+UseZGC"
-                            "--sun-misc-unsafe-memory-access=allow"]
-                 :main-opts ["-m" "sfsim.core"]}}}
-
-The option to use ZGC is also specified in the Packr JSON file used to deploy the application.
-
-Building the project
-
-In order to build the map tiles, atmospheric lookup tables, and other data files using tools.build, the project source code was made available in the build.clj file using a :local/root dependency:
-
-{:deps {; ...
-        }
- :aliases {; ...
-           :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.10"}
-                          sfsim/sfsim {:local/root "."}}
-                   :ns-default build
-                   :exec-fn all
-                   :jvm-opts ["-Xms2g" "-Xmx4g" "--sun-misc-unsafe-memory-access=allow"]}}}
-
-Various targets were defined to build the different components of the project.
-For example the atmospheric lookup tables can be build by specifying clj -T:build atmosphere-lut on the command line.
-
-The following section in the build.clj file was added to allow creating an “Uberjar” JAR file with all dependencies by specifying clj -T:build uber on the command-line.
-
-(defn uber [_]
-  (b/copy-dir {:src-dirs ["src/clj"]
-               :target-dir class-dir})
-  (b/compile-clj {:basis basis
-                  :src-dirs ["src/clj"]
-                  :class-dir class-dir})
-  (b/uber {:class-dir class-dir
-           :uber-file "target/sfsim.jar"
-           :basis basis
-           :main 'sfsim.core}))
-
-To create a Linux executable with Packr, one can then run java -jar packr-all-4.0.0.jar scripts/packr-config-linux.json where the JSON file has the following content:
-
-{
-  "platform": "linux64",
-  "jdk": "/usr/lib/jvm/jdk-24.0.2-oracle-x64",
-  "executable": "sfsim",
-  "classpath": ["target/sfsim.jar"],
-  "mainclass": "sfsim.core",
-  "resources": ["LICENSE", "libjolt.so", "venturestar.glb", "resources"],
-  "vmargs": ["Xms2g", "Xmx4g", "XX:+UseZGC"],
-  "output": "out-linux"
-}
-
-In order to distribute the game on Steam, three depots were created:
-
-
-  a data depot with the operating system independent data files
-  a Linux depot with the Linux executable and Uberjar including LWJGL’s Linux native bindings
-  and a Windows depot with the Windows executable and an Uberjar including LWJGL’s Windows native bindings
-
-
-When updating a depot, the Steam ContentBuilder command line tool creates and uploads a patch in order to preserve storage space and bandwidth.
-
-Future work
-
-Although the hard parts are mostly done, there are still several things to do:
-
-
-  control surfaces and thruster graphics
-  launchpad and runway graphics
-  sound effects
-  a 3D cockpit
-  the Moon
-  a space station
-
-
-It would also be interesting to make the game modable in a safe way (maybe evaluating Clojure files in a sandboxed environment?).
-
-Conclusion
-
-
-    
-
-You can find the source code on Github.
-Currently there is only a playtest build, but if you want to get notified, when the game gets released, you can wishlist it here.
-
-Anyway, let me know any comments and suggestions.
-
-Enjoy!
-
-
-
-
-  Flight dynamics model for simulating Venturestar style spacecraft
-  Test Driven Development with OpenGL
-  Implementing GUIs using Clojure and LWJGL Nuklear bindings
-  Procedural Volumetric Clouds
-  Procedural generation of global cloud cover
-  Reversed-Z Rendering in OpenGL
-  Specifying Clojure function schemas with Malli
-  Implement an Interpreter using Clojure Instaparse
-  Orbits with Jolt Physics
-  Getting started with the Jolt Physics Engine
-  Create Blender bones and animate and import with Assimp
-
-
-
-]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[The sunscreen scandal shocking Australia - the world's skin cancer capital]]></title>
             <link>https://www.bbc.com/news/articles/c4gzl41rpdqo</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45145624</guid>
             <description><![CDATA[It has shaken consumer trust and raised questions about global sunscreen regulation.]]></description>
-            <content:encoded><![CDATA[4 hours agoTabby Wilson and Tiffanie TurnbullBBC News, SydneyMarianna Massey/Getty ImagesSunscreens are at the heart of a national scandal in Australia Like many Australians, Rach grew up "terrified of the sun" in a country that has the unenviable title of skin cancer capital of the world.Her childhood was characterised by the infamous "no hat, no play" rule that is commonplace in Australian schools, 90s advertisements that warned the sun would give you cancer, and sunscreen tubes that stood guard at every door in her home.It made the now 34-year-old the kind of person who religiously applies sunscreen multiple times a day and rarely leaves the house without a hat.So she was shocked when doctors found a skin cancer on her nose during a check last November, something they said was abnormal given her age and ray-dodging regime.Though technically classified as a "low grade" skin cancer – a basel cell carcinoma – it had to be surgically removed, leaving the Newcastle mum with a scar just below her eye."I was just confused, and I was a little bit angry because I was like, 'Are you kidding me?'" Rach – who asked that her surname not be used – told the BBC. "I thought I'd done all the right stuff and it still happened to me."That rage grew when she learned the sunscreen she had been using for years was unreliable and, according to some tests, offered next to no sun protection at all.ABC News/Billy CooperThis Ultra Violette product is at the centre of the sunscreen controversy Independent analysis by a trusted consumer advocacy group has found that several of Australia's most popular, and expensive, sunscreens are not providing the protection they claim to, kicking off a national scandal.There has been a massive backlash from customers, a probe launched by the country's medical watchdog, multiple products pulled from shelves, and questions raised about the regulation of sunscreen around the globe."It's definitely not an issue isolated to Australia," cosmetic chemist Michelle Wong told the BBC.The reckoningAustralians have a complicated relationship with the sun: they love it, but they also fear it. Effective public health messaging – which has drilled "Slip, Slop, Slap" into their heads – competes with a beauty culture which often idolises bronzed skin.The country has the highest incidence of skin cancers in the world and it is estimated that two out of three Australians will have at least one cut out in their lifetime.So when Choice Australia released its damning report in June, it immediately made waves. The group had tested 20 sunscreens in an independent accredited Australian lab, finding 16 did not meet the SPF, or skin protection factor, rating listed on the packet.Ultra Violette's Lean Screen SPF 50+ Mattifying Zinc Skinscreen, a facial product that Rach says she used exclusively, was the "most significant failure" identified. It returned a result of SPF 4, something that shocked Choice so much it commissioned a second test that produced a similar reading.Other products that did not meet their SPF claims included those from Neutrogena, Banana Boat, Bondi Sands and the Cancer Council - but they all rejected Choice's findings and said their own independent testing showed their sunscreens worked as advertised.Getty ImagesFor decades Australians have been urged to slip on a shirt, slop on sunscreen and slap on a hatThe uproar was immediate for the brands named in the report, and also prompted a swift response from the Therapeutic Goods Association (TGA), which said it would investigate the findings and "take regulatory action as required".Ultra Violette bit back, saying they were "confident that Lean Screen is safe and effective" and detailing extensive testing of the product – which has been sold in almost 30 countries, including the UK, and retails for upwards of A$50 (£24, $33).But less than two months later, it announced that Lean Screen would be recalled after it returned inconsistent results across eight different sets of lab testing."We are deeply sorry that one of our products has fallen short of the standards we pride ourselves on and that you have come to expect of us," read a statement published to the brand's Instagram account.It added that it has "since ended the relationship with the initial testing lab".In the past fortnight, other brands have "paused" the sale of at least four more products, none of which were included in the Choice report.Rach knows there is no way to prove that there is a link between her diagnosis and the brand of sunscreen she relied on. She says she is not alleging there is such a connection. But she said Ultra Violette's response to the scandal was like "a kick in the guts". She felt that they took no real accountability for the pitfalls of their product, and was let down by their decision to continue selling it for two months despite doubts over its efficacy."I just had like the five stages of grief, you know?" she said. "I was angry, I was upset, I was almost in denial."Getty ImagesAva Chandler-Matthews and Rebecca Jefferd founded Ultra Violette in 2019Like Rach, a horde of annoyed customers say the saga has shaken their faith in the industry."A refund isn't really going to reverse years of sun damage, is it?" one wrote in response to Ultra Violette's recall statement.Choice has urged the TGA to conduct further investigations into the sunscreen market, and also urged any brands who had reason to question the SPF protection listed on their products to remove them from sale immediately."It is clear there is a serious issue in the Australian sunscreen industry that urgently needs to be addressed," said Rosie Thomas, the director of campaigns, in a statement to the BBC.How did this happen?While in Europe sunscreen is classed as a cosmetic, Australia regulates it as a therapeutic good – essentially a medicine – which means it is subject to some of the most robust sunscreen regulations in the world. And that's something many of the brands caught up in this saga trade on. So, how did this happen?An investigation by the Australian Broadcasting Corporation found that a single US-based laboratory had certified at least half of the products that had failed Choice's testing, and that this facility routinely recorded high test results.It also found that several of the sunscreens pulled from shelves shared a similar base formula and linked them to a manufacturer in Western Australia.The TGA says it does not usually speak about ongoing investigations because it does not want to compromise them, but that it is also looking into "reviewing existing SPF testing requirements" which can be "highly subjective"."The TGA is also aware that it is common practice for different sunscreen products to share the same or similar base formulations," a spokesperson said in a statement to the BBC."Ultimately it is the sponsor's [seller's] responsibility to ensure that their medicine remains compliant with all applicable legislative requirements."Consistent and comfortable sunscreens which offer high protection are very technical and difficult to make, says Dr Wong, founder of Lab Muffin Beauty Science. Everyone's skin responds differently to the product, he adds, and it's one that is almost always being stress-tested – by sweat, water, or makeup.It is very difficult to rate effectively for the same reasons. Historically, it has been done by spreading the sunscreen on 10 people at the same thickness, then timing how long it takes for their skin to start burning both with and without the product applied.Getty ImagesEffective and popular sunscreens are hard to get right, experts sayWhile there are clear guidelines as to what you are looking for, Dr Wong says there is still a lot of variability. That is down to skin texture or tone, or even the colour of the walls, and "different labs get different results".But she says results are also quite easy to fake, pointing to a 2019 probe by US authorities into a sunscreen testing laboratory which resulted in the owner being jailed for fraud.Many sunscreen brands from all over the world use the same manufacturers and testing labs - and so this issue is unlikely to be isolated to Australia, she adds."Until someone goes out and tests a whole bunch of sunscreens in other countries, we just don't know the extent of it."She says the scandal is a reminder that regulations are only as good as they are enforced.But while it has touched a nerve for many people who are at high risk for skin cancer simply by virtue of being Australian, Dr Wong said she felt the panic triggered by the investigation was blown out of proportion.She points to the world's largest clinical trial of sunscreen, done in the 90s, which found that the daily use of an SPF 16 sunscreen dramatically dropped skin cancer rates."95% of the sunscreens tested [by Choice] have high enough SPF to more than halve the incidence of skin cancer," Dr Wong said."Some of the SPF testing, I feel, has become a bit more of a marketing exercise than a real reflection of efficacy."The most important thing you can do when choosing a sunscreen, she says, is actually wear enough of it – a full teaspoon at least for each part of your body, face included. And ideally you should apply it about every two hours,  especially if you have been sweating a lot or swimming.  Experts also advise that you combine the sunscreen with other safety methods, such as wearing protective clothing and seeking out shade.Read more Australia stories ]]></content:encoded>
+            <content:encoded><![CDATA[5 hours agoTabby Wilson and Tiffanie TurnbullBBC News, SydneyMarianna Massey/Getty ImagesSunscreens are at the heart of a national scandal in Australia Like many Australians, Rach grew up "terrified of the sun" in a country that has the unenviable title of skin cancer capital of the world.Her childhood was characterised by the infamous "no hat, no play" rule that is commonplace in Australian schools, 90s advertisements that warned the sun would give you cancer, and sunscreen tubes that stood guard at every door in her home.It made the now 34-year-old the kind of person who religiously applies sunscreen multiple times a day and rarely leaves the house without a hat.So she was shocked when doctors found a skin cancer on her nose during a check last November, something they said was abnormal given her age and ray-dodging regime.Though technically classified as a "low grade" skin cancer – a basel cell carcinoma – it had to be surgically removed, leaving the Newcastle mum with a scar just below her eye."I was just confused, and I was a little bit angry because I was like, 'Are you kidding me?'" Rach – who asked that her surname not be used – told the BBC. "I thought I'd done all the right stuff and it still happened to me."That rage grew when she learned the sunscreen she had been using for years was unreliable and, according to some tests, offered next to no sun protection at all.ABC News/Billy CooperThis Ultra Violette product is at the centre of the sunscreen controversy Independent analysis by a trusted consumer advocacy group has found that several of Australia's most popular, and expensive, sunscreens are not providing the protection they claim to, kicking off a national scandal.There has been a massive backlash from customers, a probe launched by the country's medical watchdog, multiple products pulled from shelves, and questions raised about the regulation of sunscreen around the globe."It's definitely not an issue isolated to Australia," cosmetic chemist Michelle Wong told the BBC.The reckoningAustralians have a complicated relationship with the sun: they love it, but they also fear it. Effective public health messaging – which has drilled "Slip, Slop, Slap" into their heads – competes with a beauty culture which often idolises bronzed skin.The country has the highest incidence of skin cancers in the world and it is estimated that two out of three Australians will have at least one cut out in their lifetime.So when Choice Australia released its damning report in June, it immediately made waves. The group had tested 20 sunscreens in an independent accredited Australian lab, finding 16 did not meet the SPF, or skin protection factor, rating listed on the packet.Ultra Violette's Lean Screen SPF 50+ Mattifying Zinc Skinscreen, a facial product that Rach says she used exclusively, was the "most significant failure" identified. It returned a result of SPF 4, something that shocked Choice so much it commissioned a second test that produced a similar reading.Other products that did not meet their SPF claims included those from Neutrogena, Banana Boat, Bondi Sands and the Cancer Council - but they all rejected Choice's findings and said their own independent testing showed their sunscreens worked as advertised.Getty ImagesFor decades Australians have been urged to slip on a shirt, slop on sunscreen and slap on a hatThe uproar was immediate for the brands named in the report, and also prompted a swift response from the Therapeutic Goods Association (TGA), which said it would investigate the findings and "take regulatory action as required".Ultra Violette bit back, saying they were "confident that Lean Screen is safe and effective" and detailing extensive testing of the product – which has been sold in almost 30 countries, including the UK, and retails for upwards of A$50 (£24, $33).But less than two months later, it announced that Lean Screen would be recalled after it returned inconsistent results across eight different sets of lab testing."We are deeply sorry that one of our products has fallen short of the standards we pride ourselves on and that you have come to expect of us," read a statement published to the brand's Instagram account.It added that it has "since ended the relationship with the initial testing lab".In the past fortnight, other brands have "paused" the sale of at least four more products, none of which were included in the Choice report.Rach knows there is no way to prove that there is a link between her diagnosis and the brand of sunscreen she relied on. She says she is not alleging there is such a connection. But she said Ultra Violette's response to the scandal was like "a kick in the guts". She felt that they took no real accountability for the pitfalls of their product, and was let down by their decision to continue selling it for two months despite doubts over its efficacy."I just had like the five stages of grief, you know?" she said. "I was angry, I was upset, I was almost in denial."Getty ImagesAva Chandler-Matthews and Rebecca Jefferd founded Ultra Violette in 2019Like Rach, a horde of annoyed customers say the saga has shaken their faith in the industry."A refund isn't really going to reverse years of sun damage, is it?" one wrote in response to Ultra Violette's recall statement.Choice has urged the TGA to conduct further investigations into the sunscreen market, and also urged any brands who had reason to question the SPF protection listed on their products to remove them from sale immediately."It is clear there is a serious issue in the Australian sunscreen industry that urgently needs to be addressed," said Rosie Thomas, the director of campaigns, in a statement to the BBC.How did this happen?While in Europe sunscreen is classed as a cosmetic, Australia regulates it as a therapeutic good – essentially a medicine – which means it is subject to some of the most robust sunscreen regulations in the world. And that's something many of the brands caught up in this saga trade on. So, how did this happen?An investigation by the Australian Broadcasting Corporation found that a single US-based laboratory had certified at least half of the products that had failed Choice's testing, and that this facility routinely recorded high test results.It also found that several of the sunscreens pulled from shelves shared a similar base formula and linked them to a manufacturer in Western Australia.The TGA says it does not usually speak about ongoing investigations because it does not want to compromise them, but that it is also looking into "reviewing existing SPF testing requirements" which can be "highly subjective"."The TGA is also aware that it is common practice for different sunscreen products to share the same or similar base formulations," a spokesperson said in a statement to the BBC."Ultimately it is the sponsor's [seller's] responsibility to ensure that their medicine remains compliant with all applicable legislative requirements."Consistent and comfortable sunscreens which offer high protection are very technical and difficult to make, says Dr Wong, founder of Lab Muffin Beauty Science. Everyone's skin responds differently to the product, he adds, and it's one that is almost always being stress-tested – by sweat, water, or makeup.It is very difficult to rate effectively for the same reasons. Historically, it has been done by spreading the sunscreen on 10 people at the same thickness, then timing how long it takes for their skin to start burning both with and without the product applied.Getty ImagesEffective and popular sunscreens are hard to get right, experts sayWhile there are clear guidelines as to what you are looking for, Dr Wong says there is still a lot of variability. That is down to skin texture or tone, or even the colour of the walls, and "different labs get different results".But she says results are also quite easy to fake, pointing to a 2019 probe by US authorities into a sunscreen testing laboratory which resulted in the owner being jailed for fraud.Many sunscreen brands from all over the world use the same manufacturers and testing labs - and so this issue is unlikely to be isolated to Australia, she adds."Until someone goes out and tests a whole bunch of sunscreens in other countries, we just don't know the extent of it."She says the scandal is a reminder that regulations are only as good as they are enforced.But while it has touched a nerve for many people who are at high risk for skin cancer simply by virtue of being Australian, Dr Wong said she felt the panic triggered by the investigation was blown out of proportion.She points to the world's largest clinical trial of sunscreen, done in the 90s, which found that the daily use of an SPF 16 sunscreen dramatically dropped skin cancer rates."95% of the sunscreens tested [by Choice] have high enough SPF to more than halve the incidence of skin cancer," Dr Wong said."Some of the SPF testing, I feel, has become a bit more of a marketing exercise than a real reflection of efficacy."The most important thing you can do when choosing a sunscreen, she says, is actually wear enough of it – a full teaspoon at least for each part of your body, face included. And ideally you should apply it about every two hours,  especially if you have been sweating a lot or swimming.  Experts also advise that you combine the sunscreen with other safety methods, such as wearing protective clothing and seeking out shade.Read more Australia stories ]]></content:encoded>
         </item>
         <item>
-            <title><![CDATA[GLM 4.5 with Claude Code is a killer combination]]></title>
+            <title><![CDATA[GLM 4.5 with Claude Code]]></title>
             <link>https://docs.z.ai/guides/llm/glm-4.5</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45145457</guid>
             <description><![CDATA[GLM-4.5 and GLM-4.5-Air are our latest flagship models, purpose-built as foundational models for agent-oriented applications. Both leverage a Mixture-of-Experts (MoE) architecture. GLM-4.5 has a total parameter count of 355B with 32B active parameters per forward pass, while GLM-4.5-Air adopts a more streamlined design with 106B total parameters and 12B active parameters.
@@ -552,7 +174,7 @@ Epsilon Eridani is orbited by a large planet which might look like this.
     
         
           
-          33
+          41
           stars
         
           
@@ -1131,54 +753,6 @@ Address: 192.168.1.10
 And now you should be able to ping the machines with their hostname. ssh into them. Get certificates with the CA that runs in the podman container. Life is good!
 
 I hope you enjoyed this post and could learn something new! Feel free to comment or send corrections vie the Toot linked below that collects the comments!
-]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[Fantastic pretraining optimizers and where to find them]]></title>
-            <link>https://arxiv.org/abs/2509.02046</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45141762</guid>
-            <description><![CDATA[AdamW has long been the dominant optimizer in language model pretraining, despite numerous claims that alternative optimizers offer 1.4 to 2x speedup. We posit that two methodological shortcomings have obscured fair comparisons and hindered practical adoption: (i) unequal hyperparameter tuning and (ii) limited or misleading evaluation setups. To address these two issues, we conduct a systematic study of ten deep learning optimizers across four model scales (0.1B-1.2B parameters) and data-to-model ratios (1-8x the Chinchilla optimum). We find that fair and informative comparisons require rigorous hyperparameter tuning and evaluations across a range of model scales and data-to-model ratios, performed at the end of training. First, optimal hyperparameters for one optimizer may be suboptimal for another, making blind hyperparameter transfer unfair. Second, the actual speedup of many proposed optimizers over well-tuned baselines is lower than claimed and decreases with model size to only 1.1x for 1.2B parameter models. Thirdly, comparing intermediate checkpoints before reaching the target training budgets can be misleading, as rankings between two optimizers can flip during training due to learning rate decay. Through our thorough investigation, we find that all the fastest optimizers such as Muon and Soap, use matrices as preconditioners -- multiplying gradients with matrices rather than entry-wise scalars. However, the speedup of matrix-based optimizers is inversely proportional to model scale, decreasing from 1.4x over AdamW for 0.1B parameter models to merely 1.1x for 1.2B parameter models.]]></description>
-            <content:encoded><![CDATA[
-    
-    
-                
-    View PDF
-    HTML (experimental)
-            Abstract:AdamW has long been the dominant optimizer in language model pretraining, despite numerous claims that alternative optimizers offer 1.4 to 2x speedup. We posit that two methodological shortcomings have obscured fair comparisons and hindered practical adoption: (i) unequal hyperparameter tuning and (ii) limited or misleading evaluation setups. To address these two issues, we conduct a systematic study of ten deep learning optimizers across four model scales (0.1B-1.2B parameters) and data-to-model ratios (1-8x the Chinchilla optimum). We find that fair and informative comparisons require rigorous hyperparameter tuning and evaluations across a range of model scales and data-to-model ratios, performed at the end of training. First, optimal hyperparameters for one optimizer may be suboptimal for another, making blind hyperparameter transfer unfair. Second, the actual speedup of many proposed optimizers over well-tuned baselines is lower than claimed and decreases with model size to only 1.1x for 1.2B parameter models. Thirdly, comparing intermediate checkpoints before reaching the target training budgets can be misleading, as rankings between two optimizers can flip during training due to learning rate decay. Through our thorough investigation, we find that all the fastest optimizers such as Muon and Soap, use matrices as preconditioners -- multiplying gradients with matrices rather than entry-wise scalars. However, the speedup of matrix-based optimizers is inversely proportional to model scale, decreasing from 1.4x over AdamW for 0.1B parameter models to merely 1.1x for 1.2B parameter models.
-    
-
-    
-    
-              
-          Comments:
-          108 pages, 8 figures, reproducible runs available at this https URL
-        
-
-          Subjects:
-          
-            Machine Learning (cs.LG); Artificial Intelligence (cs.AI); Machine Learning (stat.ML)
-        
-          Cite as:
-          arXiv:2509.02046 [cs.LG]
-        
-        
-           
-          (or 
-              arXiv:2509.02046v1 [cs.LG] for this version)
-          
-        
-        
-           
-                        https://doi.org/10.48550/arXiv.2509.02046
-              
-                                arXiv-issued DOI via DataCite (pending registration)
-            
-          
-        
-    
-  
-      Submission history From: Kaiyue Wen [view email]          [v1]
-        Tue, 2 Sep 2025 07:43:22 UTC (701 KB)
 ]]></content:encoded>
         </item>
         <item>
@@ -3272,6 +2846,166 @@ signalsandthreads.com. Thanks for joining us. See you next time.
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45137245</guid>
             <description><![CDATA[→日本語で読むWelcome to &amp;quot;Interviews with Demosceners&amp;quot;! This time, we welcome Japanese demoscener 0b5vr, who mainly creates 64K...…]]></description>
             <content:encoded><![CDATA[→日本語で読むWelcome to “Interviews with Demosceners”! This time, we welcome Japanese demoscener 0b5vr, who mainly creates 64K and 4K intros.For many, 0b5vr is best remembered for his 64K demo “0b5vr GLSL Techno Live Set”, released at Revision 2023. In this interview, he talks about how this piece was created, as well as his recent live music performance.He also talks about trends around the Japanese demoscene, like music production with GLSL, machine live, and generative VJ. I also took the chance to ask how he feels about sceners like me—that is, people who know nothing about programming or technology! Happy reading!Note: If you don’t know what demoscene is, you may want to start from here!First of all, could you introduce yourself?I’m 0b5vr, and I don’t belong to any particular group. I mainly work on 64k intros and 4k intros/exegfx using WebGL. I also compete in Shader Jam and perform live coding and VJ sets at club events and similar venues.Your demo “0b5vr GLSL Techno Live Set” had a strong impact on me. I was curious about this. It says “Live Set,” but was released in the 64K category. What is this exactly? Is this live coding?0b5vr GLSL Techno Live Set (“0mix”) is indeed a 64K intro demo. Just like any other 64K intro, this audiovisual piece is generated from a 64KB file―an HTML file, in this case.That said, as described in the title, its format is “Live Set.” It can be somewhat tricky, because it looks like a recorded video of a live performance at an event, but it’s actually a 64K intro.Hmm… I’m still not sure if I understood correctly. Could you elaborate a bit more?0mix was inspired by three different scenes: techno demos, live coding, and 64K intros.Let me start with techno demos. There are many techno-themed demos in the history of the demoscene. If you look at the demos such as “Medium” by Einklang.net, “X-MIX 2004: Ion Traxx” by Kewlers & mfx, and “Emix” by Epoch, they use multiple tracks mixed together like a DJ set, rather than a single techno soundtrack. They also use VJ-style visuals to create an atmosphere similar to a club event. Emix has black-and-white visuals with unique textures that fit perfectly with cold, mechanical techno, and it’s one of my favorites.Next is live coding. Live coding is a live performance where visuals and music are generated with programming in real time. On the screen, you’ll see the visuals and sound waveforms being generated alongside the code you’re writing. This highlights that the artwork is generated by code. In the demoscene, live coding sessions focus mostly on visuals in GLSL (eg, Shader Showdown, Shader Jam). But in live coding events like Algorave and Eulerroom, music live coding is as popular as, or even more popular than, visual coding. From what I see, Tidal Cycles and Sonic Pi are the most commonly used tools in those environments. (Reference video)Finally, there’s the 64K intro. It’s a category where you create visuals and audio with an executable file of just 64KB. This is the most challenging category since every element has to be procedurally generated within the intro. Most 64K creators build their own engines and tools from scratch. This category requires a broad range of knowledge and skills including modeling, animation, rendering, post-processing, music, and compression.If I managed to merge all three inspirations and create a 64K techno demo with music generated by live coding, I knew I could present it to demosceners and other creators around the scene with confidence. I came up with the idea about a year before Revision 2023. Over the course of that year, I refined a demo engine, built a live coding environment, composed music, and created visual assets almost entirely on my own. Here’s the working environment for 0mix. The top screen shows the preview, timeline, etc., while the bottom screen is the code editor. Basically, I spend most of the time in the code editor. So, you climbed the highest mountain by yourself. What was the process like?It was extremely tough and painful to spend a year working on a challenging 64K project by myself. My advice is to collaborate with others. At the very least, you should find someone you can discuss the progress with. It was indeed fun to surprise many friends at demoparties, but at the end of the day, completing the project is more important.You entered 64K compo, but it ended up being released in the PC Demo compo. Did that bother you?It’s true that 0mix was released in the PC Demo Compo at Revision 2023. That was because it was the only entry in the PC 64K intro, which wasn’t enough to hold a separate compo. So the two compos were merged. The same thing happened at Revision 2022. PC 64K intro compo was incorporated into the 8K intro compo because there were only two entries. Nevertheless, I’ve always pursued uncompromising quality, so I was down with it. Along with the works of other demo groups (such as Fairlight, mfx, and Still), I think I could contribute to making that compo interesting.Ah, you’re right. That felt like a never-ending compo!There were so many entries for Revision 2023, and from the chat I got the impression that many participants and viewers were exhausted after the compo. Still, it was a great compo. All of the top works featured demoscene-style visuals built with their own engines, and their narratives were also impressive. So I’m happy with my result. When there’s a big entry in the compo I’m in, I feel more accomplished because it means I helped make that compo exciting together with those great pieces.That’s right, I remember some big names rushing in at the end. Nevertheless, this demo stood out for its originality.Thank you. Revision has an award called “Crowd Favorite” where viewers can vote for their favorite demo in any category, and 0mix received first prize. 0mix is a piece that reflects what I love, so I felt happy that everyone else enjoyed it, too.photo provided by 0b5vrCongratulations! It was indeed a cool demo.Oh, I have a question for you. How do you feel about the code constantly shown in 0mix? What kind of impression does it give you?  (Interviewer’s note: I’m not from the programming field. I’m the type of person who chooses a laptop by its color.)Maybe it’s more like a design or typography? It says “live coding,” so I figured this code is for its visuals, but I have absolutely no idea if the code itself is cool or not. If I didn’t know what live coding is, I’d probably just look at it as part of the design, just like seeing the typography in a language I don’t understand.Ah, that’s interesting! Actually, the code displayed on the screen is not for visuals but for music. I use a programming language called GLSL, which is normally used to generate visuals. But 0mix is a live performance-themed demo where I use GLSL for music, and that’s why it’s called “GLSL Techno Live.” If you look at the code closely, you’ll see the parts for instruments, like “KICK,” “HIHAT,” and “BASS.” And by adding and subtracting these elements, I shaped the flow of music.Ohh, so that was code for music! But even after knowing this fact, my impression of this piece hasn’t really changed. I guess that shows I interpreted the code as part of the design. Is it okay if a viewer like me sees it that way? (laughs)In my post about this production on Scrapbox, I wrote, “for viewers without coding knowledge, it feels like music-making magic. And for viewers who know programming languages and environments, it’s a hint to guess the next move.” So I expected that some people would see it as part of the design.To reveal a bit more about my understanding, now I do understand that “demo is generated from an executable file” and that “a 64K piece has a 64KB file.” But I still don’t see things like “this is real-time rendering, so it’s more impressive than live-action” or “it’s great quality considering this is 64KB.” Basically, I watch demos like I watch music videos, and the only thing that matters to me is whether I find it cool or not.Ryoji Ikeda has a work that presents data including planets and genes using 5×5 pixel fonts. Of course, only experts can truly understand such data, so most of us simply enjoy the visual design that comes out of it. Even if we try to find deeper meaning in it, we probably just end up saying something like, “Wow, the world is huge.” I’ve read that Ikeda actually intended for viewers to see it that way.Oh, then I’m actually one of his intended viewers. When I first saw his installation video, I knew him as a musician, so I thought, “Wow, that’s his MV? Cool! Very futuristic!” I later realized that it wasn’t just design. It’s nice to know that creators and demosceners expected viewers like me, and personally, I feel relieved. I’d always thought they might be annoyed to hear a clueless person like me commenting on their piece. (laughs)To me, how others first got interested in a piece or in the culture is as fascinating as the motives behind its creation. So I do appreciate sceners who are not from the tech side!Thank you! That’s really nice and reassuring to hear! OK, let’s go back to that music code. You wrote in your post on Scrapbox that you put a lot of time and effort into the music.Actually, I had never really made this type of techno music before, so I watched a lot of live performances of this style and tutorials on YouTube. I also bought and tried hardware for “machine live” performances, like the Elektron Syntakt and Dirtywave M8, for research.What is “machine live”?“Machine live” is a type of music performance similar to live coding. Performers use music equipment like grooveboxes and modular synths in real-time to control the sound during the performance. What you can do depends on the features of the equipment, so performers always have to be aware of limitations—something somewhat similar to the demoscene. It’s a fascinating culture. There’s even a “DAWless Live” category where you perform without using a DAW, the standard PC-based music production system. For 0mix, I drew a lot of inspiration from the philosophy and methods of machine live and applied them to GLSL live coding. (Reference video)I just watched the reference video you sent me. Does everyone in this scene really use that much gear?Of course not. Not everyone uses this much equipment, or equipment of this size, for live performance. Lately, it seems like the palm-sized Dirtywave M8 is trending for live sets. The Dirtywave M8 uses a tracker-style UI, and it’s fun to compose with. Plus, it fits well with the demoscene aesthetic.I did a lot of research on machine live and live coding performances, and this gave me ideas about how to create sound and how to evolve live performance. But that only covered the technical side. When it comes to making techno, especially abstract sounds, I had to learn through trial and error and trust my feelings. Even after I learned how to make sounds on standard hardware or software, GLSL follows a completely different set of rules, and I had to be really fired up to tackle it.I heard that you did a live performance recently. What kind of event was it?I performed a live coding set at “draw(tokyo); #2” in March 2025. “draw(); ” is a club event focused on audiovisuals, especially live coding and generative VJ (the so-called “gene-kei” performances). It takes place from time to time in VRChat and at physical venues.At draw(tokyo); #2, I performed using Wavenerd, my custom GLSL live coding environment. For my 40-minute live set, I mainly used techno patterns created for 0mix. It was a really memorable experience, since it was my first time doing a live music performance with Wavenerd. I’d love to do more live performances in the future.The “Wavenerd” system I used for my live coding performance at draw(tokyo); #2. Since we were chroma keying with VJ visuals, the background is blue. The performers are always lit up in blue.When a coder does a live music performance, aren’t you too busy typing code in front of the PC to even look at the audience’s reaction?During the performances, I rewrite parts of prewritten code, so I don’t need to constantly keep typing. But I’m busy adding and removing parts, changing parameters, and doing some DJ-style mixing, so basically I completely zone in on the screen. That said, I can still see the audience’s reactions to some extent, and I felt really happy when they reacted at the moments I expected.Do you know who the primary audience is? I guess this kind of live performance requires some knowledge to really enjoy it.I still don’t know what kind of audience it attracts. From what I saw, I got the impression that many of them are interested in musical experiences and visual production at least. But I’m not sure how many are interested in coding, or actually create things with code. How technical it should get, how strictly you stick to the technical restrictions, and how much you make the audience dance—I think performers are expected to balance these elements well. Probably, this is something gene-kei performers constantly have to tackle. In fact, quite a few performers change their set depending on the tone of the event.Did you have VJs for your live performance?Yes, I asked fellow demosceners, ukonpower and Renard, and they generated visuals that matched the techno. I just told them, “I’m going to do 0mix,” and they both knew what it meant, so everything went very smoothly. (laughs) They created visuals in my style, but their own personalities also shone through. It was really cool.Oh, that’s really cool!  According to your discography, you also have 4K as well as 64K works. Is there a reason for that? For the 4K intros I’ve released lately, I can usually create them in one or two weeks. But 64K is my soul, so I want to keep making 64K intros. The thing is, 64K requires hundreds of times more work than 4K. So, when I don’t have the time or motivation but still want to contribute to a demoparty, I just make a 4K intro.I must say that the production environment for 4K intros is well-supported in the current demoscene. Recently I’ve been using 0x4015’s minimalGL. With this demotool, I can easily create 4K intros just by writing GLSL. That being said, I wouldn’t recommend it to everyone, because you also have to write the music in GLSL.In 2023, I released a 4K intro called “Architectural Shapeshifter” with Renard. For this piece, Renard was in charge of the concept and visuals, while I was in charge of the music and direction. We used minimalGL for this piece as well. It was the first time for Renard to create a 4K intro, but he was able to create it easily. We collaborated by tweaking the source code on GitHub and communicating via Discord. We exchanged ideas and suggestions on each other’s code, and it turned out to be a very efficient workflow.There are many coders who can write GLSL in Japan, but not many of them take on 4K. So I’d love to collaborate more using minimalGL.What’s hot in the Japanese demoscene these days? What category is popular? I noticed there was a demoparty called SESSIONS in Japan last year.It seems like a lot of people are coming into the demoscene from shader culture centered around VRChat. The people I got to know at demoparties like SESSIONS were mostly active in VRChat. In particular, the event draw(); seems to have a strong influence, and many of the people who got interested in live coding or generative VJ through draw();’s audiovisual experience also developed an interest in the demoscene.Live coding and generative VJ becoming a gateway into the demoscene sounds like a new path to me.Yes, indeed. draw();’s main crew, Saina-san, purposefully aims for a crossover with demoscene culture, like SESSIONS, and this accelerates the influx. We’re really grateful for that.I’m sure a person like that is supporting the demoscene in Japan and around the world.  OK, let’s go back to the production. Is there anything you do in everyday life to get inspired for your creations?I check Pouet and Demozoo as much as possible to stay in the know about recent demoscene productions. If I ever stopped checking Pouet and Demozoo, I think that would be the end of me as a demoscener.I also try to take in other cultures as well. Recently, I’ve been fascinated by the flashy audiovisual productions in pachinko and pachislot machines. They use dazzling visuals and music to stir up the spirit of gambling. These productions thoroughly pursue how to exploit the human reward system, all within machines that operate under very strict legal restrictions. In a way, I think this represents the highest peak of visual entertainment.I also go for walks frequently. Especially walking around Tokyo late at night gives me a strong sense of urban life and social activity, and it inspires me a lot. “Domain“, a 64K intro I released at Tokyo Demo Fest 2021, was heavily inspired by night Tokyo. I find the concept of the night city very interesting, and I’d like to explore it further.Which areas do you usually walk around?I mainly walk around downtown. I can feel the rhythm of social activity through people’s movements, clothing, and buildings. It’s also very fun to walk around residential areas. When I imagine that this is someone’s everyday life, I can sense their presence through the scenery.Do you have anything you always keep in mind when you create, like a routine or your own personal rule?For my demo source code, I use Git for version control and share as much of the code as possible on GitHub. Basically, I publish my source code under the Creative Commons BY-NC 4.0 license, and users can adapt and use it freely for non-profit purposes. By publishing my source code, I allow other people to refer to my production methods. In fact, I’ve often heard that people have made demos based on my code. Getting more chances to discover other demosceners’ great works is valuable for me too, so I’ll continue to publish my source code.Also, when I do version control on Git, I try to write commit logs—comments you can add to each version—as detailed as possible. Commit logs explain which part of the code I changed, and they also serve as a kind of production journal. In addition to information like what type of change I made and for what purpose, they help me recall my state of mind or what I was thinking during the creative process.For programmers, is it a hassle to write detailed commit logs?Commit logs aren’t considered a direct contribution to a program, just like READMEs or documentation. So, engineers who want to focus on coding and dislike communicating often don’t write them at all. Usually, detailed commit logs are recommended when you work with other people on business projects. However, even for a one-off piece of code written by a single person, I think we should consider how detailed we make the commit logs, because someone else—or even yourself—may end up reading them like archaeology.Archaeology… that’s interesting.  Okay, let me go to the classic question: your favorite demo, a memorable demo, or a demo that changed your life… anything. Tell us about a demo, or demos that are special to you.As I mentioned, “Emix” by Epoch is the demo I like the most. From the theme of each effect to the color grading, glitch effects, music, and direction, this piece defined what a demo should have, for me. Other pieces that helped define my standards include “cdak” by Quite & Orange, “Transformer 3” by Limp Ninja, and “Clean Slate” by Conspiracy. I put them together in my Pouet playlist “0b5vr’s bible”, if you’re interested.Among many other forms of self-expression, why did you choose the demoscene? Or are you trapped by this culture? Tell me what’s so attractive about it.The demoscene is a creative activity free from art as a capital asset or from commercial value. We mostly create and present pieces in a format that has little value in today’s society, and we purely inspire one another’s technical curiosity and the craving for expression. Also, the demoscene ecosystem is cooperative. Anyone can access demotools, ask questions to veterans, and start creating a piece. I respect the works, workflows, and ideas of active demosceners in the community, and that’s what motivates me to create something that earns their recognition.On the other hand, due to the methods used in the demoscene, a lot of pieces look similar, and that’s clearly a weak point of the scene. If I only keep exploring the demoscene, I can’t expand my range of expression. As a creator, I think it’s important to look at various cultures and absorb many different methods of expression. The easy exchange of fresh inspiration is one of the features of the demoscene, so I’d like to take in many forms of expression both inside and outside the scene, and keep inspiring each other.Is there anything you want to do in the future?What I want to do most is live music performance using GLSL, as I mentioned. Seemingly, this format of live music with GLSL is currently performed only by me and “Rakuto-ice” san. So I want to perform more to develop my style further, and I hope more people will enjoy it.And of course, I want to create demos like 64K, but right now I don’t have enough motivation or ideas. To find more motivation and inspiration, I think it’s about time I formed a demogroup.Sounds like there’s much to look forward to!  Finally, your message for demosceners and demo fans out there, please.For those of you who are not yet demosceners:  I’ve seen many people who have an interest in the demoscene but also fears about the culture itself. And it’s not just Japanese people, people in other countries have reacted that way too. Please don’t be afraid of us. If you are interested in creating something with a computer and having fun at a demoparty, then you are a demoscener. Whether you already have a medium of expression or not, if you join the party, you may naturally feel inspired to think, “I want to express myself too.” Demoparties like Tokyo Demo Fest, SESSIONS, and Revision have various compos, including simple programs, illustration, photography, music, along with the demo compo. Of course, if you want to create a demo, fellow creators will help you. We demosceners hope you will have fun in this scene.For those who are already demosceners (including me):  Make 64K!Thank you very much for answering my question, 0b5vr!0b5vr’s works can be found on Pouet and Demozoo. Also, be sure to check his essay on the production of 0mix on Scrapbox, where he goes deeper into his thoughts on the demoscene and the creative process.Thank you very much for reading this to the end!—————-In case you’re wondering what “demo” or “demoscene” is, better check out the well-made documentary called Moleman2.  (and the director, M. Szilárd Matusik’s interview can be read in here.) #1: q from nonoil/gorakubu is here.  #2: Gargaj from Conspiracy, Ümlaüt Design is here.  #3: Preacher from Brainstorm, Traction is here.  #4: Zavie from Ctrl-Alt-Test is here.  #5: Smash from Fairlight is here.  #6: Gloom from Excess, Dead Roman is here.  #7: kioku from System K is here.  #8: kb from Farbrausch is here.  #9: iq from RGBA is here. #10: Navis from Andromeda Software Development is here. #11: Pixtur from Still, LKCC is here. #12: Cryptic from Approximate is here. #13: 0x4015 aka Yosshin is here. #14: Flopine from Cookie Collective is here.  #15: noby from Epoch, Prismbeings is here.Why I’m interested in demoscene is explained in this article. And for some of my other posts related to “demo and “demoscene” culture is here.]]></content:encoded>
+        </item>
+        <item>
+            <title><![CDATA[I bought the cheapest EV, a used Nissan Leaf]]></title>
+            <link>https://www.jeffgeerling.com/blog/2025/i-bought-cheapest-ev-used-nissan-leaf</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45136103</guid>
+            <content:encoded><![CDATA[
+
+I bought a used 2023 Nissan Leaf in 2025, my first 'new' car in 15 years. The above photo was taken by the dealership; apparently their social media team likes to post photos of all purchasers.
+
+I test drove a Tesla in 2012, and quickly realized my mistake. No gasoline-powered car (outside of supercars, maybe? Never drove one of those) could match the feel of pressing the throttle on an electric.
+
+I started out with a used minivan, which I drove into the ground. Then I bought a used Olds that I drove into the ground. Then I bought a used Camry that I bought before we had kids, when I had a 16 mile commute.
+
+Fast forward about 15 years, and I found myself with a very short commute, only driving a few miles a day, and a family minivan we use for nearly all the 'driving around the kids' stuff.
+
+So I wanted a smaller car (get back a foot or so of garage space...) that was also more efficient.
+
+Video and GitHub EV Project
+
+If you don't like reading blog posts (why are you here?), I also posted a video going over most of this, with a little more color, on my YouTube channel:
+
+
+
+
+
+Also, this blog post is also the centerpiece of my new GitHub project geerlingguy/electric-car, where I detail all the steps on my nascent EV journey.
+
+Equipment and Add-ons
+
+Before I go further, I thought I'd mention some of the things I've added to my Leaf to make the EV experience a little nicer (some links are Amazon affiliate links. I earn for qualifying referrals):
+
+
+Grizzl-E Level 2 Charger for the garage (see Issue #5)
+Lectron L1 J1772 EV charger for a more portable charger, when I just need to top off the car for a few hours
+J1772 Wall mount for cable and plug - I was going to 3D print one, but figured the metal product would hold up better in a garage in the midwest
+NACS to J1772 AC L1/L2 charging adapter
+CCS1 to CHAdeMO L3 DC Fast charge adapter (see Issue #9)
+CarlinKit 5.0 Wireless CarPlay/Android Auto adapter because the Leaf only supports wired CarPlay by default
+VIOFO A119 Mini Dashcam with a Dongar wiring harness adapter (see Issue #3)
+
+
+Monitoring the Battery
+
+If you're considering a used Leaf, or if you have a Leaf already, it's a good idea to keep tabs on the battery health, especially since the meter on your dash is painfully basic in how much data it provides.
+
+Individual cell charge, 'State of Health' of the overall battery, and much more are available through the car's OBD-II port.
+
+
+
+Soon after I bought my Leaf, I ordered a LeLink 2 ($35) and bought the LeafSpy Pro App for my iPhone ($20).
+
+I plugged the LeLink 2 into the OBD-II diagnostics port under the steering column, and fired up LeafSpy Pro. It gives me some helpful metrics like:
+
+
+  
+  SOH: State of Health
+  Hx: Conductance
+  
+
+
+See Issue #8: Document battery health for all my notes monitoring my own Leaf's battery. But bottom line, my battery showed a 93.16% 'SoH' (State of Health), meaning it still has most of its capacity.
+
+I've been reading up on various forums about managing the Leaf's battery, and am trying to do some things to extend the battery's life as long as possible:
+
+
+Limiting the number of QCs (Quick Charges / DC Fast Charge), as this heats up the uncooled Leaf battery, degrading it slightly each time, especially on hotter days
+Keeping the charge between 50-80% when manageable
+Charging up to 100% at least once a month, and letting it 'top off' to rebalance the pack for at least a few hours afterwards
+Not driving like a maniac, despite having more torque in this car than I've ever had in any of my previous cars
+
+
+Why buy electric?
+
+I overanalyze most things, so had been researching this purchase for about a decade now.
+
+With EVs there are tradeoffs. Even in my situation, only driving a car a few miles a day, I do take my car on one or two regional road trips every year.
+
+Having the ability to hop in at 6 am and be in Chicago or KC by late morning is nice. Having to plan a long break somewhere halfway to charge is not.
+
+
+
+But if I only take that trip once a year, I can either (a) rent a gas car that gets me there a little more quickly, and ensures I don't have to find a spot in the destination city to do a full charge before the return trip. Or (b) plan for an extra X hours total during the trip to ensure I have padding for charging.
+
+Charging infrastructure's improving in the US (and in many parts of the world), but it's nowhere near as ubiquitous as gas stations.
+
+Hopefully this improves over time, but for now, I plan on using the electric car for local travel, likely only going more than 100 miles or so in a day once or twice a year.
+
+Why buy Leaf?
+
+Price.
+
+That's mostly it. And I drove a Nissan Sentra rental on a recent trip, and realized Nissan isn't half bad. They seem to not require an Internet connection for their cars, they offer basic lane following and adaptive cruise control, they have CarPlay/Android Auto...
+
+The Leaf ticks all the little 'convenience' checkboxes, but is also not 'extravagant'.
+
+And the later model years also aren't "look at me I drive an EV" ugly (though they're not amazing-looking, either).
+
+But I drove a minivan, an olds, and a Camry, so obviously I'm function > form when it comes to my car!
+
+Because of the smaller battery (and up until 2026, a battery with no active cooling), combined with the use of a DC fast charging connector (CHAdeMO) that's going out of style in the US, used Nissan Leafs are priced considerably lower than competitors.
+
+Well, all except maybe Teslas around a year or two older right now. But Teslas don't have native CarPlay. And I'm not a fan of how Tesla is trying to turn the car into some kind of appliance, RoboTaxi, self-driving thing, versus it being a transportation vehicle that I can do what I want with.
+
+No judgement on Tesla owners, the used Tesla market was enticing at the time I bought the Leaf.
+
+I also looked a lot at the Hyundai Ioniq and Kona; both were just a little bit too large for my liking, but they could've worked. The problem was used models in good condition were a lot more expensive than I was willing to pay.
+
+So back to the Leaf: Nissan's probably not the best right now when it comes to EVs and features, but they're certainly the cheapest. And 'good enough' is fine by me.
+
+
+
+She's got it where it counts, kid.
+
+Gripes about my Leaf
+
+There are a few things that baffle me about the Leaf, some that have been frustrating from the first test drive; others that are more subtle:
+
+
+There is no 'play/pause' button. Anywhere. At least not on the steering wheel or the display area. You have to go into the music section on the entertainment display, then press the software play/pause button. That's dumb. I've resorted to just turning Audio on/off using the volume knob, which accomplishes the same goal but is not always ideal.
+Going into 'Neutral' is an exercise in frustration. I thought you just put your foot on the brake and move the shifter knob to the left. But you have to do it with the right timing, I think.
+There's no way to open the tailgate short of pressing the release button. At least as far as I'm aware. There's no button in the cabin or key fob to unlatch it. The manual says the other way to open it is with a screwdriver, from inside the car, pushing on the latch (lol). I'm not alone here. At least there's a button on the remote to open the charge port.
+
+
+The joy of electric
+
+I don't care about engine noise. I appreciate it, though. My brother had a 1992 Forumula Firebird. And I nearly owned it after he moved away, instead of my Olds! (But I'm a boring-car person, so I think I was happier with the Olds).
+
+The nice things about electric vehicles that swayed me in their favor, in descending order:
+
+
+One pedal driving Seriously, why doesn't every EV have this mode? It makes driving one feel SO much better than any gas car, in terms of connection between driver and car movement.
+Sprightly torque: Outside of exotic tiny gas cars, you're not going to get the same zip even a cheap EV like a Leaf gives you—smash the accelerator in non-Eco mode and any passenger will giggle, every time.
+Blissful quiet: Though some cars have annoying noises (Nissan calls this VSP, or "Vehicle Sound for Pedestirians") they play at low speeds.
+Lower maintenance requirements: I hate every time I have to jack up my car and change the brakes, or take it in for oil/fluid changes. EVs (usually) require less maintenance, besides maybe tires.
+Conveniences: Like running climate control to cool down/heat up the car prior to hopping in, even while it's in the garage! Or plugging it in to charge at home, and not having to stop by a gas station.
+Long-term economics: in general, charging with electricity, at least here in St. Louis, is cheaper than filling up with gas, on a dollar-per-mile basis.
+
+
+The pain of electric
+
+
+
+All that said, I knew going into this there would be some pain. Maybe in 10 or 20 years these things will get solved, but off the top of my head:
+
+
+Price: The Leaf (especially used, right now) is the cheapest, but it is by no means cheap. It takes a few years to break even with a similarly-specced gas car. But buying a gas car, you have a lot more options on the low-low end.
+Range Anxiety: Yes, it's overblown, but no, it's not non-existent. The day I bought my used EV, the dealership (which doesn't sell many EVs, even new) didn't have a 'Level 3' DC fast charger—and they had only charged it to about 16%. Letting it top off at L2 while I was dealing with finance, we got to 23%. I wasn't quite sure I'd make it home off the lot! Luckily I did, with 12 miles of range remaining. Road tripping or day trips require more planning when driving an EV.
+Lack of standards: For 'L3' DC Fast Charging, the Leaf has a CHAdeMO port. Teslas and many newer EVs have NACS. Then there's CCS1 and CCS2. And charging stations are run by multiple vendors with multiple apps and payment methods. It's not like gas stations, like with Shell, BP, Buckee's, etc. where you just drive up, stick the gas nozzle in your tank, and squeeze. Even adapters can be complicated and annoying, and many EV charging stations only support one or two standards—and some may only have one CHAdeMO plug, and that plug may have been ripped off the unit to be scrapped by a copper thief!
+Lack of standards, part 2: For L1/L2 charging, some cars use J1772, some use NACS... and then wall charging units are all over the board with supporting 6, 12, or 16 Amps for L1 (they shouldn't do 16 on a 15A circuit but it seems like some do!), or various different amperages for L2. Some of these units require apps to configure them, others have dip switches, and yet others are not configurable, and don't list their exact specs in an easy-to-find location. Usually forum posts from users who buy the chargers offer more information than product manufacturers' own websites!
+Being an EV: For some reason, most EVs look like... EVs. I honestly was holding out hope Tesla would just make a Corolla, but an EV version. All the cheap EVs like the Bolt, i3, Leaf, etc. just look... sorta ugly. Subjective, sure, but at least my Olds looked kinda sleek. Even if it was an Olds. EVs stand out, and that I don't enjoy. I want an EV that looks like a Camry. Just blend in and don't stand out.
+Cables and chargers: The Leaf has slightly less trunk space than my slightly-larger Camry. I didn't realize how big L1/L2 charge cables are. Even L1-only cables (which charge at a very anemic pace, like 10 miles / hour of charge) are fairly thick, bulky affairs. About 1/10 of my trunk is devoted to my charging cable. And on a road trip, I will likely carry my NACS to J1772 and CCS1 to CHAdeMO adapters. And the latter adapter includes its own battery (that has to be charged) and firmware (that might need to be updated)!
+
+
+Further Reading
+
+Be sure to check the Issues in my GitHub project for more of my EV adventures.
+
+I don't plan on becoming an EV advocate by any means.
+
+The Leaf is the perfect option for me, but I wouldn't recommend an EV for most car owners yet, especially considering the price disparity and infrastructure requirements that exclude large swaths of the population!]]></content:encoded>
         </item>
     </channel>
 </rss>
