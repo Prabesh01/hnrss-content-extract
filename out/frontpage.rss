@@ -4,7 +4,7 @@
         <title>Hacker News: Front Page</title>
         <link>https://news.ycombinator.com/</link>
         <description>Hacker News RSS</description>
-        <lastBuildDate>Sat, 06 Sep 2025 03:04:33 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 06 Sep 2025 03:39:19 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>github.com/Prabesh01/hnrss-content-extract</generator>
         <language>en</language>
@@ -13,13 +13,391 @@
             <title><![CDATA[Developing a Space Flight Simulator in Clojure]]></title>
             <link>https://www.wedesoft.de/software/2025/09/05/clojure-game/</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45145794</guid>
+            <description><![CDATA[Developing a Space Flight Simulator in Clojure]]></description>
+            <content:encoded><![CDATA[
+  
+  05 Sep 2025    
+
+In 2017 I discovered the free of charge Orbiter 2016 space flight simulator which was proprietary at the time and it inspired me to develop a space flight simulator myself.
+I prototyped some rigid body physics in C and later in GNU Guile and also prototyped loading and rendering of Wavefront OBJ files.
+I used GNU Guile (a Scheme implementation) because it has a good native interface and of course it has hygienic macros.
+Eventually I got interested in Clojure because unlike GNU Guile it has multi-methods as well as fast hash maps and vectors.
+I finally decided to develop the game for real in Clojure.
+I have been developing a space flight simulator in Clojure for almost 5 years now.
+While using Clojure I have come to appreciate the immutable values and safe parallelism using atoms, agents, and refs.
+
+In the beginning I decided to work on the hard parts first, which for me were 3D rendering of a planet, an atmosphere, shadows, and volumetric clouds.
+I read the OpenGL Superbible to get an understanding on what functionality OpenGL provides.
+When Orbiter was eventually open sourced and released unter MIT license here, I inspected the source code and discovered that about 90% of the code is graphics-related.
+So starting with the graphics problems was not a bad decision.
+
+Software dependencies
+
+The following software is used for development.
+The software libraries run on both GNU/Linux and Microsoft Windows.
+
+
+  Clojure the programming language
+  LWJGL provides Java wrappers for various libraries
+    
+      lwjgl-opengl for 3D graphics
+      lwjgl-glfw for windowing and input devices
+      lwjgl-nuklear for graphical user interfaces
+      lwjgl-stb for image I/O and using truetype fonts
+      lwjgl-assimp to load glTF 3D models with animation data
+    
+  
+  Jolt Physics to simulate wheeled vehicles and collisions with meshes
+  Fastmath for fast matrix and vector math as well as spline interpolation
+  Comb for templating shader code
+  Instaparse to parse NASA Planetary Constant Kernel (PCK) files
+  Gloss to parse NASA Double Precision Array Files (DAF)
+  Coffi as a foreign function interface
+  core.memoize for least recently used caching of function results
+  Apache Commons Compress to read map tiles from tar files
+  Malli to add schemas to functions
+  Immuconf to load the configuration file
+  Progrock a progress bar for long running builds
+  Claypoole to implement parallel for loops
+  tools.build to build the project
+  clj-async-profiler Clojure profiler creating flame graphs
+  slf4j-timbre Java logging implementation for Clojure
+
+
+The deps.edn file contains operating system dependent LWJGL bindings.
+For example on GNU/Linux the deps.edn file contains the following:
+
+{:deps {; ...
+        org.lwjgl/lwjgl {:mvn/version "3.3.6"}
+        org.lwjgl/lwjgl$natives-linux {:mvn/version "3.3.6"}
+        org.lwjgl/lwjgl-opengl {:mvn/version "3.3.6"}
+        org.lwjgl/lwjgl-opengl$natives-linux {:mvn/version "3.3.6"}
+        org.lwjgl/lwjgl-glfw {:mvn/version "3.3.6"}
+        org.lwjgl/lwjgl-glfw$natives-linux {:mvn/version "3.3.6"}
+        org.lwjgl/lwjgl-nuklear {:mvn/version "3.3.6"}
+        org.lwjgl/lwjgl-nuklear$natives-linux {:mvn/version "3.3.6"}
+        org.lwjgl/lwjgl-stb {:mvn/version "3.3.6"}
+        org.lwjgl/lwjgl-stb$natives-linux {:mvn/version "3.3.6"}
+        org.lwjgl/lwjgl-assimp {:mvn/version "3.3.6"}
+        org.lwjgl/lwjgl-assimp$natives-linux {:mvn/version "3.3.6"}}
+        ; ...
+        }
+
+In order to manage the different dependencies for Microsoft Windows, a separate Git branch is maintained.
+
+Atmosphere rendering
+
+
+    
+
+For the atmosphere, Bruneton’s precomputed atmospheric scattering was used.
+The implementation uses a 2D transmittance table, a 2D surface scattering table, a 4D Rayleigh scattering, and a 4D Mie scattering table.
+The tables are computed using several iterations of numerical integration.
+Higher order functions for integration over a sphere and over a line segment were implemented in Clojure.
+Integration over a ray in 3D space (using fastmath vectors) was implemented as follows for example:
+
+(defn integral-ray
+  "Integrate given function over a ray in 3D space"
+  {:malli/schema [:=> [:cat ray N :double [:=> [:cat [:vector :double]] :some]] :some]}
+  [{::keys [origin direction]} steps distance fun]
+  (let [stepsize      (/ distance steps)
+        samples       (mapv #(* (+ 0.5 %) stepsize) (range steps))
+        interpolate   (fn interpolate [s] (add origin (mult direction s)))
+        direction-len (mag direction)]
+    (reduce add (mapv #(-> % interpolate fun (mult (* stepsize direction-len))) samples))))
+
+Precomputing the atmospheric tables takes several hours even though pmap was used.
+When sampling the multi-dimensional functions, pmap was used as a top-level loop and map was used for interior loops.
+Using java.nio.ByteBuffer the floating point values were converted to a byte array and then written to disk using a clojure.java.io/output-stream:
+
+(defn floats->bytes
+  "Convert float array to byte buffer"
+  [^floats float-data]
+  (let [n           (count float-data)
+        byte-buffer (.order (ByteBuffer/allocate (* n 4)) ByteOrder/LITTLE_ENDIAN)]
+    (.put (.asFloatBuffer byte-buffer) float-data)
+    (.array byte-buffer)))
+
+(defn spit-bytes
+  "Write bytes to a file"
+  {:malli/schema [:=> [:cat non-empty-string bytes?] :nil]}
+  [^String file-name ^bytes byte-data]
+  (with-open [out (io/output-stream file-name)]
+    (.write out byte-data)))
+
+(defn spit-floats
+  "Write floating point numbers to a file"
+  {:malli/schema [:=> [:cat non-empty-string seqable?] :nil]}
+  [^String file-name ^floats float-data]
+  (spit-bytes file-name (floats->bytes float-data)))
+
+When launching the game, the lookup tables get loaded and copied into OpenGL textures.
+Shader functions are used to lookup and interpolate values from the tables.
+When rendering the planet surface or the space craft, the atmosphere essentially gets superimposed using ray tracing.
+After rendering the planet, a background quad is rendered to display the remaining part of the atmosphere above the horizon.
+
+Templating OpenGL shaders
+
+It is possible to make programming with OpenGL shaders more flexible by using a templating library such as Comb.
+The following shader defines multiple octaves of noise on a base noise function:
+
+#version 410 core
+
+float <%= base-function %>(vec3 idx);
+
+float <%= method-name %>(vec3 idx)
+{
+  float result = 0.0;
+<% (doseq [multiplier octaves] %>
+  result += <%= multiplier %> * <%= base-function %>(idx);
+  idx *= 2;
+<% ) %>
+  return result;
+}
+
+One can then for example define the function fbm_noise using octaves of the base function noise as follows:
+
+(def noise-octaves
+  "Shader function to sum octaves of noise"
+  (template/fn [method-name base-function octaves] (slurp "resources/shaders/core/noise-octaves.glsl")))
+
+; ...
+
+(def fbm-noise-shader (noise-octaves "fbm_noise" "noise" [0.57 0.28 0.15]))
+
+Planet rendering
+
+
+    
+
+To render the planet, NASA Bluemarble data, NASA Blackmarble data, and NASA Elevation data was used.
+The images were converted to a multi resolution pyramid of map tiles.
+The following functions were implemented for color map tiles and for elevation tiles:
+
+
+  a function to load and cache map tiles of given 2D tile index and level of detail
+  a function to extract a pixel from a map tile
+  a function to extract the pixel for a specific longitude and latitude
+
+
+The functions for extracting a pixel for given longitude and latitude then were used to generate a cube map with a quad tree of tiles for each face.
+For each tile, the following files were generated:
+
+
+  A daytime texture
+  A night time texture
+  An image of 3D vectors defining a surface mesh
+  A water mask
+  A normal map
+
+
+Altogether 655350 files were generated.
+Because the Steam ContentBuilder does not support a large number of files, each row of tile data was aggregated into a tar file.
+The Apache Commons Compress library allows you to open a tar file to get a list of entries and then perform random access on the contents of the tar file.
+A Clojure LRU cache was used to maintain a cache of open tar files for improved performance.
+
+At run time, a future is created, which returns an updated tile tree, a list of tiles to drop, and a path list of the tiles to load into OpenGL.
+When the future is realized, the main thread deletes the OpenGL textures from the drop list, and then uses the path list to get the new loaded images from the tile tree, load them into OpenGL textures, and create an updated tile tree with the new OpenGL textures added.
+The following functions to manipulate quad trees were implemented to realize this:
+
+(defn quadtree-add
+  "Add tiles to quad tree"
+  {:malli/schema [:=> [:cat [:maybe :map] [:sequential [:vector :keyword]] [:sequential :map]] [:maybe :map]]}
+  [tree paths tiles]
+  (reduce (fn add-title-to-quadtree [tree [path tile]] (assoc-in tree path tile)) tree (mapv vector paths tiles)))
+
+(defn quadtree-extract
+  "Extract a list of tiles from quad tree"
+  {:malli/schema [:=> [:cat [:maybe :map] [:sequential [:vector :keyword]]] [:vector :map]]}
+  [tree paths]
+  (mapv (partial get-in tree) paths))
+
+(defn quadtree-drop
+  "Drop tiles specified by path list from quad tree"
+  {:malli/schema [:=> [:cat [:maybe :map] [:sequential [:vector :keyword]]] [:maybe :map]]}
+  [tree paths]
+  (reduce dissoc-in tree paths))
+
+(defn quadtree-update
+  "Update tiles with specified paths using a function with optional arguments from lists"
+  {:malli/schema [:=> [:cat [:maybe :map] [:sequential [:vector :keyword]] fn? [:* :any]] [:maybe :map]]}
+  [tree paths fun & arglists]
+  (reduce (fn update-tile-in-quadtree
+            [tree [path & args]]
+            (apply update-in tree path fun args)) tree (apply map list paths arglists)))
+
+Other topics
+
+Solar system
+
+The astronomy code for getting the position and orientation of planets was implemented according to the Skyfield Python library.
+The Python library in turn is based on the SPICE toolkit of the NASA JPL.
+The JPL basically provides sequences of Chebyshev polynomials to interpolate positions of Moon and planets as well as the orientation of the Moon as binary files.
+Reference coordinate systems and orientations of other bodies are provided in text files which consist of human and machine readable sections.
+The binary files were parsed using Gloss (see Wiki for some examples) and the text files using Instaparse.
+
+Jolt bindings
+
+The required Jolt functions for wheeled vehicle dynamics and collisions with meshes were wrapped in C functions and compiled into a shared library.
+The Coffi Clojure library (which is a wrapper for Java’s new Foreign Function & Memory API) was used to make the C functions and data types usable in Clojure.
+
+For example the following code implements a call to the C function add_force:
+
+(defcfn add-force
+  "Apply a force in the next physics update"
+  add_force [::mem/int ::vec3] ::mem/void)
+
+Here ::vec3 refers to a custom composite type defined using basic types.
+The memory layout, serialisation, and deserialisation for ::vec3 are defined as follows:
+
+(def vec3-struct
+  [::mem/struct
+   [[:x ::mem/double]
+    [:y ::mem/double]
+    [:z ::mem/double]]])
+
+
+(defmethod mem/c-layout ::vec3
+  [_vec3]
+  (mem/c-layout vec3-struct))
+
+
+(defmethod mem/serialize-into ::vec3
+  [obj _vec3 segment arena]
+  (mem/serialize-into {:x (obj 0) :y (obj 1) :z (obj 2)} vec3-struct segment arena))
+
+
+(defmethod mem/deserialize-from ::vec3
+  [segment _vec3]
+  (let [result (mem/deserialize-from segment vec3-struct)]
+    (vec3 (:x result) (:y result) (:z result))))
+
+Performance
+
+The clj-async-profiler was used to create flame graphs visualising the performance of the game.
+In order to get reflection warnings for Java calls without sufficient type declarations, *unchecked-math* was set to :warn-on-boxed.
+
+(set! *unchecked-math* :warn-on-boxed)
+
+Furthermore to discover missing declarations of numerical types, *warn-on-reflection* was set to true.
+
+(set! *warn-on-reflection* true)
+
+To reduce garbage collector pauses, the ZGC low-latency garbage collector for the JVM was used.
+The following section in deps.edn ensures that the ZGC garbage collector is used when running the project with clj -M:run:
+
+{:deps {; ...
+        }
+ :aliases {:run {:jvm-opts ["-Xms2g" "-Xmx4g" "--enable-native-access=ALL-UNNAMED" "-XX:+UseZGC"
+                            "--sun-misc-unsafe-memory-access=allow"]
+                 :main-opts ["-m" "sfsim.core"]}}}
+
+The option to use ZGC is also specified in the Packr JSON file used to deploy the application.
+
+Building the project
+
+In order to build the map tiles, atmospheric lookup tables, and other data files using tools.build, the project source code was made available in the build.clj file using a :local/root dependency:
+
+{:deps {; ...
+        }
+ :aliases {; ...
+           :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.10"}
+                          sfsim/sfsim {:local/root "."}}
+                   :ns-default build
+                   :exec-fn all
+                   :jvm-opts ["-Xms2g" "-Xmx4g" "--sun-misc-unsafe-memory-access=allow"]}}}
+
+Various targets were defined to build the different components of the project.
+For example the atmospheric lookup tables can be build by specifying clj -T:build atmosphere-lut on the command line.
+
+The following section in the build.clj file was added to allow creating an “Uberjar” JAR file with all dependencies by specifying clj -T:build uber on the command-line.
+
+(defn uber [_]
+  (b/copy-dir {:src-dirs ["src/clj"]
+               :target-dir class-dir})
+  (b/compile-clj {:basis basis
+                  :src-dirs ["src/clj"]
+                  :class-dir class-dir})
+  (b/uber {:class-dir class-dir
+           :uber-file "target/sfsim.jar"
+           :basis basis
+           :main 'sfsim.core}))
+
+To create a Linux executable with Packr, one can then run java -jar packr-all-4.0.0.jar scripts/packr-config-linux.json where the JSON file has the following content:
+
+{
+  "platform": "linux64",
+  "jdk": "/usr/lib/jvm/jdk-24.0.2-oracle-x64",
+  "executable": "sfsim",
+  "classpath": ["target/sfsim.jar"],
+  "mainclass": "sfsim.core",
+  "resources": ["LICENSE", "libjolt.so", "venturestar.glb", "resources"],
+  "vmargs": ["Xms2g", "Xmx4g", "XX:+UseZGC"],
+  "output": "out-linux"
+}
+
+In order to distribute the game on Steam, three depots were created:
+
+
+  a data depot with the operating system independent data files
+  a Linux depot with the Linux executable and Uberjar including LWJGL’s Linux native bindings
+  and a Windows depot with the Windows executable and an Uberjar including LWJGL’s Windows native bindings
+
+
+When updating a depot, the Steam ContentBuilder command line tool creates and uploads a patch in order to preserve storage space and bandwidth.
+
+Future work
+
+Although the hard parts are mostly done, there are still several things to do:
+
+
+  control surfaces and thruster graphics
+  launchpad and runway graphics
+  sound effects
+  a 3D cockpit
+  the Moon
+  a space station
+
+
+It would also be interesting to make the game modable in a safe way (maybe evaluating Clojure files in a sandboxed environment?).
+
+Conclusion
+
+
+    
+
+You can find the source code on Github.
+Currently there is only a playtest build, but if you want to get notified, when the game gets released, you can wishlist it here.
+
+Anyway, let me know any comments and suggestions.
+
+Enjoy!
+
+
+
+
+  Flight dynamics model for simulating Venturestar style spacecraft
+  Test Driven Development with OpenGL
+  Implementing GUIs using Clojure and LWJGL Nuklear bindings
+  Procedural Volumetric Clouds
+  Procedural generation of global cloud cover
+  Reversed-Z Rendering in OpenGL
+  Specifying Clojure function schemas with Malli
+  Implement an Interpreter using Clojure Instaparse
+  Orbits with Jolt Physics
+  Getting started with the Jolt Physics Engine
+  Create Blender bones and animate and import with Assimp
+
+
+
+]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[The sunscreen scandal shocking Australia - the world's skin cancer capital]]></title>
             <link>https://www.bbc.com/news/articles/c4gzl41rpdqo</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45145624</guid>
             <description><![CDATA[It has shaken consumer trust and raised questions about global sunscreen regulation.]]></description>
-            <content:encoded><![CDATA[5 hours agoTabby Wilson and Tiffanie TurnbullBBC News, SydneyMarianna Massey/Getty ImagesSunscreens are at the heart of a national scandal in Australia Like many Australians, Rach grew up "terrified of the sun" in a country that has the unenviable title of skin cancer capital of the world.Her childhood was characterised by the infamous "no hat, no play" rule that is commonplace in Australian schools, 90s advertisements that warned the sun would give you cancer, and sunscreen tubes that stood guard at every door in her home.It made the now 34-year-old the kind of person who religiously applies sunscreen multiple times a day and rarely leaves the house without a hat.So she was shocked when doctors found a skin cancer on her nose during a check last November, something they said was abnormal given her age and ray-dodging regime.Though technically classified as a "low grade" skin cancer – a basel cell carcinoma – it had to be surgically removed, leaving the Newcastle mum with a scar just below her eye."I was just confused, and I was a little bit angry because I was like, 'Are you kidding me?'" Rach – who asked that her surname not be used – told the BBC. "I thought I'd done all the right stuff and it still happened to me."That rage grew when she learned the sunscreen she had been using for years was unreliable and, according to some tests, offered next to no sun protection at all.ABC News/Billy CooperThis Ultra Violette product is at the centre of the sunscreen controversy Independent analysis by a trusted consumer advocacy group has found that several of Australia's most popular, and expensive, sunscreens are not providing the protection they claim to, kicking off a national scandal.There has been a massive backlash from customers, a probe launched by the country's medical watchdog, multiple products pulled from shelves, and questions raised about the regulation of sunscreen around the globe."It's definitely not an issue isolated to Australia," cosmetic chemist Michelle Wong told the BBC.The reckoningAustralians have a complicated relationship with the sun: they love it, but they also fear it. Effective public health messaging – which has drilled "Slip, Slop, Slap" into their heads – competes with a beauty culture which often idolises bronzed skin.The country has the highest incidence of skin cancers in the world and it is estimated that two out of three Australians will have at least one cut out in their lifetime.So when Choice Australia released its damning report in June, it immediately made waves. The group had tested 20 sunscreens in an independent accredited Australian lab, finding 16 did not meet the SPF, or skin protection factor, rating listed on the packet.Ultra Violette's Lean Screen SPF 50+ Mattifying Zinc Skinscreen, a facial product that Rach says she used exclusively, was the "most significant failure" identified. It returned a result of SPF 4, something that shocked Choice so much it commissioned a second test that produced a similar reading.Other products that did not meet their SPF claims included those from Neutrogena, Banana Boat, Bondi Sands and the Cancer Council - but they all rejected Choice's findings and said their own independent testing showed their sunscreens worked as advertised.Getty ImagesFor decades Australians have been urged to slip on a shirt, slop on sunscreen and slap on a hatThe uproar was immediate for the brands named in the report, and also prompted a swift response from the Therapeutic Goods Association (TGA), which said it would investigate the findings and "take regulatory action as required".Ultra Violette bit back, saying they were "confident that Lean Screen is safe and effective" and detailing extensive testing of the product – which has been sold in almost 30 countries, including the UK, and retails for upwards of A$50 (£24, $33).But less than two months later, it announced that Lean Screen would be recalled after it returned inconsistent results across eight different sets of lab testing."We are deeply sorry that one of our products has fallen short of the standards we pride ourselves on and that you have come to expect of us," read a statement published to the brand's Instagram account.It added that it has "since ended the relationship with the initial testing lab".In the past fortnight, other brands have "paused" the sale of at least four more products, none of which were included in the Choice report.Rach knows there is no way to prove that there is a link between her diagnosis and the brand of sunscreen she relied on. She says she is not alleging there is such a connection. But she said Ultra Violette's response to the scandal was like "a kick in the guts". She felt that they took no real accountability for the pitfalls of their product, and was let down by their decision to continue selling it for two months despite doubts over its efficacy."I just had like the five stages of grief, you know?" she said. "I was angry, I was upset, I was almost in denial."Getty ImagesAva Chandler-Matthews and Rebecca Jefferd founded Ultra Violette in 2019Like Rach, a horde of annoyed customers say the saga has shaken their faith in the industry."A refund isn't really going to reverse years of sun damage, is it?" one wrote in response to Ultra Violette's recall statement.Choice has urged the TGA to conduct further investigations into the sunscreen market, and also urged any brands who had reason to question the SPF protection listed on their products to remove them from sale immediately."It is clear there is a serious issue in the Australian sunscreen industry that urgently needs to be addressed," said Rosie Thomas, the director of campaigns, in a statement to the BBC.How did this happen?While in Europe sunscreen is classed as a cosmetic, Australia regulates it as a therapeutic good – essentially a medicine – which means it is subject to some of the most robust sunscreen regulations in the world. And that's something many of the brands caught up in this saga trade on. So, how did this happen?An investigation by the Australian Broadcasting Corporation found that a single US-based laboratory had certified at least half of the products that had failed Choice's testing, and that this facility routinely recorded high test results.It also found that several of the sunscreens pulled from shelves shared a similar base formula and linked them to a manufacturer in Western Australia.The TGA says it does not usually speak about ongoing investigations because it does not want to compromise them, but that it is also looking into "reviewing existing SPF testing requirements" which can be "highly subjective"."The TGA is also aware that it is common practice for different sunscreen products to share the same or similar base formulations," a spokesperson said in a statement to the BBC."Ultimately it is the sponsor's [seller's] responsibility to ensure that their medicine remains compliant with all applicable legislative requirements."Consistent and comfortable sunscreens which offer high protection are very technical and difficult to make, says Dr Wong, founder of Lab Muffin Beauty Science. Everyone's skin responds differently to the product, he adds, and it's one that is almost always being stress-tested – by sweat, water, or makeup.It is very difficult to rate effectively for the same reasons. Historically, it has been done by spreading the sunscreen on 10 people at the same thickness, then timing how long it takes for their skin to start burning both with and without the product applied.Getty ImagesEffective and popular sunscreens are hard to get right, experts sayWhile there are clear guidelines as to what you are looking for, Dr Wong says there is still a lot of variability. That is down to skin texture or tone, or even the colour of the walls, and "different labs get different results".But she says results are also quite easy to fake, pointing to a 2019 probe by US authorities into a sunscreen testing laboratory which resulted in the owner being jailed for fraud.Many sunscreen brands from all over the world use the same manufacturers and testing labs - and so this issue is unlikely to be isolated to Australia, she adds."Until someone goes out and tests a whole bunch of sunscreens in other countries, we just don't know the extent of it."She says the scandal is a reminder that regulations are only as good as they are enforced.But while it has touched a nerve for many people who are at high risk for skin cancer simply by virtue of being Australian, Dr Wong said she felt the panic triggered by the investigation was blown out of proportion.She points to the world's largest clinical trial of sunscreen, done in the 90s, which found that the daily use of an SPF 16 sunscreen dramatically dropped skin cancer rates."95% of the sunscreens tested [by Choice] have high enough SPF to more than halve the incidence of skin cancer," Dr Wong said."Some of the SPF testing, I feel, has become a bit more of a marketing exercise than a real reflection of efficacy."The most important thing you can do when choosing a sunscreen, she says, is actually wear enough of it – a full teaspoon at least for each part of your body, face included. And ideally you should apply it about every two hours,  especially if you have been sweating a lot or swimming.  Experts also advise that you combine the sunscreen with other safety methods, such as wearing protective clothing and seeking out shade.Read more Australia stories ]]></content:encoded>
+            <content:encoded><![CDATA[6 hours agoTabby Wilson and Tiffanie TurnbullBBC News, SydneyMarianna Massey/Getty ImagesSunscreens are at the heart of a national scandal in Australia Like many Australians, Rach grew up "terrified of the sun" in a country that has the unenviable title of skin cancer capital of the world.Her childhood was characterised by the infamous "no hat, no play" rule that is commonplace in Australian schools, 90s advertisements that warned the sun would give you cancer, and sunscreen tubes that stood guard at every door in her home.It made the now 34-year-old the kind of person who religiously applies sunscreen multiple times a day and rarely leaves the house without a hat.So she was shocked when doctors found a skin cancer on her nose during a check last November, something they said was abnormal given her age and ray-dodging regime.Though technically classified as a "low grade" skin cancer – a basel cell carcinoma – it had to be surgically removed, leaving the Newcastle mum with a scar just below her eye."I was just confused, and I was a little bit angry because I was like, 'Are you kidding me?'" Rach – who asked that her surname not be used – told the BBC. "I thought I'd done all the right stuff and it still happened to me."That rage grew when she learned the sunscreen she had been using for years was unreliable and, according to some tests, offered next to no sun protection at all.ABC News/Billy CooperThis Ultra Violette product is at the centre of the sunscreen controversy Independent analysis by a trusted consumer advocacy group has found that several of Australia's most popular, and expensive, sunscreens are not providing the protection they claim to, kicking off a national scandal.There has been a massive backlash from customers, a probe launched by the country's medical watchdog, multiple products pulled from shelves, and questions raised about the regulation of sunscreen around the globe."It's definitely not an issue isolated to Australia," cosmetic chemist Michelle Wong told the BBC.The reckoningAustralians have a complicated relationship with the sun: they love it, but they also fear it. Effective public health messaging – which has drilled "Slip, Slop, Slap" into their heads – competes with a beauty culture which often idolises bronzed skin.The country has the highest incidence of skin cancers in the world and it is estimated that two out of three Australians will have at least one cut out in their lifetime.So when Choice Australia released its damning report in June, it immediately made waves. The group had tested 20 sunscreens in an independent accredited Australian lab, finding 16 did not meet the SPF, or skin protection factor, rating listed on the packet.Ultra Violette's Lean Screen SPF 50+ Mattifying Zinc Skinscreen, a facial product that Rach says she used exclusively, was the "most significant failure" identified. It returned a result of SPF 4, something that shocked Choice so much it commissioned a second test that produced a similar reading.Other products that did not meet their SPF claims included those from Neutrogena, Banana Boat, Bondi Sands and the Cancer Council - but they all rejected Choice's findings and said their own independent testing showed their sunscreens worked as advertised.Getty ImagesFor decades Australians have been urged to slip on a shirt, slop on sunscreen and slap on a hatThe uproar was immediate for the brands named in the report, and also prompted a swift response from the Therapeutic Goods Association (TGA), which said it would investigate the findings and "take regulatory action as required".Ultra Violette bit back, saying they were "confident that Lean Screen is safe and effective" and detailing extensive testing of the product – which has been sold in almost 30 countries, including the UK, and retails for upwards of A$50 (£24, $33).But less than two months later, it announced that Lean Screen would be recalled after it returned inconsistent results across eight different sets of lab testing."We are deeply sorry that one of our products has fallen short of the standards we pride ourselves on and that you have come to expect of us," read a statement published to the brand's Instagram account.It added that it has "since ended the relationship with the initial testing lab".In the past fortnight, other brands have "paused" the sale of at least four more products, none of which were included in the Choice report.Rach knows there is no way to prove that there is a link between her diagnosis and the brand of sunscreen she relied on. She says she is not alleging there is such a connection. But she said Ultra Violette's response to the scandal was like "a kick in the guts". She felt that they took no real accountability for the pitfalls of their product, and was let down by their decision to continue selling it for two months despite doubts over its efficacy."I just had like the five stages of grief, you know?" she said. "I was angry, I was upset, I was almost in denial."Getty ImagesAva Chandler-Matthews and Rebecca Jefferd founded Ultra Violette in 2019Like Rach, a horde of annoyed customers say the saga has shaken their faith in the industry."A refund isn't really going to reverse years of sun damage, is it?" one wrote in response to Ultra Violette's recall statement.Choice has urged the TGA to conduct further investigations into the sunscreen market, and also urged any brands who had reason to question the SPF protection listed on their products to remove them from sale immediately."It is clear there is a serious issue in the Australian sunscreen industry that urgently needs to be addressed," said Rosie Thomas, the director of campaigns, in a statement to the BBC.How did this happen?While in Europe sunscreen is classed as a cosmetic, Australia regulates it as a therapeutic good – essentially a medicine – which means it is subject to some of the most robust sunscreen regulations in the world. And that's something many of the brands caught up in this saga trade on. So, how did this happen?An investigation by the Australian Broadcasting Corporation found that a single US-based laboratory had certified at least half of the products that had failed Choice's testing, and that this facility routinely recorded high test results.It also found that several of the sunscreens pulled from shelves shared a similar base formula and linked them to a manufacturer in Western Australia.The TGA says it does not usually speak about ongoing investigations because it does not want to compromise them, but that it is also looking into "reviewing existing SPF testing requirements" which can be "highly subjective"."The TGA is also aware that it is common practice for different sunscreen products to share the same or similar base formulations," a spokesperson said in a statement to the BBC."Ultimately it is the sponsor's [seller's] responsibility to ensure that their medicine remains compliant with all applicable legislative requirements."Consistent and comfortable sunscreens which offer high protection are very technical and difficult to make, says Dr Wong, founder of Lab Muffin Beauty Science. Everyone's skin responds differently to the product, he adds, and it's one that is almost always being stress-tested – by sweat, water, or makeup.It is very difficult to rate effectively for the same reasons. Historically, it has been done by spreading the sunscreen on 10 people at the same thickness, then timing how long it takes for their skin to start burning both with and without the product applied.Getty ImagesEffective and popular sunscreens are hard to get right, experts sayWhile there are clear guidelines as to what you are looking for, Dr Wong says there is still a lot of variability. That is down to skin texture or tone, or even the colour of the walls, and "different labs get different results".But she says results are also quite easy to fake, pointing to a 2019 probe by US authorities into a sunscreen testing laboratory which resulted in the owner being jailed for fraud.Many sunscreen brands from all over the world use the same manufacturers and testing labs - and so this issue is unlikely to be isolated to Australia, she adds."Until someone goes out and tests a whole bunch of sunscreens in other countries, we just don't know the extent of it."She says the scandal is a reminder that regulations are only as good as they are enforced.But while it has touched a nerve for many people who are at high risk for skin cancer simply by virtue of being Australian, Dr Wong said she felt the panic triggered by the investigation was blown out of proportion.She points to the world's largest clinical trial of sunscreen, done in the 90s, which found that the daily use of an SPF 16 sunscreen dramatically dropped skin cancer rates."95% of the sunscreens tested [by Choice] have high enough SPF to more than halve the incidence of skin cancer," Dr Wong said."Some of the SPF testing, I feel, has become a bit more of a marketing exercise than a real reflection of efficacy."The most important thing you can do when choosing a sunscreen, she says, is actually wear enough of it – a full teaspoon at least for each part of your body, face included. And ideally you should apply it about every two hours,  especially if you have been sweating a lot or swimming.  Experts also advise that you combine the sunscreen with other safety methods, such as wearing protective clothing and seeking out shade.Read more Australia stories ]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[GLM 4.5 with Claude Code]]></title>
@@ -174,7 +552,7 @@ Epsilon Eridani is orbited by a large planet which might look like this.
     
         
           
-          41
+          45
           stars
         
           
@@ -206,32 +584,6 @@ Epsilon Eridani is orbited by a large planet which might look like this.
         
         
   ]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[Should we revisit Extreme Programming in the age of AI?]]></title>
-            <link>https://www.hyperact.co.uk/blog/should-we-revisit-xp-in-the-age-of-ai</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45143945</guid>
-            <description><![CDATA[Discover why Extreme Programming (XP) is essential in the AI era. Learn how human-centred practices and smart constraints drive successful software delivery.]]></description>
-            <content:encoded><![CDATA[The pace of software output has never been faster. AI tooling and decades of platform innovation have dramatically lowered the barrier to code creation. With just a few prompts or API calls, it is now possible to generate entire products, features,  infrastructure, and functionality in hours rather than weeks.And yet, despite all this acceleration, delivery outcomes remain stubbornly poor. Too many initiatives underdeliver, budgets continue to overrun, and users are left underserved. If cheaper and faster code has not solved delivery, then the bottleneck must lie elsewhere.Output is not the problemTyping has never been the bottleneck. We have seen successive waves of acceleration:
-The rise of high-level languages
-Widespread adoption of frameworks and package managers
-The move to DevOps and serverless computing
-Developer platforms that abstract away infrastructure
-And now, AI-enabled code generation.Despite this acceleration, outcomes remain stubbornly inconsistent. The long-running Standish Chaos study still finds that most IT projects miss expectations, while McKinsey reports that 70% of digital transformations fail. More output has not meant better software.If faster code generation alone doesn’t deliver value, the answer is not more acceleration, but smarter constraints. For me, that’s why XP resonates now more than ever: it teaches us to slow down just enough to learn, align, and build with intent.XP as a counterweightUnbounded acceleration leaves no time to steer. Without slowing down to notice mistakes, learn, and correct course, teams risk shipping software no one asked for.Extreme Programming (XP), developed in the late 1990s, was never intended to maximise throughput. Quite the opposite: it introduced deliberate friction and constraints that enabled teams to learn, raising the probability they were moving in the right direction. One of its most radical principles, pair programming everything, halves raw output by design.The principle is simple: go slower in the small so you can go faster in the large.Take pair programming. On paper, you cut output in half. In practice, you double shared understanding. You surface assumptions early. You build trust. You improve quality. You raise the baseline of capability across the team.This is the sociotechnical nature of XP practices. They shape collaboration as much as they shape code. They are an investment in learning, not just shipping. And in doing so, they provide direction, not just speed.AI magnifies the problem XP was built to solveAs code generation becomes effortless, a new risk emerges: producing software faster than we can validate it.This is especially pronounced in agentic AI systems, where multiple autonomous agents generate, refine, and ship code. Without constraints, these systems can rapidly layer unvalidated logic on top of itself, entrenching assumptions and amplifying architectural complexity.Recent research reinforces the risk: LLM accuracy declines the longer the context window. In practice, this means the more you “vibe code,” the more brittle the output becomes over time, because large language models perform best at the start and end of the context window, while the middle is poorly generalised and prone to error.The result is brittle, tangled code that becomes increasingly expensive to change. Extreme Programming was designed to prevent exactly this kind of runaway entropy.Software is still humanDespite AI’s rise, software remains a profoundly human discipline. Code is written by people, for people, in organisations shaped by culture, incentives, and communication.While tools evolve, the persistent barriers to delivery remain: alignment, shared context, clarity of outcome, and user validation.XP’s values are still powerful today:
-Simplicity helps reduce system complexity
-Communication keeps teams cohesive
-Feedback drives learning and adaptation
-Respect builds safety and trust
-Courage empowers transparency and change
-From feature factories to value deliveryThe most successful teams do not chase speed at all costs. They prioritise flow over velocity and feedback over features.XP’s emphasis on small batches, continuous integration, automated testing, and shared ownership helps teams remain adaptable, resilient, and user-focused.As AI accelerates output, these practices will be critical to managing quality, risk, and intent.Lessons from the pastThe CHAOS report data is telling:
-1994: only 16% of software projects delivered on time and on budget
-2012: improved to 37%
-2020: regressed to 31%
-In over two decades of innovation: agile, DevOps, cloud-native platforms, and now AI, the net difference in reliable software delivery is just +14 percentage points.Toolchains alone have not solved delivery. Methodology still matters.What needs to change?As we enter the next phase of software acceleration, three things become clear:
-Output creation is no longer the constraint. We can produce code faster than we can validate or align it with real-world needs.
-We must invest in outcome-generating capabilities. Stronger feedback loops, clearer product direction, tighter team collaboration, and greater design discipline.
-The process needs to become more human, not less. Even as AI capabilities expand, sustainable delivery will always depend on human collaboration.
-Our view of the Product Operating Model is built on this principle: technology only delivers when teams are optimised for collaboration, clarity, and flow. By aligning product strategy, operating rhythms, and engineering practices around people, not just platforms, you create the conditions for sustainable delivery in the AI era.Should we revisit XP in the age of AI?Yes.We need frameworks that anchor us to human-centred practices, even as tools become more powerful. XP provides both discipline and empathy. It centres the team. It elevates shared understanding above raw speed. It asks the most important question: are we building the right thing?In an era defined by faster code and fewer constraints, XP is a rare methodology that reminds us: software is about people, not just code.]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[Nest 1st gen and 2nd gen thermostats no longer supported from 10/25/2025]]></title>
@@ -753,6 +1105,54 @@ Address: 192.168.1.10
 And now you should be able to ping the machines with their hostname. ssh into them. Get certificates with the CA that runs in the podman container. Life is good!
 
 I hope you enjoyed this post and could learn something new! Feel free to comment or send corrections vie the Toot linked below that collects the comments!
+]]></content:encoded>
+        </item>
+        <item>
+            <title><![CDATA[Fantastic pretraining optimizers and where to find them]]></title>
+            <link>https://arxiv.org/abs/2509.02046</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45141762</guid>
+            <description><![CDATA[AdamW has long been the dominant optimizer in language model pretraining, despite numerous claims that alternative optimizers offer 1.4 to 2x speedup. We posit that two methodological shortcomings have obscured fair comparisons and hindered practical adoption: (i) unequal hyperparameter tuning and (ii) limited or misleading evaluation setups. To address these two issues, we conduct a systematic study of ten deep learning optimizers across four model scales (0.1B-1.2B parameters) and data-to-model ratios (1-8x the Chinchilla optimum). We find that fair and informative comparisons require rigorous hyperparameter tuning and evaluations across a range of model scales and data-to-model ratios, performed at the end of training. First, optimal hyperparameters for one optimizer may be suboptimal for another, making blind hyperparameter transfer unfair. Second, the actual speedup of many proposed optimizers over well-tuned baselines is lower than claimed and decreases with model size to only 1.1x for 1.2B parameter models. Thirdly, comparing intermediate checkpoints before reaching the target training budgets can be misleading, as rankings between two optimizers can flip during training due to learning rate decay. Through our thorough investigation, we find that all the fastest optimizers such as Muon and Soap, use matrices as preconditioners -- multiplying gradients with matrices rather than entry-wise scalars. However, the speedup of matrix-based optimizers is inversely proportional to model scale, decreasing from 1.4x over AdamW for 0.1B parameter models to merely 1.1x for 1.2B parameter models.]]></description>
+            <content:encoded><![CDATA[
+    
+    
+                
+    View PDF
+    HTML (experimental)
+            Abstract:AdamW has long been the dominant optimizer in language model pretraining, despite numerous claims that alternative optimizers offer 1.4 to 2x speedup. We posit that two methodological shortcomings have obscured fair comparisons and hindered practical adoption: (i) unequal hyperparameter tuning and (ii) limited or misleading evaluation setups. To address these two issues, we conduct a systematic study of ten deep learning optimizers across four model scales (0.1B-1.2B parameters) and data-to-model ratios (1-8x the Chinchilla optimum). We find that fair and informative comparisons require rigorous hyperparameter tuning and evaluations across a range of model scales and data-to-model ratios, performed at the end of training. First, optimal hyperparameters for one optimizer may be suboptimal for another, making blind hyperparameter transfer unfair. Second, the actual speedup of many proposed optimizers over well-tuned baselines is lower than claimed and decreases with model size to only 1.1x for 1.2B parameter models. Thirdly, comparing intermediate checkpoints before reaching the target training budgets can be misleading, as rankings between two optimizers can flip during training due to learning rate decay. Through our thorough investigation, we find that all the fastest optimizers such as Muon and Soap, use matrices as preconditioners -- multiplying gradients with matrices rather than entry-wise scalars. However, the speedup of matrix-based optimizers is inversely proportional to model scale, decreasing from 1.4x over AdamW for 0.1B parameter models to merely 1.1x for 1.2B parameter models.
+    
+
+    
+    
+              
+          Comments:
+          108 pages, 8 figures, reproducible runs available at this https URL
+        
+
+          Subjects:
+          
+            Machine Learning (cs.LG); Artificial Intelligence (cs.AI); Machine Learning (stat.ML)
+        
+          Cite as:
+          arXiv:2509.02046 [cs.LG]
+        
+        
+           
+          (or 
+              arXiv:2509.02046v1 [cs.LG] for this version)
+          
+        
+        
+           
+                        https://doi.org/10.48550/arXiv.2509.02046
+              
+                                arXiv-issued DOI via DataCite (pending registration)
+            
+          
+        
+    
+  
+      Submission history From: Kaiyue Wen [view email]          [v1]
+        Tue, 2 Sep 2025 07:43:22 UTC (701 KB)
 ]]></content:encoded>
         </item>
         <item>
