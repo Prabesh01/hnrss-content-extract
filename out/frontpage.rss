@@ -4,17 +4,526 @@
         <title>Hacker News: Front Page</title>
         <link>https://news.ycombinator.com/</link>
         <description>Hacker News RSS</description>
-        <lastBuildDate>Sun, 07 Sep 2025 19:01:15 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 07 Sep 2025 19:25:57 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>github.com/Prabesh01/hnrss-content-extract</generator>
         <language>en</language>
         <atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/frontpage.rss" rel="self" type="application/rss+xml"/>
         <item>
-            <title><![CDATA[An empty S3 bucket can make your AWS bill explode]]></title>
-            <link>https://medium.com/@maciej.pocwierz/how-an-empty-s3-bucket-can-make-your-aws-bill-explode-934a383cb8b1</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45160672</guid>
-            <description><![CDATA[Imagine you create an empty, private AWS S3 bucket in a region of your preference. What will your AWS bill be the next morning?]]></description>
-            <content:encoded><![CDATA[4 min readApr 29, 2024--Update 7.05.2024The S3 team is working on a fix:https://twitter.com/jeffbarr/status/1785386554372042890Imagine you create an empty, private AWS S3 bucket in a region of your preference. What will your AWS bill be the next morning?A few weeks ago, I began working on a PoC of a document indexing system for my client. I created a single S3 bucket in the eu-west-1 region and uploaded some files there for testing. Two days later, I checked my AWS billing page, primarily to make sure that what I was doing was well within the free-tier limits. Apparently, it wasn’t. My bill was over $1,300, with the billing console showing nearly 100,000,000 S3 PUT requests executed within just one day!Press enter or click to view image in full sizeMy billed S3 usage per day, per regionWhere were these requests coming from?By default, AWS doesn’t log requests executed against your S3 buckets. However, such logs can be enabled using AWS CloudTrail or S3 Server Access Logging. After enabling CloudTrail logs, I immediately observed thousands of write requests originating from multiple accounts or entirely outside of AWS.But why would some third parties bombard my S3 bucket with unauthorised requests?Was it some kind of DDoS-like attack against my account? Against AWS? As it turns out, one of the popular open-source tools had a default configuration to store their backups in S3. And, as a placeholder for a bucket name, they used… the same name that I used for my bucket. This meant that every deployment of this tool with default configuration values attempted to store its backups in my S3 bucket!Note: I can’t disclose the name of the tool I’m referring to, as that would put the impacted companies at risk of data leak (as explained further).So, a horde of misconfigured systems is attempting to store their data in my private S3 bucket. But why should I be the one paying for this mistake? Here’s why:S3 charges you for unauthorized incoming requestsThis was confirmed in my exchange with AWS support. As they wrote:Yes, S3 charges for unauthorized requests (4xx) as well[1]. That’s expected behavior.So, if I were to open my terminal now and type:aws s3 cp ./file.txt s3://your-bucket-name/random_keyI would receive an AccessDenied error, but you would be the one to pay for that request. And I don’t even need an AWS account to do so.Another question was bugging me: why was over half of my bill coming from the us-east-1 region? I didn’t have a single bucket there! The answer to that is that the S3 requests without a specified region default to us-east-1 and are redirected as needed. And the bucket’s owner pays extra for that redirected request.The security aspectWe now understand why my S3 bucket was bombarded with millions of requests and why I ended up with a huge S3 bill. At that point, I had one more idea I wanted to explore. If all those misconfigured systems were attempting to back up their data into my S3 bucket, why not just let them do so? I opened my bucket for public writes and collected over 10GB of data within less than 30 seconds. Of course, I can’t disclose whose data it was. But it left me amazed at how an innocent configuration oversight could lead to a dangerous data leak!What did I learn from all this?Lesson 1: Anyone who knows the name of any of your S3 buckets can ramp up your AWS bill as they like.Other than deleting the bucket, there’s nothing you can do to prevent it. You can’t protect your bucket with services like CloudFront or WAF when it’s being accessed directly through the S3 API. Standard S3 PUT requests are priced at just $0.005 per 1,000 requests, but a single machine can easily execute thousands of such requests per second.Lesson 2: Adding a random suffix to your bucket names can enhance security.This practice reduces vulnerability to misconfigured systems or intentional attacks. At least avoid using short and common names for your S3 buckets.Lesson 3: When executing a lot of requests to S3, make sure to explicitly specify the AWS region.This way you will avoid additional costs of S3 API redirects.Aftermath:I reported my findings to the maintainers of the vulnerable open-source tool. They quickly fixed the default configuration, although they can’t fix the existing deployments.I notified the AWS security team. I suggested that they restrict the unfortunate S3 bucket name to protect their customers from unexpected charges, and to protect the impacted companies from data leaks. But they were unwilling to address misconfigurations of third-party products.I reported the issue to two companies whose data I found in my bucket. They did not respond to my emails, possibly considering them as spam.AWS was kind enough to cancel my S3 bill. However, they emphasized that this was done as an exception.Thank you for taking the time to read my post. I hope it will help you steer clear of unexpected AWS charges!]]></content:encoded>
+            <title><![CDATA[Keeping secrets out of logs (2024)]]></title>
+            <link>https://allan.reyes.sh/posts/keeping-secrets-out-of-logs/</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45160774</guid>
+            <description><![CDATA[There's no silver bullet, but if we put some "lead" bullets in the right
+places, we have a good shot at keeping sensitive data out of logs.]]></description>
+            <content:encoded><![CDATA[tl;dr:
+There's no silver bullet, but if we put some "lead" bullets in the right
+places, we have a good shot at keeping sensitive data out of logs."This is the blog version of a talk I gave at LocoMocoSec 2024. It’s
+mostly a lightly edited transcript with some screenshots, so if you’d prefer,
+you can watch the
+video or just
+flip through the slides."This post is about how to keep secrets out of logs, and my claim is that (like
+many things in security) there isn’t a singular action or silver bullet that
+lets you do this. I would go so far as to say that there’s not even an 80/20
+rule, where one action fixes 80% of the problem. It’s not like preventing SQL
+injection with prepared statements or preventing buffer overflows by using
+memory-safe languages.What I will offer instead, are lead bullets, of which there are many. I’m going
+to talk about 10 of them. They are imperfect and sometimes unreliable things
+that, if put in the right places and with defense-in-depth, can still give us a
+real good chance at succeeding. My hope is that by the end, you’ll
+have a slightly better framework for how to reason about this problem and some
+new ideas to add to your kit.Table of contents:The ProblemCauses🤦 Direct logging🚰 Kitchen sinks🔧 Configuration changes🥧 Embedded secrets📡 Telemetry🕺🏻 User inputFixes (lead bullets)📐 Data architecture🍞 Data transformations🪨 Domain primitivesCompile-timeRun-timeRun-time: part deux🎁 Read-once objects🔎 Taint checkingAwesomeNot awesome🗃️ Log formatters🧪 Unit tests🕵️ Sensitive data scannersSampling🤖 Log pre-processors🦸 PeopleRecapStrategy0. Lay the foundation1. Understand the data flow2. Protect at chokepoints3. Apply defense-in-depth4. Plan for response and recoveryConclusionThe ProblemWith that, let’s dive in and set the table by talking about the problem with
+secrets in logs.So, there are some problems that are annoying. And there are some problems that
+are difficult.This is both. I’m gonna level with you: I absolutely hate this problem. But I’m
+not going to gaslight you and tell you that this is the most important thing to
+work on worry about, because it probably isn’t!You have somewhere between 5 and 50 other problems in your backlog that seem
+more important, 1 of which you found out about this morning. But I think it’s
+likely that none of those problems are nearly as annoying. While researching
+this topic, I interviewed about a dozen other engineers and, on this point, they
+unanimously agreed! Nobody likes dealing with secrets in logs because it is
+extraordinarily annoying.This is a problem that’s also difficult, but not even in the fun sense, like
+being technically complex or interesting. Once you catch sensitive data in logs,
+it’s usually pretty straightforward (at least in retrospect) to determine how
+they got there. But, it’s also surprisingly elusive to prevent, and it crops up
+in incredibly unexpected places and ways.Secrets could mean lots of different things to lots of different teams, but I’ll
+use it interchangeably with “sensitive data”: stuff that you want to keep
+confidential. What’s so frustrating when breaching confidentiality in logs is
+the full spectrum of potential impact.In the best case (left), you might log an isolated, internal credential, like
+an API key, which (kudos!) you rotate right after fixing the source of leak.
+The impact is minimal, and you just move on. Of course, all the way on the other
+end of the spectrum (right), you might log something that an attacker or
+inside threat could use to do some real harm.And then somewhere in-between, where I suspect most of the incidents lie. You
+might log secrets that you unfortunately, can’t rotate yourself. Things like PII
+or your customer’s passwords, which are reused on other sites, because of course
+they are. And, depending on your policies, threat model, or regulations, you
+might choose to issue a disclosure or notification.And it is painful.You could be doing so many good data security practices, like
+secure-by-design frameworks, database and field-level encryption, zero-touch
+production, access control… but logging bypasses all of that… and ultimately
+degrades trust, in your systems and in your company. It feels unfair because
+it’s only a fraction of your security story.And this is a problem that happens to companies of all sizes:Something about “plaintext” just kinda stings, especially as a security
+practitioner. It’s like… the most profane insult you can hurl at a security
+engineer. Imagine retorting with, “Oh yea? Well, you store your passwords in
+plaintext!”But logging passwords and storing them in plaintext are… kinda the same thing.Because while logs are rarely or purposefully public, they’re typically afforded
+broader access than direct access to your databases.Everyone knows by now that storing plaintext secrets in your database is a
+terrible idea. Logs, however, are still data-at-rest, and we should treat them
+with the same level of scrutiny.I cherry picked those examples because they are established companies with very
+mature security programs. I’m not trying to throw shade; in fact, I deeply
+respect them for being public and transparent about this. I think this also
+hints that preventing secrets in logs is a deceptively difficult and frustrating
+problem.If we can understand some causes, we might gain a deeper appreciation for these
+past occurrences, and stand a better chance at avoiding new incidents in the
+future.CausesThis is certainly not comprehensive, but from my interviews and personal
+experience, here are six of the most common causes.🤦 Direct logging🚰 Kitchen sinks🔧 Configuration changes🥧 Embedded secrets📡 Telemetry🕺🏻 User input🤦 Direct loggingconst temp = res.cookie["session"];
+
+// TODO: remove after testing is done
+Logger.info("session HERE", { temp });
+Narrator: it was not removed after testing was doneThe first group is perhaps the most obvious and facepalm one: when sensitive
+data is directly logged. Sometimes it’s purely accidental, like the example
+above: someone wants to debug session cookies in their local environment and
+then… accidentally commits the code. Sometimes it comes from an uninformed
+position where the developer just doesn’t know any better.These tend to be fairly easy to trace down the exact line of code or commit that
+introduces it. With this example, you can just grep the codebase for session here and you’ll find it instantly.🚰 Kitchen sinksconst client = googleSdk.admin(...);
+try {
+  const res = client.tokens.list(...);
+} catch (e) {
+  Logger.error("failed fetch", { e });
+}
+I’m sure you’ve seen or written code like this before. Here we have an API
+client or SDK that is used to fetch some data. Exceptions are caught, kind of,
+and then promptly logged so that on-call engineers can debug the errors.What happens?That error is decorated with a config object stuffed with secrets and the full
+response object, which is also stuffed with secrets, and now they’re both in
+your logs!{
+  e: {
+    status: 400,
+    ...
+    config: { 💥☠️🪦 },
+    response: { 💣😭😱 },
+  }
+}
+I call these “kitchen sinks,” objects that contain or hold secrets, often in
+opaque or unexpected ways. Think of an actual kitchen sink that’s filled to the
+brim with dirty dishes and you can’t easily tell what’s at the bottom without
+reaching into it. Maybe it’s a spoon, or maybe it’s knife and now you have to
+go to the hospital. What tends to happen is that the whole kitchen sink gets
+logged, and the logging library happily serializes it, including parts that were
+actually sensitive.This seems to happen with code that attaches additional data onto errors, or
+code that logs full request and response objects. It’s typically a bit hard to
+catch in code review unless you know to look for them. If you are blessed with
+static types, seeing an any type flow into logs can be a good hint that you’re
+logging too much.🔧 Configuration changesNarrator: it was not okayNext example: someone needs additional observability and changes a setting like
+the global log level. You know exactly what happens, here. This dev is about to
+have a bad time and find out that hope, in fact, is not a valid strategy.We started with an observability problem. Now we also have security problem: brand
+new secrets are getting emitted into logs.In that example (that totally never happened to me ever), developers built
+production around log levels set to WARN and above, but once you flip it to
+DEBUG, all this new stuff comes out of the woodwork.These type of configuration changes tend to involve a system that was built with
+one set of assumptions, but some kind of modification moves that system from a
+known state into a unknown state, introducing a new set of problems.These often involve low-level or global utilities like logging config, HTTP
+middleware, or some central piece of infra like a load balancer. They tend to be
+singletons that are difficult or costly to test, or they crop up only at
+runtime. On the positive side, it’s usually loud and quick to patch, but cleanup
+can be kinda painful.🥧 Embedded secretsapp.get("/login/:slug", async (req, res) => {
+  const magicLink = req.params["slug"];
+  await login({ magicLink });
+});
+I completely made up this phrase, but the idea is that secrets are coupled to,
+embedded into, and baked into more general formats like URLs or remote
+procedure calls. The central idea is that it’s designed into the format and the
+system, and can’t easily be separated.Say you have a magic login link handler (see above) where a user can click a
+link and sign into a web app. There’s nothing in that code that logs the link,
+but if you look at HTTP logs, it’s right there in plain view:47.29.201.179 - - [17/Jul/2024:13:17:10 +0000] "GET /login/Uj79z1pe01...
+These types of leaks arise from fundamental designs that don’t take logging into
+consideration or incorrectly assume some end-to-end flow. The sensitivity gets lost out of context, and ends up getting logged in another layer,
+system, or service.📡 Telemetrytry:
+    db_name = os.getenv("DB_NAME")
+    db_pass = os.getenv("DB_PASS") # 🤫 Secret!
+    conn = db.connect(db_name, db_pass)
+    ...
+except Error as e:
+    # Don't log e! Not today!!11
+    Logger.error("failed to connect")
+finally:
+    conn.close()
+Next example: we have some Python code that’s connecting to a database, we’re
+specifically NOT logging the error object, and we want to ensure we always close
+out the connection.How can db_pass possibly make it into logs? Telemetry!"Oops, that's a log, too!"It turns out that things like error monitoring and analytics can totally be
+logs, too. I kind of cheated in the code example, because there’s no mention of
+telemetry in it at all, but it turns out that if you hook it up to error
+monitoring like Sentry (above), run-time errors send the
+local variable context right to the dashboard, and you can see the database
+password in plaintext.These causes tend to bypass the central logging pipeline and become Yet Another
+Place to have to worry about secrets.🕺🏻 User inputAlright, last example. Say there’s a sign in form and the entire dev team made
+super duper sure that the password field is totally locked down from logging,
+they read this super awesome post, and took care of all the causes we discussed.What happens?Users end up jamming passwords into the username field!So if you ever looked at login alerts for AWS and saw usernames replaced with
+HIDDEN_DUE_TO_SECURITY_REASONS, this is precisely why!Everything that’s within proximity to sensitive user input tends to be
+radioactive. It could be a UI issue, but users are surprisingly determined to
+volunteer secrets in ways that you haven’t prepared for.We’ve touched on a half dozen causes, and the list of things goes on. We didn’t
+even talk about the wonder that is crashdumps. But, I think it’s important to
+zoom out and note that these are proximate causes.I stand by my claim that there’s no silver bullet to take these all out. If we
+want to avoid playing whack-a-mole, we must bring out our lead bullets that
+address these issues at a deeper level, and prevent these kinds of things from
+happening.Fixes (lead bullets)So let’s dive in! We will survey 10 fixes, and the order we’ll go in is
+somewhere between “a dependency graph of things that build on each other” and
+“following the lifecycle of a secret.” Some of these are obvious or perhaps
+things you’re already doing, so I’ll focus more on fixes that I think might be a
+bit newer. That said, it is worth starting with the basics.📐 Data architecture🍞 Data transformations🪨 Domain primitives🎁 Read-once objects🗃️ Log formatters🧪 Unit tests🕵️ Sensitive data scanners🤖 Log pre-processors🔎 Taint checking🦸 People📐 Data architectureLead bullet #1 is the most basic and high-level: data architecture and
+understanding that this is primarily a data flow problem. And part of the
+solution is reducing the number of data flows and shrinking the problem space so
+you simply have less things to worry about and protect.Instead of stray print statements or components that write directly to
+filesystem, you instead centralize all your data flows through a single stream.
+Make it so that there’s one and only one way to log something. If you can
+understand and control the data structures that enter that funnel, you can
+prohibit secrets from exiting it.This has the allure of being a silver bullet, because of course if you can get
+to 100% of all the things we mentioned here, you’re golden! But in practice (and
+as we’ve seen previously), that’s difficult because secrets find a way to sneak
+in or new outflows and side channels are created.🍞 Data transformationsThe previous bullet was about controlling how data flows through your system,
+this is about transforming, slicing, and disarming that data into safer forms
+that can be logged. These are the data security fundamentals that you’re already
+familiar with and likely already doing. This is your bread and butter, so I’m
+not going to dive into every one. From top to bottom, this is generally arranged
+from awesome to meh… basically, by how much information is retained.TransformationResultMinimization☁ (nothing)Redaction[redacted]Tokenization2706a40d-3d1d…Hashingdaadfab322b59…EncryptionAzKt7vBE7qEuf…Masking··········5309On the top, we have data minimization. The best way to not log secrets, is to
+not have secrets to begin with! This is everything from going passwordless to
+fetching only the data you need.Redaction is the next best thing. Blanking out the secret parts and before you pass
+objects around in memory.Tokenization, hashing, encryption: these all have their pros, cons, and caveats.
+Like… are you even doing it correctly?Dead last is masking. You leave parts of the secret intact. Maybe this works for you.
+Maybe it doesn’t. Maybe you go straight to jail 🤷When these techniques work, they generally work well. But very often what
+happens is that they aren’t used or are used too late, after something is
+already logged. These have their places in our toolbox, but my claim again is
+one bullet isn’t enough.🪨 Domain primitivesLet’s introduce lead bullet #3: domain primitives. Almost all the secrets you
+run across in codebases are encoded in-memory as string primitives, and I think
+that makes our jobs harder. Strings can be almost anything.Strings: any sequence of bytes from "" to "c̴̞̑ť̸͈̘̌ h̸͝ ̭̘̊ü̶̜̫̦̠͋̆͠ ļ̵̮̤̟̉̀͂ṹ̴̝̂🤷867-53-0999"const secret = "..."
+There’s very little about them——at compile time or run-time——that lets you
+know that it’s sensitive, dangerous to log, or somehow different than any other
+vanilla string.The alternative is a concept I learned from the book Secure by
+Design, and I think it’s one of
+the most powerful concepts you can add to your codebase, for logs or anything
+else where you want to layer in security at a fundamental level.Domain primitives: “combines secure constructs and value objects to define the
+smallest building block of a domain”const secret = new Secret("...")
+You use them as basic building blocks that hold secret values, and they provide
+security invariants and guarantees that basic string primitives simply cannot.It’s one of the easiest things you can do. If you shift from “any string can be
+a secret” to “secrets are secrets”, it makes things a lot easier to reason about
+and protect.Compile-time"Check out a previous blog post on branded types, which are fantastic domain primitives with strong
+compile-time guardrails."You can use these to great advantage at compile-time, giving developers
+immediate feedback right in their editors.We can type a logging function (log()) so that it never accepts secrets.
+Then, we use some fetching function that returns secrets, typed as secrets (and
+not as strings). If we try to log that secret, it will not compile. The type
+system will not let you log this secret.// Types
+declare const brand: unique symbol;
+type Secret = string & { [brand]: string }; // Branded type that extends string
+type NotSecret<T> = T extends Secret ? never : T; // Type that excludes secrets
+
+// Logging function
+function log<T extends string>(message: NotSecret<T>) { ... };
+const message: string = "this is fine"; // 🧵 string primitive
+const secretz: Secret = getSecret();    // 👈 domain primitive
+
+log(message); // 👌 compiles!
+log(secretz); // 💥 error!
+See this example in the TypeScript Playground.I’m omitting and glossing over a ton of details here, because I don’t want you
+to focus on the implementation or even TypeScript, for that matter. The salient
+point here is that instead of tossing secret strings around, you brand them as
+secret types, providing useful context to both compiler and developer.Run-timeIt’s really easy to get started, even with code that is functionally a no-op.
+This is basically the simplest form I can think of—an almost empty
+class:class OpenAIToken extends String { /* that could be it! */ }
+
+const token = new OpenAIToken(...);
+It’s supposed to represent OpenAI credentials, but it’s just using and extending
+basic language primitives. You can introduce these objects where secrets
+originate, like password fields or anytime you decrypt sensitive data fetched
+from the database. And then layer in behaviors and invariants for where they
+tend to end up. You progressively start introducing these at both sources and
+sinks, allowing you to control where secrets should or shouldn’t go. You can
+embed these into data structures so you know what contains secrets. And along
+the way, you increase the clarity and safety of your codebase: not only can you
+prevent these tokens from going into logs, you can make sure you’re sending them
+only to OpenAI and not to some other API by accident.I think in the long run, domain primitives are the most powerful control we have
+because it makes our code secure by design, but it does take some time to get
+there. These can easily address the direct logging cause we discussed earlier,
+and with some modifications can help with many more.Run-time: part deuxWe can extend this and make it so that the default serialization behavior is
+redaction.class Secret extends String {
+    toString() { return "[redacted]" } // Override!
+}
+const secret = new Secret("shhh!");
+console.log(secret);
+Secret: "[redacted]"
+If you try to stuff this into logs, into JSON, into kitchen sinks, into error
+monitoring, wherever, it’ll always spit out the word “redacted”. You have to
+intentionally reach for the value.Let’s take it further. We can create a custom class with an explicit unwrap()
+function:class Secret<T> {
+    constructor(private readonly value: T) {}
+    toString() { return "[redacted]" } // Override serialization
+    unwrap() { return this.value }     // Explicit getter function
+}
+There’s so many things you can do here, like maybe you want to encrypt or zero it out
+in memory, because that’s in your threat model. You can take this as far as you need
+to or are comfortable with. We’ll take it just one step further.🎁 Read-once objectsThere’s a bit to unpack here, but these build off domain primitives in a very
+powerful way.class Secret<T> {
+    private locked = false;
+    constructor(private readonly value: T) {}
+    toString() { return "[redacted]" }
+
+    /* @returns the sensitive value (once and only once) */
+    unwrap() {
+        if (this.locked) { throw new Error("already read") }
+        this.locked = true;
+        return this.value;
+    }
+}
+These objects wrap and keep the secret safe, until you actually
+need it. The code in the unwrap() function is the crux: there’s a latch or
+lock that activates after the secret is retrieved the first time. It goes into a
+“locked” state, and any following reads result in an error that fails loudly.const secret = getSecret();
+const res = await authenticate(secret.unwrap()); // Proper usage
+
+Logger.info(secret);          // [redacted]
+Logger.info(secret.unwrap()); // 💥 Error!
+Once you get a secret (from user input, database, decryption, etc.) you wrap
+it in a read-once object immediately and keep it wrapped for as long as you can.
+And for its single, intended purpose, like using it for some kind of API
+authentication, you unwrap the value, use it, and then the object stays locked
+for good. This is surprisingly effective at preventing and detecting
+unintentional use. It addresses and disarms many of the proximate causes that we
+discussed earlier.This object pairs extremely well with static analysis. Tools like CodeQL or
+Semgrep can help ensure that developers aren’t bypassing any safety guarantees.These are generally high signal, especially when you have good unit test
+coverage. One drawback is that read-once objects, if handled incorrectly but not
+necessarily unsafely, could cause errors at run-time. But I think the tradeoffs
+are usually worth it, especially if you complement it with testing, static
+analysis, and taint-checking. Speaking of which…🔎 Taint checkingI like to think of taint checking as static analysis with superpowers. I
+absolutely love it and the first time I used it, it was like someone just handed
+me a lightsaber. Quick review for the uninitiated: the general idea here is that
+you add taint to various sources (like database objects), and yell loudly if the
+data flows into certain sinks (like logs).The red data flow trace on the right detects the secret flowing into logs. But
+the green path is fine, because the secret is tokenized. Let’s walk through a
+quick example:
+semgrep.dev/playground/s/4bq5LOn the left, we’ve marked a couple sources like decrypt and a database fetcher.
+We’ve also marked our logger as a sink, and the tokenize() function as a
+sanitizer.On the right in red, we can see that taint was created from the decrypt
+function, propagated through the getSSN() function, and then flagged for
+going into the logs on line 18.In blue, there’s a much shorter path where the user model from the database is
+tainted and then flagged for going into logs.And then lastly, in green, we’re tokenizing the decrypted SSN, so it’s not
+flagging that it’s logged.The idea that this is checking millions or more different data flows is the
+real magic part for me.AwesomeSome of the strengths of taint analysis: obviously automation. Tracing these
+data flows is 100% a job for a machine. This can really help with domain
+primitives but also can be used standalone and can even key in on heuristics
+like variable names: for example, all variables containing “password”. You can
+tie this into all of your critical tools, from code review to CI/CD.This is especially potent against kitchen sinks and embedded secrets, because
+those data structures can be tainted by secret values and checked accordingly.Not awesomeSome personal opinions on drawbacks: I do feel like taint checking rules tend to
+be a bit difficult to write. I really, really like Semgrep, but I’m also not the
+biggest fan of YAML.It also turns out that data flow analysis is an NP-hard problem so for large
+codebases and monorepos, you likely can’t run full taint analysis on every pull
+request or commit. Because it runs in CI/CD and as part of change management,
+when it works, it can prevent the introduction of insecure logging into the
+codebase.But, like all of the lead bullets we’ve discussed and will discuss, they can
+miss. How can we handle that?🗃️ Log formattersLet’s say we made the mistake of logging too much data with our email service:{
+  tenantId: "52902156-7fb6-4ab0-b659-6b07b80cf89a",
+  email: {
+    subject: "Log in to your account",
+    html: '<a href="https://acme.com/login/98fPm...">Click here</a> to log in!',
+    from: "AcmeCorp <[email protected]>",
+    to: "Darth Plagueis (The Wise) <[email protected]>",
+    ...
+  },
+  response: {
+    status: 200,
+    originalRequest: {
+      headers: {
+        Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIi..."
+      },
+      body: '{"html": "<a href=\\"https://acme.com/login/98fP...\\">Click..."}',
+      ...
+    }
+    ....
+  },
+  ...
+}
+We have a couple of our usual suspects here. Because we’re logging email
+contents, magic links show up in logs… twice! We’re also logging some kitchen
+sinks, like email metadata and the original request, so we have PII and
+authorization headers also in logs. But because this data is structured, if we
+can traverse these objects, it turns out that we can zero in on these leaks
+quite effectively.{
+  tenantId: "52902156-7fb6-4ab0-b659-6b07b80cf89a",
+  email: {
+    subject: "Log in to your account",
+    html: '<a href="https://acme.com/login/REDACTED">Click here</a> to log in!',
+    from: "AcmeCorp <[email protected]>",
+    to: "REDACTED",
+    ...
+  },
+  response: {
+    status: 200,
+    originalRequest: {
+      headers: "REDACTED",
+      body: '{"html": "<a href=\\"https://acme.com/login/REDACTED\\">..."}',
+      ...
+    }
+    ....
+  },
+  ...
+}
+If we can introspect these objects, we can scan for dangerous substrings like our
+login links, and then drop or redact them. Or we can drop whole values, if we
+know that certain paths like email.to are particularly dangerous. Fields like
+request or headers tend to be risky objects that we can also remove. We can
+even drop the whole log object if it doesn’t meet some admission criteria,
+or—we can simply error out.So, how and where do we deploy something like this? Most application loggers
+should have some type of middleware stack or pipeline, kinda like here on the
+right. These are typically configured for operations like converting objects
+into JSON, turning error objects into readable formats, or enriching logs by
+inserting useful context like network information. We can invert that, and
+instead of enriching with useful data, we can remove or redact sensitive data.export const logger = createLogger({
+  format: format.combine(
+    transform(),
+    handleErrors(),
+    enrich(),
+
+      redact(), // 👈 insert here!
+
+    truncate(),
+    jsonify(),
+    ...
+  ),
+  ...
+});
+This is a type of guardrail that helps catch many of the common problems we
+described previously, like request headers or config objects. I’ve used this
+with decent success and found that it works best as a rifle instead of a
+shotgun. Because it’s at the application tier, you can customize it for the type
+of data or context that each application handles. For example, we can make it so
+that any of our domain primitives that reach this layer are quickly detected and
+removed.This is extremely cheap to introduce, but there are some trade-offs. It’s
+certainly more of a safety net than hard control, and a developer determined to
+bypass it, can and will. Steady state, I measured this at less than 1% of clock
+time, but there are some deeply unfortunate ways this can go wrong such as
+poorly written regexes and self-ReDoS.More or less, these risks can be mitigated with solid unit-testing. Which leads
+us to…🧪 Unit testsLead bullet #7: hooking into and using the existing test suite—that’s already
+there—to our advantage. We can use several of the tools we discussed, but
+instead of simply detecting or redacting secrets, we can ramp up the sensitivity
+in our test environment to fail or error loudly.TechniqueProdTest🪨 Domain primitivesRedactError🎁 Read-once objectsErrorError🗃️ Log formattersRedactError🕵️ Sensitive data scannersDetectErrorI’ll cover sensitive data scanners next, but many test suites are already set up
+to capture stdout and stderr, and so you can even point your scanners to
+these capture buffers.The takeaway here is that you can reap the same benefits of CI/CD and change
+management by catching unsafe code before it’s merged or deployed, but of
+course, you’re also dependent on coverage and if the right code and data paths
+are exercised.🕵️ Sensitive data scannersThese are fairly blunt but effective tools that can discover and remove
+sensitive data. I’m actively going to avoid diving deep here, because it does
+seem like many teams and vendors focus on this as the solution. So instead, I’d
+like to pose a few questions that might help you reason about trade-offs:Where and when in your logging pipeline is it most effective?Is it a gate, in-line of the critical path, or does it scan asynchronously?Do you simply want to detect or do you bias towards masking and
+redaction? How will your team handle and deal with false positives?How far do the general, out-of-box rules take you? Can you tailor it
+specifically to your usage patterns?Can you verify the credentials? Can that even keep up with log throughput?And then perhaps what tends to be the long pole in the tent: what are the
+costs, and can you sample instead?I think these tools tend to be better suited for defense-in-depth, because
+they presume that secrets made it into logs to begin with. They can help catch the
+more elusive causes we discussed like configuration changes or user input.SamplingA very brief segue into sampling. Logs tend to have a kind of power law
+distribution, where certain types of logs vastly outnumber others. And typically
+what you see is that log sources have static points in code, generally with the
+same type of data running through them. And so within each log type, scanning
+and finding a single true positive might be highly representative of that group.And so you might run into a scenario where, given some global sample rate,
+you’re wasting a lot of work for high frequency logs and not even scanning lower
+frequency logs. I think a better alternative to a global sample rate is to
+aggregate logs by some heuristic like type or origin, and to ensure you hit some
+minimum threshold.In practice, I’ve found this difficult or impossible to configure with
+out-of-box solutions. I’ve had to introduce additional infrastructure to help.
+And that’s our next lead bullet.🤖 Log pre-processorsSecond to last lead bullet, #9: log pre-processors. These sit between apps that
+emit logs, and the final data stores.In the above example, something like Vector can receive
+and process logs from our microservices before dispatching them to DataDog or
+wherever logs end up. We can configure it to drop sensitive data in-place using
+many of the techniques we discussed before. And we can sample some subset of
+them and store them onto an S3 bucket, using a more powerful tool like
+Trufflehog or an LLM to catch
+and verify secrets.The idea here is to process logs streams before they’re persisted. It doesn’t
+need to be Vector, chances are, you already have this existing infrastructure
+that’s used for deduping, aggregation, and dropping noisy debug logs. We can
+re-use it to prevent and detect secrets in logs. This pairs very well with
+sensitive data scanners that we discussed earlier, and might even unlock new
+ones you thought were out of reach.🦸 People“Human practitioners are the adaptable element of complex systems.
+Practitioners and first line management actively adapt the system to maximize
+production and minimize accidents.”-Richard Cook, https://how.complexsystems.fail/#12Our last stop is people. Modern software is a complex system. And while people
+will write the code that accidentally introduces sensitive data into logs,
+they’re also the ones that will report, respond, and fix them. They’ll build out
+the systems and infrastructure that will keep these complex systems safe. And
+early on in your maturity story and before you’re able to build out
+secure-by-design frameworks, this is the lead bullet you’ll most likely use the
+most.The most important message I want to convey here is that your security team isn’t
+alone, especially if you:educate your teammates on secure logging designempower them to report and address these issuesand equip them with tools that get out of their way and helps them succeed.RecapAlright, so we’ve covered lead bullets that protect code, protect data, and
+protect logs:📐 Data architecture🍞 Data transformations🪨 Domain primitives🎁 Read-once objects🗃️ Log formatters🧪 Unit tests🕵️ Sensitive data scanners🤖 Log pre-processors🔎 Taint checking🦸 PeopleSome of these might work for you, some of these won’t, and some that we haven’t
+even mentioned could be a homerun for you. Maybe you have super tight control
+over your log schemas or maybe you’re using LLMs in a really neat and effective
+way. Or maybe you’re building or using a language that has first class support
+for controlling secrets.These worked for me. I have some personal opinions on ones which are
+foundational, some that are powerful in the long-run, and some that are really
+easy to get started. But your story is different, so I’d like to zoom
+out and close out with a high-level, methodical strategy that you can apply for
+your security programs, and that we’ll apply and walk through with an example.StrategyHere’s a general strategy:Lay the foundationUnderstand the data ﬂowProtect at chokepointsApply defense-in-depthPlan for response and recoveryI’m not shooting for a Nobel, here. You’re probably doing some of these already,
+and chances are, you have some type of playbook or process that looks just like
+this. The key idea here is to not miss the forest for the trees, and use these
+explicit steps to place our efforts where they’ll matter most. I’ll walk you
+through a hypothetical system and we’ll apply these in order.0. Lay the foundationStep zero is the foundation. Table stakes. This is like the base tier of
+Maslow’s hierarchy, and we need these before we try anything else.Developing expectations, culture, and support is a must-have. They’re easy to
+ignore or forget about, but can make or break success. If you work at place that
+hasn’t addressed these in the past, it can be quite jarring or difficult to
+shift that mentality.I don’t have a ton of advice here other than making sure your org is aligned on
+this. It’ll probably feel like it’s getting worse before it’s getting better,
+but that is a sign of progress. A great litmus test for a solid foundation is if
+developers will (or already have) come to you to report secrets they found in
+logs.The second thing we’ll need is to decide is what we consider a secret to begin
+with. I, admittedly, used secrets and sensitive data interchangeably. This may
+not be the case for you. It doesn’t need to be perfect or comprehensive, and
+maybe it’s just a framework. But employees, especially the security team, need
+common understanding.The third item is technical. If our logs aren’t structured or aren’t JSON, it’ll
+make this endeavor a lot more difficult. A lot of the techniques we discussed
+just won’t work. If we don’t have that central pipeline or there isn’t One and
+Only One Way to both dispatch and view logs, we’ll have to do a lot more
+lifting. We’ve seen a few ways that logs bypass this, but having a central
+pipeline should cover most of the bases.1. Understand the data flowWith the foundation laid, the next best thing to do is to understand and chart
+out how secrets flow through your system. This is basically a Data Flow Diagram,
+and we’ll go through a fairly modest example.On the left, we have users that visit some type of single-page web app. Requests
+and data flow through an application load balancer to several web application
+services running in containers. This is our core compute and where all the
+application code runs. Let’s assume that these are disparate microservices
+processing all types of data, some of which are considered secret. For the most
+sensitive data, they use KMS to encrypt and then store the ciphertext blobs in
+their respective database.And then, applications use a standard logging library to emit to stdout, which
+gets shipped to CloudWatch and then forwarded to Datadog. That’s the final stop,
+and that’s where employees, devs, support staff, etc. can view them.I highly recommend going through an exercise like this, because not only does it
+force you to understand the flows and boundaries of the system, if you spend
+time at each node and threat model it, you end up finding a bunch of unexpected
+ways and places that secrets make it into logs. For example…Front-end analytics! It turns out that secrets from things like form contents
+to session replays could end up getting sent to your user analytics platform.And then what about our application load balancers? These ship their HTTP logs
+directly to CloudWatch, so we could be logging embedded secrets in URLs, and
+it’s totally bypassing our application tiers.Last surprise: error monitoring! Let’s just say that some team wired up Sentry
+instead of DataDog for error monitoring, because of course they did, and now
+you have another stream of secrets in logs.We could go further, and we haven’t even drilled into application architecture,
+but I think this is a good time to move from discovery to action.2. Protect at chokepointsThe next step we want to take is to protect the chokepoints. And if some flow
+isn’t going through that chokepoint, like our rogue team that yeeted Sentry
+into prod, we fix it! We can get rid of Sentry and get that team onto the paved
+path of our logging pipeline.We have a very clear chokepoint; a narrow path that most logs eventually flow
+through. Here’s where most of our lead bullets should go.Here’s that chokepoint splayed out. I also added an upstream node to represent
+CI/CD, because that’s how code get into our apps. We can then put the bulk of
+our protective controls here on the critical path.We can re-architect the app to use a single logging library and
+secure-by-default domain primitives. Then we could use those to build out and
+augment our static analysis, taint-checking, and unit tests. These give us a
+decent front-line defense for our logging pipeline.3. Apply defense-in-depth“Every preventative control should have a detective control at the same level
+and/or one level downstream in the architecture.”
+-Phil Venables, https://www.philvenables.com/post/defense-in-depthThe third step is about adding depth to that defense, a concept we’re all
+familiar with. I really like how Phil Venables crystallizes what
+defense-in-depth means and I think he generally gives great advice. The idea is
+that our controls are not simply overlapping, but mutually supportive.
+Something’s always got your back.Along this chokepoint we add our downstream components, in depth. Some are
+preventative, while some are detective.We can add additional protections like tokenization and read-once objects. We
+can add the downstream tools like our custom log formatters, and employ various
+sensitive data scanners at different points. And then finally, we can educate
+and equip our team.This is what defense-in-depth looks like to me, and I think this maximizes
+chances of success.4. Plan for response and recoveryDetermine the scopeRestrict accessStop the bleeding / ﬁx the sourceClean up all the places, e.g. indexesRestore accessDo a post-mortemMake it ~impossible to happen againBut, of course, if we do miss or if we manage to only detect vs. prevent, we
+should be prepared for response and recovery. You already know how to respond to
+incidents like this, so I won’t add much here, other than making sure you’re
+sticking to a playbook in the right order, pulling levers to restrict and
+restore access while you’re responding, as well as thinking about all the weird
+places secrets might persist in logs, like indexes.ConclusionAnd that’s it. This is the culmination of our strategy, our work, and about 30
+some minutes of blabber.With a solid foundation and understanding of our data
+flows, we protected our chokepoints in-depth and kept secrets out of logs. We’ve
+also introduced a lot of other strong primitives that materially improve our
+security program. So is that it? Is the job done?Well, no, because the data team wired up some ETL jobs that are now spewing
+secrets into data lake logs, because of course they did.Like most things in security, the job often isn’t ever done. But we have the
+understanding, the tools, and a strategy to fight the next fight. Keeping
+secrets out of logs is in your hands.*meIf you liked what you heard, or if you hated it, I’d love to hear your story.
+Please, reach out! Thanks! ✌️]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[Campfire: Web-Based Chat Application]]></title>
@@ -78,9 +587,419 @@ docker run \
             <content:encoded><![CDATA[Something went wrong, but don’t fret — let’s give it another shot. Some privacy related extensions may cause issues on x.com. Please disable them and try again.]]></content:encoded>
         </item>
         <item>
-            <title><![CDATA[Nepal Bans 26 Social Media Platforms, Including Facebook and YouTube]]></title>
-            <link>https://www.nytimes.com/2025/09/07/world/asia/nepal-bans-social-media-platforms.html</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45158877</guid>
+            <title><![CDATA[SQLite's Use of Tcl]]></title>
+            <link>https://www.tcl-lang.org/community/tcl2017/assets/talk93/Paper.html</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45158814</guid>
+            <description><![CDATA[SQLite is a TCL extension that has escaped into the wild.]]></description>
+            <content:encoded><![CDATA[
+
+
+
+D. Richard Hipp
+24th Annual Tcl/Tk Conference
+Houston, TX
+2017-10-19
+
+
+1.0 Introduction
+
+
+SQLite is a TCL extension that has escaped into the wild.
+
+
+
+The design of SQLite was inspired by the design of TCL, both in
+the way it handles datatypes and in the formatting of its source
+code.
+The index use case for SQLite was in a Tcl/Tk application for an
+industrial company.
+From its inception, SQLite has always depended heavily on TCL.
+These days, SQLite no longer uses TCL internally and can be run
+separately from any TCL interpreter, and yet the SQLite development
+process still depends heavily on TCL.
+
+
+1.1 About SQLite
+
+
+SQLite is an SQL database engine, and 
+the most widely used database engine in the world.
+SQLite is built into all cellphones as a core component and is the
+primary means of data persistence on phones.  SQLite is also an
+integral part of most web browsers.  SQLite is built into MacOS and
+is used by most of the default applications on that platform.
+Windows10 requires the C:\Windows\System32\winsqlite3.dll file in
+order to boot.  Countless other popular applications like Skype 
+and WhatsApp and iTunes depend on SQLite.
+
+
+Because SQLite is open source and can be freely downloaded and
+duplicated, exact usage numbers are unavailable.  But reasonable
+estimates are that there are more SQLite instances in operation
+today than there are people on earth.  Most devices that
+use the SQLite database engine contain hundreds of separate databases,
+and there are billions of such devices.  Hence, there are likely
+around one trillion SQLite databases in active use.
+
+
+There are more copies of SQLite in use than there are copies of Linux.
+We know this because SQLite is used on almost all Linux systems, but
+SQLite is also used on many other non-linux systems such as Macs, iPhones,
+and Windows computers.
+By similar arguments, there are more copies of SQLite in use than
+there are Macs, or Windows PCs.
+There are probably more copies of SQLite in use than all other database
+engines combined.
+It seems likely that SQLite is the most widely used and deployed
+software component of any kind, with the possible exception of the
+zLib compression library.
+
+1.2 SQLite Is A TCL Extension, Not A TCL Application
+
+
+SQLite is not written in TCL.  Rather, SQLite is intended to be used
+by TCL.  Like the TCL interpreter, SQLite is written in ANSI C.
+
+
+The fact that SQLite was primarily intended to be used from TCL
+is evident in an number of ways.
+
+
+All programming languages, other than C/C++, require some kind of
+adaptor in order to interface with the SQLite C implementation.  Language
+adaptors for SQLite are widely available from third party programmers.
+The adaptors for PHP and Python are built into those languages, for
+example.  A Java adaptor is baked into Android.  And so forth.  Only
+the TCL adaptor is included as part of the SQLite core.  The source code
+file that implements the TCL adaptor for SQLite, "tclsqlite.c",
+was part of the very first check-in on the SQLite source repository
+on 2000-05-29.  (See 
+https://sqlite.org/src/ci/6f3655f79f9b6fc9.)
+
+
+All modern SQL implementations provide a means to do late binding of
+parameter values to the SQL statements.  Usually a naked "?" character,
+or a "?" followed by an integer is used.  For example:
+
+SELECT passwd, photo FROM user WHERE uid=?1
+
+
+
+The "?1" token in the SQL above would be assigned a value at run-time
+in order to look up the password and photograph of a particular user.
+
+
+SQLite supports this syntax.  But because of its TCL heritage, SQLite
+also allows the parameter to take the form of a TCL variable.  Hence:
+
+SELECT passwd, photo FROM user WHERE uid=$uid
+
+
+
+When a statement such as the above is run, the TCL language adaptor
+automatically binds the value of the $uid TCL variable to the SQL statement
+before it is evaluated, providing an intuitive and seamless interface
+between TCL and SQL.  SQLite is the only database engine that behaves
+this way.
+
+
+The TCL heritage of SQLite is visible in the type system of
+SQLite.  Early versions of SQLite (prior to 2004) operated on the classic
+TCL principal that "everything is a string".  Beginning with SQLite3
+(2004-06-18), SQLite also supports binary data.  However, types are still
+very flexible in SQLite, just as they are in TCL.  SQLite treats the datatypes
+on column names in a CREATE TABLE statement as suggestions rather than
+hard requirements.  SQLite is happy to store a 100KB string value in a
+column that is declared "SHORT INT", just as TCL is happy to store either
+a large string or a small integer in the same variable.  There are some
+differences in how SQLite deals with datatypes, in comparison to TCL, due
+to the different nature of the SQL language.  SQLite has the concept of
+"type affinity".  If a column is declared "INT" and one inserts a string
+into that column that looks like an integer and can be safely converted into
+an integer without loss of information, then that conversion occurs
+automatically.  This provides a measure of compatibility with the rigid
+type systems of other SQL database engines.
+
+
+The flexible type system of SQLite seems natural and intuitive to programmers
+with prior experience programming in TCL.  Curiously, though, it is a source
+of frustration and frequent complaining from programmers accustomed to the
+rigid and unforgiving type systems of languages like Java.
+
+
+The similarities in the type systems of TCL and SQLite extends to more than
+just the interface.  An important part of the C/C++ interface for SQLite
+is the "sqlite3_value" object
+(https://sqlite.org/c3ref/value.html) which is analogous to the
+Tcl_Obj object in TCL.  Both TCL and SQLite use a dual-representation approach,
+where each value can be represented simultaneously as both a string and
+some other type.
+
+2.0 How SQLite Depends On Tcl
+
+
+SQLite began as a TCL extension, though these days most uses of SQLite
+are in applications written in languages other than TCL.  Many programmers
+who use SQLite in their applications have no knowledge or awareness of TCL.
+The SQLite source code used by most developers is a single file of pure
+C code named "sqlite3.c" that contains no TCL code.  
+This is what we mean when we
+say that SQLite as "escaped" into the wild.  Deployed instances of SQLite
+no longer depends on TCL.
+
+
+Nevertheless, SQLite is still heavily dependent upon TCL and the ongoing
+support, maintenance, and enhancement of SQLite would not be possible without
+TCL, and would be seriously inconvenienced without Tk.
+
+
+2.1 SQLite Source Code Is Mostly TCL
+
+
+The deliverable source code for SQLite is a single file named
+"sqlite3.c" and its companion header "sqlite3.h".
+Both files are 100% ANSI-C code.  But developers do not edit these
+files directly.  The sqlite3.c and sqlite3.h source files are build
+products, and the source tree used to build those files is over 50%
+TCL code.  Figure 1 nearby shows the exact ratios.
+
+
+
+Figure 1: Breakdown Of SQLite Source Code By Language
+
+
+
+Figure 1 is for the main SQLite source repository.  Many of the test
+cases and much of the documentation is held in separate repositories,
+not included in Figure 1.  The separate repositories also contain a great
+deal of TCL code.
+
+
+Much of the TCL code in the main SQLite repository consists of test scripts.
+At this writing, the core repository contains 1153 separate test scripts
+totally about 389 KB of space.
+But this is not the only use of TCL in SQLite.
+
+2.2 Machine Generated C Code
+
+
+A non-trivial amount of the deliverable C code for SQLite is machine
+generated.  Some of the machine generated code is created by C programs,
+such as LEMON which translates the SQL language grammar into C code to
+implement a push-down automaton to parse the SQL language.  But much of
+the automatically generated code is created using TCL scripts.  TCL is
+well suited for scanning source files to extract information to be
+merged with other files and for making mechanized edits.  For example,
+the byte-code engine used to evaluate SQL statements inside of SQLite
+is implemented as a large "switch" statement inside a "for" loop, with a
+separate "case" for each opcode, all in the "vdbe.c" source file.
+At build-time, TCL scripts scan the vdbe.c source file looking for the
+appropriate "case" statements and then build header files that assign
+consecutive integers to each symbolic opcode name.  (The opcodes used by
+the SQLite byte-code engine are not an API as they are in TCL and thus
+can change from one build to the next.)  This mapping of symbolic opcode
+names into integers is not a simple as one might suppose.  For reasons
+of optimization, there are many constraints on the specific values that
+are assigned to opcodes.  For example, many opcodes such as OP_Add must
+have the same numeric value as the corresponding "+" token in the SQL
+language parser.  Sometimes a group of related opcodes, such as the
+comparison operators OP_Eq, OP_Ne, OP_Lt, OP_Le, OP_Ge, and OP_Gt, need
+to be assigned consecutive integers in a specific order.  These constraints
+are all handled effortlessly in TCL.  Accomplishing the
+same with AWK would be rather more difficult.
+
+
+Perhaps the most important task for TCL during the SQLite build process
+is constructing the SQLite amalgamation source code file.
+Recall that most developers use SQLite in the form of a single big file
+of C code named "sqlite3.c" and referred to as "the amalgamation".
+A TCL script named "mksqlite3c.tcl" runs in order to construct the
+amalgamation from over one hundred separate input files.  Each of these
+inputs files must be added to the amalgamation in just the right order.
+Furthermore, the source files are edited as part of the amalgamation building
+process.  When mksqlite3c.tcl encounters a "#include" for an SQLite header,
+it replaces the "#include" with a copy of that header file, taking care
+to make sure each header file is only included once.  The mksqlite3.tcl
+script automatically adds the "static" keyword to internal SQLite APIs
+to give them file linkage, and makes other similar edits.
+
+2.3 The sqlite3_analyzer.exe Utility
+
+
+In addition to the core SQLite library, the SQLite source tree also contains
+code for several analysis and control programs.  One of these programs
+is called "sqlite3_analyzer" (or "sqlite3_analyzer.exe" on Windows).
+The sqlite3_analyzer program examines an SQLite database and generates
+a detailed report on the disk usage by the various tables and indexes
+within that database.  The sqlite3_analyzer program is very useful in
+understanding how an application is using disk space.
+
+
+It turns out that sqlite3_analyzer, though disguised as an ordinary
+executable, is really a TCL application.  The main source code file for
+this application is
+tool/spaceanal.tcl.
+During the build process, this script is converted into a C-language
+string constant (using another TCL script) and added to a very simple
+C-language wrapper than starts a TCL interpreter and then passes the
+application script to that interpreter.
+
+
+The sqlite3_analyzer program could be rewritten in pure C.  But that
+would be a lot of code.  The TCL script that implements sqlite3_analyzer is
+less than 1000 lines long.  The equivalent C program would surely be at
+least ten times larger.
+
+
+Note that the sqlite3_analyzer utility program statically links a TCL
+interpreter and so does not require a TCL installation on the target
+computer to use.  The sqlite3_analyzer utility program is used by
+tens of thousands of developers, most of whom do not realize that they
+are really running a TCL application.
+
+2.4 TCL Used For Testing SQLite
+
+
+One of the key features of SQLite is that it uses aviation-grade testing.
+The tests of SQLite, at a minimum, provide 100% modified condition/decision
+coverage (MC/DC) of the SQLite code, with independence.  100% MC/DC roughly
+means that every branch instruction at the machine code level is exercised
+at least once in each direction.  The precise definition of
+MC/DC is slightly stricter than this, for example when comparing boolean
+vectors, but the 100% branch tests coverage definition is very close
+approximation.  The "with independence" term means that SQLite is tested
+in multiple ways with test code being written and maintained by different
+individuals.
+
+
+The amount of testing done on SQLite is fanatical.  On the other hand,
+that level of testing is necessary for a fundamental low-level component,
+such as a database engine, that is used by billions of devices.  If an
+ordinary application encounters an obscure bug, it can normally be rebooted 
+to clear the problem.  But the job of a database engine is to remember things,
+and so databases tend to remember their mistakes across reboots.  For these
+reasons, it is important that SQLite have a very low bug density.
+
+
+TCL is used in every aspect of SQLite testing.
+The test cases that are part of the primary SQLite source code
+repository are written in TCL.
+Other test cases such as 
+TH3 and
+SQLLogicTest are written
+in C but still depend on TCL for operation.
+
+
+The TH3 test suite is a set of proprietary tests for SQLite that form the
+primary means of achieving 100% MC/DC.  TH3 is designed to
+run on embedded hardware without the support of a desktop operating system.
+TH3 consists of over 1350 test modules together with over 100 control files.
+The test modules are written in either C or SQL or a combination of both.
+The control files are text formatted in a way that easily parsed by TCL.
+To build a TH3 test, a TCL script is run that combines some subset of the
+test modules and control files into a single large C program that will
+automatically run the required tests.  This C program is then linked against
+the "sqlite3.c" amalgamation and the resulting binary is moved to the target
+computer and executed.  TCL scripts automate this entire process on
+all major host platforms.
+
+
+To verify that the TH3 tests really do provide 100% MC/DC, special options
+are added to the TCL scripts that run the tests, causing the GCC coverage
+analysis tools to be invoked.  The output of gcov is then postprocessed to
+reveal and report any branch instructions that were missed by the tests.
+The TH3 tests themselves are all implemented in C and SQL, but the operation
+and management of those tests is all done with TCL.
+
+2.5 TCL Generated Documentation
+
+
+The extensive documentation for SQLite available on the SQLite website
+(https://sqlite.org/) is all generated
+by TCL.  Many of the documents, such as the API reference documentation and
+the descriptions of the byte-code engine opcodes, are created by TCL scripts
+that scan C source code and extract the necessary information from the code
+and comments.  Thus, the API documentation is largely derived from
+comments in the source code.  Keeping the official documentation (in
+comments) and the source code close together helps ensure that they are
+in agreement.
+
+
+Other whitepaper documents are generated from source files that look 
+mostly like
+HTML but which contain additional TCL code embedded inside of
+<tcl>...</tcl> markup.  The added TCL code is used for
+advanced formatting techniques, for automatically creating cross-references
+and cross-links, and for constructing complex displays such as the
+popular "rail-road" syntax diagrams for SQL.
+
+2.6 Tcl/Tk Used During Development Of SQLite
+
+
+The text editor used by the primary author of SQLite is a custom editor
+with emacs-style key bindings that is built on top of the Tk Text widget.
+The "e" editor, as it is called, is cross-platform, which helps in the
+development of a cross-platform software library like SQLite.  The "e"
+editor has been used for the entire 17-year history of SQLite.  It has
+been enhanced over the years with various customizations created especially
+to help manage the SQLite source code.
+
+
+The Fossil version control system used for the SQLite source code
+(and written specifically for that purpose) uses Tcl/Tk to show graphical
+side-by-side diffs in a separate window.  When the "fossil diff --tk"
+command is run, Fossil generates a script to show the diff graphically
+and then kicks off a separate "wish" process to run that script and
+display the diff in a separate window.  This graphical diff window has
+a "Save" button which will cause the Tcl/Tk code needed to reproduce itself
+to be written to a file.  This file can be, in turn, sent to a collaborator
+for display.  Passing around graphical diffs as ordinary text files is
+much simpler and easier than passing around JPEG images or text "context"
+diffs.
+
+
+No two SQLite developers work in the same office.  The team is
+geographically distributed.  To help the team stay in touch, a custom
+chatroom has been created using a Tcl/Tk script.  The same script works
+as both client and server.  The chatroom is private and uses a proprietary
+protocol, so that developers are free to discuss sensitive matters without
+fear of eavesdropping.  The chatroom is implemented as just over
+1000 lines of Tk code, and is thus accessible and easy to customize.
+Among the customizations is the ability to send saved "fossil diff --tk"
+graphical diffs to collaborators and have the diff pop automatically on
+the collaborators screen.  Small features like this seem trivial
+by themselves, but together than help the developers
+to work much more efficiently.  These kinds of productivity-enhancing
+features are unavailable to users of commercial business collaboration 
+packages such as HipChat.
+
+3.0 Summary
+
+
+SQLite is an indispensable element of most modern computer systems, and
+TCL is an indispensable tool used in the production and maintenance of
+SQLite.  Thus, the computing infrastructure we enjoy today would not exist
+except for TCL.
+
+
+As deployed, SQLite contains no TCL code.
+However, the design of SQLite is inspired by TCL.
+And TCL is used extensively in the code generation, testing,
+analysis, documentation, and development of SQLite.  Without
+TCL, SQLite would not exist.
+
+
+Every developer and every team has a finite number of "brain cycles"
+available to do their job.  The fewer cycles spent messing with tools,
+the more cycles are available to devote towards solving the problem.
+So for maximum productivity, it is important to use tools that get
+the job done with a minimum of fuss and bother.
+Our 17-year experience using TCL in the SQLite project has convinced
+us that TCL is just such a tool.  Tcl provides the most help per
+brain cycle of any similar technology.
+
+
+]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[Delayed Security Patches for AOSP (Android Open Source Project)]]></title>
@@ -221,13 +1140,6 @@ Who Will Bell the Cat?, a children's picture book based on the fable
 
 
 ]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[Air pollution directly linked to increased dementia risk]]></title>
-            <link>https://www.nature.com/articles/d41586-025-02844-9</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45157897</guid>
-            <description><![CDATA[Long-term exposure accelerates the development of Lewy body dementia and Parkinson’s disease with dementia in people who are predisposed to the conditions. Long-term exposure accelerates the development of Lewy body dementia and Parkinson’s disease with dementia in people who are predisposed to the conditions.]]></description>
-            <content:encoded><![CDATA[ A study has found that exposure to air pollution can increase the risk of developing Lewy body dementia.Credit: Sonu Mehta/Hindustan Times/ShutterstockAn analysis of 56 million people has shown that exposure to air pollution increases the risk of developing a particular form of dementia, the third most common type after Alzheimer’s disease and vascular dementia.The study, published in Science on 4 September1, suggests that there is a clear link between long-term exposure to PM2.5 — airborne particles that are smaller than 2.5 micrometres in diameter — and the development of dementia in people with Lewy body dementia or Parkinson’s disease.The study found that PM2.5 exposure does not necessarily induce Lewy body dementia, but “accelerates the development,” in people who are already genetically predisposed to it, says Hui Chen, a clinician–neuroscientist at the University of Technology Sydney in Australia.PM2.5 exposureLewy body dementia is an umbrella term for two different types of dementia: Parkinson’s disease with dementia, and dementia with Lewy bodies. In both cases, dementia is caused by the build-up of α-synuclein (αSyn) proteins into clumps, called Lewy bodies, in the brain’s nerve cells, which cause the cells to stop working and eventually die. Studies have suggested that long-term exposure to air pollution from car-exhaust, wildfires and factory fumes, is linked with increased risks of developing neurodegenerative illnesses, including Parkinson's disease with dementia2.Study co-author Xiaobo Mao, who researches neurodegenerative conditions at Johns Hopkins University in Baltimore, Maryland, says he and his colleagues wanted to determine if PM2.5 exposure also influenced the risk of developing Lewy body dementia. They analysed 2000–2014 hospital-admissions data from 56.5 million people with Lewy body dementia and Parkinson’s disease with or without dementia. The data served to identify people with severe neurological diseases.They found that long-term PM2.5 exposure was associated with an increased risk of hospitalization for all three neurodegenerative conditions, including a 12% increased risk for severe dementia with Lewy bodies that required hospitalization. They noted that living in areas of higher PM2.5 exposure was linked with a higher relative risk of Lewy body dementia — including dementia with Lewy bodies and Parkinson’s disease dementia — compared with Parkinson’s without dementia.Source: Ref. 1The team then performed experiments in mice to investigate why exposure to air pollution affected dementia risk. Mice were exposed to PM2.5 pollution through their nostrils, then the researchers tested for behaviours linked with dementia-like problems. After ten months of PM2.5 exposure, mice showed behavioural challenges in maze exploration tests for spatial memory, and tasks that tested their recognition of new objects. At ten months, the team also observed a substantial increase in the build-up of αSyn in the animals’ brains.Exposure to PM2.5 for ten months also caused the shrinkage of the medial temporal lobe in mice — a brain region which is responsible for memory formation and retrieval. In comparison, there were no changes to the brains of genetically modified mice lacking αSyn, suggesting the protein is required for neurodegenerative pathology.The team also found clumps of αSyn in the gut and lungs of mice exposed to PM2.5, but not in the control or genetically modified mice. Mao says that αSyn acts like a seed, which can propagate and spread from the gut to the brain by way of the gut–brain axis, and eventually cause Alzheimer’s disease or Lewy body dementia. PM2.5 also accumulates in the lungs, causing inflammation before entering the bloodstream and crossing the blood–brain barrier.Predisposition neededThe researchers next investigated gene-expression changes caused by PM2.5 exposure in mice and compared them with gene-expression changes observed in people with Lewy body dementia. They focused on the anterior cingulate cortex — a brain region linked with cognitive deficits in people with dementia. They found a strong correlation of gene-expression changes between PM2.5-exposed mice and people with Lewis body dementia and Parkinson’s disease with dementia, but no correlation with Parkinson’s disease without dementia.]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[Algebraic Effects in Practice with Flix]]></title>
@@ -1892,9 +2804,13 @@ cell.
             <description><![CDATA[The Microdot web framework is quite small, as its name would imply; it supports both standard C [...]]]></description>
             <content:encoded><![CDATA[
 
-Ready to give LWN a try?
+We're bad at marketing
 
-With a subscription to LWN, you can stay current with what is happening in the Linux and free-software community and take advantage of subscriber-only site features.  We are pleased to offer you a free trial subscription, no credit card required, so that you can see for yourself.  Please, join us!
+We can admit it, marketing is not our strong suit. Our strength is
+writing the kind of articles that developers, administrators, and
+free-software supporters depend on to know what is going on in the
+Linux world. Please subscribe today to help us keep doing that, and so
+we don’t have to get good at marketing.
 
 
 
@@ -3463,88 +4379,1982 @@ File NameLanguageContent SummaryCategoryRelevance.bash_historyMixed (EN/KR)Opera
                             ]]></content:encoded>
         </item>
         <item>
-            <title><![CDATA[What to do with an old iPad]]></title>
-            <link>http://odb.ar/blog/2025/09/05/hosting-my-blog-on-an-iPad-2.html</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45140973</guid>
-            <description><![CDATA[I recently inherited my parents’ old iPad 2. It had iOS 9 on it and was barely usable, in part due to how slow it was but mostly because of old SSL certificates and apps stopping support. But I wanted to give it some life because I hate to see a working machine go to waste. So I asked around and got a great answer: The iPad 2 can be downgraded to iOS 6.1.3 or 8.4.1. Both offer better performance than iOS 9 and have untethered jailbreaks. Once downgraded and jailbroken you can sideload hours and hours worth of games. A lot from that era are IAP-free.]]></description>
+            <title><![CDATA[IRHash: Efficient Multi-Language Compiler Caching by IR-Level Hashing]]></title>
+            <link>https://www.usenix.org/conference/atc25/presentation/landsberg</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45136367</guid>
+        </item>
+        <item>
+            <title><![CDATA[SQLite's File Format]]></title>
+            <link>https://www.sqlite.org/fileformat.html</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45132488</guid>
+            <description><![CDATA[Database File Format]]></description>
             <content:encoded><![CDATA[
-        
-
-  
-
-  
-    I recently inherited my parents’ old iPad 2. It had iOS 9 on it and was barely usable, in part due to how slow it was but mostly because of old SSL certificates and apps stopping support. But I wanted to give it some life because I hate to see a working machine go to waste. So I asked around and got a great answer:
 
 
-  The iPad 2 can be downgraded to iOS 6.1.3 or 8.4.1. Both offer better performance than iOS 9 and have untethered jailbreaks. Once downgraded and jailbroken you can sideload hours and hours worth of games. A lot from that era are IAP-free.
+Database File Format
+
+
+Table Of Contents
 
 
 
-So that’s where my journey began.
-
-Downgrading
-
-Jailbreaking the iPad 2 is fairly easy thanks to iOS CFW Guide(I didn’t even realize I was following the guide for iPad 3, but it worked perfectly nonetheless). Once that is done, you can downgrade using Legacy-iOS-kit which is also pretty straightforward. And that’s it: you have your iPad jailbroken and on the software it was meant to run. iOS 6.1.3 is not as useful as some of the newer versions, but it’s pretty snappy and very aesthetically pleasing.
 
 
 
-But what can you do with it?
-
-A lot. You can download iFile and access files on device, something that was not possible on iOS 6. So that basically means you can load and watch any kind of media on the device. You can torrent files if you want with iTransmission (remember when everything started with a lowercase i?). Load up some epubs and pdfs and read them on iBooks. Get f.lux on device to get warm light on screen. Download some old iOS games.
-
-But that’s pretty boring. I wanted to do more with it and was unsatisfied with my big-ass reader. One thing that I didn’t mention is that when you jailbreak, you get root access to the device. That means you can ssh into it (which you do for the downgrade) and use the unix terminal to do whatever1 you want. So I thought, what if I use this as a tool to learn a bit more about hosting/networking?
-
-Hosting on iPad
-
-My general idea when I began was:
-
-
-  Get a server utility
-  Load a static site into the iPad
-  Tunnel out
-  ???
-  Profit
-
-
-1. Server
-
-Since the hardware is old, I needed a light web server that could run on very little resources. Enter lighttpd (pronounced lighty I’m told by Gemini). And since there was no package manager available on the iPad’s terminal, I had to load it from Cydia (like an appstore for tweaks that you get once you jailbreak). Easy. Done.
-
-2. Static Site
-
-I had no idea what I was going to host, but it was irrelevant anyway since the site itself was not the purpose of the project. So I got Jekyll installed on my pc, ran the jekyll build command, and loaded the HTML + CSS files on the iPad. Another step done. At this point I had the server up and running locally, serving the blog on the local network. Pretty good already,
-
-3. Tunnel out
-
-I knew tunneling was an option for self hosting, but I didn’t know what it really was. Tunneling, as I understand it, is setting an SSH connection to a server which processes requests, and forwards them to your local machine, in this case the iPad. It’s supposed to be safer than port forwarding since you’re not exposing your home’s IP this way. The most common provider is cloudflare, but you need to install cloudflared on the machine you’re using to host, so that was a no-go (a Cydia search for cloudflare yielded exactly 0 results).
-
-Enter localhost.run, or the first wall I hit. LHR allows you to ssh into it without needing any special software on your machine, connecting a tunnel to your web app running locally. It seems very easy at first, and I guess if you’re doing it on a regular computer it is, but it frustrated the hell out of me. First, the encryption algorithms on iOS 6.1.3 are very old, and that proves a challenge when you’re trying to SSH into anything. I figured this out by adding a flag to the ssh command to accept rsa encryption. It seemed to work, but wouldn’t recognize my user, so I went and created one. Upon account creation I realized that I needed to pay $9 monthly to set a custom domain, otherwise LHR assigns a random domain which changes periodically. Paying for it kinda defeated the purpose, but I decided to try the free version anyway. It didn’t work. On to the next attempt.
-
-So if pre-built solutions don’t work what do you do? You build your own, of course! The idea was to get a free Virtual Private Server from Google Cloud Platform, get nginx to handle the requests, set up a custom tunnel between VPS and iPad, and serve requests from lighttpd. Sounds very simple, however, I ran into a problem almost instantly: there was no way to autossh (same as ssh, but reconnects if the connection drops) from the iPad into the VPS! Since iOS 6 there have been many advances in cryptography it seems, and due to the ancient OpenSSL version, the VPS wouldn’t allow the connection. After much debugging, Gemini summarized the issue perfectly:
 
 
 
-  The server receives the signature from your iPad, but it rejects it. Your iPad’s ancient crypto library (OpenSSL 0.9.8zg from 2015) is creating a signature that the modern server considers invalid or insecure.
+This document describes and defines the on-disk database file
+format used by all releases of SQLite since 
+version 3.0.0 (2004-06-18).
+
+1. The Database File
+
+The complete state of an SQLite database is usually
+contained in a single file on disk called the "main database file".
+
+During a transaction, SQLite stores additional information 
+in a second file called the "rollback journal", or if SQLite is in
+WAL mode, a write-ahead log file.
 
 
 
-And so, my workaround had failed. At this point I realize that what I’m doing is kinda pointless and that I could just host the blog on the VPS and call it a day. But I had sunk much time into this and wasn’t about to give up. So port forwarding time! If I can’t connect from the iPad into the VPS, maybe the VPS can connect into the iPad. After all, my computer was perfectly capable of ssh-ing into the iPad. So after much assurance from both Gemini and my tech-wizard uncle that it was okay to port forward, I decided to give it a go. I’ll omit many details here just in case I’m exposing myself, but basically, I opened up a port to my router, got a dynamic DNS from FreeDNS, and once that was done, I could get the VPS to connect to my iPad remotely. It felt like magic, but again came the problems: autossh was not working, only regular ssh using the same flag to accept rsa encryption that I had to use on my computer. Key-based login was failing due to a bug in the iPad’s SSH server. Password login, however, worked. In came sshpass, which enables autossh with password-based authentication. Turns out, this didn’t work either, because the autossh command needed a -t (force terminal) flag for the password prompt. With that cleared up, I could use nohup to run the sshpass command and keep it running in the background. And that’s it! My blog was up and running.
+1.1. Hot Journals
+If the application or
+host computer crashes before the transaction completes, then the rollback
+journal or write-ahead log contains information needed 
+to restore the main database file to a consistent state.  When a rollback 
+journal or write-ahead log contains information necessary for recovering 
+the state of the database, they are called a "hot journal" or "hot WAL file".
+Hot journals and WAL files are only a factor during error recovery
+scenarios and so are uncommon, but they are part of the state of an SQLite
+database and so cannot be ignored.  This document defines the format
+of a rollback journal and the write-ahead log file, but the focus is
+on the main database file.
 
-So, if you’re reading this post right now, it means my server is working, and that this site is being served by an iPad 2 from 2012, running iOS 6.1.3 and Insomnia to keep it connected to Wi-Fi. And you may ask, was it worth it? Hell yeah. It was frustrating and had many more hurdles than I anticipated, but it’s really satisfying to know that I managed to achieve my vision. And I learned a lot in the process, as this was my first time using a VPS and really, hosting anything semi-serious. Regarding the blog, I can’t promise to post regularly, but if I do so and it becomes something kind of serious, maybe I’ll consider moving the hosting to a VPS. Or keep it on the iPad. If it accomplishes the task of serving this website, maybe it’s okay for the job after all. Tools are only as interesting as you make them with your own creations.
+1.2. Pages
 
-This post is dedicated to my uncle Mariano, my family’s designated tech wizard. Hope you enjoy it! Also, shout out to Google Gemini’s 1m token context window.
+The main database file consists of one or more pages.  The size of a
+page is a power of two between 512 and 65536 inclusive.  All pages within
+the same database are the same size.  The page size for a database file
+is determined by the 2-byte integer located at an offset of
+16 bytes from the beginning of the database file.
 
-  
-    
-      many unix utilities are missing, but some can be loaded from Cydia ↩
-    
-  
+Pages are numbered beginning with 1.  The maximum page number is
+4294967294 (232 - 2).  The minimum size
+SQLite database is a single 512-byte page.
+The maximum size database would be 4294967294 pages at 65536 bytes per
+page or 281,474,976,579,584 bytes (about 281 terabytes).  Usually SQLite will
+hit the maximum file size limit of the underlying filesystem or disk
+hardware long before it hits its own internal size limit.
+
+In common use, SQLite databases tend to range in size from a few kilobytes
+to a few gigabytes, though terabyte-size SQLite databases are known to exist
+in production.
+
+At any point in time, every page in the main database has a single
+use which is one of the following:
+
+A b-tree page
+
+A table b-tree interior page
+A table b-tree leaf page
+An index b-tree interior page
+An index b-tree leaf page
+
+A freelist page
+
+A freelist trunk page
+A freelist leaf page
+
+A payload overflow page
+A pointer map page
+The lock-byte page
 
 
-  
+
+All reads from and writes to the main database file begin at a page
+boundary and all writes are an integer number of pages in size.  Reads
+are also usually an integer number of pages in size, with the one exception
+that when the database is first opened, the first 100 bytes of the
+database file (the database file header) are read as a sub-page size unit.
 
 
-      ]]></content:encoded>
+
+The first 100 bytes of the database file comprise the database file 
+header.  The database file header is divided into fields as shown by
+the table below.  All multibyte fields in the database file header are
+stored with the most significant byte first (big-endian).
+
+
+Database Header Format
+
+OffsetSizeDescription
+016
+The header string: "SQLite format 3\000"
+162
+The database page size in bytes.  Must be a power of two between 512
+and 32768 inclusive, or the value 1 representing a page size of 65536.
+181
+File format write version.  1 for legacy; 2 for WAL.
+191
+File format read version.  1 for legacy; 2 for WAL.
+201
+Bytes of unused "reserved" space at the end of each page.  Usually 0.
+211
+Maximum embedded payload fraction.  Must be 64.
+221
+Minimum embedded payload fraction.  Must be 32.
+231
+Leaf payload fraction.  Must be 32.
+244
+File change counter.
+284
+Size of the database file in pages.  The "in-header database size".
+324
+Page number of the first freelist trunk page.
+364
+Total number of freelist pages.
+404
+The schema cookie.
+444
+The schema format number.  Supported schema formats are 1, 2, 3, and 4.
+484
+Default page cache size.
+524
+The page number of the largest root b-tree page when in auto-vacuum or
+incremental-vacuum modes, or zero otherwise.
+564
+The database text encoding.  A value of 1 means UTF-8.  A value of 2
+means UTF-16le.  A value of 3 means UTF-16be.
+604
+The "user version" as read and set by the user_version pragma.
+644
+True (non-zero) for incremental-vacuum mode.  False (zero) otherwise.
+684
+The "Application ID" set by PRAGMA application_id.
+7220
+Reserved for expansion.  Must be zero.
+924
+The version-valid-for number.
+964
+SQLITE_VERSION_NUMBER
+
+
+
+
+Every valid SQLite database file begins with the following 16 bytes 
+(in hex): 53 51 4c 69 74 65 20 66 6f 72 6d 61 74 20 33 00.  This byte sequence
+corresponds to the UTF-8 string "SQLite format 3" including the nul
+terminator character at the end.
+
+1.3.2. Page Size
+
+The two-byte value beginning at offset 16 determines the page size of 
+the database.  For SQLite versions 3.7.0.1 (2010-08-04)
+and earlier, this value is 
+interpreted as a big-endian integer and must be a power of two between
+512 and 32768, inclusive.  Beginning with SQLite version 3.7.1
+(2010-08-23), a page
+size of 65536 bytes is supported.  The value 65536 will not fit in a
+two-byte integer, so to specify a 65536-byte page size, the value
+at offset 16 is 0x00 0x01.
+This value can be interpreted as a big-endian
+1 and thought of as a magic number to represent the 65536 page size.
+Or one can view the two-byte field as a little endian number and say
+that it represents the page size divided by 256.  These two 
+interpretations of the page-size field are equivalent.
+
+1.3.3. File format version numbers
+
+The file format write version and file format read version at offsets
+18 and 19 are intended to allow for enhancements of the file format
+in future versions of SQLite.  In current versions of SQLite, both of
+these values are 1 for rollback journalling modes and 2 for WAL
+journalling mode.  If a version of SQLite coded to the current
+file format specification encounters a database file where the read
+version is 1 or 2 but the write version is greater than 2, then the database
+file must be treated as read-only.  If a database file with a read version
+greater than 2 is encountered, then that database cannot be read or written.
+
+1.3.4. Reserved bytes per page
+
+SQLite has the ability to set aside a small number of extra bytes at
+the end of every page for use by extensions.  These extra bytes are
+used, for example, by the SQLite Encryption Extension to store a nonce
+and/or cryptographic checksum associated with each page.  The 
+"reserved space" size in the 1-byte integer at offset 20 is the number
+of bytes of space at the end of each page to reserve for extensions.
+This value is usually 0.  The value can be odd.
+
+The "usable size" of a database page is the page size specified by the
+2-byte integer at offset 16 in the header less the "reserved" space size
+recorded in the 1-byte integer at offset 20 in the header.  The usable
+size of a page might be an odd number.  However, the usable size is not
+allowed to be less than 480.  In other words, if the page size is 512,
+then the reserved space size cannot exceed 32.
+
+1.3.5. Payload fractions
+
+The maximum and minimum embedded payload fractions and the leaf
+payload fraction values must be 64, 32, and 32.  These values were
+originally intended to be tunable parameters that could be used to
+modify the storage format of the b-tree algorithm.  However, that
+functionality is not supported and there are no current plans to add
+support in the future.  Hence, these three bytes are fixed at the
+values specified.
+
+1.3.6. File change counter
+
+The file change counter is a 4-byte big-endian integer at
+offset 24 that is incremented whenever the database file is unlocked
+after having been modified.
+When two or more processes are reading the same database file, each 
+process can detect database changes from other processes by monitoring 
+the change counter.
+A process will normally want to flush its database page cache when
+another process modified the database, since the cache has become stale.
+The file change counter facilitates this.
+
+In WAL mode, changes to the database are detected using the wal-index
+and so the change counter is not needed.  Hence, the change counter might
+not be incremented on each transaction in WAL mode.
+
+
+
+The 4-byte big-endian integer at offset 28 into the header 
+stores the size of the database file in pages.  If this in-header
+datasize size is not valid (see the next paragraph), then the database 
+size is computed by looking
+at the actual size of the database file. Older versions of SQLite
+ignored the in-header database size and used the actual file size
+exclusively.  Newer versions of SQLite use the in-header database
+size if it is available but fall back to the actual file size if
+the in-header database size is not valid.
+
+The in-header database size is only considered to be valid if
+it is non-zero and if the 4-byte change counter at offset 24
+exactly matches the 4-byte version-valid-for number at offset 92.
+The in-header database size is always valid 
+when the database is only modified using recent versions of SQLite,
+versions 3.7.0 (2010-07-21) and later.
+If a legacy version of SQLite writes to the database, it will not
+know to update the in-header database size and so the in-header
+database size could be incorrect.  But legacy versions of SQLite
+will also leave the version-valid-for number at offset 92 unchanged
+so it will not match the change-counter.  Hence, invalid in-header
+database sizes can be detected (and ignored) by observing when
+the change-counter does not match the version-valid-for number.
+
+1.3.8. Free page list
+
+Unused pages in the database file are stored on a freelist.  The
+4-byte big-endian integer at offset 32 stores the page number of
+the first page of the freelist, or zero if the freelist is empty.
+The 4-byte big-endian integer at offset 36 stores the total 
+number of pages on the freelist.
+
+1.3.9. Schema cookie
+
+The schema cookie is a 4-byte big-endian integer at offset 40
+that is incremented whenever the database schema changes.  A 
+prepared statement is compiled against a specific version of the
+database schema.  When the database schema changes, the statement
+must be reprepared.  When a prepared statement runs, it first checks
+the schema cookie to ensure the value is the same as when the statement
+was prepared and if the schema cookie has changed, the statement either
+automatically reprepares and reruns or it aborts with an SQLITE_SCHEMA 
+error.
+
+1.3.10. Schema format number
+
+The schema format number is a 4-byte big-endian integer at offset 44.
+The schema format number is similar to the file format read and write
+version numbers at offsets 18 and 19 except that the schema format number
+refers to the high-level SQL formatting rather than the low-level b-tree
+formatting.  Four schema format numbers are currently defined:
+
+
+Format 1 is understood by all versions of SQLite back to
+version 3.0.0 (2004-06-18).
+Format 2 adds the ability of rows within the same table
+to have a varying number of columns, in order to support the
+ALTER TABLE ... ADD COLUMN functionality.  Support for
+reading and writing format 2 was added in SQLite 
+version 3.1.3 on 2005-02-20.
+Format 3 adds the ability of extra columns added by
+ALTER TABLE ... ADD COLUMN to have non-NULL default
+values.  This capability was added in SQLite version 3.1.4
+on 2005-03-11.
+Format 4 causes SQLite to respect the
+DESC keyword on
+index declarations.  (The DESC keyword is ignored in indexes for 
+formats 1, 2, and 3.)
+Format 4 also adds two new boolean record type values (serial types
+8 and 9).  Support for format 4 was added in SQLite 3.3.0 on
+2006-01-10.
+
+
+New database files created by SQLite use format 4 by default.
+The SQLITE_DBCONFIG_LEGACY_FILE_FORMAT option for the
+sqlite3_db_config() C-language interface can be used to cause SQLite
+to create new database files using format 1. The format version number
+can be made to default to 1 instead of 4 by setting
+SQLITE_DEFAULT_FILE_FORMAT=1 at compile-time.
+
+
+If the database is completely empty, if it has no schema, then the
+schema format number can be zero.
+
+1.3.11. Suggested cache size
+
+The 4-byte big-endian signed integer at offset 48 is the suggested
+cache size in pages for the database file.  The value is a suggestion
+only and SQLite is under no obligation to honor it.  The absolute value
+of the integer is used as the suggested size.  The suggested cache size
+can be set using the default_cache_size pragma.
+
+1.3.12. Incremental vacuum settings
+
+The two 4-byte big-endian integers at offsets 52 and 64 are used
+to manage the auto_vacuum and incremental_vacuum modes.  If
+the integer at offset 52 is zero then pointer-map (ptrmap) pages are
+omitted from the database file and neither auto_vacuum nor
+incremental_vacuum are supported.  If the integer at offset 52 is
+non-zero then it is the page number of the largest root page in the
+database file, the database file will contain ptrmap pages, and the
+mode must be either auto_vacuum or incremental_vacuum.  In this latter
+case, the integer at offset 64 is true for incremental_vacuum and
+false for auto_vacuum.  If the integer at offset 52 is zero then
+the integer at offset 64 must also be zero.
+
+1.3.13. Text encoding
+
+The 4-byte big-endian integer at offset 56 determines the encoding
+used for all text strings stored in the database.  
+A value of 1 means UTF-8.
+A value of 2 means UTF-16le.
+A value of 3 means UTF-16be.
+No other values are allowed.
+The sqlite3.h header file defines C-preprocessor macros SQLITE_UTF8 as 1,
+SQLITE_UTF16LE as 2, and SQLITE_UTF16BE as 3, to use in place of
+the numeric codes for the text encoding.
+
+1.3.14. User version number
+
+The 4-byte big-endian integer at offset 60 is the user version which
+is set and queried by the user_version pragma.  The user version is
+not used by SQLite.
+
+1.3.15. Application ID
+
+The 4-byte big-endian integer at offset 68 is an "Application ID" that
+can be set by the PRAGMA application_id command in order to identify the
+database as belonging to or associated with a particular application.
+The application ID is intended for database files used as an
+application file-format.  The application ID can be used by utilities 
+such as file(1) to determine the specific
+file type rather than just reporting "SQLite3 Database".  A list of
+assigned application IDs can be seen by consulting the
+magic.txt
+file in the SQLite source repository.
+
+1.3.16. Write library version number and version-valid-for number
+
+The 4-byte big-endian integer at offset 96 stores the 
+SQLITE_VERSION_NUMBER value for the SQLite library that most
+recently modified the database file.  The 4-byte big-endian integer at
+offset 92 is the value of the change counter when the version number
+was stored.  The integer at offset 92 indicates which transaction
+the version number is valid for and is sometimes called the
+"version-valid-for number".
+
+
+
+All other bytes of the database file header are reserved for
+future expansion and must be set to zero.
+
+1.4. The Lock-Byte Page
+
+The lock-byte page is the single page of the database file
+that contains the bytes at offsets between 1073741824 and 1073742335,
+inclusive.  A database file that is less than or equal to 1073741824 bytes 
+in size contains no lock-byte page.  A database file larger than
+1073741824 contains exactly one lock-byte page.
+
+
+The lock-byte page is set aside for use by the operating-system specific
+VFS implementation in implementing the database file locking primitives.
+SQLite does not use the lock-byte page.  The SQLite core 
+will never read or write the lock-byte page,
+though operating-system specific VFS 
+implementations may choose to read or write bytes on the lock-byte 
+page according to the 
+needs and proclivities of the underlying system.  The unix and win32
+VFS implementations that come built into SQLite do not write to the
+lock-byte page, but third-party VFS implementations for
+other operating systems might.
+
+The lock-byte page arose from the need to support Win95 which was the
+predominant operating system when this file format was designed and which 
+only supported mandatory file locking.  All modern operating systems that
+we know of support advisory file locking, and so the lock-byte page is
+not really needed any more, but is retained for backwards compatibility.
+
+1.5. The Freelist
+
+A database file might contain one or more pages that are not in
+active use.  Unused pages can come about, for example, when information
+is deleted from the database.  Unused pages are stored on the freelist
+and are reused when additional pages are required.
+
+The freelist is organized as a linked list of freelist trunk pages
+with each trunk page containing page numbers for zero or more freelist
+leaf pages.
+
+A freelist trunk page consists of an array of 4-byte big-endian integers.
+The size of the array is as many integers as will fit in the usable space
+of a page.  The minimum usable space is 480 bytes so the array will always
+be at least 120 entries in length.  The first integer on a freelist trunk
+page is the page number of the next freelist trunk page in the list or zero 
+if this is the last freelist trunk page.  The second integer on a freelist
+trunk page is the number of leaf page pointers to follow.  
+Call the second integer on a freelist trunk page L.
+If L is greater than zero then integers with array indexes between 2 and
+L+1 inclusive contain page numbers for freelist leaf pages.
+
+Freelist leaf pages contain no information.  SQLite avoids reading or
+writing freelist leaf pages in order to reduce disk I/O.
+
+A bug in SQLite versions prior to 3.6.0 (2008-07-16)
+caused the database to be
+reported as corrupt if any of the last 6 entries in the freelist trunk page 
+array contained non-zero values.  Newer versions of SQLite do not have
+this problem.  However, newer versions of SQLite still avoid using the 
+last six entries in the freelist trunk page array in order that database
+files created by newer versions of SQLite can be read by older versions
+of SQLite.
+
+The number of freelist pages is stored as a 4-byte big-endian integer
+in the database header at an offset of 36 from the beginning of the file.
+The database header also stores the page number of the first freelist trunk
+page as a 4-byte big-endian integer at an offset of 32 from the beginning
+of the file.
+
+1.6. B-tree Pages
+
+The b-tree algorithm provides key/data storage with unique and
+ordered keys on page-oriented storage devices.
+For background information on b-trees, see
+Knuth, The Art Of Computer Programming, Volume 3 "Sorting
+and Searching", pages 471-479.  Two variants of b-trees are used by
+SQLite.  "Table b-trees" use a 64-bit signed integer key and store
+all data in the leaves.  "Index b-trees" use arbitrary keys and store no
+data at all.
+
+A b-tree page is either an interior page or a leaf page.
+A leaf page contains keys and in the case of a table b-tree each
+key has associated data.  An interior page contains
+K keys together with K+1 pointers to child b-tree pages.
+A "pointer" in an interior b-tree page is just the 32-bit 
+unsigned integer page number of the child page.The number of keys on an interior b-tree page, K,
+is almost always at least 2 and is usually much more than 2.
+The only exception is when page 1 is an interior b-tree page.
+Page 1 has 100 fewer bytes of storage space available,
+due to the presence of the database header at the beginning of that page,
+and so sometimes (rarely) if page 1 is an interior b-tree page, it can
+end up holding just a single key.  In all other cases, K is 2 or more.
+The upper bound on K is as many keys as will fit on the page. Large keys
+on index b-trees are split up into overflow pages so that no single key
+uses more than one fourth of the available storage space on the page
+and hence every internal page is able to store at least 4 keys.
+The integer keys of table b-trees are never large enough to
+require overflow, so key overflow only occurs on index b-trees.
+
+Define the depth
+of a leaf b-tree to be 1 and the depth of any interior b-tree to be one
+more than the maximum depth of any of its children.  In a well-formed
+database, all children of an interior b-tree have the same depth.
+
+In an interior b-tree page, the pointers and keys logically alternate 
+with a pointer on both ends. (The previous sentence is to be understood
+conceptually - the actual layout of the keys and
+pointers within the page is more complicated and will be described in
+the sequel.)  All keys within the same page are unique and are logically
+organized in ascending order from left to right.  (Again, this ordering
+is logical, not physical.  The actual location of keys within the page
+is arbitrary.) For any key X, pointers to the left
+of a X refer to b-tree pages on which all keys are less than or equal to X.
+Pointers to the right of X refer to pages where all keys are 
+greater than X.
+
+Within an interior b-tree page, each key and the pointer to its
+immediate left are combined into a structure called a "cell".  The
+right-most pointer is held separately.  A leaf b-tree page has no
+pointers, but it still uses the cell structure to hold keys for
+index b-trees or keys and content for table b-trees.  Data is also
+contained in the cell.
+
+
+Every b-tree page has at most one parent b-tree page.
+A b-tree page without a parent is called a root page.  A root b-tree page
+together with the closure of its children form a complete b-tree.
+It is possible (and in fact rather common) to have a complete b-tree
+that consists of a single page that is both a leaf and the root.
+Because there are pointers from parents to children, every page of a
+complete b-tree can be located if only the root page is known.  Hence,
+b-trees are identified by their root page number.
+
+A b-tree page is either a table b-tree page or an index b-tree page.
+All pages within each complete b-tree are of the same type: either table
+or index.  There is one table b-tree in the database file
+for each rowid table in the database schema, including system tables
+such as sqlite_schema.  There is one index b-tree
+in the database file for each index in the schema, including implied indexes
+created by uniqueness constraints.  There are no b-trees associated with
+virtual tables.  Specific virtual table implementations might make use
+of shadow tables for storage, but those shadow tables will have separate
+entries in the database schema.  WITHOUT ROWID tables use index b-trees
+rather than table b-trees, so there is one
+index b-tree in the database file for each WITHOUT ROWID table.
+The b-tree corresponding to the sqlite_schema table is always a table
+b-tree and always has a root page of 1.
+The sqlite_schema table contains the root page number for every other 
+table and index in the database file.
+
+Each entry in a table b-tree consists of a 64-bit signed integer key
+and up to 2147483647 bytes of arbitrary data.  (The key of a table b-tree
+corresponds to the rowid of the SQL table that the b-tree implements.)
+Interior table b-trees hold only keys and pointers to children.
+All data is contained in the table b-tree leaves.
+
+Each entry in an index b-tree consists of an arbitrary key of up
+to 2147483647 bytes in length and no data.
+
+Define the "payload" of a cell to be the arbitrary length section
+of the cell.  For an index b-tree, the key is always arbitrary in length
+and hence the payload is the key.  There are no arbitrary length elements
+in the cells of interior table b-tree pages and so those cells have no
+payload.  Table b-tree leaf pages contain arbitrary length content and
+so for cells on those pages the payload is the content.
+When the size of payload for a cell exceeds a certain threshold (to
+be defined later) then only the first few bytes of the payload
+are stored on the b-tree page and the balance is stored in a linked list
+of content overflow pages.
+
+A b-tree page is divided into regions in the following order:
+
+
+The 100-byte database file header (found on page 1 only)
+The 8 or 12 byte b-tree page header
+The cell pointer array
+Unallocated space
+The cell content area
+The reserved region
+
+
+
+The 100-byte database file header is found only on page 1, which is
+always a table b-tree page.  All other b-tree pages in the database file
+omit this 100-byte header.
+
+The reserved region is an area of unused space at the end of every
+page (except the locking page) that extensions can use to hold per-page
+information.  The size of the reserved region is determined by the one-byte
+unsigned integer found at an offset of 20 into the database file header.
+The size of the reserved region is usually zero.
+
+The b-tree page header is 8 bytes in size for leaf pages and 12
+bytes for interior pages.  All multibyte values in the page header
+are big-endian.
+The b-tree page header is composed of the following fields:
+
+
+B-tree Page Header Format
+
+OffsetSizeDescription
+01
+The one-byte flag at offset 0 indicating the b-tree page type.
+A value of 2 (0x02) means the page is an interior index b-tree page.
+A value of 5 (0x05) means the page is an interior table b-tree page.
+A value of 10 (0x0a) means the page is a leaf index b-tree page.
+A value of 13 (0x0d) means the page is a leaf table b-tree page.
+Any other value for the b-tree page type is an error.
+12
+The two-byte integer at offset 1 gives the start of the
+first freeblock on the page, or is zero if there are no freeblocks.
+32
+The two-byte integer at offset 3 gives the number of cells on the page.
+52
+The two-byte integer at offset 5 designates the start of the cell content
+area.  A zero value for this integer is interpreted as 65536.
+71
+The one-byte integer at offset 7 gives the number of fragmented free
+bytes within the cell content area.
+84
+The four-byte page number at offset 8 is the right-most pointer.  This
+value appears in the header of interior b-tree pages only and is omitted from
+all other pages.
+
+
+The cell pointer array of a b-tree page immediately follows the b-tree
+page header.  Let K be the number of cells on the btree.  The cell pointer
+array consists of K 2-byte integer offsets to the cell contents.  The
+cell pointers are arranged in key order with left-most cell (the cell with the
+smallest key) first and the right-most cell (the cell with the largest
+key) last.
+
+Cell content is stored in the cell content region of the b-tree page.
+SQLite strives to place cells as far toward the end of the b-tree page as
+it can, in order to leave space for future growth of the cell pointer array.
+The area in between the last cell pointer array entry and the beginning of
+the first cell is the unallocated region.
+
+
+If a page contains no cells (which is only possible for a root page
+of a table that contains no rows) then the offset to the
+cell content area will equal the page size minus the bytes of reserved space.
+If the database uses a 65536-byte page size and the reserved space is zero
+(the usual value for reserved space) then the cell content offset of an
+empty page wants to be 65536.  
+However, that integer is too large to be stored in a
+2-byte unsigned integer, so a value of 0 is used in its place.
+
+A freeblock is a structure used to identify unallocated space within
+a b-tree page.  Freeblocks are organized as a chain.  The first 2 bytes of
+a freeblock are a big-endian integer which is the offset in the b-tree page
+of the next freeblock in the chain, or zero if the freeblock is the last on
+the chain.  The third and fourth bytes of each freeblock form
+a big-endian integer which is the size of the freeblock in bytes, including
+the 4-byte header.  Freeblocks are always connected in order 
+of increasing offset.  The second field of the b-tree page header is the
+offset of the first freeblock, or zero if there are no freeblocks on the
+page.  In a well-formed b-tree page, there will always be at least one cell
+before the first freeblock.
+
+A freeblock requires at least 4 bytes of space.  If there is an isolated
+group of 1, 2, or 3 unused bytes within the cell content area, those bytes
+comprise a fragment.  The total number of bytes in all fragments is stored
+in the fifth field of the b-tree page header.  In a well-formed b-tree page,
+the total number of bytes in fragments may not exceed 60.
+
+The total amount of free space on a b-tree page consists of the size
+of the unallocated region plus the total size of all freeblocks plus the
+number of fragmented free bytes.  SQLite may from time to time reorganize
+a b-tree page so that there are no freeblocks or fragment bytes, all
+unused bytes are contained in the unallocated space region, and all
+cells are packed tightly at the end of the page.  This is called 
+"defragmenting" the b-tree page.
+
+A variable-length integer or "varint" is a static Huffman encoding
+of 64-bit twos-complement integers that uses less space for small positive 
+values. 
+A varint is between 1 and 9 bytes in length.  The varint consists of either
+zero or more bytes which have the high-order bit set followed by a single byte
+with the high-order bit clear, or nine bytes, whichever is shorter.
+The lower seven bits of each of the first eight bytes and all 8 bits of
+the ninth byte are used to reconstruct the 64-bit twos-complement integer.
+Varints are big-endian: bits taken from the earlier byte of the varint
+are more significant than bits taken from the later bytes. 
+
+The format of a cell depends on which kind of b-tree page the cell
+appears on.  The following table shows the elements of a cell, in
+order of appearance, for the various b-tree page types.
+
+
+Table B-Tree Leaf Cell (header 0x0d):
+
+A varint which is the total number of bytes of payload, including any
+overflow
+A varint which is the integer key, a.k.a. "rowid"
+The initial portion of the payload that does not spill to overflow
+pages.
+A 4-byte big-endian integer page number for the first page of the
+overflow page list - omitted if all payload fits on the b-tree page.
+
+
+Table B-Tree Interior Cell (header 0x05):
+
+A 4-byte big-endian page number which is the left child pointer.
+A varint which is the integer key
+
+
+Index B-Tree Leaf Cell (header 0x0a):
+
+A varint which is the total number of bytes of key payload, including any
+overflow
+The initial portion of the payload that does not spill to overflow
+pages.
+A 4-byte big-endian integer page number for the first page of the
+overflow page list - omitted if all payload fits on the b-tree page.
+
+
+Index B-Tree Interior Cell (header 0x02):
+
+A 4-byte big-endian page number which is the left child pointer.
+A varint which is the total number of bytes of key payload, including any
+overflow
+The initial portion of the payload that does not spill to overflow
+pages.
+A 4-byte big-endian integer page number for the first page of the
+overflow page list - omitted if all payload fits on the b-tree page.
+
+
+
+The information above can be recast into a table format as follows:
+
+
+B-tree Cell Format
+
+Datatype
+    Appears in...
+    Description
+Table Leaf (0x0d)
+    Table Interior (0x05)
+    Index Leaf (0x0a)
+    Index Interior (0x02)
+4-byte integer
+     
+    ✔
+     
+    ✔
+    Page number of left child
+varint
+    ✔
+     
+    ✔
+    ✔
+    Number of bytes of payload
+varint
+    ✔
+    ✔
+     
+     
+    Rowid
+byte array
+    ✔
+     
+    ✔
+    ✔
+    Payload
+4-byte integer
+    ✔
+     
+    ✔
+    ✔
+    Page number of first overflow page
+
+
+
+The amount of payload that spills onto overflow pages also depends on
+the page type.  For the following computations, let U be the usable size
+of a database page, the total page size less the reserved space at the
+end of each page.  And let P be the payload size.  In the following,
+symbol X represents the maximum amount of payload that can be stored directly
+on the b-tree page without spilling onto an overflow page and symbol M
+represents the minimum amount of payload that must be stored on the btree
+page before spilling is allowed.
+
+
+Table B-Tree Leaf Cell:
+
+Let X be U-35.  If the payload size P is less than or equal to X then
+the entire payload is stored on the b-tree leaf page.
+Let M be ((U-12)*32/255)-23 and let K be M+((P-M)%(U-4)).
+If P is greater than X
+then the number of bytes stored on the table b-tree leaf page is K
+if K is less or equal to X or M otherwise.
+The number of bytes stored on the leaf page is never less than M.
+
+
+Table B-Tree Interior Cell:
+
+Interior pages of table b-trees have no payload and so there is never
+any payload to spill.
+
+
+Index B-Tree Leaf Or Interior Cell:
+
+Let X be ((U-12)*64/255)-23.  If the payload size P is less than
+or equal to X then the entire payload is stored on the b-tree page.
+Let M be ((U-12)*32/255)-23 and let K be M+((P-M)%(U-4)).
+If P is greater than X then the number
+of bytes stored on the index b-tree page is K if K is less than or
+equal to X or M otherwise.
+The number of bytes stored on the index page is never less than M.
+
+
+
+Here is an alternative description of the same computation:
+
+
+X is U-35 for table btree leaf pages or
+    ((U-12)*64/255)-23 for index pages.
+M is always ((U-12)*32/255)-23.
+Let K be M+((P-M)%(U-4)).
+If P<=X then all P bytes of payload are stored directly on the 
+    btree page without overflow.
+If P>X and K<=X then the first K bytes of P are stored on the 
+    btree page and the remaining P-K bytes are stored on overflow pages.
+If P>X and K>X then the first M bytes of P are stored on the
+    btree page and the remaining P-M bytes are stored on overflow pages.
+
+
+The overflow thresholds are designed to give a minimum fanout of
+4 for index b-trees and to make sure enough of the payload
+is on the b-tree page that the record header can usually be accessed
+without consulting an overflow page.  In hindsight, the designer of
+the SQLite b-tree logic realized that these thresholds could have been
+made much simpler.  However, the computations cannot be changed
+without resulting in an incompatible file format.  And the current computations
+work well, even if they are a little complex.
+
+1.7. Cell Payload Overflow Pages
+
+When the payload of a b-tree cell is too large for the b-tree page,
+the surplus is spilled onto overflow pages.  Overflow pages form a linked
+list.  The first four bytes of each overflow page are a big-endian
+integer which is the page number of the next page in the chain, or zero
+for the final page in the chain.  The fifth byte through the last usable
+byte are used to hold overflow content.
+
+1.8. Pointer Map or Ptrmap Pages
+
+Pointer map or ptrmap pages are extra pages inserted into the database
+to make the operation of auto_vacuum and incremental_vacuum modes
+more efficient.  Other page types in the database typically have pointers
+from parent to child.  For example, an interior b-tree page contains pointers
+to its child b-tree pages and an overflow chain has a pointer
+from earlier to later links in the chain.  A ptrmap page contains linkage
+information going in the opposite direction, from child to parent.
+
+Ptrmap pages must exist in any database file which has a non-zero
+largest root b-tree page value at offset 52 in the database header.
+If the largest root b-tree page value is zero, then the database must not
+contain ptrmap pages.
+
+In a database with ptrmap pages, the first ptrmap page is page 2.
+A ptrmap page consists of an array of 5-byte entries.  Let J be the
+number of 5-byte entries that will fit in the usable space of a page.
+(In other words, J=U/5.)  The first ptrmap page will contain back pointer
+information for pages 3 through J+2, inclusive.  The second pointer map
+page will be on page J+3 and that ptrmap page will provide back pointer
+information for pages J+4 through 2*J+3 inclusive.  And so forth for
+the entire database file.
+
+In a database that uses ptrmap pages, all pages at locations identified
+by the computation in the previous paragraph must be ptrmap page and no
+other page may be a ptrmap page.  Except, if the byte-lock page happens to
+fall on the same page number as a ptrmap page, then the ptrmap is moved
+to the following page for that one case.
+
+Each 5-byte entry on a ptrmap page provides back-link information about 
+one of the pages that immediately follow the pointer map.  If page B is a
+ptrmap page then back-link information about page B+1 is provided by
+the first entry on the pointer map.  Information about page B+2 is
+provided by the second entry.  And so forth.
+
+Each 5-byte ptrmap entry consists of one byte of "page type" information
+followed by a 4-byte big-endian page number.  Five page types are recognized:
+
+
+
+A b-tree root page.  The
+page number should be zero.
+A freelist page.  The page number should be
+zero.
+The first page of a
+cell payload overflow chain.  The page number is the b-tree page that
+contains the cell whose content has overflowed.
+A page in an overflow chain
+other than the first page.  The page number is the prior page of the
+overflow chain.
+A non-root b-tree page.  The
+page number is the parent b-tree page.
+
+
+In any database file that contains ptrmap pages, all b-tree root pages 
+must come before any non-root b-tree page, cell payload overflow page, or
+freelist page.  This restriction ensures that a root page will never
+be moved during an auto-vacuum or incremental-vacuum.  The auto-vacuum
+logic does not know how to update the root_page field of the sqlite_schema
+table and so it is necessary to prevent root pages from being moved
+during an auto-vacuum in order to preserve the integrity of the
+sqlite_schema table.  Root pages are moved to the beginning of the
+database file by the CREATE TABLE, CREATE INDEX, DROP TABLE, and
+DROP INDEX operations.
+
+2. Schema Layer
+
+The foregoing text describes low-level aspects of the SQLite file
+format.  The b-tree mechanism provides a powerful and efficient means of
+accessing a large data set.  This section will describe how the
+low-level b-tree layer is used to implement higher-level SQL
+capabilities.
+
+2.1. Record Format
+
+The data for a table b-tree leaf page and the key
+of an index b-tree page was characterized above
+as an arbitrary sequence of bytes.
+The prior discussion mentioned one key being less than another, but
+did not define what "less than" meant.  The current section will address
+these omissions.
+
+Payload, either table b-tree data or index b-tree keys, 
+is always in the "record format".
+The record format defines a sequence of values corresponding
+to columns in a table or index.  The record format specifies the number
+of columns, the datatype of each column, and the content of each column.
+
+The record format makes extensive use of the 
+variable-length integer or varint
+representation of 64-bit signed integers defined above.
+
+A record contains a header and a body, in that order.  
+The header begins with a single varint which determines the total number
+of bytes in the header.  The varint value is the size of the header in
+bytes including the size varint itself.  Following the size varint are
+one or more additional varints, one per column.  These additional varints
+are called "serial type" numbers and
+determine the datatype of each column, according to the following chart:
+
+
+Serial Type Codes Of The Record Format
+
+Serial TypeContent SizeMeaning
+00
+Value is a NULL.
+11
+Value is an 8-bit twos-complement integer.
+22
+Value is a big-endian 16-bit twos-complement integer.
+33
+Value is a big-endian 24-bit twos-complement integer.
+44
+Value is a big-endian 32-bit twos-complement integer.
+56
+Value is a big-endian 48-bit twos-complement integer.
+68
+Value is a big-endian 64-bit twos-complement integer.
+78
+Value is a big-endian IEEE 754-2008 64-bit floating point number.
+80
+Value is the integer 0. (Only available for schema format 4 and higher.)
+90
+Value is the integer 1. (Only available for schema format 4 and higher.)
+10,11
+    variable
+Reserved for internal use.  These serial type codes will
+   never appear in a well-formed database file, but they
+   might be used in transient and temporary database files
+   that SQLite sometimes generates for its own use.
+   The meanings of these codes can shift from one release
+   of SQLite to the next.
+N≥12 and even
+    (N-12)/2
+Value is a BLOB that is (N-12)/2 bytes in length.
+N≥13 and odd
+    (N-13)/2
+Value is a string in the text encoding and (N-13)/2 bytes in length.
+The nul terminator is not stored.
+
+
+The header size varint
+and serial type varints will usually consist of a single byte.  The
+serial type varints for large strings and BLOBs might extend to two or three
+byte varints, but that is the exception rather than the rule. 
+The varint format is very efficient at coding the record header.
+
+The values for each column in the record immediately follow the header.
+For serial types 0, 8, 9, 12, and 13, the value is zero bytes in
+length.  If all columns are of these types then the body section of the
+record is empty.
+
+A record might have fewer values than the number of columns in the
+corresponding table.  This can happen, for example, after an
+ALTER TABLE ... ADD COLUMN SQL statement has increased
+the number of columns in the table schema without modifying preexisting rows
+in the table.
+Missing values at the end of the record are filled in using the
+default value for the corresponding columns defined in the table schema.
+
+
+
+2.2. Record Sort Order
+
+The order of keys in an index b-tree is determined by the sort order of
+the records that the keys represent.  Record comparison progresses column
+by column.  Columns of a record are examined from left to right.  The
+first pair of columns that are not equal determines the relative order
+of the two records.  The sort order of individual columns is as
+follows:
+
+
+NULL values (serial type 0) sort first.
+Numeric values (serial types 1 through 9) sort after NULLs
+      and in numeric order.
+Text values (odd serial types 13 and larger) sort after numeric
+    values in the order determined by the columns collating function.
+BLOB values (even serial types 12 and larger) sort last and in the order 
+    determined by memcmp().
+
+
+A collating function for each column is necessary in order to compute
+the order of text fields.
+SQLite defines three built-in collating functions:
+
+
+
+BINARY
+     The built-in BINARY collation compares strings byte by byte
+        using the memcmp() function
+        from the standard C library.
+NOCASE
+     The NOCASE collation is like BINARY except that uppercase
+        ASCII characters ('A' through 'Z')
+        are folded into their lowercase equivalents prior to running the
+        comparison.  Only ASCII characters are case-folded.
+        NOCASE
+        does not implement a general purpose unicode caseless comparison.
+RTRIM
+     RTRIM is like BINARY except that extra spaces at the end of either
+         string do not change the result.  In other words, strings will
+         compare equal to one another as long as they
+         differ only in the number of spaces at the end.
+
+
+Additional application-specific collating functions can be added to
+SQLite using the sqlite3_create_collation() interface.
+
+The default collating function for all strings is BINARY.
+Alternative collating functions for table columns can be specified in the
+CREATE TABLE statement using the COLLATE clause on the column definition.
+When a column is indexed, the same collating function specified in the
+CREATE TABLE statement is used for the column in the index, by default,
+though this can be overridden using a COLLATE clause in the 
+CREATE INDEX statement.
+
+
+
+2.3. Representation Of SQL Tables
+
+ Each ordinary SQL table in the database schema is represented on-disk
+by a table b-tree.  Each entry in the table b-tree corresponds to a row
+of the SQL table.  The rowid of the SQL table is the 64-bit signed
+integer key for each entry in the table b-tree.
+
+ The content of each SQL table row is stored in the database file by
+first combining the values in the various columns into a byte array
+in the record format, then storing that byte array as the payload in
+an entry in the table b-tree.  The order of values in the record is
+the same as the order of columns in the SQL table definition.
+When an SQL table includes an
+INTEGER PRIMARY KEY column (which aliases the rowid) then that
+column appears in the record as a NULL value.  SQLite will always use
+the table b-tree key rather than the NULL value when referencing the
+INTEGER PRIMARY KEY column.
+
+ If the affinity of a column is REAL and that column contains a
+value that can be converted to an integer without loss of information
+(if the value contains no fractional part and is not too large to be
+represented as an integer) then the column may be stored in the record
+as an integer.  SQLite will convert the value back to floating
+point when extracting it from the record.
+
+2.4. Representation of WITHOUT ROWID Tables
+
+If an SQL table is created using the "WITHOUT ROWID" clause at the
+end of its CREATE TABLE statement, then that table is a WITHOUT ROWID
+table and uses a different on-disk representation.  A WITHOUT ROWID
+table uses an index b-tree rather than a table b-tree for storage.
+The key for each entry in the WITHOUT ROWID b-tree is a record composed
+of the columns of the PRIMARY KEY followed by all remaining columns of
+the table.  The primary key columns appear in the order that they were
+declared in the PRIMARY KEY clause and the remaining columns appear in
+the order they occur in the CREATE TABLE statement.
+
+Hence, the content encoding for a WITHOUT ROWID table is the same
+as the content encoding for an ordinary rowid table, except that the
+order of the columns is rearranged so that PRIMARY KEY columns come
+first, and the content is used as the key in an index b-tree rather
+than as the data in a table b-tree.
+The special encoding rules for columns with REAL affinity
+apply to WITHOUT ROWID tables the same as they do with rowid tables.
+
+2.4.1. Suppression of redundant columns in the PRIMARY KEY
+    of WITHOUT ROWID tables
+
+If the PRIMARY KEY of a WITHOUT ROWID tables uses the same columns
+with the same collating sequence more than once, then the second and
+subsequent occurrences of that column in the PRIMARY KEY definition are
+ignored.  For example, the following CREATE TABLE statements all specify
+the same table, which will have the exact same representation on disk:
+
+CREATE TABLE t1(a,b,c,d,PRIMARY KEY(a,c)) WITHOUT ROWID;
+CREATE TABLE t1(a,b,c,d,PRIMARY KEY(a,c,a,c)) WITHOUT ROWID;
+CREATE TABLE t1(a,b,c,d,PRIMARY KEY(a,A,a,C)) WITHOUT ROWID;
+CREATE TABLE t1(a,b,c,d,PRIMARY KEY(a,a,a,a,c)) WITHOUT ROWID;
+
+
+The first example above is the preferred definition of the table,
+of course.  All of the examples create a WITHOUT ROWID table with
+two PRIMARY KEY columns, "a" and "c", in that order, followed by
+two data columns "b" and "d", also in that order.
+
+2.5. Representation Of SQL Indices
+
+Each SQL index, whether explicitly declared via a CREATE INDEX statement
+or implied by a UNIQUE or PRIMARY KEY constraint, corresponds to an 
+index b-tree in the database file.
+Each entry in the index b-tree corresponds to a single row in the 
+associated SQL table.
+The key to an index b-tree is
+a record composed of the columns that are being indexed followed by the
+key of the corresponding table row.  For ordinary tables, the row key is
+the rowid, and for WITHOUT ROWID tables the row key is the PRIMARY KEY.
+Because every row in the table has a unique row key,
+all keys in an index are unique.
+
+In a normal index, there is a one-to-one mapping between rows in a 
+table and entries in each index associated with that table.
+However, in a partial index, the index b-tree only contains entries
+corresponding to table rows for which the WHERE clause expression on the
+CREATE INDEX statement is true.
+Corresponding rows in the index and table b-trees share the same rowid
+or primary key values and contain the same value for all indexed columns.
+
+2.5.1. Suppression of redundant columns in WITHOUT ROWID secondary indexes
+
+
+ In an index on a WITHOUT ROWID table, if a column of the PRIMARY KEY
+is also a column in the index and has a matching collating sequence, then the
+indexed column is not repeated in the table-key suffix on the
+end of the index record.  As an example, consider the following SQL:
+
+CREATE TABLE ex25(a,b,c,d,e,PRIMARY KEY(d,c,a)) WITHOUT rowid;
+CREATE INDEX ex25ce ON ex25(c,e);
+CREATE INDEX ex25acde ON ex25(a,c,d,e);
+CREATE INDEX ex25ae ON ex25(a COLLATE nocase,e);
+
+
+Each row in the ex25ce index is a record
+with these columns: c, e, d, a.  The first two columns are
+the columns being indexed, c and e.  The remaining columns are the primary
+key of the corresponding table row.  Normally, the primary key would be
+columns d, c, and a, but because column c already appears earlier in the
+index, it is omitted from the key suffix.
+
+In the extreme case where the columns being indexed cover all columns
+of the PRIMARY KEY, the index will consist of only the columns being
+indexed.  The ex25acde example above demonstrates this.  Each entry in
+the ex25acde index consists of only the columns a, c, d, and e, in that
+order.
+
+Each row in ex25ae contains five columns: a, e, d, c, a.  The "a"
+column is repeated since the first occurrence of "a" has a collating
+function of "nocase" and the second has a collating sequence of "binary".
+If the "a" column is not repeated and if the table contains two or more
+entries with the same "e" value and where "a" differs only in case, then
+all of those table entries would correspond to a single entry in the
+index, which would break the one-to-one correspondence between the table
+and the index.
+
+ The suppression of redundant columns in the key suffix of an index
+entry only occurs in WITHOUT ROWID tables.  In an ordinary rowid table,
+the index entry always ends with the rowid even if the INTEGER PRIMARY KEY
+column is one of the columns being indexed.
+
+2.6. Storage Of The SQL Database Schema
+
+Page 1 of a database file is the root page of a table b-tree that
+holds a special table named "sqlite_schema".  This b-tree is known
+as the "schema table" since it stores the complete
+database schema.  The structure of the sqlite_schema table is as
+if it had been created using the following SQL:
+
+CREATE TABLE sqlite_schema(
+  type text,
+  name text,
+  tbl_name text,
+  rootpage integer,
+  sql text
+);
+
+
+The sqlite_schema table contains one row for each table, index, view,
+and trigger (collectively "objects") in the database schema, except there
+is no entry for the sqlite_schema table itself.  The sqlite_schema table
+contains entries for internal schema objects in addition to application-
+and programmer-defined objects.
+
+
+The sqlite_schema.type column will be one
+of the following text strings:  'table', 'index', 'view', or 'trigger'
+according to the type of object defined.  The 'table' string is used
+for both ordinary and virtual tables.
+
+The sqlite_schema.name column will hold the name of the object.
+UNIQUE and PRIMARY KEY constraints on tables cause SQLite to create
+internal indexes with names of the form "sqlite_autoindex_TABLE_N"
+where TABLE is replaced by the name of the table that contains the
+constraint and N is an integer beginning with 1 and increasing by one
+with each constraint seen in the table definition.
+In a WITHOUT ROWID table, there is no sqlite_schema entry for the
+PRIMARY KEY, but the "sqlite_autoindex_TABLE_N" name is set aside
+for the PRIMARY KEY as if the sqlite_schema entry did exist.  This
+will affect the numbering of subsequent UNIQUE constraints.
+The "sqlite_autoindex_TABLE_N" name is never allocated for an
+INTEGER PRIMARY KEY, either in rowid tables or WITHOUT ROWID tables.
+
+
+The sqlite_schema.tbl_name column holds the name of a table or view
+that the object is associated with.  For a table or view, the
+tbl_name column is a copy of the name column.  For an index, the tbl_name
+is the name of the table that is indexed.  For a trigger, the tbl_name
+column stores the name of the table or view that causes the trigger 
+to fire.
+
+The sqlite_schema.rootpage column stores the page number of the root
+b-tree page for tables and indexes.  For rows that define views, triggers,
+and virtual tables, the rootpage column is 0 or NULL.
+
+The sqlite_schema.sql column stores SQL text that describes the
+object.  This SQL text is a CREATE TABLE, CREATE VIRTUAL TABLE,
+CREATE INDEX,
+CREATE VIEW, or CREATE TRIGGER statement that if evaluated against
+the database file when it is the main database of a database connection
+would recreate the object.  The text is usually a copy of the original
+statement used to create the object but with normalizations applied so
+that the text conforms to the following rules:
+
+
+The CREATE, TABLE, VIEW, TRIGGER, and INDEX keywords at the beginning
+of the statement are converted to all upper case letters.
+The TEMP or TEMPORARY keyword is removed if it occurs after the 
+initial CREATE keyword.
+Any database name qualifier that occurs prior to the name of the
+object being created is removed.
+Leading spaces are removed.
+All spaces following the first two keywords are converted into a single
+space.
+
+
+The text in the sqlite_schema.sql column is a copy of the original
+CREATE statement text that created the object, except normalized as
+described above and as modified by subsequent ALTER TABLE statements.
+The sqlite_schema.sql is NULL for the internal indexes that are
+automatically created by UNIQUE or PRIMARY KEY constraints.
+
+2.6.1. Alternative Names For The Schema Table
+
+The name "sqlite_schema" does not appear anywhere in the file format.
+That name is just a convention used by the database implementation.
+Due to historical and operational considerations, the
+"sqlite_schema" table can also sometimes be called by one of the
+following aliases:
+
+
+ sqlite_master
+ sqlite_temp_schema
+ sqlite_temp_master
+
+
+Because the name of the schema table does not appear anywhere in
+the file format, the meaning of the database file is not changed if
+the application chooses to refer to the schema table by one of
+these alternative names.
+
+
+
+2.6.2. Internal Schema Objects
+
+In addition to the tables, indexes, views, and triggers created by
+the application and/or the developer using CREATE statements SQL, the
+sqlite_schema table may contain zero or more entries for 
+internal schema objects that are created by SQLite for its 
+own internal use.  The names of internal schema objects
+always begin with "sqlite_" and any table, index, view, or trigger
+whose name begins with "sqlite_" is an internal schema object.
+SQLite prohibits applications from creating objects whose names begin
+with "sqlite_".  
+
+Internal schema objects used by SQLite may include the following:
+
+
+Indices with names of the form "sqlite_autoindex_TABLE_N" that
+       are used to implement UNIQUE and PRIMARY KEY constraints on
+       ordinary tables.
+
+A table with the name "sqlite_sequence" that is used to keep track
+       of the maximum historical INTEGER PRIMARY KEY for a table
+       using AUTOINCREMENT.
+
+Tables with names of the form "sqlite_statN" where N is an integer.
+       Such tables store database statistics gathered by the ANALYZE
+       command and used by the query planner to help determine the best
+       algorithm to use for each query.
+
+
+New internal schema objects names, always beginning with "sqlite_",
+may be added to the SQLite file format in future releases.
+
+
+
+2.6.3. The sqlite_sequence table
+
+The sqlite_sequence table is an internal table used to help implement
+AUTOINCREMENT.  The sqlite_sequence table is created automatically
+whenever any ordinary table with an AUTOINCREMENT integer primary
+key is created.  Once created, the sqlite_sequence table exists in the
+sqlite_schema table forever; it cannot be dropped.
+The schema for the sqlite_sequence table is:
+
+CREATE TABLE sqlite_sequence(name,seq);
+
+
+There is a single row in the sqlite_sequence table for each ordinary
+table that uses AUTOINCREMENT.  The name of the table (as it appears in
+sqlite_schema.name) is in the sqlite_sequence.name field and the largest
+INTEGER PRIMARY KEY ever inserted into that table is 
+in the sqlite_sequence.seq field.  
+New automatically generated integer primary keys for AUTOINCREMENT
+tables are guaranteed to be larger than the sqlite_sequence.seq field for
+that table.
+If the sqlite_sequence.seq field of an AUTOINCREMENT table is already at
+the largest integer value (9223372036854775807) then attempts to add new
+rows to that table with an automatically generated integer primary will fail
+with an SQLITE_FULL error.
+The sqlite_sequence.seq field is automatically updated if required when
+new entries are inserted to an AUTOINCREMENT table.  
+The sqlite_sequence row for an AUTOINCREMENT table is automatically deleted
+when the table is dropped.
+If the sqlite_sequence row for an AUTOINCREMENT table does not exist when
+the AUTOINCREMENT table is updated, then a new sqlite_sequence row is created.
+If the sqlite_sequence.seq value for an AUTOINCREMENT table is manually 
+set to something other than an integer and there is a subsequent attempt to
+insert the or update the AUTOINCREMENT table, then the behavior is undefined.
+
+Application code is allowed to modify the sqlite_sequence table, to add
+new rows, to delete rows, or to modify existing rows.  However, application
+code cannot create the sqlite_sequence table if it does not already exist.
+Application code can delete all entries from the sqlite_sequence table,
+but application code cannot drop the sqlite_sequence table.
+
+
+
+2.6.4. The sqlite_stat1 table
+
+The sqlite_stat1 is an internal table created by the ANALYZE command
+and used to hold supplemental information about tables and indexes that the
+query planner can use to help it find better ways of performing queries.
+Applications can update, delete from, insert into or drop the sqlite_stat1
+table, but may not create or alter the sqlite_stat1 table.
+The schema of the sqlite_stat1 table is as follows:
+
+CREATE TABLE sqlite_stat1(tbl,idx,stat);
+
+
+ There is normally one row per index, with the index identified by the
+name in the sqlite_stat1.idx column.  The sqlite_stat1.tbl column is
+the name of the table to which the index belongs.  In each such row, 
+the sqlite_stat.stat column will be
+a string consisting of a list of integers followed by zero or more 
+arguments.  The first integer in this
+list is the approximate number of rows in the index.  (The number of
+rows in the index is the same as the number of rows in the table,
+except for partial indexes.)
+The second integer is the approximate number of rows in the index
+that have the same value in the first column of the index.  The third 
+integer is the number of rows in the index that have 
+the same value for the first two columns.  The N-th integer (for N>1) 
+is the estimated average number of rows in 
+the index which have the same value for the first N-1 columns.  For
+a K-column index, there will be K+1 integers in the stat column.  If
+the index is unique, then the last integer will be 1.
+
+The list of integers in the stat column can optionally be followed
+by arguments, each of which is a sequence of non-space characters.
+All arguments are preceded by a single space.
+Unrecognized arguments are silently ignored.
+
+If the "unordered" argument is present, then the query planner assumes
+that the index is unordered and will not use the index for a range query
+or for sorting.
+
+The "sz=NNN" argument (where NNN represents a sequence of 1 or more digits)
+means that the average row size over all records of the table or
+index is NNN bytes per row.  The SQLite query planner might use the
+estimated row size information provided by the "sz=NNN" token
+to help it choose smaller tables and indexes that require less disk I/O.
+
+The presence of the "noskipscan" token on the sqlite_stat1.stat field
+of an index prevents that index from being used with the
+skip-scan optimization.
+
+New text tokens may be added to the end of the stat column in future
+enhancements to SQLite.  For compatibility, unrecognized tokens at the end
+of the stat column are silently ignored.
+
+If the sqlite_stat1.idx column is NULL, then the sqlite_stat1.stat
+column contains a single integer which is the approximate number of
+rows in the table identified by sqlite_stat1.tbl.
+If the sqlite_stat1.idx column is the same as the sqlite_stat1.tbl
+column, then the table is a WITHOUT ROWID table and the sqlite_stat1.stat
+field contains information about the index btree that implements the
+WITHOUT ROWID table.
+
+
+
+2.6.5. The sqlite_stat2 table
+
+The sqlite_stat2 is only created and is only used if SQLite is compiled
+with SQLITE_ENABLE_STAT2 and if the SQLite version number is between
+3.6.18 (2009-09-11) and 3.7.8 (2011-09-19).
+The sqlite_stat2 table is neither read nor written by any
+version of SQLite before 3.6.18 nor after 3.7.8.
+The sqlite_stat2 table contains additional information
+about the distribution of keys within an index.
+The schema of the sqlite_stat2 table is as follows:
+
+CREATE TABLE sqlite_stat2(tbl,idx,sampleno,sample);
+
+
+The sqlite_stat2.idx column and the sqlite_stat2.tbl column in each 
+row of the sqlite_stat2 table identify an index described by that row.
+There are usually 10 rows in the sqlite_stat2
+table for each index.
+
+The sqlite_stat2 entries for an index that have sqlite_stat2.sampleno
+between 0 and 9 inclusive are samples of the left-most key value in the
+index taken at evenly spaced points along the index.
+Let C be the number of rows in the index.
+Then the sampled rows are given by
+
+
+     rownumber = (i*C*2 + C)/20
+
+
+The variable i in the previous expression varies between 0 and 9.
+Conceptually, the index space is divided into
+10 uniform buckets and the samples are the middle row from each bucket.
+
+The format for sqlite_stat2 is recorded here for legacy reference.  
+Recent versions of SQLite no longer support sqlite_stat2 and the
+sqlite_stat2 table, if is exists, is simply ignored.
+
+
+
+2.6.6. The sqlite_stat3 table
+
+The sqlite_stat3 is only used if SQLite is compiled
+with SQLITE_ENABLE_STAT3 or SQLITE_ENABLE_STAT4
+and if the SQLite version number is 3.7.9 (2011-11-01) or greater.
+The sqlite_stat3 table is neither read nor written by any
+version of SQLite before 3.7.9.
+If the SQLITE_ENABLE_STAT4 compile-time option is used and the
+SQLite version number is 3.8.1 (2013-10-17) or greater,
+then sqlite_stat3 might be read but not written.
+The sqlite_stat3 table contains additional information
+about the distribution of keys within an index, information that the
+query planner can use to devise better and faster query algorithms.
+The schema of the sqlite_stat3 table is as follows:
+
+CREATE TABLE sqlite_stat3(tbl,idx,nEq,nLt,nDLt,sample);
+
+
+There are usually multiple entries in the sqlite_stat3 table for each index.
+The sqlite_stat3.sample column holds the value of the left-most field of an
+index identified by sqlite_stat3.idx and sqlite_stat3.tbl.
+The sqlite_stat3.nEq column holds the approximate
+number of entries in the index whose left-most column exactly matches
+the sample.
+The sqlite_stat3.nLt holds the approximate number of entries in the
+index whose left-most column is less than the sample.
+The sqlite_stat3.nDLt column holds the approximate
+number of distinct left-most entries in the index that are less than
+the sample.
+
+There can be an arbitrary number of sqlite_stat3 entries per index.
+The ANALYZE command will typically generate sqlite_stat3 tables
+that contain between 10 and 40 samples that are distributed across
+the key space and with large nEq values.
+
+In a well-formed sqlite_stat3 table, the samples for any single
+index must appear in the same order that they occur in the index.  
+In other words, if the entry with left-most column S1 is earlier in
+the index b-tree than the
+entry with left-most column S2, then in the sqlite_stat3 table, 
+sample S1 must have a smaller rowid than sample S2.
+
+
+
+2.6.7. The sqlite_stat4 table
+
+The sqlite_stat4 is only created and is only used if SQLite is compiled
+with SQLITE_ENABLE_STAT4 and if the SQLite version number is
+3.8.1 (2013-10-17) or greater.
+The sqlite_stat4 table is neither read nor written by any
+version of SQLite before 3.8.1.
+The sqlite_stat4 table contains additional information
+about the distribution of keys within an index or the distribution of
+keys in the primary key of a WITHOUT ROWID table.
+The query planner can sometimes use the additional information in
+the sqlite_stat4 table to devise better and faster query algorithms.
+The schema of the sqlite_stat4 table is as follows:
+
+CREATE TABLE sqlite_stat4(tbl,idx,nEq,nLt,nDLt,sample);
+
+
+There are typically between 10 to 40 entries in the sqlite_stat4 table for
+each index for which statistics are available, however these limits are
+not hard bounds.
+The meanings of the columns in the sqlite_stat4 table are as follows:
+
+
+
+tbl:
+    The sqlite_stat4.tbl column holds name of the table that owns
+    the index that the row describes
+
+idx:
+    The sqlite_stat4.idx column holds name of the index that the
+    row describes, or in the case of
+    an sqlite_stat4 entry for a WITHOUT ROWID table, the
+    name of the table itself.
+
+sample:
+    The sqlite_stat4.sample column holds a BLOB
+    in the record format that encodes the indexed columns followed by
+    the rowid for a rowid table or by the columns of the primary key 
+    for a WITHOUT ROWID table.
+    The sqlite_stat4.sample BLOB for the WITHOUT ROWID table itself 
+    contains just the columns of the primary key.
+    Let the number of columns encoded by the sqlite_stat4.sample blob be N.
+    For indexes on an ordinary rowid table, N will be one more than the number 
+    of columns indexed.
+    For indexes on WITHOUT ROWID tables, N will be the number of columns
+    indexed plus the number of columns in the primary key.
+    For a WITHOUT ROWID table, N will be the number of columns in the
+    primary key.
+
+nEq:
+    The sqlite_stat4.nEq column holds a list of N integers where 
+    the K-th integer is the approximate number of entries in the index
+    whose left-most K columns exactly match the K left-most columns
+    of the sample.
+
+nLt:
+    The sqlite_stat4.nLt column holds a list of N integers where
+    the K-th integer is the approximate number of entries in the
+    index whose K left-most columns are collectively less than the 
+    K left-most columns of the sample.
+
+nDLt:
+    The sqlite_stat4.nDLt column holds a list of N integers where
+    the K-th integer is the approximate
+    number of entries in the index that are distinct in the first K columns and
+    where the left-most K columns are collectively less than the left-most
+    K columns of the sample.
+
+
+
+The sqlite_stat4 is a generalization of the sqlite_stat3 table.  The
+sqlite_stat3 table provides information about the left-most column of an
+index whereas the sqlite_stat4 table provides information about all columns
+of the index.
+
+There can be an arbitrary number of sqlite_stat4 entries per index.
+The ANALYZE command will typically generate sqlite_stat4 tables
+that contain between 10 and 40 samples that are distributed across
+the key space and with large nEq values.
+
+In a well-formed sqlite_stat4 table, the samples for any single
+index must appear in the same order that they occur in the index.  
+In other words, if entry S1 is earlier in the index b-tree than 
+entry S2, then in the sqlite_stat4 table, sample S1 must have a
+smaller rowid than sample S2.
+
+
+
+3. The Rollback Journal
+
+The rollback journal is a file associated with each SQLite database
+file that holds information used to restore the database file to its initial
+state during the course of a transaction.
+The rollback journal file is always located in the same 
+directory as the database
+file and has the same name as the database file but with the string
+"-journal" appended.  There can only be a single rollback journal
+associated with a give database and hence there can only be one write
+transaction open against a single database at one time.
+
+Before any information-bearing page of the database is modified, 
+the original unmodified content of that page is written into the 
+rollback journal.  If a transaction is interrupted and needs to be 
+rolled back, the rollback journal can then be used to restore the
+database to its original state.  Freelist leaf pages bear no
+information that would need to be restored on a rollback and so they
+are not written to the journal prior to modification, in order to
+reduce disk I/O.
+
+If a transaction is aborted due to an application crash, or a single,
+or an operating system crash, or a hardware power failure or crash, then 
+the main database file might be left in an inconsistent state. 
+The next time SQLite attempts to open
+the database file, the presence of the rollback journal file will be 
+detected and the journal will be automatically played back to restore the
+database to its state at the start of the incomplete transaction.
+
+A rollback journal is only considered to be valid if it exists and
+contains a valid header.  Hence a transaction can be committed in one
+of three ways:
+
+The rollback journal file can be deleted,
+The rollback journal file can be truncated to zero length, or
+The header of the rollback journal can be overwritten with
+invalid header text (for example, all zeros).
+
+
+These three ways of committing a transaction correspond to the DELETE,
+TRUNCATE, and PERSIST settings, respectively, of the journal_mode pragma.
+
+
+
+A valid rollback journal begins with a header in the following format:
+
+
+Rollback Journal Header Format
+
+OffsetSizeDescription
+0
+    8
+    Header string:  0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7
+8
+    4
+    The "Page Count" - The number of pages in the next segment of the 
+        journal, or -1 to
+        mean all content to the end of the file
+12
+    4
+    A random nonce for the checksum
+16
+    4
+    Initial size of the database in pages
+20
+    4
+    Size of a disk sector assumed by the process that wrote this
+        journal.
+24
+    4
+    Size of pages in this journal.
+
+
+
+A rollback journal header is padded with zeros out to the size of a 
+single sector (as defined by the sector size integer at offset 20).
+The header is in a sector by itself so that if a power loss occurs while
+writing the sector, information that follows the header will be
+(hopefully) undamaged.
+
+After the header and zero padding are zero or more page records.  Each
+page record stores a copy of the content of a page from the database file
+before it was changed.  The same page may not appear more than once
+within a single rollback journal.
+To rollback an incomplete transaction, a process
+has merely to read the rollback journal from beginning to end and
+write pages found in the journal back into the database file at the
+appropriate location.
+
+Let the database page size (the value of the integer at offset 24 
+in the journal header) be N.
+Then the format of a page record is as follows:
+
+
+Rollback Journal Page Record Format
+
+OffsetSizeDescription
+0
+    4
+    The page number in the database file
+4
+    N
+    Original content of the page prior to the start of the transaction
+N+4
+    4
+    Checksum
+
+
+
+
+The checksum is an unsigned 32-bit integer computed as follows:
+
+
+Initialize the checksum to the checksum nonce value found in the
+journal header at offset 12.
+Initialize index X to be N-200 (where N is the size of a database page
+in bytes.
+Interpret the byte at offset X into the page as an 8-bit unsigned integer
+ and add the value of that integer to the checksum.
+Subtract 200 from X.
+If X is greater than or equal to zero, go back to step 3.
+
+
+The checksum value is used to guard against incomplete writes of
+a journal page record following a power failure.  A different random nonce
+is used each time a transaction is started in order to minimize the risk
+that unwritten sectors might by chance contain data from the same page
+that was a part of prior journals.  By changing the nonce for each
+transaction, stale data on disk will still generate an incorrect checksum
+and be detected with high probability.  The checksum only uses a sparse sample
+of 32-bit words from the data record for performance reasons - design studies 
+during the planning phases of SQLite 3.0.0 showed
+a significant performance hit in checksumming the entire page.
+
+Let the page count value at offset 8 in the journal header be M.
+If M is greater than zero then after M page records the journal file
+may be zero padded out to the next multiple of the sector size and another
+journal header may be inserted.  All journal headers within the same
+journal must contain the same database page size and sector size.
+
+If M is -1 in the initial journal header, then the number of page records
+that follow is computed by computing how many page records will fit in
+the available space of the remainder of the journal file.
+
+4. The Write-Ahead Log
+
+Beginning with version 3.7.0 (2010-07-21), 
+SQLite supports a new transaction
+control mechanism called "write-ahead log" or "WAL".
+When a database is in WAL mode, all connections to that database must
+use the WAL.  A particular database will use either a rollback journal
+or a WAL, but not both at the same time.
+The WAL is always located in the same directory as the database
+file and has the same name as the database file but with the string
+"-wal" appended.
+
+4.1. WAL File Format
+
+A WAL file consists of a header followed by zero or more "frames".
+Each frame records the revised content of a single page from the
+database file.  All changes to the database are recorded by writing
+frames into the WAL.  Transactions commit when a frame is written that
+contains a commit marker.  A single WAL can and usually does record 
+multiple transactions.  Periodically, the content of the WAL is
+transferred back into the database file in an operation called a
+"checkpoint".
+
+A single WAL file can be reused multiple times.  In other words, the
+WAL can fill up with frames and then be checkpointed and then new
+frames can overwrite the old ones.  A WAL always grows from beginning
+toward the end.  Checksums and counters attached to each frame are
+used to determine which frames within the WAL are valid and which
+are leftovers from prior checkpoints.
+
+The WAL header is 32 bytes in size and consists of the following eight
+big-endian 32-bit unsigned integer values:
+
+
+WAL Header Format
+
+OffsetSizeDescription
+04
+    Magic number.  0x377f0682 or 0x377f0683
+44
+    File format version.  Currently 3007000.
+84
+    Database page size.  Example: 1024
+124
+    Checkpoint sequence number
+164
+    Salt-1: random integer incremented with each checkpoint
+204
+    Salt-2: a different random number for each checkpoint
+244
+    Checksum-1: First part of a checksum on the first 24 bytes of header
+284
+    Checksum-2: Second part of the checksum on the first 24 bytes of header
+
+
+
+Immediately following the wal-header are zero or more frames. Each
+frame consists of a 24-byte frame-header followed by a page-size bytes
+of page data. The frame-header is six big-endian 32-bit unsigned 
+integer values, as follows:
+
+
+WAL Frame Header Format
+
+OffsetSizeDescription
+04
+    Page number
+44
+    For commit records, the size of the database file in pages
+        after the commit.  For all other records, zero.
+84
+    Salt-1 copied from the WAL header
+124
+    Salt-2 copied from the WAL header
+164
+    Checksum-1:  Cumulative checksum up through and including this page
+204
+    Checksum-2:  Second half of the cumulative checksum.
+
+
+
+A frame is considered valid if and only if the following conditions are
+true:
+
+
+The salt-1 and salt-2 values in the frame-header match
+       salt values in the wal-header
+
+The checksum values in the final 8 bytes of the frame-header
+       exactly match the checksum computed consecutively on the
+       first 24 bytes of the WAL header and the first 8 bytes and
+       the content of all frames
+       up to and including the current frame.
+
+
+4.2. Checksum Algorithm
+
+The checksum is computed by interpreting the input as
+an even number of unsigned 32-bit integers: x(0) through x(N).
+The 32-bit integers are big-endian if the
+magic number in the first 4 bytes of the WAL header is 0x377f0683 and
+the integers are little-endian if the magic number is 0x377f0682.
+The checksum values are always stored in the frame header in a
+big-endian format regardless of which byte order is used to compute
+the checksum.
+
+The checksum algorithm only works for content which is a multiple of
+8 bytes in length.  In other words, if the inputs are x(0) through x(N)
+then N must be odd.
+The checksum algorithm is as follows:
+
+ 
+s0 = s1 = 0
+for i from 0 to n-1 step 2:
+   s0 += x(i) + s1;
+   s1 += x(i+1) + s0;
+endfor
+# result in s0 and s1
+
+
+The outputs s0 and s1 are both weighted checksums using Fibonacci weights
+in reverse order.  (The largest Fibonacci weight occurs on the first element
+of the sequence being summed.)  The s1 value spans all 32-bit integer
+terms of the sequence whereas s0 omits the final term.
+
+4.3. Checkpoint Algorithm
+
+On a checkpoint, the WAL is first flushed to persistent storage using
+the xSync method of the VFS. 
+Then valid content of the WAL is transferred into the database file.
+Finally, the database is flushed to persistent storage using another
+xSync method call.
+The xSync operations serve as write barriers - all writes launched
+before the xSync must complete before any write that launches after the
+xSync begins.
+
+A checkpoint need not run to completion.  It might be that some
+readers are still using older transactions with data that is contained
+in the database file.  In that case, transferring content for newer
+transactions from the WAL file into the database would delete the content
+out from under readers still using the older transactions.  To avoid that,
+checkpoints only run to completion if all reader are using the
+last transaction in the WAL.
+
+
+
+4.4. WAL Reset
+
+After a complete checkpoint, if no other connections are in transactions
+that use the WAL, then subsequent write transactions can
+overwrite the WAL file from the beginning.  This is called "resetting the
+WAL".  At the start of the first new
+write transaction, the WAL header salt-1 value is incremented
+and the salt-2 value is randomized.  These changes to the salts invalidate
+old frames in the WAL that have already been checkpointed but not yet
+overwritten, and prevent them from being checkpointed again.
+
+The WAL file can optionally be truncated on a reset, but it need not be.
+Performance is usually a little better if the WAL is not truncated, since
+filesystems generally will overwrite an existing file faster than they
+will grow a file.
+
+
+
+4.5. Reader Algorithm
+
+To read a page from the database (call it page number P), a reader
+first checks the WAL to see if it contains page P.  If so, then the
+last valid instance of page P that is followed by a commit frame
+or is a commit frame itself becomes the value read.  If the WAL
+contains no copies of page P that are valid and which are a commit
+frame or are followed by a commit frame, then page P is read from
+the database file.
+
+To start a read transaction, the reader records the number of value
+frames in the WAL as "mxFrame".  (More detail)
+The reader uses this recorded mxFrame value
+for all subsequent read operations.  New transactions can be appended
+to the WAL, but as long as the reader uses its original mxFrame value
+and ignores subsequently appended content, the reader will see a 
+consistent snapshot of the database from a single point in time.  
+This technique allows multiple concurrent readers to view different 
+versions of the database content simultaneously.
+
+The reader algorithm in the previous paragraphs works correctly, but 
+because frames for page P can appear anywhere within the WAL, the
+reader has to scan the entire WAL looking for page P frames.  If the
+WAL is large (multiple megabytes is typical) that scan can be slow,
+and read performance suffers.  To overcome this problem, a separate
+data structure called the wal-index is maintained to expedite the
+search for frames of a particular page.
+
+4.6. WAL-Index Format
+
+Conceptually, the wal-index is shared memory, though the current
+VFS implementations use a memory-mapped file for operating-system
+portability.  The memory-mapped
+file is in the same directory as the database and has the same name
+as the database with a "-shm" suffix appended.  Because
+the wal-index is shared memory, SQLite does not support 
+journal_mode=WAL 
+on a network filesystem when clients are on different machines, as
+all clients of the database must be able to share the same memory.
+
+The purpose of the wal-index is to answer this question quickly:
+
+
+Given a page number P and a maximum WAL frame index M,
+return the largest WAL frame index for page P that does not exceed M, 
+or return NULL if there are no frames for page P that do not exceed M.
+
+
+The M value in the previous paragraph is the "mxFrame" value
+defined in section 4.4 that is read at the start 
+of a transaction and which defines the maximum frame from the WAL that 
+the reader will use.
+
+The wal-index is transient.  After a crash, the wal-index is
+reconstructed from the original WAL file.  The VFS is required
+to either truncate or zero the header of the wal-index when the last
+connection to it closes.  Because the wal-index is transient, it can
+use an architecture-specific format; it does not have to be cross-platform.
+Hence, unlike the database and WAL file formats which store all values
+as big endian, the wal-index stores multi-byte values in the native
+byte order of the host computer.
+
+This document is concerned with the persistent state of the database
+file, and since the wal-index is a transient structure, no further 
+information about the format of the wal-index will be provided here.
+Additional details on the format of the wal-index are contained in
+the separate WAL-index File Format document.
+This page last modified on  2025-04-30 20:02:34 UTC 
+
+]]></content:encoded>
         </item>
     </channel>
 </rss>
