@@ -4,13 +4,375 @@
         <title>Hacker News: Front Page</title>
         <link>https://news.ycombinator.com/</link>
         <description>Hacker News RSS</description>
-        <lastBuildDate>Tue, 09 Sep 2025 05:51:16 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 09 Sep 2025 06:13:50 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>github.com/Prabesh01/hnrss-content-extract</generator>
         <language>en</language>
         <atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/frontpage.rss" rel="self" type="application/rss+xml"/>
         <item>
-            <title><![CDATA[Anthropic reduced model output quality from Aug 5]]></title>
+            <title><![CDATA[Byte Type: Supporting Raw Data Copies in the LLVM IR]]></title>
+            <link>https://blog.llvm.org/posts/2025-08-29-gsoc-byte-type/</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45177507</guid>
+            <description><![CDATA[This summer I participated in GSoC under the LLVM Compiler Infrastructure. The goal of the project was to add a new byte type to the LLVM IR, capable of representing raw memory values.]]></description>
+            <content:encoded><![CDATA[This summer I participated in GSoC under the LLVM Compiler Infrastructure.
+The goal of the project was to add a new byte type to the LLVM IR, capable of representing raw memory values.
+This new addition enables the native implementation of memory-related intrinsics in the IR, including memcpy, memmove and memcmp, fixes existing unsound transformations and enables new optimizations, all with a minimal performance impact.BackgroundOne of LLVM’s longstanding problems is the absence of a type capable of representing raw memory values.
+Currently, memory loads of raw bytes are performed through an appropriately sized integer type.
+However, integers are incapable of representing an arbitrary memory value.
+Firstly, they do not retain pointer provenance information, rendering them unable to fully specify the value of a pointer.
+Secondly, loading memory values containing poison bits through an integer type taints the loaded value, as integer values are either poison or have a fully-defined value, with no way to represent individual poison bits.Source languages such as C1 and C++2 provide proper types to inspect and manipulate raw memory.
+These include char, signed char and unsigned char.
+C++17 introduced the std::byte type, which offers similar raw memory access capabilities, but does not support arithmetic operations.
+Currently, Clang lowers these types to the i8 integer type, which does not accurately model their raw memory access semantics, motivating miscompilations such as the one reported in bug report 37469.The absence of a similar type in the LLVM IR hinders the implementation of memory-related intrinsics such as memcpy, memmove and memcmp, and introduces additional friction when loading and converting memory values to other types, leading to implicit conversions that are hard to identify and reason about.
+The two core problems stemming from the absence of a proper type to access and manipulate raw memory, directly addressed by the byte type and explored throughout the remainder of this section, are summarized as follows:Integers do not track provenance, rendering them incapable of representing a pointer.Loads through integer types spread poison values, which taints the load result if the loaded values contain at least one poison bit (as occurs with padded values).Pointer ProvenanceAccording to the LLVM Language Reference, pointers track provenance, which is the ability to perform memory accesses through the pointer, in the sense of the pointer aliasing rules.
+The main goal of tracking pointer provenance is to simplify alias analysis, yielding more precise results, which enables high-level optimizations.Integers, unlike pointers, do not capture provenance information, being solely characterized by their numerical value.
+Therefore, loading a pointer through an integer type discards the pointer’s provenance.
+This is problematic as such loads can cause pointer escapes that go unnoticed by alias analysis.
+Once alias analysis is compromised, simple optimizations that rely on the absence of aliasing become invalid, compromising the correctness of the whole compilation process.Currently, Alive2 defines the result of loading a pointer value through an integer type as poison.
+This implies that loads through integer types fail to accurately recreate the original memory value, hindering pointer copies via integer types.
+In the following example, storing a pointer to memory and loading it through the i64 type yields poison, invalidating the transformation.define ptr @src(ptr %ptr, ptr %v) {
+  store ptr %v, ptr %ptr
+  %l = load ptr, ptr %ptr
+  ret ptr %l
+}
+
+define ptr @tgt(ptr %ptr, ptr %v) {
+  store ptr %v, ptr %ptr
+  %l = load i64, ptr %ptr      ; poison
+  %c = inttoptr i64 %l to ptr  ; poison
+  ret ptr %c                   ; poison
+}
+Undefined BehaviorLLVM’s poison value is used to represent unspecified values, such as padding bits.
+Loading such memory values through an integer type propagates poison values, as integer types are either poison or have a fully-defined value, not providing enough granularity to represent individual poison bits.
+This hinders the copy of padded values.Moreover, this lack of granularity can lead to subtle issues that are often overlooked.
+The LLVM Language Reference defines the bitcast instruction as a no-op cast because no bits change with this conversion.
+Nonetheless, while scalar types are either poison or have a fully-defined value, vector types in LLVM track poison values on a per-lane basis.
+This introduces potential pitfalls when casting vector types to non-vector types, as the cast operation can inadvertently taint non-poison lanes.
+In the following example, considering the first lane of %v to be poison, the result of casting the vector to an i64 value is poison, regardless of the value of the second lane.define i64 @ub(ptr %ptr) {
+  %v = load <2 x i32>, ptr %ptr       ; <i32 poison, i32 42>
+  %c = bitcast <2 x i32> %v to i64    ; i64 poison
+  ret i64 %c
+}
+Although covered by the Language Reference ("the [bitcast] conversion is done as if the value had been stored to memory and read back as [the destination type]"), this duality in the value representation between vector and scalar types integer constitutes a corner case that is not widely contemplated and often unnecessarily introduces undefined behavior.Implementing the Byte TypeBack in 2021, a GSoC project with a similar goal, produced a working prototype of the byte type.
+This prototype introduced the byte type to the IR, lowered C and C++’s raw memory access types to the byte type and implemented some optimizations over the new type.The current project began by porting these patches to the latest version of LLVM, adapting the code to support the newly introduced opaque pointers.
+As the work progressed and new challenges emerged, the original proposal was iteratively refined.
+The implementation of the byte type in LLVM and Alive2 can be found here and here, respectively.Byte TypeThe byte type is a first-class single-value type, with the same size and alignment as the equivalently sized integer type.
+Memory loads through the byte type yield the value’s raw representation, without introducing any implicit casts.
+This allows the byte type to represent both pointer and non-pointer values.Additionally, the byte type is equipped with the necessary granularity to represent poison values at the bit-level, such that loads of padded values through the byte type do not taint the loaded value.
+As a consequence, a bitcast between vector and scalar byte types preserves the raw byte value.
+In the following example, a poison lane does not taint the cast result, unlike with equivalently sized integer types.define b64 @f(ptr %ptr) {
+  %v = load <2 x b32>, ptr %ptr
+  %c = bitcast <2 x b32> %v to b64
+  ret b64 %c
+}
+These two properties of the byte type directly addressed the aforementioned problems, enabling the implementation of a user-defined memcpy in the IR, as shown in the following example.
+In a similar manner, a native implementation of memmove can be achieved.define ptr @my_memcpy(ptr %dst, ptr %src, i64 %n) {
+entry:
+  br label %for.cond
+for.cond:
+  %i = phi i64 [ 0, %entry ], [ %inc, %for.body ]
+  %cmp = icmp ult i64 %i, %n
+  br i1 %cmp, label %for.body, label %for.end
+for.body:
+  %arrayidx = getelementptr inbounds b8, ptr %src, i64 %i
+  %byte = load b8, ptr %arrayidx
+  %arrayidx1 = getelementptr inbounds b8, ptr %dst, i64 %i
+  store b8 %byte, ptr %arrayidx1
+  %inc = add i64 %i, 1
+  br label %for.cond
+for.end:
+  ret ptr %dst
+}
+The newly implemented type also fixes existing optimizations.
+Previously, InstCombine lowered small calls to memcpy and memmove into integer load/store pairs.
+Due to the aforementioned reasons, this lowering is unsound.
+By using byte load/store pairs instead, the transformation, as shown in the following example, is now valid.define void @my_memcpy(ptr %dst, ptr %src) {
+  call void @llvm.memcpy(ptr %dst, ptr %src, i64 8)
+  ret void
+}
+
+define void @my_memmove(ptr %dst, ptr %src) {
+  call void @llvm.memmove(ptr %dst, ptr %src, i64 8)
+  ret void
+}
+
+define void @my_memcpy(ptr %dst, ptr %src) {
+  %l = load b64, ptr %src
+  store b64 %l, ptr %dst
+  ret void
+}
+
+define void @my_memmove(ptr %d, ptr %s) {
+  %l = load b64, ptr %s
+  store b64 %l, ptr %d
+  ret void
+}
+SROA performs a similar transformation, lowering memcpy calls to integer load/store pairs.
+Similarly, this optimization pass was changed to use byte load/store pairs, as depicted in the following example.define void @src(ptr %a, ptr %b) {
+  %mem = alloca i8
+  call void @llvm.memcpy(ptr %mem, ptr %a, i32 1)
+  call void @llvm.memcpy(ptr %a, ptr %mem, i32 1)
+  ret void
+}
+
+define void @tgt(ptr %a, ptr %b) {
+  %mem.copyload = load b8, ptr %a
+  store b8 %mem.copyload, ptr %a
+  ret void
+}
+Bytecast InstructionByte values can be reinterpreted as values of other primitive types.
+This is achieved through the bytecast instruction.
+This cast instruction comes in two flavors, either allowing or disallowing type punning.
+Considering that a byte might hold a pointer or a non-pointer value, the bytecast follows the following semantics:A vanilla bytecast, distinguished by the absence of the exact flag, is used to cast a byte to any other primitive type, allowing type punning. More precisely,If the type of the value held by the byte matches the destination type of the cast, it is a no-op.Otherwise, the cast operand undergoes a conversion to the destination type, converting pointers to non-pointer values and vice-versa, respectively wrapping a ptrtoint or inttoptr cast.A bytecast with the exact flag succeeds if both the type of the value held by the byte and the destination type are either both pointer or non-pointer types. More specifically,If the type of the value held by the byte matches the destination type of the cast, it is a no-op.Otherwise, the result is poison, preventing type punning between pointer and non-pointer values.The exact version of the bytecast mimics the reinterpretation of a value, as if it had been stored in memory and loaded back through the cast destination type.
+This is aligned with the semantics adopted by the bitcast instruction, which “is done as if the value had been stored to memory and read back as [the destination type]”", enabling store-to-load forwarding optimizations, such as the one depicted in the next example.define i8 @src(b8 %x) {
+  %a = alloca b8
+  store b8 %x, ptr %a
+  %v = load i8, ptr %a
+  ret i8 %v
+}
+
+define i8 @tgt(b8 %x) {
+  %cast = bytecast exact b8 %x to i8
+  ret i8 %cast
+}
+Memcmp LoweringThe standard version of the bytecast enables the implementation of memcmp in the IR.
+Currently, calls to memcmp of small sizes are lowered to integer loads, followed by a subtraction, comparing the two loaded values.
+Due to the aforementioned problems, this lowering is unsound.
+Loading the two memory values as bytes is insufficient as comparisons between bytes are undefined, as to avoid overloading the IR by supporting comparisons between pointers and provenance-unaware values.
+To that end, the version of the bytecast which performs type punning is used, forcefully converting possible pointer values into their integer representation.
+The two values, then converted to integers, can be compared as before.
+The following example depicts the previous and new lowerings of a memcmp of 1 byte.define i32 @before(ptr %p, ptr %q) {
+  %lhsc = load i8, ptr %p
+  %lhsv = zext i8 %lhsc to i32
+  %rhsc = load i8, ptr %q
+  %rhsv = zext i8 %rhsc to i32
+  %chardiff = sub i32 %lhsv, %rhsv
+  ret i32 %chardiff
+}
+
+define i32 @after(ptr %p, ptr %q) {
+  %lhsb = load b8, ptr %p
+  %lhsc = bytecast b8 %lhsb to i8
+  %lhsv = zext i8 %lhsc to i32
+  %rhsb = load b8, ptr %q
+  %rhsc = bytecast b8 %rhsb to i8
+  %rhsv = zext i8 %rhsc to i32
+  %chardiff = sub i32 %lhsv, %rhsv
+  ret i32 %chardiff
+}
+Load WideningA common optimization performed by LLVM is to widen memory loads when lowering calls to memcmp.
+The previously proposed lowering falls short in the presence of such optimizations.
+Whilst using a larger byte type to load the memory value preserves its raw value, the bytecast to an integer type yields poison if any of the loaded bits are poison.
+This is problematic as the remaining bits added by the widened load could assume any value or even be uninitialized.
+As such, when performing load widening, the following lowering, depicted in the next example, is performed.
+The !uninit_is_nondet, proposed in the RFC proposing uninitialized memory loads to return poison, converts any poison bits to a non-deterministic value, preventing the bytecast to an integer type from yielding poison.define i32 @src(ptr %x, ptr %y) {
+  %call = tail call i32 @memcmp(
+   ptr %x, ptr %y, i64 2)
+  ret i32 %call
+}
+
+define i32 @tgt(ptr %x, ptr %y) {
+  %1 = load b16, ptr %x, !uninit_is_nondet
+  %2 = load b16, ptr %y, !uninit_is_nondet
+  %3 = bytecast b16 %1 to i16
+  %4 = bytecast b16 %2 to i16
+  %5 = call i16 @llvm.bswap.i16(i16 %3)
+  %6 = call i16 @llvm.bswap.i16(i16 %4)
+  %7 = zext i16 %5 to i32
+  %8 = zext i16 %6 to i32
+  %9 = sub i32 %7, %8
+  ret i32 %9
+}
+Casts, Bitwise and Arithmetic OperationsValues of other primitive types can be cast to the byte type using the bitcast instruction, as shown in the following example.%1 = bitcast i8 %val to b8
+%2 = bitcast i64 %val to b64
+%3 = bitcast ptr to b64 ; assuming pointers to be 64 bits wide
+%4 = bitcast <8 x i8> to <8 x b8>
+Furthermore, bytes can also be truncated, enabling store-to-load forwarding optimizations, such as the one presented in the next example.
+Performing an exact bytecast to i32, followed by a trunc to i8 and a bitcast to b8 would be unsound, as if any of the unobserved bits of the byte value were poison, the bytecast would yield poison, invalidating the transformation.define b8 @src(b32 %x) {
+  %a = alloca b32
+  store b32 %x, ptr %a
+  %v = load b8, ptr %a
+  ret b8 %v
+}
+
+define b8 @tgt(b32 %x) {
+  %trunc = trunc b32 %x to b8
+  ret b8 %trunc
+}
+Due to the cumbersome semantics of performing arithmetic on provenance-aware values, arithmetic operations on the byte type are disallowed.
+Bitwise binary operations are also disallowed, with the exception of logical shift right.
+This instruction enables store-to-load forwarding optimization with offsets, such as the one performed in the following example.
+To rule out sub-byte accesses, its use is restricted to shift amounts that are multiples of 8.define i8 @src(b32 %x) {
+  %a = alloca b32
+  %gep = getelementptr i8, ptr %a, i64 2
+  store b32 %x, ptr %a
+  %v = load i8, ptr %gep
+  ret i8 %v
+}
+
+define i8 @tgt(b32 %x) {
+  %shift = lshr b32 %x, 16
+  %trunc = trunc b32 %shift to b8
+  %cast = bytecast exact b8 to i8
+  ret i8 %cast
+}
+Value Coercion OptimizationsSome optimization passes perform transformations that are unsound under the premise that type punning is disallowed.
+Such an optimization pass is GVN, which performs value coercion in order to eliminate redundant loads.
+Currently, a class of optimization where a pointer load is coerced to a non-pointer value or a non-pointer load is coerced to a pointer value is reported as unsound by Alive2.The following example illustrates one such optimization, in which GVN replaces the pointer load at %v3 by a phi node, merging the pointer load at %v2 with the coerced value at %1, resulting from an inttoptr cast.
+If the value stored in memory is a pointer, the source function returns the pointer value, while, in the target function, the load at %v1 returns poison.declare void @use(...) readonly
+
+define ptr @src(ptr %p, i1 %cond) {
+  br i1 %cond, label %bb1, label %bb2
+bb1:
+  %v1 = load i64, ptr %p
+  call void @use(i64 %v1)
+  %1 = inttoptr i64 %v1 to ptr
+  br label %merge
+bb2:
+  %v2 = load ptr, ptr %p
+  call void @use(ptr %v2)
+  br label %merge
+merge:
+  %v3 = load ptr, ptr %p
+  ret ptr %v3
+}
+
+define ptr @tgt(ptr %p, i1 %cond) {
+  br i1 %cond, label %bb1, label %bb2
+bb1:
+  %v1 = load i64, ptr %p
+  call void @use(i64 %v1)
+  %1 = inttoptr i64 %v1 to ptr
+  br label %merge
+bb2:
+  %v2 = load ptr, ptr %p
+  call void @use(ptr %v2)
+  br label %merge
+merge:
+  %v3 = phi ptr [ %v2, %bb2 ], [ %1, %bb1 ]
+  ret ptr %v3
+}
+The byte type can be leveraged to avoid the implicit type punning that hinders this kind of optimizations, as depicted in the following example.
+Since the byte type can represent both pointer and non-pointer values, the loads at %v1 and %v2 can instead be performed using the byte type.
+The bytecast instruction is then used to convert the byte into the desired type.
+As the load through the byte type accurately models the loaded value, avoiding implicit casts, the bytecast, yields the pointer stored in memory.
+This value can then be used to replace the load at %v3.declare void @use(...) readonly
+
+define ptr @src(ptr %p, i1 %cond) {
+  br i1 %cond, label %bb1, label %bb2
+bb1:
+  %v1 = load i64, ptr %p
+  call void @use(i64 %v1)
+  %1 = inttoptr i64 %v1 to ptr
+  br label %merge
+bb2:
+  %v2 = load ptr, ptr %p
+  call void @use(ptr %v2)
+  br label %merge
+merge:
+  %v3 = load ptr, ptr %p
+  ret ptr %v3
+}
+
+define ptr @tgt(ptr %p, i1 %cond) {
+  %load = load b64, ptr %p
+  br i1 %cond, label %bb1, label %bb2
+bb1:
+  %v1 = bytecast exact b64 %load to i64
+  call void @use(i64 %v1)
+  %1 = bytecast exact b64 %load to ptr
+  br label %merge
+bb2:
+  %v2 = bytecast exact b64 %load to ptr
+  call void @use(ptr %v2)
+  br label %merge
+merge:
+  %v3 = phi ptr [ %v2, %bb2 ], [ %1, %bb1 ]
+  ret ptr %v3
+}
+Other OptimizationsAdditional optimizations were also implemented.
+While these do not affect program correctness, they do contribute to performance improvements.
+Some of them include cast pair eliminations and combining of load and bytecast pairs with a single use, depicted in the following examples.define b32 @src_float(b32 %b) {
+  %1 = bytecast exact b32 %b to float
+  %2 = bitcast float %1 to b32
+  ret b32 %2
+}
+
+define i8 @src_int(i8 %i) {
+  %b = bitcast i8 %i to b8
+  %c = bytecast exact b8 %1 to i8
+  ret i8 %c
+}
+
+define b32 @tgt_float(b32 %b) {
+  ret b32 %b
+}
+
+define i8 @tgt_int(i8 %i) {
+  ret i8 %i
+}
+define i8 @src(ptr %p) {
+  %b = load b8, ptr %p
+  %c = bytecast exact b8 %b to i8
+  ret i8 %c
+}
+
+define i8 @tgt(ptr %p) {
+  %i = load i8, ptr %p
+  ret i8 %i
+}
+ClangGiven the raw memory access capabilities of the byte type, Clang was altered to lower C and C++’s raw memory access types were lowered to the byte type.
+These include char, signed char, unsigned char and std::byte.
+The new lowerings are depicted in the next example.void foo(
+  unsigned char arg1,
+  char arg2,
+  signed char arg3,
+  std::byte arg4
+);
+void @foo(
+  b8 zeroext %arg1,
+  b8 signext %arg2,
+  b8 signext %arg3,
+  b8 zeroext %arg4
+);
+Additionally, code generation was updated to insert missing bytecast instructions where integer values were previously expected, such as in arithmetic and comparison operations involving character types.
+The next example depicts an example function in C, adding two char values, and the corresponding lowering to LLVM IR as performed by Clang.char sum(char a, char b) {
+  return a + b;
+}
+define b8 @sum(b8 %a, b8 %b) {
+  %conv = bytecast exact b8 %a to i8
+  %conv1 = sext i8 %conv to i32
+  %conv2 = bytecast exact b8 %b to i8
+  %conv3 = sext i8 %conv2 to i32
+  %add = add nsw i32 %conv1, %conv3
+  %conv4 = trunc i32 %add to i8
+  %res = bitcast i8 %conv4 to b8
+  ret b8 %res
+}
+SummaryIn summary, the byte type contributes with the following changes/additions to the IR:Raw memory representation: Optimization passes can use the byte type to represent raw memory values, avoiding the introduction of implicit casts and treating both pointer and non-pointer values uniformly.Bit-level poison representation: The byte type provides the necessary granularity to represent individual poison bits, providing greater flexibility than integer types, which either have a fully-defined value or are tainted by poison bits.bitcast instruction: This instruction allows conversions from other primitive types to equivalently-sized byte types. Casts between vector and scalar byte types do not taint the cast result in the presence of poison lanes, as occurs with integer types.bytecast instruction: This instruction enables the conversion of byte values to other primitive types. The standard version of the cast performs type punning, reinterpreting pointers as integers and vice-versa. The exact flag disallows type punning by returning poison if the type of the value held by the byte does not match the cast destination type.trunc and lshr instructions: The trunc and lshr instructions accept byte operands, behaving similarly to their integer counterparts. The latter only accepts shift amounts that are multiples of 8, ruling out sub-byte accesses.ResultsBenchmarksThe implementation was evaluated using the Phoronix Test Suite automated benchmarking tool, from which a set of 20 C/C++ applications, listed below, were selected.BenchmarkVersionLoCDescriptionaircrack-ng1.766,988Tool suite to test WiFi/WLAN network securitybotan2.17.3147,832C++ library for cryptographic operationscompress-7zip24.05247,211File archiving tool based on the 7-Zip formatcompress-pbzip21.1.1310,187Parallel implementation of bzip2compress-zstd1.5.490,489Lossless compression tool using Zstandarddraco1.5.650,0073D mesh and point cloud compressing libraryespeak1.5145,192Compact open-source speech synthesizerffmpeg7.01,291,957Audio and video processing frameworkfftw3.3.10264,128Library for computing FFTsgraphics-magick1.3.43267,450Toolkit for image editing and conversionluajit2.1-git68,833JIT-compiler of the Lua programming languagengspice34527,637Open-source circuit simulatoropenssl3.3597,713Implementation of SSL/TLSredis7.0.4178,014In-memory data storernnoise0.2146,693Neural network for audio noise reductionscimark22.0800Scientific computing suite written in ANSI Csqlite-speedtest3.30250,607Program for executing SQLite database testsstockfish1711,054Advanced open-source chess enginetjbench2.1.057,438JPEG encoding and decoding toolz34.14.1512,002SMT solver and theorem proverAll programs were compiled with the -O3 pipeline on an AMD EPYC 9554P 64-Core CPU.
+In order to minimize result variance, turbo boost, hyperthreading, and ASLR were disabled, the performance governor was used, and core pinning was applied.
+The plots, depicted below, display the compile time, object size, peak memory usage (maximum redisent set size) and run-time performance differences between the implementation and upstream LLVM.
+The results reveal that the addition of the byte type had a minimal impact on all of the addressed performance metrics.
+Each result is averaged over three runs. The run-time results represent the average regression percentage across all tests of each benchmark.The following plots show per-function assembly size distributions and differences, indicating that the addition of the byte type results in minor changes to the generated code, with the largest observed shift being approximately 5%.
+Each subplot includes the net byte size change and the percentage of functions with differing assembly, disregarding non-semantic differences such as varying jump and call target addresses.Alive2LLVM Test SuiteThe byte type was implemented in Alive2, enabling the verification of both the reworked and newly added optimizations.
+Accessing both the correctness of the implementation and the broader impact of introducing the byte type into the IR, Alive2 was run over the LLVM test suite.
+Several previously unsound optimizations, which were addressed by the byte type, were identified in the tests listed below.TestReasonExpandMemCmp/AArch64/memcmp.llmemcmp to integer load/store pairsExpandMemCmp/X86/bcmp.llbcmp to integer load/store pairsExpandMemCmp/X86/memcmp-x32.llmemcmp to integer load/store pairsExpandMemCmp/X86/memcmp.llmemcmp to integer load/store pairsGVN/metadata.llUnsound pointer coercionsGVN/pr24397.llUnsound pointer coercionsInstCombine/bcmp-1.llbcmp to integer load/store pairsInstCombine/memcmp-1.llmemcmp to integer load/store pairsInstCombine/memcpy-to-load.llmemcpy to integer load/store pairsPhaseOrdering/swap-promotion.llmemcpy to integer load/store pairsSROA/alignment.llmemcpy to integer load/store pairsIt is worth noting that some additional tests containing unsound optimizations were addressed.
+However, Alive2 did not report them as unsound, due to the presence of unsupported features, such as multiple address spaces.
+Moreover, the ExpandMemCmp tests continue to be flagged as unsound by Alive2.
+This is because the required !uninit_is_nondet metadata has not yet been upstreamed and therefore remains absent in memcmp load widenings optimizations.Single File ProgramsThe alivecc tool was used to verify the compilation of two single-file C programs, both compiled with the -O2 optimization level.
+The results are presented below.bzip2: No differences were detected during verification.sqlite3: Two optimizations previously flagged as unsound by Alive2 were fixed. These occurred in the sqlite3WhereOkOnePass and dup8bytes functions. The reduced IR reveals that these were caused by lowerings of memcpy to integer load/store pairs.Future WorkAfter modifying Clang to lower the char, unsigned char and signed char types to the byte type, approximately 1800 Clang regression tests began failing.
+Over the course of the project, the number of failing tests was gradually reduced and, currently, around 100 regression tests are still failing.
+LLVM is a fast-moving codebase, and due to the sheer number of Clang tests affected by the introduction of the byte type, maintaining a clean test suite constitutes a continuous effort.The benchmarks were run on an x86-64 system.
+However, LLVM also supports other popular architectures such as AArch64 and RISC-V, which may require additional performance evaluation.Furthermore, the patches do not include any additions to the Language Reference.ConclusionThe addition of the byte type to the IR solves one of the long lasting problems in LLVM, with a minimal performance impact.
+Optimization passes can now safely represent and manipulate raw memory values, fixing existing optimizations, and setting up a solid foundation for new, previously inexpressible optimizations.Participating in GSoC was both a great honor and a tremendous learning opportunity.
+Over the course of this project, I’ve learned a lot about compilers, optimizations and LLVM.
+It was also a valuable opportunity to get in touch with the LLVM community and contribute through the following pull requests:[InstCombine] Fold (x == A) || (x & -Pow2) == A + 1 into range check[ADT] Add signed and unsigned mulExtended to APInt[Headers][X86] Allow pmuludq/pmuldq to be used in constexpr[LangRef] Fix ptrtoaddr code block[clang][x86] Add C/C++ and 32/64-bit test coverage to constexpr tests[Headers][X86] Allow AVX512 reduction intrinsics to be used in constexpr[InstCombine] Support offsets in memset to load forwarding[ConstantFolding] Merge constant gep inrange attributes[InstCombine] Propagate neg nsw when folding abs(-x) to abs(x)[LV] Peek through bitcasts when performing CSEI would like to thank my mentor, Nuno Lopes, for his guidance and support.
+Not only did his experience and expertise help me get through some of the most challenging parts of the project, but his presence also made the whole process genuinely enjoyable.
+I also believe few people in the world could guide me so well through the Alive2 codebase!I would also like to thank George Mitenkov, who laid the groundwork by developing the original prototype introducing the byte type.
+Not only did he accomplish quite a lot in a single summer, but he also wrote a phenomenal write-up, which greatly contributed to my understanding of the problem.Values stored in non-bit-field objects of any other object type consist of n x CHAR_BIT bits, where n is the size of an object of that type, in bytes. The value may be copied into an object of type unsigned char [n] (e.g., by memcpy); the resulting set of bytes is called the object representation of the value. (C99 ISO Standard, 6.2.6.1.4) ↩︎The underlying bytes making up the object can be copied into an array of char, unsigned char, or std::byte. If the content of that array is copied back into the object, the object shall subsequently hold its original value. (C++20 ISO Standard, 6.9.2) ↩︎]]></content:encoded>
+        </item>
+        <item>
+            <title><![CDATA[Incident Report for Anthropic]]></title>
             <link>https://status.anthropic.com/incidents/72f99lh1cj2c</link>
             <guid isPermaLink="false">https://news.ycombinator.com/item?id=45176491</guid>
             <description><![CDATA[Anthropic's Status Page - Model output quality.]]></description>
@@ -533,7 +895,7 @@
         
             
           Star
-          41
+          45
 
   
 
@@ -2497,19 +2859,6 @@ Share on Bluesky · Edit on GitHub]]></content:encoded>
                 Free Rust course: @RustCurious      
             
         ]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[How Britain built some of the world’s safest roads]]></title>
-            <link>https://ourworldindata.org/britain-safest-roads-history</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45165186</guid>
-            <description><![CDATA[The death rate per mile driven has declined 22-fold since 1950.]]></description>
-            <content:encoded><![CDATA[The death rate per mile driven has declined 22-fold since 1950.A century ago, these were the cars on Britain’s roads. Forget driving lessons or tests; to get behind the wheel legally, all you needed was a paper license, which cost the equivalent of around 25 pence today.Cars had no seatbelts and, of course, no airbags. There were no mirrors to see traffic behind. No flashing indicators, so your signal to turn left or right was simply sticking your arm out. The brakes were poor, and emergency braking was impossible. Steering was stiff and clunky, and the headlights were weak, making it difficult to see much at night.Combine this with the lack of pavements for pedestrians, the lack of signs or traffic signals, and the absence of enforced rules, and you can understand why it was a dangerous time to be on the roads.Throughout the 1920s and ‘30s, between 5,000 and 7,000 people died in road accidents each year.Fast-forward to today. Around 1,700 people die in road incidents each year in the UK, about a quarter of the number that used to be. That’s despite there being 16 times more vehicles on the road and 33 times as many miles driven.Per mile driven, the death rate declined 22-fold since 1950.You can see all of this in the chart below.If road deaths per mile driven were still as high as in 1950, then the UK would not see 1,700 road deaths per year, but 37,000.1Today, the United Kingdom has one of the lowest road death rates in the world.2 You can see it compared to other countries in the chart.How did road traffic become so safe in the UK? In this article, I want to journey through the history of policies, norms, and transport innovations that have saved thousands of lives yearly. These lessons help identify what works and what doesn’t, so that other parts of the world can make their roads much safer. Globally, around 1.2 million people die in road accidents every year. Yet this is one of the world’s most overlooked health problems, even though we already know how to prevent many of these deaths.Many of the UK’s interventions and policies are reflected in the more general guidance in reports such as those published by the World Bank’s Global Road Safety Facility.3 These reports take a more in-depth look at the policies and interventions that are effective (or not) in reducing road fatalities. They align closely with the lessons I have drawn from Britain’s history.Anarchy and blackouts: Britain’s roads until the end of World War IILet’s go back to the period before the Second World War.Speed limits on Britain’s roads had existed since the early 1900s, but they were rarely enforced, so hardly anyone followed them. In 1930, the government decided that speed limits should be abolished if no one was willing to follow them. The country’s own transport minister, Herbert Morrison, even admitted to ignoring them in parliament:“… there was not one of their Lordships who observed the speed limit [and] I venture to say that as legislators we are not entitled to enforce and to continue speed limits.”Just four years later, following concerns about the number of pedestrians killed on busy urban roads, a limit of 30 miles per hour was reintroduced in built-up areas. Road deaths stayed relatively stable throughout the 1930s until the start of the Second World War.During the first few years of the war, road deaths increased. Mandatory nighttime blackouts prevented cars from using their headlights, and streetlights were turned off completely. The chart shows that pedestrians, especially, were paying with their lives.As the King’s Surgeon wrote in the British Medical Journal in 1939:“frightening the nation into blackout regulations, the Luftwaffe was able to kill 600 British citizens a month without ever taking to the air”.The high risk to pedestrians in the first half of the 20th century was not only true in the UK. The Literary Digest was a weekly magazine in the United States; in the 1920s to 1940s, the humor section often featured jokes about how dangerous cars were to pedestrians.Here’s one published in the Nashville Banner:“With so many automobiles, the supply of pedestrians will soon be much short of the demand.”And another:TRAFFIC COP: “Hey you! Didn’t you hear me yelling for you to stop?”AUTO FIEND: “Oh! Was that you yelling? I thought that was just somebody I had run over.”Cars were becoming increasingly popular, but at the cost of those walking alongside them.The climb to a post-war peak in the mid-1960sOver the next few decades, road deaths steadily climbed to their post-war peak in 1966.But it’d be wrong to conclude that the UK government did little to improve road safety at that time. Fatality rates declined, but this was not enough to offset the rapid rise in the number of cars on the roads and the number of miles being driven.The chart below shows the change in each indicator from 1950 to 1966: the number of registered vehicles almost tripled, miles driven more than doubled, and deaths increased by just over 50%. That means rates actually went down.What were some of the policies that successfully limited the number of deaths?In the footnote, I’ll list a few small interventions for which there is mixed evidence, and instead focus on the larger ones with a more substantial evidence base.4One of the most important changes during this period was the introduction of motorways (also known as “highways”). I’d previously assumed that motorways were more dangerous than city or other rural roads because cars drive much faster.But it’s the opposite. You can see this in the most recent data for the UK, shown in the chart below. If we look at the number of deaths per billion miles driven, we see that motorways are roughly four times safer than urban roads, and more than five times safer than rural roads. This is not specific to the UK: among 24 OECD countries, approximately 5% of road deaths occurred on motorways.5 In almost all countries, it was less than 10%.Rural roads are the most dangerous. In 18 countries, more than half of deaths occurred on rural roads, and it was more than two-thirds in Spain, Sweden, Finland, Ireland, and New Zealand.Motorways are safer for several reasons. First, there are fewer road users — just cars, no pedestrians or cyclists. Second, there are fewer stops and starts. Third, there are usually physical barriers in the middle, separating vehicles traveling in different directions and reducing the risk of head-on collisions, which are much more common on narrow rural roads.One key to road safety is having well-designed motorway infrastructure. The first motorway in the UK opened in 1958, and the growth of the network since then has saved many lives.If motorways were the big infrastructural change of the 1950s, roundabouts were the innovation of the 1960s. In 1966, the UK government implemented the “priority rule”, which requires drivers at roundabouts to give priority to vehicles already in the roundabout. This rule continues to this day.Again, I previously underestimated the importance of roundabouts because I assumed that the high and constant traffic flow might increase the risk of collisions. However, there is good evidence that well-designed roundabout systems make our roads much safer than the alternatives: intersections with stop signs (2-way or 4-way) and traffic light systems.Studies have found that replacing traditional intersections with roundabouts substantially reduces injuries and deaths from collisions. The magnitude of reduction depends on the context and road conditions beforehand. A study in the US found that the conversion of 24 intersections to roundabouts reduced the number of injury crashes by 76%.6 In Europe, studies have found a 35% to 40% reduction in rates of serious injury crashes, and a reduction in deaths of 50% to 70%.7 A meta-analysis across 44 studies found that converting junctions to roundabouts was associated with a two-thirds reduction of fatal accidents.8Again, roundabouts are safer for several reasons.The risk of a side-on or head-on collision is much higher at traffic lights and stop sign interventions. These collisions tend to be much more dangerous and lead to higher fatality rates. On a roundabout, a collision will likely be at a much less severe angle, and head-on collisions are much rarer. Vehicles also tend to travel at higher speeds, especially at traffic light intersections, whereas effective roundabouts force vehicles to slow down. For this reason, roundabouts that are small and do not force cars to drive around them are ineffective because they can basically drive right through, without slowing down.Stop-sign intersections — especially 4-way ones — can cause confusion about which vehicles have right-of-way. Finally, both of these road designs force many stop-and-go movements, increasing the likelihood of crashes when drivers brake too late. Roundabouts allow a more continuous flow of traffic.9While roundabouts reduce risks for drivers, passengers, and pedestrians, the data for cyclists is less clear. There is some evidence that large multi-lane roundabouts actually increase risks compared to traffic light intersections.The battle against drunk drivingThe other major change instigated in the late 1960s was the war against drunk driving.10 It’s now incredible to hear stories from my grandparents’ generation about how common this used to be. Surveys from the late 1970s suggest that over half of male drivers and two-thirds of young male drivers would do it every week.11Those rates would be unthinkable in Britain today. That’s not just because of the legal ramifications: it’s also no longer socially acceptable to drink and drive. More than 90% of Brits say that drink-driving is unacceptable, and they’d feel ashamed if they got caught.In a large survey of road users across Europe, around 10% of car drivers in the UK said that they had driven after having at least one drink in the last month. 8% said they drove while being over the legal limit. So drink-driving still happens, but it’s much less normalized than it used to be.This shift happened through legal actions and public education campaigns.12 In 1967, the UK introduced a drink-driving law, which set an objective and measurable limit for how much alcohol was allowed in someone’s bloodstream. They also introduced breathalyzers and told police to stop and test people liberally. Before 1967, there was a law against drink-driving, but it was vague and hard to enforce. It was illegal to be "under the influence of drink or drugs to such an extent as to be incapable of having proper control of the vehicle", but without a legal limit or standardized testing, police often struggled to prove that someone was impaired due to alcohol, especially in court. This is a clear example of better data measurement having saved many lives.Over time, the consequences for getting caught increased, including a permanent driving ban, hefty fines, or even jail time for serious offenses.While the legal consequences were ramping up, the government launched hard-hitting ad campaigns to highlight the suffering that could be caused by drunk driving. Slogans such as “drinking and driving wrecks lives” became well-known. Advertisements where a night out ended with someone’s loved ones being killed increased the stigma of prioritizing one more drink over a person’s life. The evidence suggests that public information campaigns alone produce mixed (and often unimpressive) results, but they can make a real difference when paired with strong enforcement.This battle has been incredibly successful. In 1967, 1,640 people died in drunk-driving incidents. This has fallen by 82% to roughly 300 per year. As you can see in the chart below, collisions involving drunk drivers have fallen even more quickly than the overall reduction in road collisions.This reduction matters a lot because drink-driving incidents are particularly fatal. In 2022, just 4% of road collisions involved drunk drivers, but these incidents resulted in 18% of road deaths.13The rise of motorcycle helmets, seatbelts, and safer carsTackling drunk driving helped to reduce the number of collisions, but much of the drop in deaths during the 1980s and 1990s was about protecting drivers and passengers when a vehicle did crash.This rise in protection within cars was pre-dated by mandatory helmets on motorcycles in 1973. At the time, early data suggested that wearing a helmet dramatically reduced the likelihood of a serious or life-threatening head injury in a motorcycle incident. In the decades since, the evidence for this has only gotten stronger.14 In the US, states with less stringent helmet laws have more head injuries.15 A meta-analysis of studies across Africa suggests that helmet-wearing reduced the risk of a severe head injury by up to 88%.16A decade later, in 1983, wearing seatbelts in the front seats of vehicles became mandatory. A few years later, belts became mandatory for children in the back seats, and by 1991, it was mandatory for everyone in the car. Like motorcycle helmets, seatbelts make a huge difference to someone’s odds of surviving a crash.17But it wasn’t just the provision of seatbelts that changed. By the late 1990s, the European New Car Assessment Programme (NCAP) was introduced, spearheaded by the UK. It provided detailed safety assessments and tests for new cars. This programme was voluntary, but vehicles could receive a “safety rating” depending on how well drivers, passengers, and children would be protected during tests such as front-on and side collisions. This meant that people now factored in the safety rating of cars when choosing a new one, and manufacturers had to develop safer cars. Tests also showed the effectiveness of airbags, seatbelts, and “crumple zones” — the parts that absorb energy during a collision to protect occupants.These innovations made a real difference to the odds that someone would survive a crash. It was during the 1990s and early 2000s that the number of deaths among drivers and passengers fell particularly strongly.Making roads safer for kids: stricter speed limits and traffic-calmed zonesThe most dramatic decline has been the reduction in the number of pedestrians killed on Britain’s roads. Since 1990, pedestrian deaths have fallen by 75% from around 1,600 to 400 per year.Speed limits have played an incredibly important role, not just for pedestrians on urban roads but for all road users. As the World Bank’s report puts it:“[...] there are no other risk factors that have such a substantial and pervasive impact on safety as speed. Speed has an impact on both the likelihood of a crash occurring, and severity of the outcome when crashes do occur.”The relationship between speed and health impacts follows a “power law”: a 5% increase in average speed typically leads to a 10% increase in injury, and a 20% increase in deaths.18Speed limits should be set based on the most vulnerable road users. They can be higher on motorways because everyone is protected within a vehicle. On urban roads, limits need to be set based on the risks to pedestrians and cyclists. In areas with many children, their vulnerability calls for even stricter limits.In the late 1990s, the UK introduced 20-mile-per-hour zones around schools. These expanded throughout the 2000s and are now common across the country. Across the board, the enforcement of speed limits has become much tighter. These interventions can be very effective.19 If a pedestrian is hit by a vehicle at or below 20 miles per hour, they have a good chance of surviving. Above this, their chances fall dramatically. A study across 40 cities in Europe found that a 20-mph speed limit reduced the rate of fatalities by 37%.20 In some areas, including cities in the UK, it was as much as 70%.21Like the war against drunk driving, these legal limits were also accompanied by emotionally visceral public campaigns. I still remember the TV advert I saw several times a week as a child. It featured a young girl, dead at the side of the road, with her voiceover telling drivers: “If you hit me at 40 miles per hour, there’s an 80% chance I’ll die. Hit me at 30, and there’s an 80% chance I’ll live”. These are the types of messages that stay with people and can change behaviors and attitudes.As a consequence, the drop in child deaths on the UK’s roads has been dramatic. You can see this in the chart below. In 1980, over 600 children were killed. By 2021, this had fallen to less than 50.Every year, about 1.2 million die on the world’s roads — we know how to bring this number downA lot has changed since the first British drivers got their cars in the 1920s. The roads are different. The vehicles are different. People’s attitudes to driving are different.These changes transformed Britain’s roads from chaotic to some of the safest in the world, saving thousands of lives every year.Worldwide, around 1.2 million people die from road injuries every year. Most of them are in low- and middle-income countries, with much higher road death rates. If every country could lower its rates to those of the UK, Sweden, or Norway, this number would be just under 200,000.22 We’d save one million lives every year.Learning from the history of how roads became safer would make a massive difference to people's health worldwide. It would mean that hundreds of thousands of parents, children, or partners don’t have to receive the dreaded phone call that their loved one will never come home.AcknowledgmentsMany thanks to Max Roser, Saloni Dattani, and Edouard Mathieu for their valuable suggestions and feedback on this article.EndnotesThe death rate in 1950 was 111 deaths per billion miles driven. In 2023, 334.4 billion miles were driven. That means the number of deaths would be [111 * 334.4 = 37,000].In this article, I will largely use the terms “Britain” and the “United Kingdom” interchangeably for simplicity. However, these terms differ slightly: Britain includes England, Wales, and Scotland, while the United Kingdom includes Northern Ireland.“Turner, B., Job, S. and Mitra, S. (2021). Guide for Road Safety Interventions: Evidence of What Works and What Does Not Work. Washington, DC., USA: World Bank.”In 1951, Britain introduced zebra crossings. Within a year, pedestrian deaths had fallen by 11%, which is often used as evidence to support their effectiveness. However, evidence from across countries finds more mixed results. What seems key is that the zebra crossing is visible to drivers at a distance. This often means that having a raised crossing, or islands in the middle of the road, is more effective than purely markings on the road itself.In 1953, “Lollipop wardens,” individuals who stop traffic around school zones to help children cross the road safely, were introduced.In 1960, the government introduced the “MOT test”, a check that vehicles must pass to ensure they are safe enough to be on the road. Again, the benefits of MOT tests appear to be context-specific. The UK now has a relatively modern vehicle fleet, meaning mechanical faults that lead to accidents are much less likely. In the UK, just 1–2% of crashes are caused by a vehicle defect. In the US, it’s just 2-3%. From this data, we might assume that MOT tests are incredibly effective (hence why rates are so low). However, some studies suggest that the impact of MOTs on crash rates for modern cars is low; an experiment in Norway found no difference in crash rates between cars that had routine inspections and those that didn’t. This was not the case for trucks and heavier vehicles; less frequent inspections have been linked to higher crash rates.The benefits of MOT tests for modern cars could be relatively small. However, a far higher percentage of crashes in low- to middle-income countries result from mechanical fault. Here, the introduction of more routine inspection could make a difference.ITF (2024), Road Safety Annual Report 2024, OECD Publishing, Paris.Retting, R. A., Persaud, B. N., Garder, P. E., & Lord, D. (2001). Crash and injury reduction following installation of roundabouts in the United States. American journal of public health, 91(4), 628.De Brabander, B., Nuyts, E., & Vereeck, L. (2005). Road safety effects of roundabouts in Flanders. Journal of Safety Research, 36(3), 289-296.Elvik, R. (2003). Effects on road safety of converting intersections to roundabouts: review of evidence from non-US studies. Transportation Research Record, 1847(1), 1-10.Elvik, R. (2017). Road safety effects of roundabouts: A meta-analysis. Accident Analysis & Prevention, 99, 364-371.Retting, R. A., Mandavilli, S., McCartt, A. T., & Russell, E. R. (2006). Roundabouts, traffic flow and public opinion. Traffic engineering and control, 47(7), 268-272.In an article in Works in Progress, Nick Cowen looks at how this was achieved in Britain in more detail.These figures seem very high to me, but are repeatedly referenced in UK government reports and documentation. The original surveys for this data are unavailable online, so we don’t know the exact phrasing of the questions. I suspect that “drunk driving” in this case meant driving after any alcohol consumption, and did not necessarily mean they were driving “drunk”.Another piece of evidence that made me less skeptical was that self-reported rates of drink-driving are still high in many other European countries. In a large survey of road users across Europe, 37% of car drivers in Luxembourg said they had driven after having at least one drink in the last 30 days. In Portugal, it was 28%; in Spain, 24%. The rate among male drivers, and particularly young male drivers, is likely to be higher.The UK Department for Transport has an extensive document outlining these interventions and changes in public attitudes over time.Bullmore et al. (2012). Department for Transport: how thirty years of drink drive communications saved almost 2,000 lives.In 2022, there were 106,000 collisions in Great Britain; just 4600 of those involved drink driving, which is around 4%. In that year, around 1700 people died on Britain’s roads, and 300 of those — which is 18% — happened in drink driving collisions.Yu, W. Y., Chen, C. Y., Chiu, W. T., & Lin, M. R. (2011). Effectiveness of different types of motorcycle helmets and effects of their improper use on head injuries. International journal of epidemiology, 40(3), 794-803.Ganga, A., Kim, E. J., Tang, O. Y., Feler, J. R., Sastry, R. A., Anderson, M. N., ... & Sullivan, P. Z. (2023). The burden of unhelmeted motorcycle injury: A nationwide scoring-based analysis of helmet safety legislation. Injury, 54(3), 848-856.Olsen, C. S., Thomas, A. M., Singleton, M., Gaichas, A. M., Smith, T. J., Smith, G. A., ... & Cook, L. J. (2016). Motorcycle helmet effectiveness in reducing head, face and brain injuries by state and helmet law. Injury epidemiology, 3, 1-11.Abdi, N., Robertson, T., Petrucka, P., & Crizzle, A. M. (2022). Do motorcycle helmets reduce road traffic injuries, hospitalizations and mortalities in low and lower-middle income countries in Africa? A systematic review and meta-analysis. BMC public health, 22(1), 824.Evans, L. (1986). The effectiveness of safety belts in preventing fatalities. Accident Analysis & Prevention, 18(3), 229-241.Speed management: a road safety manual for decision-makers and practitioners. Geneva, Global Road Safety Partnership, 2008Retting, R. A., Ferguson, S. A., & McCartt, A. T. (2003). A review of evidence-based traffic engineering measures designed to reduce pedestrian–motor vehicle crashes. American journal of public health, 93(9), 1456-1463.This study looks at a review of 30km/h speed limits, which is around 19 mph.Yannis, G., & Michelaraki, E. (2024). Review of city-wide 30 km/h speed limit benefits in Europe. Sustainability, 16(11), 4382.Musial, S., Bunn, S. & Lally, C. (2025) Public health impacts of 20 mph limits and zones. Parliamentary Office of Science and Technology.The global death rate from road injuries was 15.4 per 100,000 in 2021. This figure was 2.4 per 100,000 in the UK. To calculate the number of deaths if the global average converged to the UK rate: [1.2 million / 15.4 * 2.4] = 189,000.Cite this workOur articles and data visualizations rely on work from many different people and organizations. When citing this article, please also cite the underlying data sources. This article can be cited as:Hannah Ritchie (2025) - “How Britain built some of the world’s safest roads” Published online at OurWorldinData.org. Retrieved from: 'https://ourworldindata.org/britain-safest-roads-history' [Online Resource]BibTeX citation@article{owid-britain-safest-roads-history,
-    author = {Hannah Ritchie},
-    title = {How Britain built some of the world’s safest roads},
-    journal = {Our World in Data},
-    year = {2025},
-    note = {https://ourworldindata.org/britain-safest-roads-history}
-}Reuse this work freelyAll visualizations, data, and code produced by Our World in Data are completely open access under the Creative Commons BY license. You have the permission to use, distribute, and reproduce these in any medium, provided the source and authors are credited.The data produced by third parties and made available by Our World in Data is subject to the license terms from the original third-party authors. We will always indicate the original source of the data in our documentation, so you should always check the license of any such third-party data before use and redistribution.All of our charts can be embedded in any site.]]></content:encoded>
         </item>
     </channel>
 </rss>
