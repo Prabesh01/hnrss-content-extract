@@ -4,11 +4,298 @@
         <title>Hacker News: Front Page</title>
         <link>https://news.ycombinator.com/</link>
         <description>Hacker News RSS</description>
-        <lastBuildDate>Wed, 10 Sep 2025 03:05:10 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 10 Sep 2025 03:40:43 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>github.com/Prabesh01/hnrss-content-extract</generator>
         <language>en</language>
         <atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/frontpage.rss" rel="self" type="application/rss+xml"/>
+        <item>
+            <title><![CDATA[I replaced Animal Crossing's dialogue with a live LLM by hacking GameCube memory]]></title>
+            <link>https://joshfonseca.com/blogs/animal-crossing-llm</link>
+            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45192655</guid>
+            <description><![CDATA[How I replaced Animal Crossing's dialogue with a live LLM by bridging GameCube memory to a cloud AI, with no game code changes required.]]></description>
+            <content:encoded><![CDATA[
+		
+			
+			A bridge from 2001 to today, with no game code changes required.
+		
+
+		
+			
+			Cookie: "Oh my gosh, Josh :)! I just had the weirdest dream, like, everything we do is a game! Arfer!"
+		
+
+		
+			Animal Crossing. Infamous for its charming but ultimately repetitive dialogue. Having picked up the GameCube classic again, I was shocked (/s) to discover that the villagers still say the same things they did 23 years ago. Let's change that.
+		
+		
+			The problem? The game runs on a Nintendo GameCube, a 24-year-old console with a 485 MHz PowerPC processor, 24MB of RAM, and absolutely no internet connectivity. It was fundamentally, physically, and philosophically designed to be an offline island.
+		
+		
+			This is the story of how I built a bridge from 2001 to today, making a vintage game console talk to a cloud-based AI without modifying a single line of the original game's code.
+		
+
+		The First Hurdle: Speaking to the Game 🗣️
+		
+			My first stroke of luck was immense. The week I started this project, a massive effort by the Animal Crossing decompilation community reached completion. Instead of staring at PowerPC assembly, I had access to readable C code.
+		
+		
+			Digging through the source, I quickly found the relevant functions under a file named m_message.c. This was it, the heart of the dialogue system. A simple test confirmed I could hijack the function call and replace the in-game text with my own string.
+		
+
+		C: A glimpse into the decompiled dialogue system
+		// A glimpse into the decompiled Animal Crossing source code
+// The function that changes message data in the dialogue system.
+// My initial entry point for hijacking the text.
+
+extern int mMsg_ChangeMsgData(mMsg_Window_c* msg_p, int index) {
+    if (index >= 0 && index < MSG_MAX && mMsg_LoadMsgData(msg_p->msg_data, index, FALSE)) {
+        msg_p->end_text_cursor_idx = 0;
+        mMsg_Clear_CursolIndex(msg_p);
+        mMsg_SetTimer(msg_p, 20.0f);
+        return TRUE;
+    }
+    
+    return FALSE;
+}
+
+
+		
+			Easy win, right? But changing static text is one thing. How could I get data from an external AI into the game in real time?
+		
+		
+			My first thought was to just add a network call. But that would mean writing an entire network stack for the GameCube from scratch (TCP/IP, sockets, HTTP) and integrating it into a game engine that was never designed for it. That was a non-starter.
+		
+		
+			My second thought was to use the Dolphin emulator's features to write to a file on my host machine. The game would write a "request" file with context, and my Python script would see it, call the LLM, and write back a "response" file. Unfortunately, I couldn't get the sandboxed GameCube environment to access the host filesystem. Another dead end.
+		
+
+		The Breakthrough: The Memory Mailbox 📬
+		
+			The solution came from a classic technique in game modding: Inter-Process Communication (IPC) via shared memory. The idea is to allocate a specific chunk of the GameCube's RAM to act as a "mailbox." My external Python script can write data directly into that memory address, and the game can read from it.
+		
+
+		
+			
+				graph TD
+					A[Python Script] -- "Writes LLM response" --> B{Memory Mailbox @ 0x81298360}
+					B -- "Game reads new dialogue" --> C[Animal Crossing on Dolphin Emulator]
+					C -- "Writes current speaker & context" --> B
+			
+		
+
+		Python: The core of the "Memory Mailbox" interface
+		# This is the bridge. These functions read from and write to GameCube RAM via Dolphin.
+GAMECUBE_MEMORY_BASE = 0x80000000
+
+def read_from_game(gc_address: int, size: int) -> bytes:
+    """Reads a block of memory from a GameCube virtual address."""
+    real_address = GAMECUBE_MEMORY_BASE + (gc_address - 0x80000000)
+    return dolphin_process.read(real_address, size)
+
+def write_to_game(gc_address: int, data: bytes) -> bool:
+    """Writes a block of data to a GameCube virtual address."""
+    real_address = GAMECUBE_MEMORY_BASE + (gc_address - 0x80000000)
+    return dolphin_process.write(real_address, data)
+
+
+		
+			This was the path forward. But it created a new, painstaking task: I had to become a memory archaeologist. I needed to find the exact stable memory addresses for the active dialogue text and the current speaker's name.
+		
+		
+			To do this, I wrote my own memory scanner in Python. The process was a tedious loop:
+		
+		
+			Talk to a villager. The moment their dialogue box appeared, I'd freeze the emulator.
+			Scan. I'd run my script to scan all 24 million bytes of the GameCube's RAM for the string of text on screen (e.g., "Hey, how's it going?").
+			Cross-Reference. This often returned multiple addresses. So, I'd unfreeze, talk to a different villager, and scan for their name to figure out which memory block belonged to the active speaker.
+		
+		
+			After hours of talking, freezing, and scanning, I finally nailed down the key addresses: 0x8129A3EA for the speaker's name and 0x81298360 for the dialogue buffer. I could now reliably read who was talking and, more importantly, write data back to the dialogue box.
+		
+
+		What About the GameCube Broadband Adapter? 🌐
+		
+			Yes, the GameCube had an official Broadband Adapter (BBA). But Animal Crossing shipped without networking primitives, sockets, or any game-layer protocol to use it. Using the BBA here would have required building a tiny networking stack and patching the game to call it. That means: hooking engine callsites, scheduling async I/O, and handling retries/timeouts, all inside a codebase that never expected the network to exist.
+		
+		
+			Engine hooks: Hijack safe points in the message loop to send/receive packets.
+			Driver/protocol: Provide a minimal UDP/RPC interface over BBA.
+			Robustness: Handle timeouts, retries, and partial reads without stalling animations/UI.
+		
+		
+			
+				graph LR
+					subgraph Option A: BBA Network Shim
+						AC[Animal Crossing] --> Hooks[Net Shim Hooks]
+						Hooks --> BBA[BBA Driver]
+						BBA --> LAN[(LAN)]
+						LAN --> Host[Host Bridge Server]
+					end
+					subgraph Option B: RAM Mailbox
+						AC2[Animal Crossing] --> Mailbox[RAM Mailbox]
+						Mailbox --> Py[Python Watcher]
+						Py --> LLM[LLM]
+					end
+			
+		
+		
+			I chose the RAM mailbox because it's deterministic, requires zero kernel/driver work, and stays entirely within the emulator boundary, with no binary network stack needed. That said, a BBA shim is absolutely possible (and a fun future project for real hardware via Swiss + homebrew).
+		
+
+		C: Minimal RPC envelope for a hypothetical BBA shim
+		#include <stdint.h>
+
+/* Minimal RPC envelope for a hypothetical BBA shim */
+typedef struct {
+    uint32_t magic;    // 'ACRP'
+    uint16_t type;     // 1=Request, 2=Response
+    uint16_t length;   // payload length
+    uint8_t  payload[512];
+} RpcMsg;
+
+int ac_net_send(const RpcMsg* msg);         // sends via BBA
+int ac_net_recv(RpcMsg* out, int timeoutMs); // polls with timeout
+
+
+		Python: Host-side UDP bridge (very simplified)
+		import socket, json
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("0.0.0.0", 19135))
+while True:
+    data, addr = sock.recvfrom(2048)
+    msg = json.loads(data.decode("utf-8", "ignore"))
+    # ... call Writer/Director LLMs ...
+    reply = json.dumps({"ok": True, "text": "Hi from the cloud!"}).encode()
+    sock.sendto(reply, addr)
+
+
+		Speaking the Game's Secret Language 🤫
+		
+			I eagerly tried writing "Hello World" to the dialogue address and... the game froze. The character animations kept playing, but the dialogue wouldn't advance. I was so close, yet so far.
+		
+		
+			The problem was that I was sending plain text. Animal Crossing doesn't speak plain text. It speaks its own encoded language filled with control codes.
+		
+		
+			Think of it like HTML. Your browser doesn't just display words; it interprets tags like <b> to make text bold. Animal Crossing does the same. A special prefix byte, CHAR_CONTROL_CODE, tells the game engine, "The next byte isn't a character, it's a command!"
+		
+		
+			These commands control everything: text color, pauses, sound effects, character emotions, and even the end of a conversation. If you don't send the <End Conversation> control code, the game simply waits forever for a command that never comes. That's why it was freezing.
+		
+		
+			Once again, the decompilation community saved me. They had already documented most of these codes. I just needed to build the tools to use them.
+		
+		
+			I wrote an encoder and a decoder in Python. The decoder could read raw game memory and translate it into a human-readable format, and the encoder could take my text with custom tags and convert it back into the exact sequence of bytes the GameCube understood.
+		
+		Python: A small sample of the control codes I had to encode/decode
+		# A small sample of the control codes I had to encode/decode
+CONTROL_CODES = {
+    0x00: "<End Conversation>",
+    0x03: "<Pause [{:02X}]>",        # e.g., <Pause [0A]> for a short pause
+    0x05: "<Color Line [{:06X}]>",  # e.g., <Color Line [FF0000]> for red
+    0x09: "<NPC Expression [Cat:{:02X}] [{}]>", # Trigger an emotion
+    0x59: "<Play Sound Effect [{}]>",  # e.g., <Play Sound Effect [Happy]>
+    0x1A: "<Player Name>",
+    0x1C: "<Catchphrase>",
+}
+
+# The magic byte that signals a command is coming
+PREFIX_BYTE = 0x7F
+
+
+		
+			With my new encoder, I tried again. This time, I wasn't just sending text. I was speaking the game's language. And it worked. The hardest part of the hack was done.
+		
+
+		Building the AI Brain 🧠
+		
+			With the communication channel established, it was time for the fun part: building the AI.
+		
+		
+			My initial approach was to have a single LLM do everything: write dialogue, stay in character, and insert the technical control codes. The results were a mess. The AI was trying to be a creative writer and a technical programmer simultaneously and was bad at both.
+		
+		
+			The solution was to split the task into a two-model pipeline: a Writer and a Director.
+		
+		
+			The Writer AI: This model's only job is to be creative. It receives a detailed character sheet (which I generated by scraping the Animal Crossing Fan Wiki) and focuses on writing dialogue that is funny, in-character, and relevant to the context.
+			The Director AI: This model receives the pure text from the Writer. Its job is purely technical. It reads the dialogue and decides how to "shoot the scene." It adds pauses for dramatic effect, emphasizes words with color, and chooses the perfect facial expression or sound effect to match the mood.
+		
+		
+			This separation of concerns worked perfectly.
+		
+
+		
+			
+				graph LR
+					subgraph Game World
+						Dolphin(Dolphin Emulator)
+					end
+
+					subgraph Python Bridge
+						Watcher(watch_dialogue.py)
+						Encoder(Encoder/Decoder)
+					end
+
+					subgraph AI Core
+						Writer(Writer LLM)
+						Director(Director LLM)
+					end
+
+					subgraph External Data
+						Wiki(Fan Wiki)
+						News(RSS Feeds)
+					end
+
+					Dolphin <--> |IPC via RAM| Watcher
+					Watcher --> |Context| Writer
+					Wiki --> |Character Sheets| Writer
+					News --> |Current Events| Writer
+
+					Writer --> |Raw Dialogue| Director
+					Director --> |Decorated Dialogue| Encoder
+					Encoder --> |Encoded Bytes| Watcher
+			
+		
+
+		Emergent Behavior 🤪
+		
+			First I piped in a lightweight news feed. Within minutes, villagers began weaving headlines into small talk, no prompts, just context.
+		
+
+		
+			
+			Mitzi: "About the news? European leaders are planning to meet with Trump and Zelenskyy!"
+		
+
+		
+			Then I gave them a tiny shared memory for gossip, who said what, to whom, and how they felt. Predictably, it escalated into an anti-Tom Nook movement.
+		
+
+		
+			
+			Cookie: "Everything's going great in town, but sometimes I feel like Tom Nook is, like, taking all the bells!"
+		
+
+		
+			And I was reminded that I used Fox News as the news feed.
+		
+
+		
+			
+			Cookie: "A woman was killed in a robbery in a blue city!"
+		
+
+		
+			Now the game is a strange, hilarious, and slightly unsettling :)
+		
+		
+			All the code for this project, including the memory interface, dialogue encoder, and AI prompting logic, is available on GitHub. It was one of the most challenging and rewarding projects I've ever tackled, blending reverse engineering, AI, and a deep love for a classic game.
+			Watch the full video: Modern AI in a 24-Year-Old Game
+	]]></content:encoded>
+        </item>
         <item>
             <title><![CDATA[Outraged Farmers Blame Ag Monopolies as Catastrophic Collapse Looms]]></title>
             <link>https://www.agweb.com/markets/outraged-farmers-blame-ag-monopolies-catastrophic-collapse-looms</link>
@@ -81,13 +368,6 @@ For example, the two patients in the clinical trial whose cancer disappeared bot
 “As a general rule, only 25 to 30% of patients will respond to immunotherapy, so the biggest challenge in the field is to try to determine which patients will benefit from it. What are the indicators or predictors of response? And how can we convert non-responders into responders?”
 
   ]]></content:encoded>
-        </item>
-        <item>
-            <title><![CDATA[A cryptography expert on how Web3 started, and how it’s going]]></title>
-            <link>https://spectrum.ieee.org/web3-hardware-security</link>
-            <guid isPermaLink="false">https://news.ycombinator.com/item?id=45186726</guid>
-            <description><![CDATA[Web3's evolution: From privacy dreams to blockchain's financial reality. How does cryptography fit in?]]></description>
-            <content:encoded><![CDATA[The term Web3 was originally coined by Etherium cofounder Gavin Wood as a secure, decentralized, peer-to-peer version of the Internet. The idea was to build an Internet based on blockchain technology and a peer-to-peer network, without the need for large data centers or third-party providers. These days, however, blockchain is most famous as the tool enabling cryptocurrencies. Most recently, the Trump administration has taken on a pro-cryptocurrency stance, boosting blockchain’s popularity and media prominence.Cryptography is central to the functioning of blockchains, whether for a decentralized Web or for cryptocurrencies. Every time a cryptocurrency transaction is initiated, all parties involved in the transaction need to securely prove that they agree to the transfer. This is done via a digital signature: a cryptographic protocol that generates a secret, private key that is unique to each user and a public key that the user shares. Then, the private key is used to generate a unique signature for each transaction. The public key can be used to verify that, indeed, the signature was created by the holder of the private key. In this way, Web3 in every incarnation relies heavily on cryptography. To learn more about the evolution of Web3, and cryptography’s role, we caught up with Riad Wahby, assistant professor of electrical and computer engineering at Carnegie Mellon University, in Pittsburgh, and a cofounder and CEO of hardware-backed Web3 security platform Cubist. Wahby explained what Web3 was meant to be, what it’s become, and how hardware-backed cryptography will enable its future.Web3 Began as a Response to What Came BeforeIEEE Spectrum: What is Web3?Riad Wahby: That’s the hardest question that you’re going to ask by far, because I don’t know how to answer it in a way that satisfies everyone.The term Web3 was coined around 2014, by people who looked at the way that the Web had developed. Web 1.0 was the first Web bubble, the dot-com bubble. Web 2.0, roughly speaking, is Google and Facebook and Microsoft and Apple and Netflix, and the like. And the perception, especially from folks who originally coined this term Web3, was that these companies had basically taken the Web in the wrong direction, because your privacy is gone, and you’re the product, so to speak. You use Gmail for free because Google is mining your emails to sell things like better advertising. Web3 was originally a reaction to this. Early proponents of Web3 basically said, “We don’t want that. We want to take back control of our stuff. I want to own my own data, and maybe cryptocurrencies and blockchains are the way there.” So that’s where the term originally came from.What does the term mean now?Wahby: Now it doesn’t mean anything like that at all. Now Web3 is the broader ecosystem around cryptocurrencies and blockchain-based technologies. And I think basically all of that revolutionary spirit has gone away in favor of building financial products and making a lot of money doing it. As far as I can tell, the term has really transformed from a reaction to a lack of privacy and a lack of sovereignty in my own data to “Hey, this is a technology that has something to do with blockchains.” Maybe you can buy some kind of speculative meme coin and make a bunch of money doing it. So I don’t know, maybe that took a dark turn at the end. That’s how things go.How are those two definitions connected?Wahby: Cryptography really fits into the revolutionary spirit, in the sense that the folks who want to cast off the chains of things like Google and Facebook, one of the tenets was—”The way that we’ll do that is we’ll build this technology that’s sort of amazing and that gives us all these great properties.” And they were going to do that using some advanced cryptographic technologies. This is the reason that there’s so many people who are cryptography researchers at universities that also are involved deeply in some kind of cryptocurrency. Because it’s like this is a sea change in the way that cryptography gets used in the world.Twenty years ago, it used to be that if you were working on really any kind of cryptography, regardless of how theoretical or how practical you intended it to be, you knew that there was not much of a chance that any of it was going to get really used in the world, unless it was extremely practical and extremely focused on solving some immediate problem. And it just used to be the case that people were extremely conservative about what kind of cryptography they used. Basically, everyone thought, “We don’t need any of this crazy stuff. That’s all theory. Nobody cares. The only stuff we need is what lets you connect to Amazon and safely buy stuff.” The rise of cryptocurrencies brought with it this whole shift in the way that cryptography gets deployed in the world, where now if you can come up with some interesting functionality that’s enabled by some advanced cryptography, probably somewhere somebody is going to try and turn that into a product that they can sell.Web3 Is Both Good and Bad for CryptographyWhat effect has this had on the cryptographic community?Wahby: It’s both good and bad. It’s good in that this means that there’s a lot of motivation to build interesting, cool stuff. And as a researcher in cryptography, I love it because it means that there’s tons more research money being poured into cryptography.That’s the good side. The bad side is that the reason that people were so conservative about deploying new cryptography is that it’s easy to get the security mechanism wrong. The default state of cryptography is [to assume everything is] broken. You have to be very, very careful that each change that you make isn’t returning your cryptography to the default state. I’m not saying that people in Web3 aren’t careful. They are. It’s just by the nature of things, since it’s a much faster time frame, there’s much more pressure to just push stuff into production. And I think the downside is that we have seen a little bit of brokenness. It’s hopefully not causing people to lose oodles of money. And I think the historical record bears this out: People lose oodles of money because other people are really dishonest, not because the cryptography is broken for the most part. But the cryptography can also be broken, and that can also be worrisome. But I’d say from the perspective of somebody who’s doing research in cryptography, the impact of Web3 on the cryptographic community has generally been a good thing.Now you’re focused on hardware security. Can you explain what that is?Wahby: Any cryptocurrency has this property that if I hold some token, and I want to send it to somebody else, the way that I do that is by producing a digital signature that says, I want to spend this token. The secret key is what lets you generate a signature. So if you have 10 ETH [cryptocurrency coins], and they’re all protected by this key, and somebody takes a copy of your key, then life is bad.With a digital signature key it could just be sitting on your hard drive, and then you get some malware, and now somebody has silently stolen your key. There have been these big, broadly targeted malware campaigns where millions and millions of people have all had their keys stolen. So now the criminals are just like sitting there counting up all the money that they’ve stolen, and there’s no reversing transactions, unlike at a bank.Here’s where hardware comes in. This is not really a Web3 technology, this is kind of old, good stuff. There are these devices called hardware security modules, and they’ve been used for multiple decades. This is a physical device, and this device can run certain cryptographic algorithms. And it knows enough that when you tell it, “Hey, please generate me a key,” it can generate you a key securely. And when you tell it, “Please give me a signature,” it can give you a signature securely. But the important thing is the way that it’s designed, the key never leaves this piece of hardware. It turns what was a piece of data into a physical object. And we know how to secure a physical object.You’re working on extending hardware security for more use cases. Can you explain what you’re doing?Wahby: There are two issues with the standard hardware security module.No. 1, you need more cryptography support, so you need to be able to apply digital signatures to transactions very quickly if you’re actively trading. And No. 2, you need a way of expressing that it’s not just a key that can generate any signature. It’s a key that also has attached to it some kind of policy that says these are the kinds of signatures that are okay to generate, and everything else is not allowed, to add extra security. These are the two directions that we have that our technology enables within traditional hardware security modules.We start with the security that’s provided by the traditional hardware security module, and we extend it using this, actually another piece of trusted hardware called the Trusted Execution Environment. We extend it to support the actual kinds of cryptography that are needed for Web3 and to support this rich programmable policy layer that lets you say, “This key is only intended for this specific kind of use,” or “anytime somebody tries to make a payment from this key, first I have to check whether the recipient is subject to sanctions,” or any other rule. So in the end, we have, not only a hardware security module, we have also this Trusted Execution Environment and this policy layer, and all this other cryptographic stuff that together gives us a hardware security module that’s really designed for the Web3 use case.]]></content:encoded>
         </item>
         <item>
             <title><![CDATA[Memory Integrity Enforcement]]></title>
