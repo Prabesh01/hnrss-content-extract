@@ -18,6 +18,7 @@ fg.link( href='https://news.ycombinator.com/', rel='alternate' )
 fg.subtitle('Hacker News RSS')
 fg.link( href='https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml', rel='self' )
 fg.language('en')
+fg.updated()
 
 items = requests.get("https://hnrss.org/frontpage.jsonfeed").json()['items']
 total = len(items)
