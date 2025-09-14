@@ -33,6 +33,7 @@ for itm in items:
     fe.id(itm['id'])
     fe.title(itm['title'])
     fe.link(href=url)
+    fe.published(itm['date_published'])
 
     try: res = requests.get(url,headers={'user-agent':'Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0'})
     except: pass
