@@ -1,331 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-09-18T13:01:13.142434+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=45279792</id><title>Optimizing ClickHouse for Intel's 280 core processors</title><updated>2025-09-18T13:01:20.896068+00:00</updated><content>&lt;doc fingerprint="fb5f1c762d32084a"&gt;
-  &lt;main&gt;&lt;quote&gt;&lt;p&gt;This is a guest post from Jiebin Sun, Zhiguo Zhou, Wangyang Guo and Tianyou Li, performance optimization engineers at Intel Shanghai.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;Intel's latest processor generations are pushing the number of cores in a server to unprecedented levels - from 128 P-cores per socket in Granite Rapids to 288 E-cores per socket in Sierra Forest, with future roadmaps targeting 200+ cores per socket. These numbers multiply on multi-socket systems, such servers may consist of 400 and more cores. The paradigm of "more, not faster cores" is driven by physical limitations. Since the end of Dennard scaling in the mid-2000s, power density concerns made it increasingly difficult to push single-thread performance further.&lt;/p&gt;&lt;p&gt;For analytical databases like ClickHouse, ultra-high core counts represent a huge opportunity and a complex challenge at the same time. While more cores theoretically mean more power to process tasks in parallel, most databases struggle to utilize the available hardware fully. Bottlenecks for parallel processing like lock contention, cache coherence, non-uniform memory access (NUMA), memory bandwidth, and coordination overhead become significantly worse as the core count increases.&lt;/p&gt;&lt;head rend="h2"&gt;Optimizing for ultra-high core counts #&lt;/head&gt;&lt;p&gt;Over the past three years, I dedicated a part of my professional life to understand and optimize ClickHouse's scalability on Intel Xeon ultra-high core count processors. My work focused on using various profiling and analysis tools - including perf, emon, and Intel VTune - to analyze all 43 ClickBench queries on ultra-high core count servers systematically, identifying bottlenecks, and optimizing the ClickHouse accordingly.&lt;/p&gt;&lt;p&gt;The results have been exciting: individual optimizations routinely deliver speedups of multiple times for individual queries, in some cases up to 10x. The geometric mean of all 43 ClickBench queries consistently improved between 2% and 10% per optimization. The results demonstrate that ClickHouse can be made to scale very well on ultra-high core count systems.&lt;/p&gt;&lt;head rend="h2"&gt;The core scaling challenge #&lt;/head&gt;&lt;p&gt;Beyond single-thread performance, several key challenges must be addressed to optimize performance in ultra-high core count systems.&lt;/p&gt;&lt;list rend="ol"&gt;&lt;item&gt;Cache coherence overhead: Bouncing cache lines costs CPU cycles.&lt;/item&gt;&lt;item&gt;Lock contention: Amdahl's Law becomes brutal for serialized code sections as little as 1% of the overall code.&lt;/item&gt;&lt;item&gt;Memory bandwidth: Utilizing the memory bandwidth effectively is a persistent challenge for data-intensive systems. Proper memory reuse, management and caching becomes critical.&lt;/item&gt;&lt;item&gt;Thread coordination: The cost of synchronizing threads grows super-linearly with the number of threads.&lt;/item&gt;&lt;item&gt;NUMA effects: The memory latency and bandwidth on multi-socket systems differs for local or remote memory.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;This blog post summarizes our optimizations for ClickHouse on ultra-high core count servers. All of them were merged into the main codeline and they now help to speed up queries in ClickHouse deployments around the globe.&lt;/p&gt;&lt;p&gt;Hardware setup: Our work was conducted on Intel's latest generation platforms, including 2 x 80 vCPUs Ice Lake (ICX), 2 x 128 vCPUs Sapphire Rapids (SPR), 1 x 288 vCPUs Sierra Forest (SRF), and 2 x 240 vCPUs Granite Rapids (GNR). SMT (Hyper-threading) was enabled, except on SRF which doesn't support SMT, and high-memory-bandwidth configurations.&lt;/p&gt;&lt;p&gt;Software setup: We used perf, Intel VTune, pipeline visualization, and other custom profiling infrastructure.&lt;/p&gt;&lt;head rend="h2"&gt;The five optimization areas #&lt;/head&gt;&lt;p&gt;Through a systematic analysis of ClickHouse's performance on ultra-high core count systems, I identified five areas with a high potential for optimization. Each area addresses a different aspect of scalability, and together they form a comprehensive approach to unlocking the full potential of ultra-high core count systems.&lt;/p&gt;&lt;p&gt;My journey began with the most fundamental challenge: lock contention.&lt;/p&gt;&lt;head rend="h2"&gt;Bottleneck 1: Lock contention #&lt;/head&gt;&lt;p&gt;According to queue theory, if N threads compete for the same lock, the cycles grows quadratically (N^2). For example, if we go from 8 to 80 cores, lock wait times increase by (80/8)² = 100x. Furthermore, cache coherence traffic for the mutex itself grows linearly with the core count, and the overhead for context switching compounds the problem. In such settings, every mutex becomes a potential scalability obstacle, and seemingly innocent synchronization patterns can bring entire systems to their knee.&lt;/p&gt;&lt;p&gt;The key insight is that lock contention isn't just about removing locks - it's about rethinking more fundamentally how threads coordinate and share state. This requires a multi-pronged approach: reducing the duration of critical sections, replacing exclusive locks (mutexes) with more granular synchronization primitives, and in some cases, eliminating shared state entirely.&lt;/p&gt;&lt;head rend="h3"&gt;Optimization 1.1: Query condition cache (PR #80247) #&lt;/head&gt;&lt;p&gt;After resolving jemalloc page faults (an optimization detailed below), a new hotspot appeared in &lt;code&gt;native_queued_spin_lock_slowpath&lt;/code&gt; which consumed 76% of the CPU time. This function was called from &lt;code&gt;QueryConditionCache::write&lt;/code&gt; on 2×240 vCPU systems.&lt;/p&gt;&lt;p&gt;What is the query condition cache?&lt;/p&gt;&lt;p&gt;ClickHouse’s query condition cache stores the results of WHERE filters, enabling the database to skip irrelevant data. In each SELECT query, multiple threads check if cache entries must be updated based on different criteria:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;the hash of the filter condition (as cache key)&lt;/item&gt;&lt;item&gt;the read mark ranges&lt;/item&gt;&lt;item&gt;whether the currently read part has a final mark&lt;/item&gt;&lt;/list&gt;&lt;p&gt;The query condition cache is read-heavy, i.e. there are far more reads than writes, but the original implementation used exclusive locking for all operations.&lt;/p&gt;&lt;p&gt;Reducing critical paths in read-heavy workloads&lt;/p&gt;&lt;p&gt;This optimization demonstrates the importance of reducing the time spent holding locks, especially write locks in read-heavy code.&lt;/p&gt;&lt;p&gt;With 240 threads within a single query, the original code created a perfect storm:&lt;/p&gt;&lt;list rend="ol"&gt;&lt;item&gt;Unnecessary write locks: All threads acquired exclusive locks, even when they only read cache entries.&lt;/item&gt;&lt;item&gt;Long critical sections: Expensive updates of cache entries were performed inside exclusive locks.&lt;/item&gt;&lt;item&gt;Redundant work: Multiple threads updated the same cache entries potentially multiple times.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Our optimization uses double-checked locking with atomic operations to resolve these bottlenecks:&lt;/p&gt;&lt;list rend="ol"&gt;&lt;item&gt;The code now first checks with atomic reads (no locking), respectively under a shared lock if an update is needed at all (fast path).&lt;/item&gt;&lt;item&gt;Next, the code checks immediately after acquiring an exclusive lock (slow path) if an update is actually required - another thread may have performed the same update in the meantime.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Implementation&lt;/p&gt;&lt;p&gt;Based on PR #80247, the optimization introduces a fast path which checks if an update is needed before acquiring the expensive write lock.&lt;/p&gt;&lt;code&gt;/// Original code
-void updateCache(mark_ranges, has_final_mark)
-{
-    acquire_exclusive_lock(cache_mutex);  /// 240 threads wait here!
-
-    /// Always update marks, even if already in desired state
-    for (const auto &amp;amp; range : mark_ranges)
-        set_marks_to_false(range.begin, range.end);
-
-    if (has_final_mark):
-        set_final_mark_to_false();
-
-    release_lock(cache_mutex);
-}
-&lt;/code&gt;&lt;code&gt;
-/// Optimized code
-void updateCache(mark_ranges, has_final_mark)
-{
-    /// Fast path: Check if update is needed with a cheap shared lock
-    acquire_shared_lock(cache_mutex);  /// Multiple threads can read simultaneously
-
-    need_update = false;
-    for (const auto &amp;amp; range : mark_ranges)
-    {
-        if (any_marks_are_true(range.begin, range.end))
-        {
-            need_update = true;
-            break;
-        }
-    }
-
-    if (has_final_mark &amp;amp;&amp;amp; final_mark_is_true())
-        need_update = true;
-
-    release_shared_lock(cache_mutex);
-
-    if (!need_update)
-        return;  /// Early out - no expensive lock needed!
-
-    /// Slow path: Actually need to update, acquire exclusive lock
-    acquire_exclusive_lock(cache_mutex);
-
-    /// Double-check: verify update is still needed after acquiring lock
-    need_update = false;
-    for (const auto &amp;amp; range : mark_ranges)
-    {
-        if (any_marks_are_true(range.begin, range.end))
-        {
-            need_update = true;
-            break;
-        }
-    }
-
-    if (has_final_mark &amp;amp;&amp;amp; final_mark_is_true())
-        need_update = true;
-
-    if (need_update)
-    {
-        // Perform the actual updates only if still needed
-        for (const auto &amp;amp; range : mark_ranges)
-            set_marks_to_false(range.begin, range.end);
-
-        if (has_final_mark)
-            set_final_mark_to_false();
-    }
-
-    release_lock(cache_mutex);
-}
-&lt;/code&gt;&lt;p&gt;Performance impact&lt;/p&gt;&lt;p&gt;The optimized code delivered impressive performance improvements:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;CPU cycles spend for &lt;code&gt;native_queued_spin_lock_slowpath&lt;/code&gt;reduced from 76% to 1%&lt;/item&gt;&lt;item&gt;The QPS of ClickBench queries Q10 and Q11 improved by 85% and 89%&lt;/item&gt;&lt;item&gt;The geometric mean of all ClickBench queries improved by 8.1%&lt;/item&gt;&lt;/list&gt;&lt;head rend="h3"&gt;Optimization 1.2: Thread-Local Timer ID (PR #48778) #&lt;/head&gt;&lt;p&gt;ClickHouse's query profiler was frequently creating and deleting a global timer_id variable, causing lock contention during query profiling.&lt;/p&gt;&lt;p&gt;Query profiler timer usage&lt;/p&gt;&lt;p&gt;ClickHouse's query profiler uses POSIX timers to sample thread stacks in periodic intervals for performance analysis. The original implementation:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;created and deleted timer_id frequently during profiling, and&lt;/item&gt;&lt;item&gt;required global synchronization for all operations that read or write the timer.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Usage of shared data structures that needed protection with locks caused significant overhead.&lt;/p&gt;&lt;p&gt;Eliminating global state with thread-local storage&lt;/p&gt;&lt;p&gt;Here, we eliminated lock contention by thread-local storage, removing the need for shared state. Now, each thread has its own timer_id. This avoids shared state and the overhead of thread synchronization. To update a timer, it is no longer required to acquire locks.&lt;/p&gt;&lt;p&gt;Technical solution&lt;/p&gt;&lt;code&gt;/// Original code
-class QueryProfiler
-{
-    static global_mutex timer_management_lock
-
-    void startProfiling()
-    {
-        timer_id = create_new_timer();  /// Expensive system call
-
-        acquire_exclusive_lock(timer_management_lock);  /// Global lock!
-        update_shared_timer_state(timer_id);  /// Modify shared state
-        release_lock(timer_management_lock);
-    }
-
-    void stopProfiling()
-    {
-        acquire_exclusive_lock(timer_management_lock);
-        cleanup_shared_timer_state(timer_id);
-        release_lock(timer_management_lock);
-
-        delete_timer(timer_id);
-    }
-}
-&lt;/code&gt;&lt;code&gt;/// Optimized code
-class QueryProfiler
-{
-    static thread_local timer_id per_thread_timer;
-    static thread_local boolean timer_initialized;
-
-    void startProfiling()
-    {
-        if (!timer_initialized)
-        {
-            per_thread_timer = create_new_timer();  /// Once per thread
-            timer_initialized = true;
-        }
-
-        /// Reuse existing timer - no locks, no system calls!
-        enable_timer(per_thread_timer);
-    }
-
-    void stopProfiling()
-    {
-        /// Just disable timer - no deletion, no locks!
-        disable_timer(per_thread_timer);
-    }
-}
-&lt;/code&gt;&lt;p&gt;Performance impact&lt;/p&gt;&lt;p&gt;The new implementation has the following advantages:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;It eliminated timer-related lock contention hotspots from profiling traces&lt;/item&gt;&lt;item&gt;It reduced timer create/delete system calls through reuse&lt;/item&gt;&lt;item&gt;It makes profiling on ultra-high core count servers more scalable.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Thread-local storage can eliminate lock contention by removing the need for shared state. Global synchronization becomes unnecessary if threads maintain their own state.&lt;/p&gt;&lt;head rend="h2"&gt;Bottleneck 2: Memory management #&lt;/head&gt;&lt;p&gt;Memory optimization on ultra-high core count systems differs a lot from single-threaded memory management. Memory allocators themselves become contention points, memory bandwidth is divided across more cores, and allocation patterns that work fine on small systems can create cascading performance problems at scale. It is crucial to be mindful of how much memory is allocated and how memory is used.&lt;/p&gt;&lt;p&gt;This class of optimizations involves the allocator’s behavior, reducing pressure on memory bandwidth, and sometimes completely rethinking algorithms to eliminate memory-intensive operations altogether.&lt;/p&gt;&lt;head rend="h3"&gt;Optimization 2.1: Jemalloc Memory Reuse Optimization (PR #80245) #&lt;/head&gt;&lt;p&gt;This optimization is motivated by high page fault rates and excessive resident memory usage which we observed for certain aggregation queries on ultra-high core count systems.&lt;/p&gt;&lt;p&gt;Understanding two-level hash tables in ClickHouse&lt;/p&gt;&lt;p&gt;Aggregation in ClickHouse uses different hash tables, depending on the data type, data distribution and data size. Large aggregation states are maintained in ephemeral hash tables.&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;The 1st level consists of 256 static buckets, each pointing to a 2nd level hash table.&lt;/item&gt;&lt;item&gt;2nd level hash tables grow independently of each other.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Memory reuse for two-level hash tables&lt;/p&gt;&lt;p&gt;At the end of an aggregation query, all hash tables used by the query are deallocated. In particular, the 256 sub-hash tables are deallocated and their memory is merged into larger free memory blocks.&lt;/p&gt;&lt;p&gt;jemalloc (as ClickHouse’s memory allocator) unfortunately prevented the reuse of merged memory blocks for future smaller allocations. This is because by default, only memory from blocks up to 64x larger than the requested size can be reused. This issue in jemalloc is very subtle but critical on ultra-high core count systems.&lt;/p&gt;&lt;p&gt;Based on jemalloc issue #2842, we noticed a fundamental problem with jemalloc’s memory reuse for the irregularly-sized allocations typical in two-level hash tables:&lt;/p&gt;&lt;list rend="ol"&gt;&lt;item&gt;Extent management issue: When large allocations are freed, jemalloc fails to efficiently track and reuse these memory extents.&lt;/item&gt;&lt;item&gt;Size class fragmentation: Memory gets trapped in size classes that don't match future allocation patterns.&lt;/item&gt;&lt;item&gt;Metadata overhead: Excessive metadata structures prevent efficient memory coalescing.&lt;/item&gt;&lt;item&gt;Page fault amplification: New allocations trigger page faults instead of reusing existing committed pages.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;We identified jemalloc's &lt;code&gt;lg_extent_max_active_fit&lt;/code&gt; parameter as the root cause - it was too restrictive for ClickHouse's allocation patterns.&lt;/p&gt;&lt;p&gt;We contributed the fix to jemalloc PR #2842, but jemalloc didn’t have new stable releases for an extended period. Fortunately, we could resolve this issue through jemalloc's configuration parameters at compilation time.&lt;/p&gt;&lt;p&gt;Based on ClickHouse PR #80245, the fix involved tuning jemalloc's configuration parameters:&lt;/p&gt;&lt;code&gt;/// Original jemalloc configuration
-JEMALLOC_CONFIG_MALLOC_CONF = "oversize_threshold:0,muzzy_decay_ms:0,dirty_decay_ms:5000"
-/// lg_extent_max_active_fit defaults to 6, meaning memory can be reused from extents up to 64x larger than the requested allocation size
-&lt;/code&gt;&lt;code&gt;/// Optimized jemalloc configuration
-JEMALLOC_CONFIG_MALLOC_CONF = "oversize_threshold:0,muzzy_decay_ms:0,dirty_decay_ms:5000,lg_extent_max_active_fit:8"
-/// lg_extent_max_active_fit is set to 8.
-/// This allows memory reuse from extents up to 256x larger
-/// than the requested allocation size (2^8 = 256x vs default 2^6 = 64x).
-/// The 256x limit matches ClickHouse's two-level hash table structure (256 buckets).
-/// This enables efficient reuse of merged hash table memory blocks.
-&lt;/code&gt;&lt;p&gt;Performance impact&lt;/p&gt;&lt;p&gt;The optimization improved&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;the performance of ClickBench query Q35 by 96.1%,&lt;/item&gt;&lt;item&gt;memory usage (VmRSS, resident memory) and page faults reduced for the same query went down by 45.4% and 71%, respectively.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;The behavior of the memory allocator can have a dramatic impact on ultra-high core count systems.&lt;/p&gt;&lt;head rend="h3"&gt;Optimization 2.2: AST Query Rewriting for Memory Reduction (PR #57853) #&lt;/head&gt;&lt;p&gt;ClickBench query Q29 was memory-bound and bottlenecked in excessive memory accesses caused by redundant computations of the form &lt;code&gt;sum(column + literal)&lt;/code&gt;.&lt;/p&gt;&lt;p&gt;Understanding the memory bottleneck&lt;/p&gt;&lt;p&gt;ClickBench query Q29 contains multiple sum expressions with literals:&lt;/p&gt;&lt;code&gt;SELECT SUM(ResolutionWidth), SUM(ResolutionWidth + 1), SUM(ResolutionWidth + 2), 
-       SUM(ResolutionWidth + 3), SUM(ResolutionWidth + 4), SUM(ResolutionWidth + 5), 
-       SUM(ResolutionWidth + 6), SUM(ResolutionWidth + 7), SUM(ResolutionWidth + 8), 
-       SUM(ResolutionWidth + 9), SUM(ResolutionWidth + 10), SUM(ResolutionWidth + 11), 
-       SUM(ResolutionWidth + 12), SUM(ResolutionWidth + 13), SUM(ResolutionWidth + 14), 
-       SUM(ResolutionWidth + 15), SUM(ResolutionWidth + 16), SUM(ResolutionWidth + 17), 
-       SUM(ResolutionWidth + 18), SUM(ResolutionWidth + 19), SUM(ResolutionWidth + 20),
-       -- ... continues up to SUM(ResolutionWidth + 89)
-FROM hits;
-&lt;/code&gt;&lt;p&gt;The original query execution&lt;/p&gt;&lt;list rend="ol"&gt;&lt;item&gt;Loaded column “ResolutionWidth” from storage once,&lt;/item&gt;&lt;item&gt;Compute expressions - 90 times, creating 90 temporary columns (one per expression),&lt;/item&gt;&lt;item&gt;Sum values performing 90 separate aggregation operations on each computed column.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Creating 90 temporary columns and running 90 redundant aggregations obviously created massive memory pressure.&lt;/p&gt;&lt;p&gt;Frontend query optimization for memory efficiency&lt;/p&gt;&lt;p&gt;This optimization demonstrates how better optimizer rules can reduce memory pressure by eliminating redundant computations. The key insight is that many analytical queries contain patterns that can be algebraically simplified.&lt;/p&gt;&lt;p&gt;The optimization recognizes that &lt;code&gt;sum(column + literal)&lt;/code&gt; can be rewritten to &lt;code&gt;sum(column) + count(column) * literal&lt;/code&gt;.&lt;/p&gt;&lt;p&gt;Performance impact&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;ClickBench query Q29 sped up by 11.5x on a 2×80 vCPU system.&lt;/item&gt;&lt;item&gt;The geometric mean of all ClickBench queries saw a 5.3% improvement overall.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;More intelligent query plans can be more effective than optimizing execution itself. Avoiding work is better than doing work efficiently.&lt;/p&gt;&lt;head rend="h2"&gt;Bottleneck 3: Increase parallelism #&lt;/head&gt;&lt;p&gt;Fast aggregation is a core promise of any analytical database. From a database perspective, aggregating data in parallel threads is only one part of the equation. It is equally important to merge the local results in parallel.&lt;/p&gt;&lt;p&gt;ClickHouse's aggregation operator has two phases: In the first phase, each thread processes its portion of the data in parallel, creating a local and partial result. In the second phase, all partial results must be merged. If the merge phase is not properly parallelized, it becomes a bottleneck. More threads can actually make this issue worse by creating more partial results to merge.&lt;/p&gt;&lt;p&gt;Solving this issue requires careful algorithm design, smart data structure choices, and a deep understanding how hash tables behave under different load patterns. The goal is to eliminate the serial merge phase and enable linear scaling even for the most complex aggregation queries.&lt;/p&gt;&lt;head rend="h3"&gt;Optimization 3.1: Hash Table Conversion (PR #50748) #&lt;/head&gt;&lt;p&gt;ClickBench query Q5 showed a severe performance degradation as the core count increased from 80 to 112 threads. Our pipeline analysis revealed serial processing in the hash table conversion.&lt;/p&gt;&lt;p&gt;Understanding hash tables in ClickHouse&lt;/p&gt;&lt;p&gt;ClickHouse uses two types of hash tables for hash aggregation:&lt;/p&gt;&lt;list rend="ol"&gt;&lt;item&gt;Single-level hash tables: This is a flat hash table that is suitable (= faster) for smaller datasets.&lt;/item&gt;&lt;item&gt;Two-level hash tables: This is a hierarchical hash table with 256 buckets. Two-level hash tables are more amendable to large datasets.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;The database chooses the right hash table type based on the size of the processed data: Once a single-level hash table reaches a certain threshold during aggregation, it is automatically converted to a two-level hash table. The code to merge hash tables of different types was serialized.&lt;/p&gt;&lt;p&gt;The serial bottleneck&lt;/p&gt;&lt;p&gt;When merging hash tables from different threads,&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;single-level hash tables were serially merged in a pair-wise manner, e.g. ht1 / ht2 → result, then result / ht3, etc.&lt;/item&gt;&lt;item&gt;two-level hash tables are merged one-by-one as well but the merge is parallelized across buckets.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;In the case of mixed single/two-level hash tables, the single-level hash tables had to be converted to two-level hash tables first (this was a serial process). Once the was done, the resulting two-level hash tables could be merged in parallel.&lt;/p&gt;&lt;p&gt;With Q5, increasing the number of threads from 80 to 112 meant that each thread processes less data. With 80 threads, all hash tables were two-level. With 112 threads, the aggregation ended up with the mixed scenario: some hash tables remained single-level while others became two-level. This caused serialization - all single-level hash tables had to be converted to two-level before parallel merging could take place.&lt;/p&gt;&lt;p&gt;To diagnose the issue, pipeline visualization was a crucial tool. The telltale sign was that the merge phase duration increased with thread count - this is the opposite of what should happen.&lt;/p&gt;&lt;p&gt;Performance degradation with increased core count&lt;/p&gt;Pipeline visualization (max_threads=80) - the merge phase is reasonable Pipeline visualization (max_threads=112) - the merge phase takes 3.2x longer&lt;p&gt;Our optimization parallelizes the conversion phase: instead of converting all single-level hash tables to two-level hash tables one by one (serially), we now convert them in parallel. As each hash table can be converted independently, this eliminates the serial bottleneck.&lt;/p&gt;&lt;code&gt;/// Original code
-void mergeHashTable(left_table, right_table)
-{
-    if (left_table.is_single_level() &amp;amp;&amp;amp; right_table.is_two_level())    
-        left_table.convert_to_two_level();  /// Serial conversion blocks threads
-
-    /// Now merge
-    merge_sets(left_table, right_table);
-}
-&lt;/code&gt;&lt;code&gt;/// Optimized code
-void mergeHashTableParallel(all_tables)
-{
-    /// Phase 1: Parallel conversion
-    parallel_tasks = [];
-    for (const auto &amp;amp; table : all_tables)
-    {
-        if (table.is_single_level())
-        {
-            /// Parallel conversion!
-            task = create_parallel_task(table.convert_to_two_level());
-            parallel_tasks.add(task);
-        }
-    }
-
-    /// Wait for all conversions to complete
-    wait_for_all_tasks(parallel_tasks);
-
-    /// Phase 2: Now all sets are two-level, merge efficiently.
-    for (const auto &amp;amp; pair : all_tables)
-        merge_sets(pair.left_table, pair.right_table);
-}
-&lt;/code&gt;&lt;p&gt;Performance impact&lt;/p&gt;&lt;p&gt;The performance did not improve only for Q5 - the optimization enabled linear scaling for any aggregation-heavy query on ultra-high core count systems.&lt;/p&gt;&lt;p&gt;Performance improvement after parallel conversion - Q5 achieves 264% improvement&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;ClickBench query Q5 improved by a 264% on a 2×112 vCPU system,&lt;/item&gt;&lt;item&gt;24 queries achieved &amp;gt;5% improvement,&lt;/item&gt;&lt;item&gt;the overall geometric mean improved by 7.4%&lt;/item&gt;&lt;/list&gt;&lt;p&gt;The optimization demonstrates that scalability isn't just about making things more parallel - it's about eliminating serial sections that grow with parallelism. Sometimes you need to restructure algorithms on a more deep level, not just add more threads.&lt;/p&gt;&lt;head rend="h3"&gt;Optimization 3.2: Single-Level Hash Table Merging (PR #52973) #&lt;/head&gt;&lt;p&gt;We noticed that the performance was also subpar when all hash tables were single-level.&lt;/p&gt;&lt;p&gt;Extending parallel merge to single-level cases&lt;/p&gt;&lt;p&gt;Building on PR #50748, this optimization recognizes that the benefits of parallel merging are not limited to mixed hash tables. Even when all hash tables are single-level, parallel merging can improve performance if the total data size is large enough.&lt;/p&gt;&lt;p&gt;The challenge was to determine when single-level hash tables should be merged in parallel parallel:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;If datasets are too small, parallelization introduces extra overhead.&lt;/item&gt;&lt;item&gt;If datasets are too large, parallelization may not be beneficial enough.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Based on the implementation in PR #52973, the optimization added parallel merges to all single-level cases:&lt;/p&gt;&lt;code&gt;/// Before: Only parallelize mixed-level merges
-void parallelizeMergePrepare(hash_tables)
-{
-    single_level_count = 0;
-
-    for (const auto &amp;amp; hash_table : hash_tables)
-        if hash_table.is_single_level():
-            single_level_count++;
-
-    /// Only convert if mixed levels (some single, some two-level)
-    if single_level_count &amp;gt; 0 and single_level_count &amp;lt; hash_tables.size():
-        convert_to_two_level_parallel(hash_tables);
-}
-&lt;/code&gt;&lt;code&gt;/// Optimized code
-void parallelizeMergePrepare(hash_tables):
-{
-    single_level_count = 0;
-    all_single_hash_size = 0;
-
-    for (const auto &amp;amp; hash_table : hash_tables)
-        if (hash_table.is_single_level())
-            single_level_count++
-
-    /// Calculate total size if all hash tables are single-level
-    if (single_level_count == hash_tables.size())
-        for (const auto &amp;amp; hash_table : hash_tables)
-            all_single_hash_size += hash_table.size();
-
-    /// Convert if mixed levels OR if all single-level with average size &amp;gt; THRESHOLD
-    if (single_level_count &amp;gt; 0 and single_level_count &amp;lt; hash_tables.size())
-        ||
-       (all_single_hash_size / hash_tables.size() &amp;gt; THRESHOLD)
-        convert_to_two_level_parallel(hash_tables);
-}
-&lt;/code&gt;&lt;p&gt;Performance impact&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;Performance for single-level merge scenarios improved by 235%&lt;/item&gt;&lt;item&gt;The optimal threshold was determined through systematic testing&lt;/item&gt;&lt;item&gt;There were no regressions on small datasets&lt;/item&gt;&lt;/list&gt;&lt;head rend="h3"&gt;Optimization 3.3: Parallel Merge with Key Support (PR #68441) #&lt;/head&gt;&lt;p&gt;GROUP BY operations with large hash tables were merged serially.&lt;/p&gt;&lt;p&gt;Extending parallelization to keyed aggregations&lt;/p&gt;&lt;p&gt;The previous two optimizations (3.1 and 3.2) addressed merges without key - simple hash table operations like &lt;code&gt;COUNT(DISTINCT)&lt;/code&gt;. We applied the same optimization to merges with key where hash tables contain both keys and aggregated values that must be combined, e.g. general &lt;code&gt;GROUP BY&lt;/code&gt; semantics.&lt;/p&gt;&lt;p&gt;Performance Impact:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;ClickBench query Q8 improved by 10.3%, Q9 by 7.6%&lt;/item&gt;&lt;item&gt;There were no regressions in other queries&lt;/item&gt;&lt;item&gt;CPU utilization during the merge phase improved&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Parallel merging can be extended to complex aggregation scenarios with careful attention to cancellation and error handling.&lt;/p&gt;&lt;head rend="h2"&gt;Bottleneck 4: Algorithm optimization #&lt;/head&gt;&lt;p&gt;Harnessing the full potential of SIMD instructions is notoriously difficult. Compilers are conservative about vectorization, and database workloads often have complex control flows that inhibit auto-vectorization.&lt;/p&gt;&lt;p&gt;Effective usage of SIMD instructions in databases requires thinking beyond traditional vectorization. Besides processing N data items simultaneously instead of one, one can also utilize parallel SIMD comparisons for smart pruning strategies which lead to less work done overall. This idea is particularly powerful for string operations. These are at the same time frequently used in practice and computationally expensive.&lt;/p&gt;&lt;head rend="h3"&gt;Optimization 4.1: Two-character SIMD string search (PR #46289) #&lt;/head&gt;&lt;p&gt;String search (e.g. plain substring search or LIKE pattern search) is a bottleneck in a lot of queries, for example in ClickBench query Q20.&lt;/p&gt;&lt;p&gt;Understanding string search in analytical queries&lt;/p&gt;&lt;p&gt;Clickbench query 20 evaluates a LIKE pattern on millions of URLs, making fast string search crucial.&lt;/p&gt;&lt;code&gt;SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'
-&lt;/code&gt;&lt;p&gt;Reducing false positives with two-character filtering&lt;/p&gt;&lt;p&gt;PR #46289 is based on the insight that SIMD instructions can be used in a smart way beyond brute-force parallelization. The original code already leveraged SIMD instructions but it only considered the search pattern’s first character, leading to expensive false positives. We rewrite the code to check the second character as well. This improved selectivity dramatically while adding only a negligible amount of new SIMD operations.&lt;/p&gt;&lt;code&gt;/// Original code
-class StringSearcher
-{
-    first_needle_character = needle[0];
-    first_needle_character_vec = broadcast_to_simd_vector(first_needle_character);
-
-    void search()
-    {
-        for (position in haystack; step by 16 bytes)
-        {
-            haystack_chunk = load_16_bytes(haystack + position);
-            first_matches = simd_compare_equal(haystack_chunk, first_needle_character_vec);
-            match_mask = extract_match_positions(first_matches);
-
-            for (const auto &amp;amp; match : match_mask)
-                /// High false positive rate - many expensive verifications
-                if (full_string_match(haystack + match_pos, needle))
-                    return match_pos;
-        }
-    }
-}
-&lt;/code&gt;&lt;code&gt;// Optimized code
-class StringSearcher
-{
-    first_needle_character = needle[0];
-    second_needle_character = needle[1];  /// Second character
-    first_needle_character_vec = broadcast_to_simd_vector(first_needle_character);
-    second_needle_character_vec = broadcast_to_simd_vector(second_needle_character);
-
-    void search()
-    {
-        for (position : haystack, step by 16 bytes)
-        {
-            haystack_chunk1 = load_16_bytes(haystack + position);
-            haystack_chunk2 = load_16_bytes(haystack + position + 1);
-
-            /// Compare both characters simultaneously
-            first_matches = simd_compare_equal(haystack_chunk1, first_needle_character_vec);
-            second_matches = simd_compare_equal(haystack_chunk2, second_needle_character_vec);
-            combined_matches = simd_and(first_matches, second_matches);
-
-            match_mask = extract_match_positions(combined_matches);
-
-            for (const auto &amp;amp; match : match_mask)
-                // Dramatically fewer false positives - fewer expensive verifications
-                if full_string_match(haystack + match_pos, needle):
-                    return match_pos;
-        }
-    }
-}
-&lt;/code&gt;&lt;p&gt;Performance impact&lt;/p&gt;&lt;p&gt;Two-character SIMD filtering improved performance significantly:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;ClickBench query Q20 sped up by 35%&lt;/item&gt;&lt;item&gt;Other queries which perform substring matching saw an overall improvement of ~10%&lt;/item&gt;&lt;item&gt;The geometric mean of all queries improved by 4.1%&lt;/item&gt;&lt;/list&gt;&lt;p&gt;The performance improvements are a result of fewer false positives, better cache locality and more efficient branch prediction.&lt;/p&gt;&lt;p&gt;Two-character SIMD filtering demonstrates that effective SIMD optimization isn't just about processing more data per instruction - it's about using SIMD's parallel comparison capabilities to improve the algorithmic efficiency. The two-character approach shows how a small number of additional SIMD operations can in some cases yield massive performance gains.&lt;/p&gt;&lt;head rend="h2"&gt;Bottleneck 5: False Sharing #&lt;/head&gt;&lt;p&gt;False sharing occurs when multiple threads access variables in the same cache. The CPU's cache coherence protocol works at cache line granularity, meaning that any cache line modifications - including modifications of two different variables - are treated as conflicts which require expensive synchronization between cores. On a 2 x 240 vCPUs system, false sharing can turn simple counter increments into system-wide performance disasters.&lt;/p&gt;&lt;p&gt;Eliminating false sharing requires how CPU cache coherence is implemented at the hardware level. It's not enough to optimize algorithms - to avoid false sharing, one must also optimize the memory layout to make sure that frequently-accessed data structures don't accidentally interfere with each other through cache line conflicts. This involves for example a strategic data layout and use of alignment and padding.&lt;/p&gt;&lt;head rend="h3"&gt;Optimization 5.1: Profile Event Counter Alignment (PR #82697) #&lt;/head&gt;&lt;p&gt;ClickBench query Q3 showed 36.6% of CPU cycles spent in &lt;code&gt;ProfileEvents::increment&lt;/code&gt; on a 2×240 vCPU system. Performance profiling revealed a severe cache line contention.&lt;/p&gt;&lt;p&gt;ProfileEvents counters at scale&lt;/p&gt;&lt;p&gt;Profile event counters refer to ClickHouse's internal eventing system - profile events track all internal operations, from detailed query execution steps to memory allocations. In a typical analytical query, these counters are incremented millions of times across all threads. The original implementation organized multiple counters in the same memory region without considering cache line boundaries.&lt;/p&gt;&lt;p&gt;This creates three challenges:&lt;/p&gt;&lt;list rend="ol"&gt;&lt;item&gt;&lt;p&gt;Cache line physics: Modern Intel processors use 64-byte cache lines. When any byte in a cache line is modified, the entire line must be invalidated in the other cores' caches.&lt;/p&gt;&lt;/item&gt;&lt;item&gt;&lt;p&gt;False sharing amplification: With 240 threads, each counter update triggers a cache line invalidation across potentially dozens of cores. What should be independent operations become serialized through the cache coherence protocol.&lt;/p&gt;&lt;/item&gt;&lt;item&gt;&lt;p&gt;Exponential degradation: As the number of cores increases, the probability of a simultaneous access to the same cache line grows exponentially, compounding the impact of cache misses.&lt;/p&gt;&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Using perf, I discovered that &lt;code&gt;ProfileEvents::increment&lt;/code&gt; was generating massive cache coherence traffic. The smoking gun was the cache line utilization report that showed eight different counters packed into a single cache line. We also added new capabilities to Linux’s perf c2c tool and worked with the community to help developers more easily identify false sharing issues like this.&lt;/p&gt;&lt;p&gt;Proper cache line alignment ensures that each counter gets its own 64-byte cache line. This transforms false sharing (bad) into true sharing (manageable). When a thread updates its counter, now only a single cache line wil be affected.&lt;/p&gt;&lt;p&gt;Based on our implementation in PR #82697, the fix improved the cache line alignment for the profile event counters:&lt;/p&gt;&lt;code&gt;// Before: Counters packed without alignment
-struct ProfileEvents:
-    atomic_value counters[NUM_EVENTS]  // Multiple counters per cache line
-    // 8 counters sharing single 64-byte cache lines
-
-// After: Cache line aligned counters  
-struct ProfileEvents:
-    struct alignas(64) AlignedCounter:
-        atomic_value value
-        // Padding automatically added to reach 64 bytes
-    
-    AlignedCounter counters[NUM_EVENTS]  // Each counter gets own cache line
-    // Now each counter has exclusive cache line ownership
-&lt;/code&gt;&lt;p&gt;Performance impact&lt;/p&gt;&lt;p&gt;This optimization pattern applies to any frequently updated shared and compact data structure. The lesson is that the memory layout becomes critical at scale - what works fine on eight cores can be excruciatingly slow on 240 cores.&lt;/p&gt;After optimization: ProfileEvents::increment drops to 8.5% (from 36.6%)&lt;p&gt;As a result of our optimization, ClickBench query Q3 saw a 27.4% improvement on ultra-high core count systems. The performance gain increases with the number of cores because the cache coherence overhead grows super-linearly. This optimization therefore doesn't merely fix a bottleneck - it changes the scalability curve.&lt;/p&gt;ClickBench Q3: 27.4% improvement, with larger gains on higher core count systems&lt;head rend="h2"&gt;Building a foundation that scales #&lt;/head&gt;&lt;p&gt;In this post I covered optimizations for five performance bottlenecks:&lt;/p&gt;&lt;list rend="ol"&gt;&lt;item&gt;Lock contention - The coordination overhead grows exponentially with core count.&lt;/item&gt;&lt;item&gt;Memory optimization - The memory bandwidth per core decreases as the core count increases.&lt;/item&gt;&lt;item&gt;Increased parallelism - Serial phases become the dominant bottleneck.&lt;/item&gt;&lt;item&gt;SIMD optimization - Smarter algorithms like two-character filtering beyond brute-force vectorization can improve performance significantly.&lt;/item&gt;&lt;item&gt;False sharing - False sharing is caused by the granularity of cache line size.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;The bottlenecks and optimizations presented here are not just about ClickHouse - they represent a fundamental shift in how we must approach database optimization in the ultra-high core count era. As processors continue to evolve toward higher core counts, these techniques will become essential for any system that needs to scale.&lt;/p&gt;&lt;p&gt;Our optimizations enable ClickHouse to achieve close-to-linear scalability as the core count increases. This enables ClickHouse to thrive as an analytics database in a future world where Intel and other hardware manufacturers push the core count into the thousands.&lt;/p&gt;&lt;head rend="h2"&gt;References and Resources #&lt;/head&gt;&lt;list rend="ul"&gt;&lt;item&gt;Source Code: All optimizations available in ClickHouse main branch&lt;/item&gt;&lt;item&gt;Slide Deck: 2025 Shanghai Meetup Presentation&lt;/item&gt;&lt;item&gt;Pull Requests: Individual PRs linked throughout this post with detailed performance analysis&lt;/item&gt;&lt;item&gt;Intel Intrinsics Guide: Intel® Intrinsics Guide&lt;/item&gt;&lt;/list&gt;&lt;head rend="h3"&gt;Acknowledgments #&lt;/head&gt;&lt;p&gt;Special thanks to the ClickHouse community for rigorous code review and performance validation. These optimizations represent collaborative effort between Intel and ClickHouse teams to unlock the full potential of modern ultra-high core count processors.&lt;/p&gt;&lt;p&gt;For questions about implementation details or performance reproduction, please refer to the individual PR discussions linked throughout this post.&lt;/p&gt;&lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://clickhouse.com/blog/optimizing-clickhouse-intel-high-core-count-cpu"/><published>2025-09-17T18:46:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45281139</id><title>A postmortem of three recent issues</title><updated>2025-09-18T13:01:20.275307+00:00</updated><content>&lt;doc fingerprint="8d3083968c38d9d6"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Between August and early September, three infrastructure bugs intermittently degraded Claude's response quality. We've now resolved these issues and want to explain what happened.&lt;/p&gt;
-    &lt;p&gt;In early August, a number of users began reporting degraded responses from Claude. These initial reports were difficult to distinguish from normal variation in user feedback. By late August, the increasing frequency and persistence of these reports prompted us to open an investigation that led us to uncover three separate infrastructure bugs.&lt;/p&gt;
-    &lt;p&gt;To state it plainly: We never reduce model quality due to demand, time of day, or server load. The problems our users reported were due to infrastructure bugs alone.&lt;/p&gt;
-    &lt;p&gt;We recognize users expect consistent quality from Claude, and we maintain an extremely high bar for ensuring infrastructure changes don't affect model outputs. In these recent incidents, we didn't meet that bar. The following postmortem explains what went wrong, why detection and resolution took longer than we would have wanted, and what we're changing to prevent similar future incidents.&lt;/p&gt;
-    &lt;p&gt;We don't typically share this level of technical detail about our infrastructure, but the scope and complexity of these issues justified a more comprehensive explanation.&lt;/p&gt;
-    &lt;head rend="h2"&gt;How we serve Claude at scale&lt;/head&gt;
-    &lt;p&gt;We serve Claude to millions of users via our first-party API, Amazon Bedrock, and Google Cloud's Vertex AI. We deploy Claude across multiple hardware platforms, namely AWS Trainium, NVIDIA GPUs, and Google TPUs. This approach provides the capacity and geographic distribution necessary to serve users worldwide.&lt;/p&gt;
-    &lt;p&gt;Each hardware platform has different characteristics and requires specific optimizations. Despite these variations, we have strict equivalence standards for model implementations. Our aim is that users should get the same quality responses regardless of which platform serves their request. This complexity means that any infrastructure change requires careful validation across all platforms and configurations.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Timeline of events&lt;/head&gt;
-    &lt;p&gt;The overlapping nature of these bugs made diagnosis particularly challenging. The first bug was introduced on August 5, affecting approximately 0.8% of requests made to Sonnet 4. Two more bugs arose from deployments on August 25 and 26.&lt;/p&gt;
-    &lt;p&gt;Although initial impacts were limited, a load balancing change on August 29 started to increase affected traffic. This caused many more users to experience issues while others continued to see normal performance, creating confusing and contradictory reports.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Three overlapping issues&lt;/head&gt;
-    &lt;p&gt;Below we describe the three bugs that caused the degradation, when they occurred, and how we resolved them:&lt;/p&gt;
-    &lt;head rend="h3"&gt;1. Context window routing error&lt;/head&gt;
-    &lt;p&gt;On August 5, some Sonnet 4 requests were misrouted to servers configured for the upcoming 1M token context window. This bug initially affected 0.8% of requests. On August 29, a routine load balancing change unintentionally increased the number of short-context requests routed to the 1M context servers. At the worst impacted hour on August 31, 16% of Sonnet 4 requests were affected.&lt;/p&gt;
-    &lt;p&gt;Approximately 30% of Claude Code users who made requests during this period had at least one message routed to the wrong server type, resulting in degraded responses. On Amazon Bedrock, misrouted traffic peaked at 0.18% of all Sonnet 4 requests from August 12. Incorrect routing affected less than 0.0004% of requests on Google Cloud's Vertex AI between August 27 and September 16.&lt;/p&gt;
-    &lt;p&gt;However, some users were affected more severely, as our routing is "sticky". This meant that once a request was served by the incorrect server, subsequent follow-ups were likely to be served by the same incorrect server.&lt;/p&gt;
-    &lt;p&gt;Resolution: We fixed the routing logic to ensure short- and long-context requests were directed to the correct server pools. We deployed the fix on September 4. A rollout to our first-party platforms and Google Cloud’s Vertex was completed by September 16. The fix is in the process of being rolled out on Bedrock.&lt;/p&gt;
-    &lt;head rend="h3"&gt;2. Output corruption&lt;/head&gt;
-    &lt;p&gt;On August 25, we deployed a misconfiguration to the Claude API TPU servers that caused an error during token generation. An issue caused by a runtime performance optimization occasionally assigned a high probability to tokens that should rarely be produced given the context, for example producing Thai or Chinese characters in response to English prompts, or producing obvious syntax errors in code. A small subset of users that asked a question in English might have seen "สวัสดี" in the middle of the response, for example.&lt;/p&gt;
-    &lt;p&gt;This corruption affected requests made to Opus 4.1 and Opus 4 on August 25-28, and requests to Sonnet 4 August 25–September 2. Third-party platforms were not affected by this issue.&lt;/p&gt;
-    &lt;p&gt;Resolution: We identified the issue and rolled back the change on September 2. We've added detection tests for unexpected character outputs to our deployment process.&lt;/p&gt;
-    &lt;head rend="h3"&gt;3. Approximate top-k XLA:TPU miscompilation&lt;/head&gt;
-    &lt;p&gt;On August 25, we deployed code to improve how Claude selects tokens during text generation. This change inadvertently triggered a latent bug in the XLA:TPU[1] compiler, which has been confirmed to affect requests to Claude Haiku 3.5.&lt;/p&gt;
-    &lt;p&gt;We also believe this could have impacted a subset of Sonnet 4 and Opus 3 on the Claude API. Third-party platforms were not affected by this issue.&lt;/p&gt;
-    &lt;p&gt;Resolution: We first observed the bug affecting Haiku 3.5 and rolled it back on September 4. We later noticed user reports of problems with Opus 3 that were compatible with this bug, and rolled it back on September 12. After extensive investigation we were unable to reproduce this bug on Sonnet 4 but decided to also roll it back out of an abundance of caution.&lt;/p&gt;
-    &lt;p&gt;Simultaneously, we have (a) been working with the XLA:TPU team on a fix for the compiler bug and (b) rolled out a fix to use exact top-k with enhanced precision. For details, see the deep dive below.&lt;/p&gt;
-    &lt;head rend="h2"&gt;A closer look at the XLA compiler bug&lt;/head&gt;
-    &lt;p&gt;To illustrate the complexity of these issues, here's how the XLA compiler bug manifested and why it proved particularly challenging to diagnose.&lt;/p&gt;
-    &lt;p&gt;When Claude generates text, it calculates probabilities for each possible next word, then randomly chooses a sample from this probability distribution. We use "top-p sampling" to avoid nonsensical outputs—only considering words whose cumulative probability reaches a threshold (typically 0.99 or 0.999). On TPUs, our models run across multiple chips, with probability calculations happening in different locations. To sort these probabilities, we need to coordinate data between chips, which is complex.[2]&lt;/p&gt;
-    &lt;p&gt;In December 2024, we discovered our TPU implementation would occasionally drop the most probable token when temperature was zero. We deployed a workaround to fix this case.&lt;/p&gt;
-    &lt;p&gt;The root cause involved mixed precision arithmetic. Our models compute next-token probabilities in bf16 (16-bit floating point). However, the vector processor is fp32-native, so the TPU compiler (XLA) can optimize runtime by converting some operations to fp32 (32-bit). This optimization pass is guarded by the &lt;code&gt;xla_allow_excess_precision&lt;/code&gt; flag which defaults to true.&lt;/p&gt;
-    &lt;p&gt;This caused a mismatch: operations that should have agreed on the highest probability token were running at different precision levels. The precision mismatch meant they didn't agree on which token had the highest probability. This caused the highest probability token to sometimes disappear from consideration entirely.&lt;/p&gt;
-    &lt;p&gt;On August 26, we deployed a rewrite of our sampling code to fix the precision issues and improve how we handled probabilities at the limit that reach the top-p threshold. But in fixing these problems, we exposed a trickier one.&lt;/p&gt;
-    &lt;p&gt;Our fix removed the December workaround because we believed we'd solved the root cause. This led to a deeper bug in the approximate top-k operation—a performance optimization that quickly finds the highest probability tokens.[3] This approximation sometimes returned completely wrong results, but only for certain batch sizes and model configurations. The December workaround had been inadvertently masking this problem.&lt;/p&gt;
-    &lt;p&gt;The bug's behavior was frustratingly inconsistent. It changed depending on unrelated factors such as what operations ran before or after it, and whether debugging tools were enabled. The same prompt might work perfectly on one request and fail on the next.&lt;/p&gt;
-    &lt;p&gt;While investigating, we also discovered that the exact top-k operation no longer had the prohibitive performance penalty it once did. We switched from approximate to exact top-k and standardized some additional operations on fp32 precision.[4] Model quality is non-negotiable, so we accepted the minor efficiency impact.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Why detection was difficult&lt;/head&gt;
-    &lt;p&gt;Our validation process ordinarily relies on benchmarks alongside safety evaluations and performance metrics. Engineering teams perform spot checks and deploy to small "canary" groups first.&lt;/p&gt;
-    &lt;p&gt;These issues exposed critical gaps that we should have identified earlier. The evaluations we ran simply didn't capture the degradation users were reporting, in part because Claude often recovers well from isolated mistakes. Our own privacy practices also created challenges in investigating reports. Our internal privacy and security controls limit how and when engineers can access user interactions with Claude, in particular when those interactions are not reported to us as feedback. This protects user privacy but prevents engineers from examining the problematic interactions needed to identify or reproduce bugs.&lt;/p&gt;
-    &lt;p&gt;Each bug produced different symptoms on different platforms at different rates. This created a confusing mix of reports that didn't point to any single cause. It looked like random, inconsistent degradation.&lt;/p&gt;
-    &lt;p&gt;More fundamentally, we relied too heavily on noisy evaluations. Although we were aware of an increase in reports online, we lacked a clear way to connect these to each of our recent changes. When negative reports spiked on August 29, we didn't immediately make the connection to an otherwise standard load balancing change.&lt;/p&gt;
-    &lt;head rend="h2"&gt;What we're changing&lt;/head&gt;
-    &lt;p&gt;As we continue to improve our infrastructure, we're also improving the way we evaluate and prevent bugs like those discussed above across all platforms where we serve Claude. Here's what we're changing:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;More sensitive evaluations: To help discover the root cause of any given issue, we’ve developed evaluations that can more reliably differentiate between working and broken implementations. We’ll keep improving these evaluations to keep a closer eye on model quality.&lt;/item&gt;
-      &lt;item&gt;Quality evaluations in more places: Although we run regular evaluations on our systems, we will run them continuously on true production systems to catch issues such as the context window load balancing error.&lt;/item&gt;
-      &lt;item&gt;Faster debugging tooling: We'll develop infrastructure and tooling to better debug community-sourced feedback without sacrificing user privacy. Additionally, some bespoke tools developed here will be used to reduce the remediation time in future similar incidents, if those should occur.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Evals and monitoring are important. But these incidents have shown that we also need continuous signal from users when responses from Claude aren't up to the usual standard. Reports of specific changes observed, examples of unexpected behavior encountered, and patterns across different use cases all helped us isolate the issues.&lt;/p&gt;
-    &lt;p&gt;It remains particularly helpful for users to continue to send us their feedback directly. You can use the &lt;code&gt;/bug&lt;/code&gt; command in Claude Code or you can use the "thumbs down" button in the Claude apps to do so. Developers and researchers often create new and interesting ways to evaluate model quality that complement our internal testing. If you'd like to share yours, reach out to feedback@anthropic.com.&lt;/p&gt;
-    &lt;p&gt;We remain grateful to our community for these contributions.&lt;/p&gt;
-    &lt;p&gt;[1] XLA:TPU is the optimizing compiler that translates XLA High Level Optimizing language—often written using JAX—to TPU machine instructions.&lt;/p&gt;
-    &lt;p&gt;[2] Our models are too large for single chips and are partitioned across tens of chips or more, making our sorting operation a distributed sort. TPUs (just like GPUs and Trainium) also have different performance characteristics than CPUs, requiring different implementation techniques using vectorized operations instead of serial algorithms.&lt;/p&gt;
-    &lt;p&gt;[3] We had been using this approximate operation because it yielded substantial performance improvements. The approximation works by accepting potential inaccuracies in the lowest probability tokens, which shouldn't affect quality—except when the bug caused it to drop the highest probability token instead.&lt;/p&gt;
-    &lt;p&gt;[4] Note that the now-correct top-k implementation may result in slight differences in the inclusion of tokens near the top-p threshold, and in rare cases users may benefit from re-tuning their choice of top-p.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues"/><published>2025-09-17T20:41:07+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45282497</id><title>One Token to rule them all – Obtaining Global Admin in every Entra ID tenant</title><updated>2025-09-18T13:01:19.980750+00:00</updated><content>&lt;doc fingerprint="3d63029d0fa3c0af"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-09-18T13:40:40.830860+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=45282497</id><title>One Token to rule them all – Obtaining Global Admin in every Entra ID tenant</title><updated>2025-09-18T13:40:46.936407+00:00</updated><content>&lt;doc fingerprint="3d63029d0fa3c0af"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;One Token to rule them all - obtaining Global Admin in every Entra ID tenant via Actor tokens&lt;/head&gt;
     &lt;p&gt;While preparing for my Black Hat and DEF CON talks in July of this year, I found the most impactful Entra ID vulnerability that I will probably ever find. This vulnerability could have allowed me to compromise every Entra ID tenant in the world (except probably those in national cloud deployments1). If you are an Entra ID admin reading this, yes that means complete access to your tenant. The vulnerability consisted of two components: undocumented impersonation tokens, called “Actor tokens”, that Microsoft uses in their backend for service-to-service (S2S) communication. Additionally, there was a critical flaw in the (legacy) Azure AD Graph API that failed to properly validate the originating tenant, allowing these tokens to be used for cross-tenant access.&lt;/p&gt;
@@ -477,7 +151,7 @@ struct ProfileEvents:
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://dirkjanm.io/obtaining-global-admin-in-every-entra-id-tenant-with-actor-tokens/"/><published>2025-09-17T23:03:21+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45283196</id><title>Stepping Down as Libxml2 Maintainer</title><updated>2025-09-18T13:01:19.609102+00:00</updated><content>&lt;doc fingerprint="1f9f5cdbd006b6ce"&gt;
+&lt;/doc&gt;</content><link href="https://dirkjanm.io/obtaining-global-admin-in-every-entra-id-tenant-with-actor-tokens/"/><published>2025-09-17T23:03:21+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45283196</id><title>Stepping Down as Libxml2 Maintainer</title><updated>2025-09-18T13:40:46.070469+00:00</updated><content>&lt;doc fingerprint="1f9f5cdbd006b6ce"&gt;
   &lt;main&gt;
     &lt;div&gt;
       &lt;div&gt;nwellnhof
@@ -513,7 +187,7 @@ struct ProfileEvents:
         &lt;p&gt;I haven’t find how to manage both output and input buffers. I found functions like: xmlOutputBufferCreateIO but by the places in which I’ve found them is not clear on how to use them.&lt;/p&gt;
         &lt;p&gt;Should I send you an email with my questions or do you prefer other means of communication?&lt;/p&gt;
       &lt;/div&gt;
-      &lt;p&gt; 7 Likes &lt;/p&gt;
+      &lt;p&gt; 8 Likes &lt;/p&gt;
     &lt;/div&gt;
     &lt;div&gt;
       &lt;div&gt;sri
@@ -532,7 +206,7 @@ struct ProfileEvents:
     &lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://discourse.gnome.org/t/stepping-down-as-libxml2-maintainer/31398"/><published>2025-09-18T00:17:20+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45283306</id><title>Meta Ray-Ban Display</title><updated>2025-09-18T13:01:19.111748+00:00</updated><content/><link href="https://www.meta.com/blog/meta-ray-ban-display-ai-glasses-connect-2025/"/><published>2025-09-18T00:30:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45283731</id><title>Hypervisor 101 in Rust</title><updated>2025-09-18T13:01:18.995184+00:00</updated><content>&lt;doc fingerprint="8eb71d9bf88743ae"&gt;
+&lt;/doc&gt;</content><link href="https://discourse.gnome.org/t/stepping-down-as-libxml2-maintainer/31398"/><published>2025-09-18T00:17:20+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45283306</id><title>Meta Ray-Ban Display</title><updated>2025-09-18T13:40:45.736549+00:00</updated><content/><link href="https://www.meta.com/blog/meta-ray-ban-display-ai-glasses-connect-2025/"/><published>2025-09-18T00:30:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45283731</id><title>Hypervisor 101 in Rust</title><updated>2025-09-18T13:40:45.675227+00:00</updated><content>&lt;doc fingerprint="8eb71d9bf88743ae"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Welcome to Hypervisor 101 in Rust&lt;/head&gt;
     &lt;p&gt;This is a day long course to quickly learn the inner working of hypervisors and techniques to write them for high-performance fuzzing.&lt;/p&gt;
@@ -543,7 +217,7 @@ struct ProfileEvents:
 &lt;/code&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://tandasat.github.io/Hypervisor-101-in-Rust/"/><published>2025-09-18T01:18:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45283887</id><title>Slack has raised our charges by $195k per year</title><updated>2025-09-18T13:01:18.782222+00:00</updated><content>&lt;doc fingerprint="314880df7fbeeee1"&gt;
+&lt;/doc&gt;</content><link href="https://tandasat.github.io/Hypervisor-101-in-Rust/"/><published>2025-09-18T01:18:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45283887</id><title>Slack has raised our charges by $195k per year</title><updated>2025-09-18T13:40:45.582912+00:00</updated><content>&lt;doc fingerprint="314880df7fbeeee1"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Slack is extorting us with a $195k/yr bill increase&lt;/head&gt;
     &lt;p&gt;An open letter, or something&lt;/p&gt;
@@ -556,15 +230,15 @@ struct ProfileEvents:
     &lt;p&gt;This post was rushed out because, well, this has been a shock! If you’d like any additional details then feel free to send me an email.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://skyfall.dev/posts/slack"/><published>2025-09-18T01:37:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45284311</id><title>Show HN: The text disappears when you screenshot it</title><updated>2025-09-18T13:01:18.499204+00:00</updated><link href="https://unscreenshottable.vercel.app/?text=Hello"/><published>2025-09-18T02:18:45+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45284398</id><title>A QBasic Text Adventure Still Expanding in 2025</title><updated>2025-09-18T13:01:18.187809+00:00</updated><content>&lt;doc fingerprint="72a7387f83d3e415"&gt;
+&lt;/doc&gt;</content><link href="https://skyfall.dev/posts/slack"/><published>2025-09-18T01:37:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45284311</id><title>Show HN: The text disappears when you screenshot it</title><updated>2025-09-18T13:40:45.345873+00:00</updated><link href="https://unscreenshottable.vercel.app/?text=Hello"/><published>2025-09-18T02:18:45+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45284398</id><title>A QBasic Text Adventure Still Expanding in 2025</title><updated>2025-09-18T13:40:45.137234+00:00</updated><content>&lt;doc fingerprint="72a7387f83d3e415"&gt;
   &lt;main&gt;
     &lt;p&gt;Welcome to the world of text adventures! Here, we dive into the art of creating interactive stories that immerse players in thrilling, choice-driven narratives. Whether you're a fellow developer, a fan of retro games, or just curious about text-based adventures, this channel has something for you. Join me as I share insights, tips, and updates on my latest text games. Get ready to shape worlds, solve mysteries, and experience stories where your choices lead the way. Let's bring adventures to life, one line at a time!&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://the-ventureweaver.itch.io/"/><published>2025-09-18T02:25:59+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45284766</id><title>Towards a Physics Foundation Model</title><updated>2025-09-18T13:01:17.999563+00:00</updated><content>&lt;doc fingerprint="1cdc341adbb7c22e"&gt;
+&lt;/doc&gt;</content><link href="https://the-ventureweaver.itch.io/"/><published>2025-09-18T02:25:59+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45284766</id><title>Towards a Physics Foundation Model</title><updated>2025-09-18T13:40:45.063689+00:00</updated><content>&lt;doc fingerprint="1cdc341adbb7c22e"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;Computer Science &amp;gt; Machine Learning&lt;/head&gt;&lt;p&gt; [Submitted on 17 Sep 2025]&lt;/p&gt;&lt;head rend="h1"&gt;Title:Towards a Physics Foundation Model&lt;/head&gt;View PDF HTML (experimental)&lt;quote&gt;Abstract:Foundation models have revolutionized natural language processing through a ``train once, deploy anywhere'' paradigm, where a single pre-trained model adapts to countless downstream tasks without retraining. Access to a Physics Foundation Model (PFM) would be transformative -- democratizing access to high-fidelity simulations, accelerating scientific discovery, and eliminating the need for specialized solver development. Yet current physics-aware machine learning approaches remain fundamentally limited to single, narrow domains and require retraining for each new system. We present the General Physics Transformer (GPhyT), trained on 1.8 TB of diverse simulation data, that demonstrates foundation model capabilities are achievable for physics. Our key insight is that transformers can learn to infer governing dynamics from context, enabling a single model to simulate fluid-solid interactions, shock waves, thermal convection, and multi-phase dynamics without being told the underlying equations. GPhyT achieves three critical breakthroughs: (1) superior performance across multiple physics domains, outperforming specialized architectures by up to 29x, (2) zero-shot generalization to entirely unseen physical systems through in-context learning, and (3) stable long-term predictions through 50-timestep rollouts. By establishing that a single model can learn generalizable physical principles from data alone, this work opens the path toward a universal PFM that could transform computational science and engineering.&lt;/quote&gt;&lt;p&gt; Current browse context: &lt;/p&gt;&lt;p&gt;cs.LG&lt;/p&gt;&lt;head rend="h3"&gt;References &amp;amp; Citations&lt;/head&gt;&lt;p&gt; export BibTeX citation Loading... &lt;/p&gt;&lt;head rend="h1"&gt;Bibliographic and Citation Tools&lt;/head&gt;&lt;p&gt; Bibliographic Explorer (What is the Explorer?) &lt;/p&gt;&lt;p&gt; Connected Papers (What is Connected Papers?) &lt;/p&gt;&lt;p&gt; Litmaps (What is Litmaps?) &lt;/p&gt;&lt;p&gt; scite Smart Citations (What are Smart Citations?) &lt;/p&gt;&lt;head rend="h1"&gt;Code, Data and Media Associated with this Article&lt;/head&gt;&lt;p&gt; alphaXiv (What is alphaXiv?) &lt;/p&gt;&lt;p&gt; CatalyzeX Code Finder for Papers (What is CatalyzeX?) &lt;/p&gt;&lt;p&gt; DagsHub (What is DagsHub?) &lt;/p&gt;&lt;p&gt; Gotit.pub (What is GotitPub?) &lt;/p&gt;&lt;p&gt; Hugging Face (What is Huggingface?) &lt;/p&gt;&lt;p&gt; Papers with Code (What is Papers with Code?) &lt;/p&gt;&lt;p&gt; ScienceCast (What is ScienceCast?) &lt;/p&gt;&lt;head rend="h1"&gt;Demos&lt;/head&gt;&lt;head rend="h1"&gt;Recommenders and Search Tools&lt;/head&gt;&lt;p&gt; Influence Flower (What are Influence Flowers?) &lt;/p&gt;&lt;p&gt; CORE Recommender (What is CORE?) &lt;/p&gt;&lt;p&gt; IArxiv Recommender (What is IArxiv?) &lt;/p&gt;&lt;head rend="h1"&gt;arXivLabs: experimental projects with community collaborators&lt;/head&gt;&lt;p&gt;arXivLabs is a framework that allows collaborators to develop and share new arXiv features directly on our website.&lt;/p&gt;&lt;p&gt;Both individuals and organizations that work with arXivLabs have embraced and accepted our values of openness, community, excellence, and user data privacy. arXiv is committed to these values and only works with partners that adhere to them.&lt;/p&gt;&lt;p&gt;Have an idea for a project that will add value for arXiv's community? Learn more about arXivLabs.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://arxiv.org/abs/2509.13805"/><published>2025-09-18T03:06:08+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45286369</id><title>CERN Animal Shelter for Computer Mice</title><updated>2025-09-18T13:01:17.096187+00:00</updated><content>&lt;doc fingerprint="d059938848eb287e"&gt;
+&lt;/doc&gt;</content><link href="https://arxiv.org/abs/2509.13805"/><published>2025-09-18T03:06:08+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45286369</id><title>CERN Animal Shelter for Computer Mice</title><updated>2025-09-18T13:40:44.267699+00:00</updated><content>&lt;doc fingerprint="d059938848eb287e"&gt;
   &lt;main&gt;
     &lt;p&gt;We are back!!! After the disaster early 2012, we have been able to secure new funds and are happy to annouce the reopening of the CERN Animal Shelter for Computer Mice on the lawn in front of the CERN Computer Centre. Our shelter is open all week-days from 8:30 to 17:30.&lt;/p&gt;
     &lt;table&gt;
@@ -594,7 +268,7 @@ struct ProfileEvents:
     &lt;p&gt;Let us help you:&lt;lb/&gt; visit https://cern.ch/Computer.Security or contact Computer.Security@cern.ch&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://computer-animal-shelter.web.cern.ch/index.shtml"/><published>2025-09-18T06:53:08+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45286394</id><title>History of the Gem Desktop Environment</title><updated>2025-09-18T13:01:16.965453+00:00</updated><content/><link href="https://nemanjatrifunovic.substack.com/p/history-of-the-gem-desktop-environment"/><published>2025-09-18T06:55:28+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45286526</id><title>Pnpm has a new setting to stave off supply chain attacks</title><updated>2025-09-18T13:01:16.651658+00:00</updated><content>&lt;doc fingerprint="7674f93dd943850b"&gt;
+&lt;/doc&gt;</content><link href="https://computer-animal-shelter.web.cern.ch/index.shtml"/><published>2025-09-18T06:53:08+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45286394</id><title>History of the Gem Desktop Environment</title><updated>2025-09-18T13:40:44.205738+00:00</updated><content/><link href="https://nemanjatrifunovic.substack.com/p/history-of-the-gem-desktop-environment"/><published>2025-09-18T06:55:28+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45286526</id><title>Pnpm has a new setting to stave off supply chain attacks</title><updated>2025-09-18T13:40:43.951175+00:00</updated><content>&lt;doc fingerprint="7674f93dd943850b"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;pnpm 10.16&lt;/head&gt;
     &lt;head rend="h2"&gt;Minor Changes&lt;/head&gt;
@@ -632,7 +306,7 @@ struct ProfileEvents:
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://pnpm.io/blog/releases/10.16"/><published>2025-09-18T07:12:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45286905</id><title>John Grisham Still Wonders: Will Texas Kill Robert Roberson?</title><updated>2025-09-18T13:01:16.499491+00:00</updated><content/><link href="https://www.dmagazine.com/frontburner/2025/09/author-john-grisham-still-wonders-will-texas-kill-robert-roberson/"/><published>2025-09-18T08:08:05+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45287155</id><title>This Website Has No Class</title><updated>2025-09-18T13:01:16.239361+00:00</updated><content>&lt;doc fingerprint="2bdc203e2ba735d9"&gt;
+&lt;/doc&gt;</content><link href="https://pnpm.io/blog/releases/10.16"/><published>2025-09-18T07:12:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45286905</id><title>John Grisham Still Wonders: Will Texas Kill Robert Roberson?</title><updated>2025-09-18T13:40:43.800017+00:00</updated><content/><link href="https://www.dmagazine.com/frontburner/2025/09/author-john-grisham-still-wonders-will-texas-kill-robert-roberson/"/><published>2025-09-18T08:08:05+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45287155</id><title>This Website Has No Class</title><updated>2025-09-18T13:40:43.568395+00:00</updated><content>&lt;doc fingerprint="2bdc203e2ba735d9"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;This website has no class&lt;/head&gt;
     &lt;p&gt;In my recent post, “There’s no such thing as a CSS reset”, I wrote this:&lt;/p&gt;
@@ -711,13 +385,13 @@ struct ProfileEvents:
     &lt;p&gt;A mea culpa; I only got 99% of the way there. I use 11ty’s syntax highlighting plugin, which uses classes for styling. I gave syntax-highlight a hard look, but I don’t love the idea of introducing client-side js where none need exist, and the authoring experience would be a step back, so I begrudgingly left it alone for now.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://aaadaaam.com/notes/no-class/"/><published>2025-09-18T08:41:32+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45287513</id><title>Fast Fourier Transforms Part 1: Cooley-Tukey</title><updated>2025-09-18T13:01:15.981951+00:00</updated><content>&lt;doc fingerprint="a499143b0d082236"&gt;
+&lt;/doc&gt;</content><link href="https://aaadaaam.com/notes/no-class/"/><published>2025-09-18T08:41:32+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45287513</id><title>Fast Fourier Transforms Part 1: Cooley-Tukey</title><updated>2025-09-18T13:40:43.297012+00:00</updated><content>&lt;doc fingerprint="a499143b0d082236"&gt;
   &lt;main&gt;&lt;p&gt;Find me on:&lt;/p&gt;&lt;p&gt;Posts:&lt;/p&gt;&lt;p&gt;by Connor Boyle&lt;/p&gt;&lt;p&gt;tags: mathematicssoftware&lt;/p&gt;&lt;p&gt;I’m planning to write a series of posts about fast Fourier transform algorithms. This first post covers the Cooley-Tukey algorithm, which is the original and most well-known FFT algorithm.&lt;/p&gt;&lt;p&gt;If \(x\) is a sequence of complex numbers with a length \(\lvert x \rvert\) and a starting index of 0, then the discrete Fourier transform of \(x\), \(\mathcal{F} \{ x \}\), is defined as follows:&lt;/p&gt;\[|\mathcal{F} \{ x \}| = |x|\] \[\mathcal{F} \{ x \}[k] = \sum_{j=0}^{|x|-1} x[j] \cdot e^{-i 2 \pi jk \frac{1}{|x|}}\]&lt;p&gt;Since complex exponentation is so commonly used in Fourier transforms, we’ll define a helpful term \(W_N\) as follows:&lt;/p&gt;\[W_N \triangleq e^{-i 2 \pi \frac{1}{N}}\]&lt;p&gt;i.e. \(W_N = W_N^1\) is a \(\frac{1}{N}\)-turn rotation in the complex plane (starting at 1). \(W_N^2\) is a \(\frac{2}{N}\)-turn rotation in the complex plane, etc. Substituting to the original discrete Fourier transform definition, we get:&lt;/p&gt;\[\mathcal{F} \{ x \}[k] = \sum_{j=0}^{|x|-1} x[j] \cdot W_{|x|}^{jk}\]&lt;p&gt;Naïvely evaluating this equation for each of the \(\lvert x \rvert\) different output frequency buckets of the DFT (\(k = 0, 1, \ldots, \lvert x \rvert - 2, \lvert x \rvert - 1\)) requires a summation of complex products of the \(\lvert x \rvert\) samples in the signal, thus giving any naïve DFT algorithm a time complexity of \(O(\lvert x \rvert^2)\).&lt;/p&gt;&lt;p&gt;If \(\lvert x \rvert\) is a composite number, we can pick two natural numbers \(r\) and \(d\), such that:&lt;/p&gt;\[\lvert x \rvert = r \cdot d\]&lt;p&gt;This allows us to change the single summation over \(j\) into nested summations:&lt;/p&gt;\[\mathcal{F} \{ x \}[k] = \sum_{j_1=0}^{d-1} \sum_{j_0=0}^{r-1} x[j_1 r + j_0] \cdot W_{\lvert x \rvert}^{(j_1 r + j_0)k}\] \[= \sum_{j_0=0}^{r-1} \sum_{j_1=0}^{d-1} x[j_1 r + j_0] \cdot W_{\lvert x \rvert}^{(j_1 r + j_0)k}\]&lt;p&gt;Similarly, we can define variables \(k_0\) and \(k_1\) such that \(k = k_1 d + k_0\). Let:&lt;/p&gt;\[k_1 \triangleq \lfloor \frac{k}{d} \rfloor\] \[k_0 \triangleq k - k_1 d\]&lt;p&gt;In other words, \(k_1\) is the quotient and \(k_0\) is the remainder of the Euclidean division1 of \(k\) by \(d\).&lt;/p&gt;&lt;p&gt;This allows us to again re-formulate the discrete Fourier transform:&lt;/p&gt;\[\mathcal{F} \{ x \}[k] = \sum_{j_0=0}^{r-1} \sum_{j_1=0}^{d-1} x[j_1 r + j_0] \cdot W_{|x|}^{(j_1 r + j_0) (k_1 d + k_0)}\] \[= \sum_{j_0=0}^{r-1} \sum_{j_1=0}^{d-1} x[j_1 r + j_0] \cdot W_{|x|}^{j_1 r k_1 d + j_1 r k_0 + j_0 (k_1 d + k_0)}\] \[= \sum_{j_0=0}^{r-1} \sum_{j_1=0}^{d-1} x[j_1 r + j_0] \cdot W_{|x|}^{j_1 k_1 |x| + j_1 r k_0 + j_0 k}\] \[= \sum_{j_0=0}^{r-1} \sum_{j_1=0}^{d-1} x[j_1 r + j_0] \cdot W_{|x|}^{j_1 k_1 |x|} \cdot W_{|x|}^{j_1 r k_0} \cdot W_{|x|}^{j_0 k}\]&lt;p&gt;Since \(W_{\lvert x \rvert}^{j_1 k_1 \lvert x \rvert} = (e^{-i \frac{2 \pi \lvert x \rvert}{\lvert x \rvert}})^{j_1 k_1} = 1^{j_1 k_1} = 1\), therefore:&lt;/p&gt;\[\mathcal{F} \{ x \}[k] = \sum_{j_0=0}^{r-1} \sum_{j_1=0}^{d-1} x[j_1 r + j_0] \cdot W_{\lvert x \rvert}^{j_1 r k_0} \cdot W_{\lvert x \rvert}^{j_0 k}\]&lt;p&gt;At this point, we can split the elements of \(x\) into sub-sequences corresponding to modulo classes. Let \(x_{r}^{j_0}\) be a sequence whose elements are equal to the elements of \(x\) whose indices are equivalent \(j_0\) modulo \(r\). More formally, these sequences (of which there are \(r\) total) can be defined as follows:&lt;/p&gt;\[x_r^{j_0}[j_1] = x[j_1 r + j_0]\] \[|x_r^{j_0}| = \frac{|x|}{r} = d\]&lt;p&gt;Substituting this sequence definition, we get:2&lt;/p&gt;\[\mathcal{F} \{ x \}[k] = \sum_{j_0=0}^{r-1} \sum_{j_1=0}^{d-1} x_r^{j_0}[j_1] W_{|x|}^{k_0 j_1 r} W_{|x|}^{j_0 k}\] \[= \sum_{j_0=0}^{r-1} \sum_{j_1=0}^{d-1} x_r^{j_0}[j_1] W_d^{k_0 j_1} W_{|x|}^{j_0 k}\] \[= \sum_{j_0=0}^{r-1} \mathcal{F} \{ x_r^{j_0} \}[k_0] W_{|x|}^{j_0 k}\]&lt;p&gt;Let’s consider how long it will take to evaluate the discrete Fourier transform in this formulation:&lt;/p&gt;&lt;p&gt;Added together, these two sub-routines require \(O(\lvert x \rvert \cdot d + \lvert x \rvert \cdot r) = O(\lvert x \rvert \cdot (d + r))\) operations, possibly a significant improvement from the original \(O(\lvert x \rvert^2)\) complexity of the original naive formulation, depending on the values of \(r\) &amp;amp; \(d\). More importantly, this manipulation can be applied recursively. Specifically, each of the \(r\) discrete Fourier transforms of the \(d\)-length sequences \(x_r^{j_0}\) can be broken down into \(r'\) Fourier transforms of length \(d'\), assuming that two natural numbers exist such that \(d = r' \cdot d'\).3 In the ideal4 case where \(\lvert x \rvert = 2^n\), \(n \in \mathbb{N}\), calculating the Cooley-Tukey algorithm will require \(O(\lvert x \rvert \cdot (2 + 2 + \ldots + 2)) = O(\lvert x \rvert \cdot 2 \cdot \log_2(\lvert x \rvert)) = O (\lvert x \rvert \cdot \log(\lvert x \rvert))\) operations.&lt;/p&gt;&lt;p&gt;The Cooley-Tukey algorithm can also be used to calculate the inverse discrete Fourier transform with only very slight modification. In fact, the original Cooley-Tukey paper (see “related reading”) specifically described an algorithm to compute the inverse discrete Fourier transform, not the “forward” DFT. I will leave the Cooley-Tukey iDFT algorithm as an exercise for the reader.&lt;/p&gt;&lt;p&gt;However, note that the Cooley-Tukey algorithm gives no speed-up for input sequences of prime length, and provides relatively little speed-up when the factors of the input length contain large primes. To efficiently compute the DFT for sequences of prime or even non-highly-composite lengths, we will need additional algorithms. Ultimately, however, these other FFT algorithms generally depend on Cooley-Tukey for part of the computation. I plan to cover at least one of these techniques—Bluestein’s algorithm—in a future blog post(s).&lt;/p&gt;&lt;p&gt;This visualization shows how the discrete Fourier transform of some signal \(x\) is computed using the Cooley-Tukey algorithm. The black boxes at the very bottom are the input signal. While the DFT can be applied to complex signals, I’ve restricted the sample values of the input signal to be real numbers, for simplicity’s sake (this mimics some real-world applications, such as performing a DFT on an audio recording). You can click and drag on the input boxes to change their values.&lt;/p&gt;&lt;p&gt;The grey circles and the sometimes visible white “clock hands” inside of them represent the complex exponent \(W_N^x = e^{-2 i \pi \frac{x}{N}}\) for some \(N\) (e.g. \(\lvert x \rvert\), \(d\), \(d'\), etc.) and some \(x\). These complex exponents, which are equivalent to rotations in the complex plane, are applied to the relevant input value. Unlike the usual convention, I’ve decided to show the real component of the complex plane as vertical (“up” is positive-real) and the imaginary component as horizontal (“right” is imaginary-positive). You can see where the input value is drawn from by hovering the mouse over a given “rotation” box.&lt;/p&gt;&lt;p&gt;The sum of those rotated input values is added together to calculate one element of a discrete Fourier transform. Hover over a white “output” box of a discrete Fourier transform in the visualization to highlight the column of “rotation” boxes that it was summed from.&lt;/p&gt;&lt;p&gt;\(|x| =\)&lt;/p&gt;&lt;p&gt;Available factors:&lt;/p&gt;&lt;p&gt;I’ve noticed an irritating and confusing tendency among many people–including published authors–when talking about discrete Fourier transforms. I find they often use the phrase “fast Fourier transform” (or perhaps more often, the abbreviation “FFT”) when they mean “discrete Fourier transform” (or “DFT”). I think this is wrong and confusing; to understand why, imagine you have a list:&lt;/p&gt;&lt;code&gt;x = [10, 3, 2, 19, -2]
 &lt;/code&gt;&lt;p&gt;would it make sense to refer to the following list as the “mergesort” of the previous list?&lt;/p&gt;&lt;code&gt;y = [-2, 2, 3, 10, 19]
 &lt;/code&gt;&lt;p&gt;I think most people would find that very strange. We can say that the second list is the result of sorting the first list, but we don’t know anything about the specific algorithm that was used to sort the list. It could have been sorted using mergesort, quicksort, heapsort, bubblesort, bogosort, or any other sorting algorithm (in reality, I just sorted this one in my head). However, even if I had used mergesort, &lt;code&gt;y&lt;/code&gt; still wouldn’t be the “mergesort” of
 &lt;code&gt;x&lt;/code&gt;, it would still just be “the result of sorting &lt;code&gt;x&lt;/code&gt;”.&lt;/p&gt;&lt;p&gt;Similarly, the output of an FFT algorithm should not be referred to as “an/the FFT of” anything. In theory, calculating the DFT of a sequence using Cooley-Tukey gives the exact same result as calculating that DFT using a naïvely-implemented DFT algorithm. In practice, Cooley-Tukey will probably give a slightly more accurate result since there are fewer total calculations and therefore fewer opportunities for floating point round-off error.&lt;/p&gt;&lt;p&gt;This is not just irritating to me; I think it causes confusion among the public. A friend of mine–an intelligent mathematics major and software engineer–recently asked me “what would I lose by taking the fast Fourier transform instead of the ‘normal’ Fourier transform? I’ve always just taken the normal Fourier transform”. He probably inferred from the way many people throw around the phrase “FFT” that the “fast Fourier transform” is some kind of approximation or related concept yet distinct from the discrete Fourier transform or Fourier transforms in general, rather than an algorithm for calculating such.&lt;/p&gt;&lt;p&gt;Thank you to my friend Andre Archer, who helped to proofread an earlier version of this post. Any mistakes are my own.&lt;/p&gt;&lt;p&gt;Footnotes:&lt;/p&gt;&lt;p&gt;As far as I am aware, there is no widely-standardized notation for Euclidean division in mathematics. Personally, I find this quite silly. ↩&lt;/p&gt;&lt;p&gt;If \(r\) is chosen to be equal to \(\lvert x \rvert\), and therefore \(d = 1\), then calculating \(\mathcal{F} \{ x \}\) using Cooley-Tukey is equivalent to calculating \(\mathcal{F} \{ x \}\) naïvely, taking \(O(\lvert x \rvert^2)\) steps. ↩&lt;/p&gt;&lt;p&gt;By “ideal” I do not necessarily mean optimal, in any sense. \(|x| = 2^n\) is “ideal” in that it is very simple to reason about. ↩&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://connorboyle.io/2025/09/11/fft-cooley-tukey.html"/><published>2025-09-18T09:28:40+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45287551</id><title>CircuitHub (YC W12) Is Hiring Operations Research Engineers (UK/Remote)</title><updated>2025-09-18T13:01:15.406057+00:00</updated><content>&lt;doc fingerprint="29da4270258e37c0"&gt;
+&lt;/doc&gt;</content><link href="https://connorboyle.io/2025/09/11/fft-cooley-tukey.html"/><published>2025-09-18T09:28:40+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45287551</id><title>CircuitHub (YC W12) Is Hiring Operations Research Engineers (UK/Remote)</title><updated>2025-09-18T13:40:42.868975+00:00</updated><content>&lt;doc fingerprint="29da4270258e37c0"&gt;
   &lt;main&gt;
     &lt;p&gt;On-Demand Electronics Manufacturing&lt;/p&gt;
     &lt;p&gt;CircuitHub is reshaping electronics manufacturing with The Grid , a factory-scale robotics platform designed to make small-batch, high-mix electronics assembly radically more efficient. Think semiconductor-fab levels of precision applied to the chaotic world of prototyping and low-volume production. The result? A 10x throughput improvement in one of the world's most foundational industries.&lt;/p&gt;
@@ -740,21 +414,23 @@ struct ProfileEvents:
     &lt;p&gt;Join us to solve real world problems while shaping the future of automated manufacturing.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.ycombinator.com/companies/circuithub/jobs/UM1QSjZ-operations-research-engineer"/><published>2025-09-18T09:33:07+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45288161</id><title>Nvidia buys $5B in Intel stock in seismic deal</title><updated>2025-09-18T13:01:14.916446+00:00</updated><content>&lt;doc fingerprint="27f84771ddaa5063"&gt;
+&lt;/doc&gt;</content><link href="https://www.ycombinator.com/companies/circuithub/jobs/UM1QSjZ-operations-research-engineer"/><published>2025-09-18T09:33:07+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45288161</id><title>Nvidia buys $5B in Intel stock in seismic deal</title><updated>2025-09-18T13:40:42.669346+00:00</updated><content>&lt;doc fingerprint="27f94771ddaa5063"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Nvidia and Intel announce jointly developed 'Intel x86 RTX SOCs' for PCs with Nvidia graphics, also custom Nvidia data center x86 processors — Nvidia buys $5 billion in Intel stock in seismic deal&lt;/head&gt;
     &lt;p&gt;Cats and Dogs, living together!&lt;/p&gt;
-    &lt;p&gt;In a surprising announcement that finds two long-time rivals working together, Nvidia and Intel announced today that the companies would jointly develop multiple new generations of x86 products together. The products include x86 Intel CPUs tightly fused with an Nvidia RTX graphics chiplet for the consumer gaming PC market, named the ‘Intel x86 RTX SOCs.’ Nvidia will also have Intel build custom x86 data center CPUs for its AI products for hyperscale and enterprise customers. Additionally, Nvidia announced that it will buy $5 billion in Intel common stock at $23.28 per share, representing a roughly 5% ownership stake in Intel. (Intel stock is now up 33% in premarket trading.) We spoke with Nvidia representatives to learn more details about the company’s plans.&lt;/p&gt;
-    &lt;p&gt;Nvidia says that the partnership between the two companies is in the very early stages, so the timeline for product releases, along with any product specifications, will be disclosed at a later, unspecified date. (Given the traditionally long lead-times for new processors, it is rational to expect these products will take at least a year, and likely longer, to come to market.)&lt;/p&gt;
-    &lt;p&gt;Nvidia emphasized that the companies are committed to multi-generation roadmaps for the co-developed products, which represents a strong investment in the x86 ecosystem. However, Nvidia tells us it also remains fully committed to its other announced product roadmaps and architectures, including for its Arm-based GB10 Grace Blackwell processors for workstations and the Nvidia Grace CPUs for data centers and the next-gen Vera CPUs. Nvidia says it also remains committed to products on its internal roadmaps that haven’t been publicly disclosed yet, indicating that the new roadmap with Intel will merely be additive to its existing initiatives.&lt;/p&gt;
-    &lt;p&gt;Nvidia hasn’t disclosed whether it will use Intel Foundry to produce any of the products yet. However, while Intel has used TSMC to manufacture some of its recent products, its goal is to bring production of most of its high-performance products back into its own foundries, and some of its products never left. For instance, Intel’s existing Granite Rapids data center processors use the ‘Intel 3’ node, and the upcoming Clearwater Forest Xeons will use Intel’s own 18A process node for compute. This suggests that at least some of the Nvidia-custom x86 silicon, particularly for the data center, could be fabbed on Intel nodes. However, Intel also uses TSMC to fabricate many of its client x86 processors now, so we won’t know for sure until official announcements are made — particularly for the RTX GPU chiplet.&lt;/p&gt;
-    &lt;p&gt;In either case, Nvidia has been mulling using Intel Foundry since 2022, has fabbed test chips there, and participates in the U.S. Defense Dept's RAMP-C project with Intel that involves Nvidia already making chips on Intel's 18A process node, so it wouldn't be a total surprise.&lt;/p&gt;
-    &lt;p&gt;While the two companies have engaged in heated competition in some market segments, Intel and Nvidia have partnered for decades, ensuring interoperability between their hardware and software for products spanning both the client and data center markets. However, these products have long used the PCIe interface to connect Intel CPUs and Nvidia’s GPUs. The new partnership will find tighter integration using the NVLink interface for CPU-to-GPU communication, which affords up to 14 times more bandwidth along with lower latency than PCIe, thus granting the new x86 products access to the highest performance possible when paired with GPUs. Let’s dive into the details we’ve learned so far.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Intel x86 RTX SOCs for the PC gaming market&lt;/head&gt;
-    &lt;p&gt;For the PC market, the Intel x86 RTX SoC chips will come with an x86 CPU chiplet tightly connected with an Nvidia RTX GPU chiplet via the NVLink interface. This type of processor will have both the CPU and GPU units merged into one compact chip package that externally looks much like a standard CPU, rivaling AMD’s competing APU products.&lt;/p&gt;
+    &lt;p&gt;In a surprise announcement that finds two long-time rivals working together, Nvidia and Intel announced today that the companies will jointly develop multiple new generations of x86 products together — a seismic shift with profound implications for the entire world of technology. Before the news broke, Tom's Hardware spoke with Nvidia representatives to learn more details about the company’s plans.&lt;/p&gt;
+    &lt;p&gt;The products include x86 Intel CPUs tightly fused with an Nvidia RTX graphics chiplet for the consumer gaming PC market, named the ‘Intel x86 RTX SOCs.’ Nvidia will also have Intel build custom x86 data center CPUs for its AI products for hyperscale and enterprise customers. Additionally, Nvidia will buy $5 billion in Intel common stock at $23.28 per share, representing a roughly 5% ownership stake in Intel. (Intel stock is now up 33% in premarket trading.)&lt;/p&gt;
+    &lt;p&gt;The partnership between the two companies is in the very early stages, Nvidia told us, so the timeline for product releases along with any product specifications will be disclosed at a later, unspecified date. (Given the traditionally long lead-times for new processors, it is rational to expect these products will take at least a year, and likely longer, to come to market.)&lt;/p&gt;
+    &lt;p&gt;Nvidia emphasized that the companies are committed to multi-generation roadmaps for the co-developed products, which represents a strong investment in the x86 ecosystem. But representatives tells us it also remains fully committed to other announced product roadmaps and architectures, including the company's Arm-based GB10 Grace Blackwell processors for workstations and the Nvidia Grace CPUs for data centers, as well as the next-gen Vera CPUs. Nvidia says it also remains committed to products on its internal roadmaps that haven’t been publicly disclosed yet, indicating that the new roadmap with Intel will merely be additive to existing initiatives.&lt;/p&gt;
+    &lt;p&gt;The chip giant hasn’t disclosed whether it will use Intel Foundry to produce any of these products yet. However, while Intel has used TSMC to manufacture some recent products, its goal is to bring production of most high-performance products back into its own foundries.&lt;/p&gt;
+    &lt;p&gt;Some products never left. For instance, Intel’s existing Granite Rapids data center processors use the ‘Intel 3’ node, and the upcoming Clearwater Forest Xeons will use Intel’s own 18A process node for compute. This suggests that at least some of the Nvidia-custom x86 silicon, particularly for the data center, could be fabbed on Intel nodes. Intel also uses TSMC to fabricate many of its client x86 processors, however, so we won’t know for sure until official announcements are made — particularly for the RTX GPU chiplet.&lt;/p&gt;
+    &lt;p&gt;In either case, Nvidia has been mulling using Intel Foundry since 2022, has fabbed test chips there, and participates in the U.S. Defense Dept.'s RAMP-C project with Intel. The DoD project involves Nvidia already making chips on Intel's 18A process node, so it wouldn't be a total surprise.&lt;/p&gt;
     &lt;p&gt;Get Tom's Hardware's best news and in-depth reviews, straight to your inbox.&lt;/p&gt;
+    &lt;p&gt;While the two companies have engaged in heated competition in some market segments, Intel and Nvidia have partnered for decades, ensuring interoperability between their hardware and software for products spanning both the client and data center markets. And the PCIe interface has long been used to connect Intel CPUs and Nvidia GPUs. The new partnership will find tighter integration using the NVLink interface for CPU-to-GPU communication, which affords up to 14 times more bandwidth along with lower latency than PCIe, thus granting the new x86 products access to the highest performance possible when paired with GPUs. Let’s dive into the details we’ve learned so far.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Intel x86 RTX SOCs for the PC gaming market&lt;/head&gt;
+    &lt;p&gt;For the PC market, the Intel x86 RTX SoC chips will come with an x86 CPU chiplet tightly connected with an Nvidia RTX GPU chiplet via the NVLink interface. This type of processor will have both CPU and GPU units merged into one compact chip package that externally looks much like a standard CPU, rivaling AMD’s competing APU products.&lt;/p&gt;
     &lt;p&gt;This type of tight integration packs all the gaming prowess into one package without an external discrete GPU, providing power and footprint advantages. As such, these chips will be heavily focused on thin-and-light gaming laptops and small form-factor PCs, much like today’s APUs from AMD. However, it’s possible the new Nvidia/Intel chips could come in multiple flavors and permeate further into the Intel stack over time.&lt;/p&gt;
-    &lt;p&gt;Intel has worked on a similar type of chip before with AMD; however, there is at least one significant technical difference between these initiatives. Intel launched its Kaby Lake-G chip in 2017 with an Intel processor fused into the same package with an AMD Radeon GPU chiplet, much the same as the description of the new Nvidia/Intel chips. You can see an image of the Intel/AMD chip below.&lt;/p&gt;
+    &lt;p&gt;Intel has worked on a similar type of chip before with AMD; there is at least one significant technical difference between these initiatives, however. Intel launched its Kaby Lake-G chip in 2017 with an Intel processor fused into the same package as an AMD Radeon GPU chiplet, much the same as the description of the new Nvidia/Intel chips. You can see an image of the Intel/AMD chip below.&lt;/p&gt;
     &lt;p&gt;This SoC had a CPU at one end connected via a PCIe connection to the separate AMD GPU chiplet, which is flanked by a small, dedicated memory package. This separate memory package was only usable by the GPU. The Nvidia/Intel products will have an RTX GPU chiplet connected to the CPU chiplet via the faster and more efficient NVLink interface, and we’re told it will have uniform memory access (UMA), meaning both the CPU and GPU will be able to access the same pool of memory.&lt;/p&gt;
     &lt;p&gt;Intel notoriously axed the Kaby Lake-G products in 2019, and the existing systems were left without proper driver support for quite some time, in part because Intel was responsible for validating the drivers, and then finger-pointing ensued. We’re told that both Intel and Nvidia will be responsible for their respective drivers for the new models, with Nvidia naturally providing its own GPU drivers. However, Intel will build and sell the consumer processors.&lt;/p&gt;
     &lt;p&gt;We haven’t spoken with Intel yet, but the limited scope of this project means that Intel’s proprietary Xe graphics architecture will most assuredly live on as the primary integrated GPU (iGPU) for its mass-market products.&lt;/p&gt;
@@ -840,10 +516,10 @@ struct ProfileEvents:
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.tomshardware.com/pc-components/cpus/nvidia-and-intel-announce-jointly-developed-intel-x86-rtx-socs-for-pcs-with-nvidia-graphics-also-custom-nvidia-data-center-x86-processors-nvidia-buys-usd5-billion-in-intel-stock-in-seismic-deal"/><published>2025-09-18T11:04:48+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45288271</id><title>Nvidia to Invest $5B in Intel</title><updated>2025-09-18T13:01:14.120004+00:00</updated><content>&lt;doc fingerprint="9e7b0571dfaad1e9"&gt;
+&lt;/doc&gt;</content><link href="https://www.tomshardware.com/pc-components/cpus/nvidia-and-intel-announce-jointly-developed-intel-x86-rtx-socs-for-pcs-with-nvidia-graphics-also-custom-nvidia-data-center-x86-processors-nvidia-buys-usd5-billion-in-intel-stock-in-seismic-deal"/><published>2025-09-18T11:04:48+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45288271</id><title>Nvidia to Invest $5B in Intel</title><updated>2025-09-18T13:40:41.988565+00:00</updated><content>&lt;doc fingerprint="9e7b0571dfaad1e9"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;&lt;quote&gt;Nvidia to invest $5bn in rival Intel&lt;/quote&gt;&lt;/head&gt;&lt;head rend="h2"&gt;Save 40% on Standard Digital&lt;/head&gt;was $540 now $319 for your first year&lt;p&gt;Save now on essential digital access to quality FT journalism on any device. Saving based on monthly annualised price.&lt;/p&gt;&lt;head rend="h2"&gt;Explore more offers.&lt;/head&gt;&lt;head rend="h3"&gt;Trial&lt;/head&gt;&lt;p&gt;Then $75 per month. Complete digital access to quality FT journalism on any device. Cancel or change your plan anytime during your trial.&lt;/p&gt;&lt;head rend="h3"&gt;Premium Digital&lt;/head&gt;&lt;p&gt;Complete digital access to quality FT journalism with expert analysis from industry leaders. Pay a year upfront and save 20%.&lt;/p&gt;&lt;p&gt;FT newspaper delivered Monday-Saturday, plus FT Digital Edition delivered to your device Monday-Saturday.&lt;/p&gt;&lt;p&gt;Check whether you already have access via your university or organisation.&lt;/p&gt;&lt;p&gt;Terms &amp;amp; Conditions apply&lt;/p&gt;&lt;head rend="h2"&gt;Explore our full range of subscriptions.&lt;/head&gt;&lt;head rend="h3"&gt;For individuals&lt;/head&gt;&lt;p&gt;Discover all the plans currently available in your country&lt;/p&gt;&lt;head rend="h3"&gt;For multiple readers&lt;/head&gt;&lt;p&gt;Digital access for organisations. Includes exclusive features and content.&lt;/p&gt;&lt;head rend="h2"&gt;Why the FT?&lt;/head&gt;&lt;p&gt;See why over a million readers pay to read the Financial Times.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.ft.com/content/be8d4c0c-66ff-4dfd-9b43-af6c0b290ada"/><published>2025-09-18T11:24:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45288551</id><title>You Had No Taste Before AI</title><updated>2025-09-18T13:01:13.598289+00:00</updated><content>&lt;doc fingerprint="a49ea3d18a83c5cd"&gt;
+&lt;/doc&gt;</content><link href="https://www.ft.com/content/be8d4c0c-66ff-4dfd-9b43-af6c0b290ada"/><published>2025-09-18T11:24:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45288551</id><title>You Had No Taste Before AI</title><updated>2025-09-18T13:40:41.689006+00:00</updated><content>&lt;doc fingerprint="a49ea3d18a83c5cd"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;You Had No Taste Before AI&lt;/head&gt;
     &lt;head class="block cursor-pointer bg-neutral-100 py-1 ps-5 text-lg font-semibold text-neutral-800 dark:bg-neutral-700 dark:text-neutral-100 lg:hidden"&gt;Table of Contents&lt;/head&gt;
@@ -901,4 +577,138 @@ struct ProfileEvents:
     &lt;p&gt;Stop waiting for AI to force you to develop taste. Start now.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://matthewsanabria.dev/posts/you-had-no-taste-before-ai/"/><published>2025-09-18T12:00:44+00:00</published></entry></feed>
+&lt;/doc&gt;</content><link href="https://matthewsanabria.dev/posts/you-had-no-taste-before-ai/"/><published>2025-09-18T12:00:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45288690</id><title>KDE is now my favorite desktop</title><updated>2025-09-18T13:40:41.251667+00:00</updated><content>&lt;doc fingerprint="7416641b31042abb"&gt;
+  &lt;main&gt;
+    &lt;p&gt;From my last blog post, I am now using KDE as the desktop environment for my gaming rig. The reason is because I want a reasonably easy to use Linux desktop for when my wife needs to use the PC for something other than gaming, and this was the reason why my "traditional" Sway setup was a no-go.&lt;/p&gt;
+    &lt;p&gt;But, after using KDE for a while I am starting to really appreciate how good it is. And no, this is not compared to other Linux desktops, but also with both Windows and macOS (that I need to use often, especially the later since my job gave me a MacBook Pro).&lt;/p&gt;
+    &lt;p&gt;To start, KDE is surprisingly feature-complete. For example, the network applet gives lots of information that in other operational systems are either not available or difficult to access. It is easy to see in the screenshot below:&lt;/p&gt;
+    &lt;p&gt;You can see things like channel, signal strength, frequency, MAC address, BSSID address (so the MAC address of the router). It even includes a handy button to share the Wi-Fi information via QR code, so you can easily setup a new mobile device like Android.&lt;/p&gt;
+    &lt;p&gt;By the way, the crop and blur from that screenshot above? I made everything using the integrated screenshot tool. I didn't need to open an external application even once. It is also really smart, I need to redo this screenshot a few times and it kept the cropping to the exact area I was taking the screenshot before.&lt;/p&gt;
+    &lt;p&gt;Another example, I wanted Steam to start automatically with the system, but it has the bad habit of putting its main window at the top. Really annoying since it sometimes ended up stealing up the focus. However KDE has this "Window Rules" feature inside "Window Management" settings where you can pretty much control whatever you want about application windows. Really useful tool.&lt;/p&gt;
+    &lt;p&gt;KDE also has lots of really well integrated tools. For example, I am using some Flatpak applications and I can easily configure the permissions via System Settings. Or if I want hardware information like SMART status, I can just open Info Center. I can prevent the screen and computer to sleep at the click of a button (something that in both Windows and macOS I need to install a separate program). The list goes on, I keep getting surprised how many things that I used to need a third-party program that KDE just has available by default.&lt;/p&gt;
+    &lt;p&gt;But not only KDE is fully featured, it is also fast. Now to be clear, this is a completely subjective analysis but I find KDE faster than Windows 11 in the same hardware, especially for things integrated in the system itself. For example, while opening Windows settings it can take a few seconds after a cold boot, the KDE's System Settings is pretty much instantaneous. Even compared with macOS in my MacBook Pro M2 Pro (that is of course comparing Apples and Bananas), KDE just feels snappier. I actually can't find much difference between KDE and my Sway setup to be honest, except maybe for the heavy use of animations (that can be disabled, but I ended up liking it after a while).&lt;/p&gt;
+    &lt;p&gt;I will not say KDE is perfect though. At the first launch I got one issue where it started without the task bar because I connected this PC to both my monitor and TV, but the TV is used exclusively for gaming. However, KDE considered my TV the primary desktop and put the task bar only in that monitor, and even disabling the TV didn't add the task bar to my monitor. Easily fixed by manually adding a task bar, but an annoying problem (especially when you're not used to the desktop). There were also a few other minor issues that I don't remember right now.&lt;/p&gt;
+    &lt;p&gt;After using KDE for about a week I can say that this is the first time that I really enjoy a desktop environment on Linux, after all those years. Props for the KDE developers for making the experience so good.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://kokada.dev/blog/kde-is-now-my-favorite-desktop/"/><published>2025-09-18T12:17:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45289168</id><title>The quality of AI-assisted software depends on unit of work management</title><updated>2025-09-18T13:40:41.008865+00:00</updated><content>&lt;doc fingerprint="2651f55330438f4e"&gt;
+  &lt;main&gt;
+    &lt;p&gt;The craft of AI-assisted software creation is substantially about correctly managing units of work.&lt;/p&gt;
+    &lt;p&gt;When I was new to this emerging craft of AI-assisted coding, I was getting lousy results, despite the models being rather intelligent. Turns out the major bottleneck is not intelligence, but rather providing the correct context.&lt;/p&gt;
+    &lt;p&gt;Andrej Karpathy, while referencing my earlier article on this topic, described the work of AI-assisted engineering as “putting AI on a tight leash”. What does a tight leash look like for a process where AI agents are operating on your code more independently than ever? He dropped a hint: work on small chunks of a single concrete thing.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The right sized unit of work respects the context&lt;/head&gt;
+    &lt;p&gt;I like the term context engineering, because it has opened up the vocabulary to better describe why managing units of work is perhaps the most important technique to get better results out of AI tools. It centers our discussion around the “canvas” against which our AI is generating code.&lt;/p&gt;
+    &lt;p&gt;The generated output of the LLM is a sample of the next token probability. Every time we generate a token, what has already been generated in the previous iteration is appended to the context window. What this context window looks like has a huge influence on the quality of your generated output.&lt;/p&gt;
+    &lt;p&gt;Drew Breunig wrote an excellent article about all kinds of things that can go wrong with your context and proposed various techniques to fix them.&lt;/p&gt;
+    &lt;p&gt;The best AI-assisted craftsmen are often thinking about the design and arrangement of their context to get the AI to one-shot a solution. This is tricky and effortful, contrary to what the AI coding hype suggests.&lt;/p&gt;
+    &lt;p&gt;If you don’t provide the necessary information in the context to do a good job, your AI will hallucinate or generate code that is not congruent with the practices of your codebase. It is especially brittle at integration points of your software system.&lt;/p&gt;
+    &lt;p&gt;On the other hand, if you fill up the context with too much information, and the quality of your output degrades, because of a lack of focused attention.&lt;/p&gt;
+    &lt;p&gt;Breaking down your task into “right-sized” units of work, which describe just the right amount of detail is perhaps the most powerful lever to improve your context window, and thus the correctness and quality of the generated code.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The right sized unit of work controls the propagation of errors&lt;/head&gt;
+    &lt;p&gt;Time for some napkin maths.&lt;/p&gt;
+    &lt;p&gt;Let’s say your AI agent has a 5% chance of making a mistake. I’m not just referring to hallucinations—it could be a subtle mistake because it forgot to look up some documentation or you missed a detail in your specification.&lt;/p&gt;
+    &lt;p&gt;In an agentic multi-turn workflow, which is what all coding workflows are converging to, this error compounds. If your task takes 10 turns to implement, you will have a (1 – 0.95)10 = 59.9% chance of success. Not very high.&lt;/p&gt;
+    &lt;p&gt;Utkarsh Kanwat in his blog post has made the same argument. His conclusion was that any AI agent would need some kind of pause-and-verify gating mechanism at each step for a long-horizon task.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="5"&gt;
+        &lt;cell role="head"&gt;Per-action&lt;p&gt;error rate&lt;/p&gt;&lt;/cell&gt;
+        &lt;cell role="head"&gt;Overall Error Rate&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;5 turns&lt;/cell&gt;
+        &lt;cell&gt;10 turns&lt;/cell&gt;
+        &lt;cell&gt;20 turns&lt;/cell&gt;
+        &lt;cell&gt;50 turns&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;0.1%&lt;/cell&gt;
+        &lt;cell&gt;99.5%&lt;/cell&gt;
+        &lt;cell&gt;99.0%&lt;/cell&gt;
+        &lt;cell&gt;98.0%&lt;/cell&gt;
+        &lt;cell&gt;95.1%&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1%&lt;/cell&gt;
+        &lt;cell&gt;95.1%&lt;/cell&gt;
+        &lt;cell&gt;90.4%&lt;/cell&gt;
+        &lt;cell&gt;81.8%&lt;/cell&gt;
+        &lt;cell&gt;60.5%&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;5%&lt;/cell&gt;
+        &lt;cell&gt;77.4%&lt;/cell&gt;
+        &lt;cell&gt;59.9%&lt;/cell&gt;
+        &lt;cell&gt;35.8%&lt;/cell&gt;
+        &lt;cell&gt;7.7%&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;10%&lt;/cell&gt;
+        &lt;cell&gt;59.0%&lt;/cell&gt;
+        &lt;cell&gt;34.9%&lt;/cell&gt;
+        &lt;cell&gt;12.2%&lt;/cell&gt;
+        &lt;cell&gt;0.5%&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;20%&lt;/cell&gt;
+        &lt;cell&gt;32.8%&lt;/cell&gt;
+        &lt;cell&gt;10.7%&lt;/cell&gt;
+        &lt;cell&gt;1.2%&lt;/cell&gt;
+        &lt;cell&gt;0.0%&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;What does the state of the art for multi-turn error rates look like? METR recently published a popular chart describing how AI models are getting better at long-horizon tasks. Currently GPT-5 is at the top of the leaderboard, where it can perform ~2-hour long tasks at around a 70% success rate. Working backwards (let’s say a 2 hour task is 50+ turns) this would amount to a sub-1% error rate per action.&lt;/p&gt;
+    &lt;p&gt;Doesn’t a &amp;lt;1% error rate per action seem suspicious to you? As a regular user of agentic coding tools (my current one is Codex CLI), I’ll eat my shoe if GPT-5 starts nailing my tasks 99.9% of the time.&lt;/p&gt;
+    &lt;p&gt;My intuition derived from experience tells me that even the best AI right now isn’t even 95% likely to be correct. So where is the difference coming from? It needs a closer look at the actual paper:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Our tasks typically use environments that do not significantly change unless directly acted upon by the agent. In contrast, real tasks often occur in the context of a changing environment.&lt;/p&gt;
+      &lt;p&gt;[…]&lt;/p&gt;
+      &lt;p&gt;Similarly, very few of our tasks are punishing of single mistakes. This is in part to reduce the expected cost of collecting human baselines.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;This is not at all like the tasks I am doing.&lt;/p&gt;
+    &lt;p&gt;METR acknowledges the messiness of the real world. They have come up with a “messiness rating” for their tasks, and the “mean messiness” of their tasks is 3.2/16.&lt;/p&gt;
+    &lt;p&gt;By METR’s definitions, the kind of software engineering work that I’m mostly exposed to would score at least around 7-8, given that software engineering projects are path-dependent, dynamic and without clear counterfactuals. I have worked on problems that get to around 13/16 levels of messiness.&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;An increase in task messiness by 1 point reduces mean success rates by roughly 8.1%&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Extrapolating from METR’s measured effect of messiness, GPT-5 would go from 70% to around 40% success rate for 2-hour tasks. This maps to my experienced reality.&lt;/p&gt;
+    &lt;p&gt;I am not certain that pure intelligence can solve for messiness. Robustness to environmental chaos and the fuzzy nature of reality is fundamentally about managing context well. Until we find the magic sauce that solves this, it is clear that we need a workflow that can break down our problem into units of work, with verifiable checkpoints to manage the compounding of errors.&lt;/p&gt;
+    &lt;p&gt;These verifiable checkpoints need to be legible to humans.&lt;/p&gt;
+    &lt;head rend="h2"&gt;So, what is the “right sized” unit of work?&lt;/head&gt;
+    &lt;p&gt;The right sized unit of work needs to be small and describe the desired outcome concisely.&lt;/p&gt;
+    &lt;p&gt;The desired outcome on completion of a unit of work needs to be human-legible. I argue that it needs to provide legible business value. Ultimately, the users of software are going to be humans (or systems that model human constructs). Therefore, an elegant way to break down a project is to model it as small units of work that provide legible business value at each checkpoint. This will serve the purpose of respecting the context window of the LLM and help manage the propagation of errors.&lt;/p&gt;
+    &lt;p&gt;Software engineers have already defined a unit of work that provides business value and serve as the placeholder for all the context and negotiation of scope—User Stories. I think they are a good starting point to help us break down a large problem into smaller problems that an LLM can one-shot, while providing a concrete result. They center user outcomes, which unlike “tasks”, are robust to the messy dynamic environment of software development.&lt;/p&gt;
+    &lt;p&gt;Deliverable business value is also what all stakeholders can understand and work with. Software is not built in a vacuum by developers—it needs the coordination of teams, product owners, business people and users. The fact that AI agents work in their own context environment separate from the other stakeholders hurts effectiveness and transfer of its benefits. I think this is an important gap that needs to be bridged.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;unit size&lt;/cell&gt;
+        &lt;cell role="head"&gt;outcome of completion&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;TODO item&lt;/cell&gt;
+        &lt;cell&gt;small&lt;/cell&gt;
+        &lt;cell&gt;incremental technical value&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;“Plan Mode”&lt;/cell&gt;
+        &lt;cell&gt;large&lt;/cell&gt;
+        &lt;cell&gt;technical value&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Amazon Kiro Spec&lt;/cell&gt;
+        &lt;cell&gt;small&lt;/cell&gt;
+        &lt;cell&gt;technical value&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;User Story&lt;/cell&gt;
+        &lt;cell&gt;small&lt;/cell&gt;
+        &lt;cell&gt;business value&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Most AI agents today have well-functioning “planning” modes. These are good at keeping the agent on rails, but they mostly provide technical value, and not necessarily a legible business outcome. I believe planning is complementary to our idea of breaking down a project into small units of business value. My proposed unit of work can be planned with existing planning tools. And I believe this is superior to planning over a large unit of work due to the context rot issues described earlier.&lt;/p&gt;
+    &lt;p&gt;Of course, plain old User Stories as described in the Agile canon is not sufficient. It needs to be accompanied by “something more” that can nudge the agents to gather the right context that serves the business value outcome of the stories. What that “something more” could look like is something we hope to answer in the coming months.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The StoryMachine experiment&lt;/head&gt;
+    &lt;p&gt;To test whether user stories with “something more” can indeed serve as optimal units of work that that have the properties I described above, we are running an experiment called StoryMachine. Currently StoryMachine does not do much—it reads your PRD and Tech Specs and produces story cards. It is still early days. But we will set up an evaluation system that will help us iterate to a unit of work description that helps us build useful software effortlessly. I hope to share updates on what we find in the coming months.&lt;/p&gt;
+    &lt;p&gt;I want the craft of AI-assisted development to be less effortful and less like a slot-machine. And our best lever to get there is managing the unit of work.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://blog.nilenso.com/blog/2025/09/15/ai-unit-of-work/"/><published>2025-09-18T13:06:03+00:00</published></entry></feed>
