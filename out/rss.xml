@@ -1,108 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 24 Sep 2025 16:12:59 +0000</lastBuildDate><item><title>My game's server is blocked in Spain whenever there's a football match on</title><link>https://old.reddit.com/r/gamedev/comments/1np6kyn/my_games_server_is_blocked_in_spain_whenever/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45358433</guid><pubDate>Wed, 24 Sep 2025 10:26:23 +0000</pubDate></item><item><title>Preparing for the .NET 10 GC</title><link>https://maoni0.medium.com/preparing-for-the-net-10-gc-88718b261ef2</link><description>&lt;doc fingerprint="2e6b5a97a927d570"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Preparing for the .NET 10 GC&lt;/head&gt;
-    &lt;p&gt;In .NET 9 we enabled DATAS by default. But .NET 9 is not an LTS release so for many people they will be getting DATAS for the first time when they upgrade to .NET 10. This was a tough decision because GC features are usually the kind that don’t require user intervention — but DATAS is a bit different. That’s why this post is titled “preparing for” instead of just “what’s new” 😊.&lt;/p&gt;
-    &lt;p&gt;If you’re using Server GC, you might notice a performance profile that’s more noticeably different than what you saw in previous runtime upgrades. Memory usage may look drastically different (very likely smaller) — and that may or may not be desirable. It all depends on whether the tradeoff is noticeable, and if it is, whether it aligns with your optimization goals. I’d recommend taking at least a quick look at your application performance metrics to see if you are happy with the results of this change. Many people will absolutely welcome it — but if you are not one of them, don’t panic. I encourage you to read on to see whether it makes sense to simply turn DATAS off or if a bit of tuning could make it work in your favor.&lt;/p&gt;
-    &lt;p&gt;I’ll talk about how we generally decide which performance features to add, why DATAS is so different from typical GC features, and the tuning changes introduced since my last DATAS blog post. I’ll also share two examples of how I tuned DATAS in first-party scenarios.&lt;/p&gt;
-    &lt;p&gt;If you’re mainly here to see which scenarios DATAS isn’t designed for — to help decide whether to turn it off — feel free to skip ahead to this section.&lt;/p&gt;
-    &lt;head rend="h2"&gt;General policies of adding GC performance features&lt;/head&gt;
-    &lt;p&gt;Most GC performance features — whether it’s a new GC flavor, a new mechanism that enables the GC to do something it couldn’t before, or optimizations that improve an existing mechanism — are typically lit up automatically when you upgrade to a new runtime version. We don’t require users to take action because these features are designed to improve a wide range of scenarios. In fact, that’s often why we choose to implement them: we analyze many scenarios to understand the most common problems, figure out what it would take to solve them, and then prioritize which ones to design and implement.&lt;/p&gt;
-    &lt;p&gt;Of course, with any performance changes, there’s always the risk of regressions — and for a framework used by millions, you’re guaranteed to regress someone. These regressions can be especially visible in microbenchmarks, where the behavior is so extreme that even small changes can cause wild swings in results.&lt;/p&gt;
-    &lt;p&gt;A recent example being the change we made in how we handle the free regions for UOH (ie, LOH + POH) generations. We changed from the budget based trimming policy to an age based because it’s more robust in general (so we don’t either quickly decommit memory and have to recommit again, or keep extra free regions around even after a long time because we continue not consuming nearly all of the UOH budgets). But this can totally change a microbenchmark that used to observe the primary memory go down to a very low value after one GC.Collect() now requires 3 GC.Collect() calls (because we have to wait for the UOH free regions to age out in 2 gen2 GCs and the 3rd one will put it on the decommit list).&lt;/p&gt;
-    &lt;p&gt;But for DATAS, we knew it was by definition not necessarily for a wide range of scenarios. As I mentioned in my last blog post, there were 2 specific kinds of scenarios that DATAS targeted. I’ll reiterate them here –&lt;/p&gt;
-    &lt;p&gt;1. Bursty workloads running in memory constraint environments. DATAS aims to retract the heap size back when the application doesn’t require as much memory and grow it when the app requires more. This is especially important for apps running in containers with memory limits.&lt;/p&gt;
-    &lt;p&gt;2. Small workloads using Server GC — for example, if someone wants to try out a small asp.net core app to see what the experience is like in .NET, DATAS aims provide a heap size much more inline with what the small app actually needs.&lt;/p&gt;
-    &lt;p&gt;I should give more explanation about 1). It’s not uncommon to see bursty workloads at all. If you have an app that handles requests, which is completely common, naturally you could have many more users during a specific time of the day than the rest of the day. However, the key here is the action that follows it — if you have memory freed up during the non peak hours, what would you do with this memory? It turns out that sometimes folks don’t actually know — they want to see the memory go down when the workload lightens, but they have no plans to do anything with this memory. And for some teams, they don’t need to the memory usage to go down because they already budgeted all that memory to their apps. I was just talking to a customer recently and when I asked them “if DATAS frees up memory for you, what would you use for it?”. The answer was “that’s a good question, we never thought about it”.&lt;/p&gt;
-    &lt;p&gt;For folks who do want to make use of the freed up memory, a common way is to use an orchestrated environment . DATAS makes this scenario more robust as heap sizes will be much more predictable, as I’ll explain below, which helps with setting sensible memory limits. For example, in k8s, you can determine appropriate request and limit values for both non-peak and peak workloads to better leverage HPA. I have also seen teams that schedule tasks to run when the machines/VMs have free memory — this is more involved (and these teams usually are equipped with a team of dedicated perf engineers) but gives them more control.&lt;/p&gt;
-    &lt;p&gt;Then there are plenty of teams that have dedicated fleets of machines and want to maximize their throughput during peak hours as much as possible. They do not want to tolerate any type of slow down. They are definitely not the target of DATAS which will almost always regress their throughput — when it comes to perf it’s rarely an all or none situation and I will discuss below how to make a decision if you should turn DATAS off.&lt;/p&gt;
-    &lt;p&gt;All these made it difficult to make DATAS the default because we know there are a lot of teams that don’t want to sacrifice throughput at all or don’t make use of freed up memory.&lt;/p&gt;
-    &lt;p&gt;I will discuss in detail below if you do want to look at the perf differences and make a decision if DATAS is for you or not (maybe when you see the memory reduction you will have ideas of using the freed up memory).&lt;/p&gt;
-    &lt;head rend="h2"&gt;Performance differences between DATAS and the traditional Server GC&lt;/head&gt;
-    &lt;p&gt;DATAS is a GC feature that I spent more time explaining to my coworkers than any other — being such a user visible feature, it naturally attracted more questions than pretty much any other GC features I added. And there were lots of misconceptions. Some thought that DATAS only affected startup; some assumed it would just “reduce memory by x% and throughput by y%”; some expected it to “magically reducing memory without any other perf differences” (okay, I added the “magically” part 😆); and etc.&lt;/p&gt;
-    &lt;p&gt;To understand the differences properly, we need to understand the difference in policies. First and foremost, Server GC does not adapt to the application size — it was never a goal. Server GC looks mostly at the survival rate of each generation and does GCs based on that (there are a number of other factors that affect when GCs are triggered but survival rate is one of the most significant). In the last DATAS post I talked about the number of heaps which can affect the heap size significantly, especially in workloads that allocate a lot of temporary data. Since Server GC creates the same number of heaps as the number of cores the process is allowed to use, it means you can see very different heap sizes when running the same app with a different number of cores (by running it on a machine with a different number of cores or let your process use different number of cores on the same machine).&lt;/p&gt;
-    &lt;p&gt;DATAS, on the other hand, aims to adapt to the application size which means you should see similar heap sizes even when the number of cores varies a lot. So there’s no “DATAS will reduce memory by X%” compared to Server GC.&lt;/p&gt;
-    &lt;p&gt;If we look at the “Max heap size” metric for asp.net benchmarks, it’s obvious that Server GC behaves very differently when running on a 28-core machine (28c) vs a 12-core machine (12c) –&lt;/p&gt;
-    &lt;p&gt;Careful readers will notice that the order of which color is on top is not consistent. For example, for MultipleQueriesPlatform, the max heap size is actually much larger for 12c than 28c. Looking at the data in more detail reveals that the max heap size happens at the very beginning of the test for the 12c case –&lt;/p&gt;
-    &lt;p&gt;(Heap size (before) is right before a GC before that GC could possibly shrink the heap size. So “Max Heap Size” would be the max of this metric)&lt;/p&gt;
-    &lt;p&gt;This is because at the beginning, there were a lot more allocations happened before the first GC happened on 28c with 28 heaps. So after that GC, a smaller survival rate was observed which caused the gen0 budget to be much smaller than on 12c. 12c quickly dropped to the steady state which has a much lower heap size than 28c. For steady state, these benchmarks always exhibit a much higher heap size on 28c. This illustrates 2 points –if you just measure “max heap size”, it can easily be affected by the non-steady state behavior; secondly, the heap size can vary a lot due to the machine the test runs on. Note that these effects can be magnified because we are looking at small benchmarks, but the reasoning applies to real-world apps.&lt;/p&gt;
-    &lt;p&gt;With DATAS we see this picture -&lt;/p&gt;
-    &lt;p&gt;The max heap sizes are very similar on 28c and 12c which is exactly what DATAS is for — it adapts to the application size.&lt;/p&gt;
-    &lt;p&gt;Do I need to care if I’m using Workstation GC?&lt;/p&gt;
-    &lt;p&gt;The answer depends on why you are using Workstation GC. If you are using Workstation GC because your workload simply does not call for using Server GC at all, then there’s no need to change. This could be due to your app being single threaded or the allocation is simply not stressful and you are totally fine with having one thread doing the collection work, in which case Workstation GC not only suffices but is exactly the correct choice to make.&lt;/p&gt;
-    &lt;p&gt;But if you are using it because Server GC’s memory usage was too large and you are just using Workstation to limit the memory usage, you could find DATAS very attractive because it can both limit the memory usage and make the GC pauses lower with more GC threads doing the collection work.&lt;/p&gt;
-    &lt;head rend="h2"&gt;How DATAS does its job&lt;/head&gt;
-    &lt;p&gt;If you understood how DATAS does it job, it would be natural to arrive at the recommendations below for deciding if DATAS is for you. You could also skip this section, but I always like to understand how something works if I care about it, so I can come to my own conclusions instead of just memorizing some rules. In the last blog post I mentioned some details of DATAS at the time (.NET 8), noting that it would likely change dramatically — and it did, both in design and implementation. The implementation we had in .NET 8 was mostly for functional — we spent very little time in tuning. The majority of the tuning work happened after .NET 8.&lt;/p&gt;
-    &lt;p&gt;The goal of DATAS is to adapt to the application size, or the LDS (Live Data Size). So there needs to be some way to adapt to it. Because the .NET GC is generational, it means we don’t collect the whole heap often. And since most full GCs we do are background GCs which don’t compact, it’s reasonable to approximate the LDS with the space objects take up in the old generations, i.e., (total size — fragmentation). Another convenient number to use when you do your perf investigations is to look at the promoted size when a full GC is done.&lt;/p&gt;
-    &lt;p&gt;In the last blog post I mentioned the conserve memory config is part of the DATAS implementation — that part did not change. But conserve memory only affects when full GCs are triggered. For apps that allocate very frequently, unless these are temporary UOH objects, most of the GCs are ephemeral GCs. And ephemeral generation sizes can be a significant portion of the whole heap especially for small heaps.&lt;/p&gt;
-    &lt;p&gt;After experimenting with various approaches, I settled on the approach of “adapting to the app size while maintaining reasonable performance” which consisted of 2 key components -&lt;/p&gt;
-    &lt;p&gt;1) introduced a concept of “Budget Computed via DATAS (BCD)” which is calculated based on the application size and gives us an upper bound of the gen0 budget for that size, which can approximate the generation size for gen0 (since there’s pinning it may not be exactly the generation size for gen0).&lt;/p&gt;
-    &lt;p&gt;2) within this upper bound, we can further reduce memory if we can still maintain reasonable performance. And we define this “reasonable performance” with a target Throughput Cost Percentage (TCP). This takes into consideration both GC pauses and how much allocating threads have to wait. But you can approximate TCP with % pause time in GC in steady state. The idea is to keep TCP around this target if we can, which means if the workload gets lighter, we’d be adjusting the gen0 budget smaller. And that in turn means gen0 will be smaller before the next GC, which translates to smaller heap size. The default target TCP is 2%. This can be changed via the GCDTargetTCP config.&lt;/p&gt;
-    &lt;p&gt;Let’s look at 2 example scenarios to see how this manifests. For simplicity, I’m ignoring background GCs, and I’ll use % pause time in GC to approximate TCP.&lt;/p&gt;
-    &lt;p&gt;Scenario A — I have an e-commerce app which stores the whole catalog in memory, and this remains the same during the process lifetime. This is our LDS. Now the process starts to process requests and for each request there’s memory allocated and only used for the duration of that request.&lt;/p&gt;
-    &lt;p&gt;During peak hours, it processes many concurrent requests. We hit our max budget which is our BCD. Let’s say this is 1gb, it means we are doing a GC each time 1GB is allocated. If we use the % pause time in GC to approximate TCP, let’s say during each second it allocates 1GB and observes one GC that has a 20ms pause. So the % time in GC is 2%. And that’s the same as our target TCP.&lt;/p&gt;
-    &lt;p&gt;When it’s outside the peak hours and handling way fewer concurrent requests, let’s say we allocate ~200MB per second. If we keep our 1GB budget, it means we are doing a GC every 5s. And our % time in GC would be (20ms / 5s = 0.4%), much lower than 2%. So to reach the target TCP we’d want to reduce the budget and trigger a GC much sooner. If we reduce the budget to 200MB, and we’ll still use 20ms as our GC pause just to make it simple (it’ll likely be shorter as it’s roughly proportional to the survival and there’s likely less survival out of 200MB vs 1GB), now we are achieving 2% TCP again.&lt;/p&gt;
-    &lt;p&gt;So for this scenario, the heap size is reduced by ~800MB when it’s outside peak hours. Depending on your total heap size, this can be a very significant reduction.&lt;/p&gt;
-    &lt;p&gt;Scenario B is built on top of A but we’ll throw in a cache that’s part of the LDS but gets smaller during lighter workload as we don’t need to cache as much. Because the LDS is smaller it means your BCD will be smaller as it’s a function of LDS. So during the lighter workload, the gen0 budget will be further reduced which again reflects the adapting to size nature. The conserve memory mechanism is still in effect too and would adjust the old generation budget and size accordingly.&lt;/p&gt;
-    &lt;p&gt;Notice that so far I have not talked about the number of heaps at all! This is completely taken care of by DATAS itself so you don’t need to worry about it. Previously, some of our customers were using the GCHeapCount config to specify the number of heaps for Server GC. But DATAS makes it more robust as it can take advantage of more heaps if needed (which usually means shorter individual pause times) and reduces the heap size when the LDS goes down, without your having to specify a heap count yourself.&lt;/p&gt;
-    &lt;p&gt;DATAS has specific events that indicate the actual TCP and LDS but that requires you to programmatically get them via the TraceEvent library. The approximations I mentioned above are sufficient for almost all perf investigations.&lt;/p&gt;
-    &lt;head rend="h2"&gt;When DATAS might not be applicable to your scenario&lt;/head&gt;
-    &lt;p&gt;If you read the previous sections, what’s listed below hopefully makes sense.&lt;/p&gt;
-    &lt;p&gt;1) If you have no use for free memory, you don’t need DATAS&lt;/p&gt;
-    &lt;p&gt;This one should be obvious — why change it at all if you don’t have any use for the memory that gets freed up by DATAS anyway? You can turn DATAS off by the GCDynamicAdaptationMode config.&lt;/p&gt;
-    &lt;p&gt;I’ve come across a few first party teams who simply didn’t need DATAS — they have dedicated machines to run their processes and have no use for free memory as they don’t plan to run anything else on the machine. So they have no use for DATAS. One team did say “now we probably want to think about taking advantage of free memory” (they were not thinking about it because Server GC isn’t aggressive at reducing memory usage). So for them, they will disable DATAS for now but will enable it when they can take advantage of memory during non peak hours.&lt;/p&gt;
-    &lt;p&gt;2) If startup perf is critical, DATAS is not for you&lt;/p&gt;
-    &lt;p&gt;DATAS always starts with 1 heap. We cannot predict how stressful your workload will be and since we are optimizing for size here, it starts with the smallest heap count which is 1. So if your startup perf is critical, you will see a regression because it takes time to go from 1 heap to multiple.&lt;/p&gt;
-    &lt;p&gt;3) If you do not tolerate any throughput regression, DATAS may not be for you&lt;/p&gt;
-    &lt;p&gt;If this includes the startup throughput, as 2) also states, DATAS is not for you. However, some scenarios aren’t concerned with startup perf so DATAS may or may not be desirable. Let’s say your % pause time in GC is 1% with Server GC, you can just set the GCDTargetTCP config to 1. If you were restricting the heap count you could very possibly see a perf improvement because the pause time can be shorter with DATAS. If the adaptation to the size aspect is beneficial to you, using DATAS can be a much better choice. But as stated in 1) if you don’t have any use for the freed up memory anyway, it wouldn’t justify spending time on using DATAS.&lt;/p&gt;
-    &lt;p&gt;4) If you are doing mostly gen2 GCs, DATAS may not be for you&lt;/p&gt;
-    &lt;p&gt;One case I haven’t spent much time tuning is when your scenario mostly does gen2 GCs (this is almost always due to excessive allocation of temporary large objects). If this is the case for you, and if you’ve tried DATAS and weren’t happy with the results, I would suggest to disable DATAS. You could investigate to see if you can make it work by following the tuning section if it’s justified to spend the time.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Tuning DATAS if necessary&lt;/head&gt;
-    &lt;p&gt;I’ve tried DATAS on some first party workloads and in general it worked out great. I’ll show a couple of examples where the default parameters of DATAS weren’t great but tuning one or 2 configs made it work.&lt;/p&gt;
-    &lt;p&gt;Customer case 1&lt;/p&gt;
-    &lt;p&gt;This is a server app running on dedicated machines. But they are in the process of containerizing it so there’s definitely merit to use DATAS. With DATAS they observed a 6.8% regression in throughput with a 10% reduction in working set. For now they’ve disabled DATAS — I will explain how I debugged it and determined what DATAS config to use to make it work if/when they want to enable DATAS.&lt;/p&gt;
-    &lt;p&gt;Because DATAS limits the largest gen0 budget based on the LDS, we want to see if we are hitting that limit. It’d be easiest if you captured a GC trace with DATAS and one without DATAS. If you are seeing more GCs triggered, that means most likely you are hitting that limit.&lt;/p&gt;
-    &lt;p&gt;You can approximate the TCP with what’s shown in the “% Pause Time” column, and gen0 budget with the “Gen0 Alloc MB” column. And you’d want to find the phase when you have the highest % pause time and see if you are triggering more GCs.&lt;/p&gt;
-    &lt;p&gt;So for this particular customer, here are some excerpts of the GC (I’ve trimmed down the columns of the GCStats view) –&lt;/p&gt;
-    &lt;p&gt;Without DATAS&lt;/p&gt;
-    &lt;p&gt;With DATAS&lt;/p&gt;
-    &lt;p&gt;Comparing their gen0 budget and % pause time in GC -&lt;/p&gt;
-    &lt;p&gt;So gen0 budget without DATAS is 2.6x with DATAS. Another useful thing we notice is the % Pause Time is basically exactly the target TCP — 2%. That tells us that this is working exactly as by design from DATAS’s POV. But without DATAS we got 2.6x budget so naturally we triggered GC less frequently and % pause time is 1.2 instead of 2.1.&lt;/p&gt;
-    &lt;p&gt;But if we want to enable DATAS and not regress throughput for this phase, we’d like to have DATAS use a larger gen0 budget. To do that we should understand how DATAS determines the BCD. Since we are adapting to the size, we want to multiply the size with something. But this should not be a constant value because when the size is very small, this multiplier should be quite large — if the LDS is only 2MB (which is totally possible for a tiny app), we wouldn’t want to trigger a GC for every 0.2MB of allocation — the overhead would be too high. Let’s say we want to allow 20MB of allocation before triggering a GC, that makes the multiplier 10. But if the LDS is 20GB, we wouldn’t want to allocate 200GB before doing a GC, which means we want a much smaller multiplier. This means a power function but we also want to clamp it between a min and max value -&lt;/p&gt;
-    &lt;code&gt;m = constant / sqrt (LDS);&lt;lb/&gt;// default for max_m is 10&lt;lb/&gt;m = min (max_m, m);&lt;lb/&gt;// default for min_m is 0.1&lt;lb/&gt;m = max (min_m, m);&lt;/code&gt;
-    &lt;p&gt;The actual formula for the power function is&lt;/p&gt;
-    &lt;code&gt;m = (20 - conserve_memory) / sqrt (LDS / 1000 / 1000);&lt;/code&gt;
-    &lt;p&gt;which can be simplified to&lt;/p&gt;
-    &lt;code&gt;m = (20 - conserve_memory) * 1000 / sqrt (LDS);&lt;lb/&gt;m = (20 - 5) * 1000 / sqrt (LDS);&lt;lb/&gt;m = 15000 / sqrt (LDS);&lt;/code&gt;
-    &lt;p&gt;So the constant is 15000, or we could just say it’s 15 if we use MB for size. here’re some example with different LDS -&lt;/p&gt;
-    &lt;p&gt;This constant, max_m and min_m can all be adjusted by configs. Please see the config page for detailed explanation.&lt;/p&gt;
-    &lt;p&gt;Now it’s quite obvious why DATAS came up with the gen0 budget and how we can adjust it. If we want to bring this up to the same budget without DATAS, we’d want to use the GCDGen0GrowthPercent config to increase the constant to 2.6x, and increase min_m with the GCDGen0GrowthMinFactor config so it’s not clamped to 0.1 — you don’t need to be very accurate since you just need to make it not be the limiting factor. So in this case if we use 15GB to approximate the LDS (the “Promoted (mb)” column for both gen2 GCs says ~15GB), and without DATAS the gen0 budget is 4.22GB. So min_m should be around (4.22/15 = 0.28). We can just set min_m to 300 which translates to 0.3 of LDS.&lt;/p&gt;
-    &lt;p&gt;Customer case 2&lt;/p&gt;
-    &lt;p&gt;This is an asp.net app on a staging server from the customer that represents one of their key scenarios. I used a load test tool to generate variable workloads.&lt;/p&gt;
-    &lt;p&gt;The team was already using some GC configs -&lt;/p&gt;
-    &lt;p&gt;· GCHeapCount is set to 2 to use 2 heaps&lt;/p&gt;
-    &lt;p&gt;· Affinity is turned off with the GCNoAffinitize config.&lt;/p&gt;
-    &lt;p&gt;If the GCHeapCount config is specified, DATAS would be disabled because it’s telling the GC to not change the heap count. And since changing the heap count is one of the key mechanisms to adjust perf for DATAS, it’s an indication to disable DATAS.&lt;/p&gt;
-    &lt;p&gt;Because this is a process that co-exist with many others on the same machine, before DATAS was available they chose to give it 2 heaps to limit the memory usage while still getting reasonable throughput. But this is not flexible — when the load becomes higher the throughput can suffer with 2 heaps and also the GC pauses can be noticeably higher since there’s only 2 GC threads collecting. They can adjust the number of GC heaps but that means more work and since Server GC isn’t very aggressive at reducing memory usage they can end up with a much bigger heap than desired when the load is lighter.&lt;/p&gt;
-    &lt;p&gt;I’ll demonstrate how using DATAS makes this robust. When I made the load pretty high I could see that % pause time in GC is quite high — not surprising with just 2 heaps. So I enabled DATAS by simply getting rid of the GCHeapCount config (I kept the GCNoAffinitize config as I still wanted the GC threads to not be affinitized). I could see the % pause time in GC was also high because even with BCD we still ended up triggering GCs quite often. So I decided to make BCD 2x the default value with the GCDGen0GrowthPercent config (I didn’t need to use the GCDGen0GrowthMinFactor config since 2x is still well within our max_m/min_m clamping values). And now the process behaves in a much more desirable way with the following characteristics –&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;the % pause time is dramatically lower. With the default DATAS the % pause time is basically comparable and the heap size is noticeably lower. Depending on your optimization goal this could be exactly what you want. DATAS is able to achieve this with smaller budgets and more GC threads doing the collection work. But I know for this customer, they don’t want % pause time in GC to be this high as it affects their throughput. I could also make DATAS use a smaller target TCP but in this case the default TCP seems quite sufficient.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;individual GC pauses are a lot lower since we have a lot more GC threads collecting.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;when the load becomes lighter (# of concurrent client threads went from 200 to 100), the heap also becomes smaller. And we are still maintaining a much lower % pause time in GC and individual GC pauses.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;I hope this helps with your DATAS tuning, if you need to do any.&lt;/p&gt;
-    &lt;head rend="h2"&gt;DATAS Events&lt;/head&gt;
-    &lt;p&gt;I expect most users never needing to look at these events, so I’ll keep it brief. The approximations that I mentioned above should suffice. For the small number of folks who want to do a detailed analysis for whatever reason, DATAS fires an event that accurately represents the metrics we discussed. Note that we only use these events programmatically, so they are not surfaced in PerfView’s Events view (all you’ll see is the GC/DynamicTraceEvent which shows you the name but not individual fields of that event). See this blog article for an example how to programmatically retrieve GC info as a list of TraceGC objects from a trace.&lt;/p&gt;
-    &lt;p&gt;LDS and TCP are indicated in the SizeAdaptationTuning event, assuming you have a gc object of the type TraceGC —&lt;/p&gt;
-    &lt;code&gt;// LDS&lt;lb/&gt;gc.DynamicEvents().SizeAdaptationTuning?.TotalSOHStableSize&lt;lb/&gt;// TCP&lt;lb/&gt;gc.DynamicEvents().SizeAdaptationTuning?.TcpToConsider&lt;/code&gt;
-    &lt;p&gt;This event is not fired every GC since we only check to see if we need to change the tuning for DATAS every few GCs.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45358527</guid><pubDate>Wed, 24 Sep 2025 10:37:14 +0000</pubDate></item><item><title>Huntington's disease treated for first time</title><link>https://www.bbc.com/news/articles/cevz13xkxpro</link><description>&lt;doc fingerprint="2e099265b8279da2"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 24 Sep 2025 16:43:51 +0000</lastBuildDate><item><title>Huntington's disease treated for first time</title><link>https://www.bbc.com/news/articles/cevz13xkxpro</link><description>&lt;doc fingerprint="2e099265b8279da2"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Huntington's disease successfully treated for first time&lt;/head&gt;
     &lt;p&gt;One of the cruellest and most devastating diseases – Huntington's – has been successfully treated for the first time, say doctors.&lt;/p&gt;
@@ -543,168 +440,7 @@ One of the maintainers (predictably) replied that they (mostly) abide by POSIX a
     &lt;p&gt;Hit subscribe to get new posts delivered to your inbox automatically.&lt;lb/&gt;Feedback? Get in touch!&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45361394</guid><pubDate>Wed, 24 Sep 2025 15:03:59 +0000</pubDate></item><item><title>Replace PostgreSQL with Git for your next project</title><link>https://devcenter.upsun.com/posts/why-you-should-replace-postgresql-with-git-for-your-next-project/</link><description>&lt;doc fingerprint="fe0a025d8cbc099b"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Why you should replace PostgreSQL with Git for your next project&lt;/head&gt;
-    &lt;p&gt;Every developer knows the pain of choosing the right database for their project. PostgreSQL offers robust relational features, but what if there was a database you’re already using every day that could handle your data storage needs?&lt;/p&gt;
-    &lt;p&gt;Meet Git â the version control system that’s been hiding its database capabilities in plain sight. Before you close this tab thinking we’ve lost our minds, consider this: Git provides built-in versioning, handles concurrent access, supports atomic transactions (commits), and offers lightning-fast data retrieval. It even comes with its own query language (Git commands) and built-in backup system (distributed repositories).&lt;/p&gt;
-    &lt;p&gt;While this approach isn’t suitable for production applications, exploring Git’s internal architecture reveals fascinating insights into how modern databases work. Let’s build a todo application using Git as our storage layer to understand these core concepts.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Git’s data model: The foundation&lt;/head&gt;
-    &lt;p&gt;Git organizes data using four fundamental types:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Blobs: Raw data storage (equivalent to table rows)&lt;/item&gt;
-      &lt;item&gt;Trees: Hierarchical organization (like directory structures)&lt;/item&gt;
-      &lt;item&gt;Commits: Transaction records with metadata&lt;/item&gt;
-      &lt;item&gt;References: Pointers to specific data states (like table indexes)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;This structure makes Git more similar to hierarchical databases like Apache ZooKeeper than traditional relational systems. Let’s experiment with these concepts by building our own “database”.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Setting up your Git database&lt;/head&gt;
-    &lt;code&gt;$ cd $(mktemp -d)
-$ git init&lt;/code&gt;
-    &lt;head rend="h3"&gt;Working with blobs: Your data records&lt;/head&gt;
-    &lt;p&gt;Blobs store raw data â think of them as individual database records. Unlike traditional databases, blobs are content-addressable, meaning their unique identifier is derived from their content.&lt;/p&gt;
-    &lt;p&gt;Create a blob containing data:&lt;/p&gt;
-    &lt;code&gt;$ echo 'foo bar baz' | git hash-object -w --stdin
-1aeaedbf4ee8dccec5bc2b1f1168efef19378ffd&lt;/code&gt;
-    &lt;p&gt;Git stores this blob in its object database using the hash as the filename:&lt;/p&gt;
-    &lt;code&gt;$ ls -al .git/objects/1a/eaedbf4ee8dccec5bc2b1f1168efef19378ffd
--r--r--r-- 1 ralt ralt 26 Sep 22 10:38 .git/objects/1a/eaedbf4ee8dccec5bc2b1f1168efef19378ffd&lt;/code&gt;
-    &lt;p&gt;The file contains compressed, binary data. Git provides tools to retrieve the original content:&lt;/p&gt;
-    &lt;code&gt;$ git cat-file -p 1aeaedbf4ee8dccec5bc2b1f1168efef19378ffd
-foo bar baz&lt;/code&gt;
-    &lt;head rend="h3"&gt;Trees: Organizing your data structure&lt;/head&gt;
-    &lt;p&gt;Trees group related blobs together, similar to how database tables organize related records. Create a tree by specifying which blobs it should contain:&lt;/p&gt;
-    &lt;code&gt;printf '100644 blob &amp;lt;hash&amp;gt;\t&amp;lt;filename&amp;gt;' | git mktree&lt;/code&gt;
-    &lt;p&gt;Using our existing blob:&lt;/p&gt;
-    &lt;code&gt;$ printf '100644 blob 1aeaedbf4ee8dccec5bc2b1f1168efef19378ffd\tbody' | git mktree
-d9d24a5d3ea8407a90f87b136283358e6ff30a87&lt;/code&gt;
-    &lt;p&gt;Examine the tree structure:&lt;/p&gt;
-    &lt;code&gt;$ git cat-file -p d9d24a5d3ea8407a90f87b136283358e6ff30a87
-100644 blob 1aeaedbf4ee8dccec5bc2b1f1168efef19378ffd	body&lt;/code&gt;
-    &lt;p&gt;The tree now references our blob with a meaningful name.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Commits: Transaction records with metadata&lt;/head&gt;
-    &lt;p&gt;Commits wrap trees in transactional context, providing metadata about when and why changes occurred:&lt;/p&gt;
-    &lt;code&gt;git commit-tree [-p &amp;lt;parent&amp;gt;] -m 'message' &amp;lt;tree hash&amp;gt;&lt;/code&gt;
-    &lt;p&gt;Create our first transaction record:&lt;/p&gt;
-    &lt;code&gt;$ git commit-tree -m 'first commit' d9d24a5d3ea8407a90f87b136283358e6ff30a87
-ba4c8e52fb092cdb810c913004c82f6ae5eae4c9&lt;/code&gt;
-    &lt;p&gt;Inspect the commit metadata:&lt;/p&gt;
-    &lt;code&gt;$ git cat-file -p ba4c8e52fb092cdb810c913004c82f6ae5eae4c9
-tree d9d24a5d3ea8407a90f87b136283358e6ff30a87
-author Florian Margaine &amp;lt;xxx@platform.sh&amp;gt; 1758530691 +0200
-committer Florian Margaine &amp;lt;xxx@platform.sh&amp;gt; 1758530691 +0200
-
-first commit&lt;/code&gt;
-    &lt;p&gt;Commits automatically include comprehensive metadata:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Tree reference (data snapshot)&lt;/item&gt;
-      &lt;item&gt;Author and committer information&lt;/item&gt;
-      &lt;item&gt;Timestamp for audit trails&lt;/item&gt;
-      &lt;item&gt;Descriptive message&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h3"&gt;References: Making data discoverable&lt;/head&gt;
-    &lt;p&gt;Without references, commits become “dangling” and get garbage collected. References act like database indexes, making specific data states discoverable:&lt;/p&gt;
-    &lt;code&gt;$ echo ba4c8e52fb092cdb810c913004c82f6ae5eae4c9 &amp;gt; .git/refs/heads/foo&lt;/code&gt;
-    &lt;p&gt;This creates a “branch” reference pointing to our commit. Git uses different reference namespaces (&lt;code&gt;.git/refs/heads&lt;/code&gt; for branches, &lt;code&gt;.git/refs/tags&lt;/code&gt; for tags) similar to database schemas.&lt;/p&gt;
-    &lt;p&gt;You can now query your “database”:&lt;/p&gt;
-    &lt;code&gt;$ git log foo
-commit ba4c8e52fb092cdb810c913004c82f6ae5eae4c9 (foo)
-Author: Florian Margaine &amp;lt;xxx@platform.sh&amp;gt;
-Date:   Mon Sep 22 10:44:51 2025 +0200
-
-    first commit&lt;/code&gt;
-    &lt;head rend="h2"&gt;Building a todo application with Git&lt;/head&gt;
-    &lt;p&gt;Now let’s apply these concepts to build a functional todo application, demonstrating how Git’s architecture compares to traditional database operations.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Defining our data schema&lt;/head&gt;
-    &lt;p&gt;Our todo application needs a simple data model:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Task Title: The task description&lt;/item&gt;
-      &lt;item&gt;Task Status: Current state (todo/done)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Using Git’s architecture, we’ll store each field as a separate blob and organize them in trees, with commits representing state changes.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Creating task data&lt;/head&gt;
-    &lt;p&gt;Create blobs for task titles:&lt;/p&gt;
-    &lt;code&gt;$ echo 'I need to buy a car' | git hash-object -w --stdin
-17fa051a3dd27c8e759b6eae068400b81e9279de
-$ echo 'I need to sell my house' | git hash-object -w --stdin
-831f49497c435f1e38765bc99bd015ec44ed436e&lt;/code&gt;
-    &lt;p&gt;Create status value blobs:&lt;/p&gt;
-    &lt;code&gt;$ echo 'done' | git hash-object -w --stdin
-19f86f493ab110b8dc8279a024880e44203968d8
-$ echo 'todo' | git hash-object -w --stdin
-258cd5725da9a125878490703e64117560b11872&lt;/code&gt;
-    &lt;head rend="h3"&gt;Organizing data with trees&lt;/head&gt;
-    &lt;p&gt;Create a task record by combining title and status blobs in a tree:&lt;/p&gt;
-    &lt;code&gt;$ printf '100644 blob 17fa051a3dd27c8e759b6eae068400b81e9279de\ttitle
-100644 blob 258cd5725da9a125878490703e64117560b11872\tstatus' | git mktree
-b235f13ebd645de5c3dc87e2302ee81bfb77c70d&lt;/code&gt;
-    &lt;p&gt;Verify the task structure:&lt;/p&gt;
-    &lt;code&gt;$ git cat-file -p b235f13ebd645de5c3dc87e2302ee81bfb77c70d
-100644 blob 258cd5725da9a125878490703e64117560b11872	status
-100644 blob 17fa051a3dd27c8e759b6eae068400b81e9279de	title&lt;/code&gt;
-    &lt;head rend="h3"&gt;Creating transactions with commits&lt;/head&gt;
-    &lt;p&gt;Commit the task to create a permanent transaction record:&lt;/p&gt;
-    &lt;code&gt;$ git commit-tree -m 'Add first task: buy a car' b235f13ebd645de5c3dc87e2302ee81bfb77c70d
-fcfe7e22edfe12170a48fd802580ebcb05e36d6c&lt;/code&gt;
-    &lt;p&gt;Create a reference to make the data discoverable:&lt;/p&gt;
-    &lt;code&gt;$ echo fcfe7e22edfe12170a48fd802580ebcb05e36d6c &amp;gt; .git/refs/heads/todo-list&lt;/code&gt;
-    &lt;head rend="h3"&gt;Querying your Git database&lt;/head&gt;
-    &lt;p&gt;View the complete transaction history:&lt;/p&gt;
-    &lt;code&gt;$ git log -p todo-list
-commit fcfe7e22edfe12170a48fd802580ebcb05e36d6c (todo-list)
-Author: Florian Margaine &amp;lt;xxx@platform.sh&amp;gt;
-Date:   Mon Sep 22 11:04:16 2025 +0200
-
-    Add first task: buy a car
-
-diff --git a/status b/status
-new file mode 100644
-index 0000000..258cd57
---- /dev/null
-+++ b/status
-@@ -0,0 +1 @@
-+todo
-diff --git a/title b/title
-new file mode 100644
-index 0000000..17fa051
---- /dev/null
-+++ b/title
-@@ -0,0 +1 @@
-+I need to buy a car&lt;/code&gt;
-    &lt;head rend="h2"&gt;Why Git makes sense for specific use cases&lt;/head&gt;
-    &lt;p&gt;While this exploration started as a thought experiment, Git offers genuine advantages for certain applications:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Built-in audit trails: Every change includes timestamp and author information&lt;/item&gt;
-      &lt;item&gt;Atomic transactions: Commits ensure data consistency&lt;/item&gt;
-      &lt;item&gt;Distributed architecture: Multiple nodes can sync data changes&lt;/item&gt;
-      &lt;item&gt;Content addressing: Automatic deduplication and integrity checking&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h2"&gt;Real-world applications at Upsun&lt;/head&gt;
-    &lt;p&gt;At Upsun, we leverage Git’s database-like properties for specific scenarios where its strengths outweigh traditional database benefits. For developer-facing configuration management, Git provides:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Automatic versioning for all configuration changes&lt;/item&gt;
-      &lt;item&gt;Distributed synchronization across development environments&lt;/item&gt;
-      &lt;item&gt;Native integration with existing developer workflows&lt;/item&gt;
-      &lt;item&gt;Built-in rollback capabilities through commit history&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;However, Git has significant limitations as a general-purpose database:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Limited concurrent access (worse than SQLite)&lt;/item&gt;
-      &lt;item&gt;No complex query capabilities&lt;/item&gt;
-      &lt;item&gt;Poor performance with large datasets&lt;/item&gt;
-      &lt;item&gt;No built-in indexing for non-content searches&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h2"&gt;Start building with proper databases on Upsun&lt;/head&gt;
-    &lt;p&gt;While Git makes an interesting database alternative for specific use cases, your production applications deserve better. Upsun provides managed PostgreSQL, MySQL, and other database services with:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Automatic scaling and performance optimization&lt;/item&gt;
-      &lt;item&gt;Built-in backup and disaster recovery&lt;/item&gt;
-      &lt;item&gt;Multi-environment support for development and staging&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Create a free Upsun account to deploy your applications with proper database infrastructure that scales with your needs.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45361574</guid><pubDate>Wed, 24 Sep 2025 15:16:56 +0000</pubDate></item><item><title>Python on the Edge: Fast, sandboxed, and powered by WebAssembly</title><link>https://wasmer.io/posts/python-on-the-edge-powered-by-webassembly</link><description>&lt;doc fingerprint="87ab2dfdccf438d4"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45361394</guid><pubDate>Wed, 24 Sep 2025 15:03:59 +0000</pubDate></item><item><title>Python on the Edge: Fast, sandboxed, and powered by WebAssembly</title><link>https://wasmer.io/posts/python-on-the-edge-powered-by-webassembly</link><description>&lt;doc fingerprint="87ab2dfdccf438d4"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Python on the Edge: Fast, sandboxed, and powered by WebAssembly&lt;/head&gt;
     &lt;p&gt;We are excited to announce full Python support in Wasmer Edge (Beta)&lt;/p&gt;
@@ -907,4 +643,401 @@ This machine benchmarks at 604057 pystones/second
     &lt;p&gt;RudraAugust 14, 2023&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45362023</guid><pubDate>Wed, 24 Sep 2025 15:48:36 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45362023</guid><pubDate>Wed, 24 Sep 2025 15:48:36 +0000</pubDate></item><item><title>SedonaDB: A new geospatial DataFrame library written in Rust</title><link>https://sedona.apache.org/latest/blog/2025/09/24/introducing-sedonadb-a-single-node-analytical-database-engine-with-geospatial-as-a-first-class-citizen/</link><description>&lt;doc fingerprint="3bdb989c4036eb8a"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Introducing SedonaDB: A single-node analytical database engine with geospatial as a first-class citizen&lt;/head&gt;
+    &lt;p&gt;The Apache Sedona community is excited to announce the initial release of SedonaDB! ð&lt;/p&gt;
+    &lt;p&gt;SedonaDB is the first open-source, single-node analytical database engine that treats spatial data as a first-class citizen. It is developed as a subproject of Apache Sedona.&lt;/p&gt;
+    &lt;p&gt;Apache Sedona powers large-scale geospatial processing on distributed engines like Spark (SedonaSpark), Flink (SedonaFlink), and Snowflake (SedonaSnow). SedonaDB extends the Sedona ecosystem with a single-node engine optimized for small-to-medium data analytics, delivering the simplicity and speed that distributed systems often cannot.&lt;/p&gt;
+    &lt;head rend="h2"&gt;ð¤ What is SedonaDB¶&lt;/head&gt;
+    &lt;p&gt;Written in Rust, SedonaDB is lightweight, blazing fast, and spatial-native. Out of the box, it provides:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;ðºï¸ Full support for spatial types, joins, CRS (coordinate reference systems), and functions on top of industry-standard query operations.&lt;/item&gt;
+      &lt;item&gt;â¡ Query optimizations, indexing, and data pruning features under the hood that make spatial operations just work with high performance.&lt;/item&gt;
+      &lt;item&gt;ð Pythonic and SQL interfaces familiar to developers, plus APIs for R and Rust.&lt;/item&gt;
+      &lt;item&gt;âï¸ Flexibility to run in single-machine environments on local files or data lakes.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;SedonaDB utilizes Apache Arrow and Apache DataFusion, providing everything you need from a modern, vectorized query engine. What sets it apart is the ability to process spatial workloads natively, without extensions or plugins. Installation is straightforward, and SedonaDB integrates easily into both local development and cloud pipelines, offering a consistent experience across environments.&lt;/p&gt;
+    &lt;p&gt;The initial release of SedonaDB provides a comprehensive suite of geometric vector operations and seamlessly integrates with GeoArrow, GeoParquet, and GeoPandas. Future versions will support all popular spatial functions, including functions for raster data.&lt;/p&gt;
+    &lt;head rend="h2"&gt;ð SedonaDB quickstart example¶&lt;/head&gt;
+    &lt;p&gt;Start by installing SedonaDB:&lt;/p&gt;
+    &lt;code&gt;pip install "apache-sedona[db]"
+&lt;/code&gt;
+    &lt;p&gt;Now instantiate the connection:&lt;/p&gt;
+    &lt;code&gt;import sedona.db
+
+sd = sedona.db.connect()
+&lt;/code&gt;
+    &lt;p&gt;Let's perform a spatial join using SedonaDB.&lt;/p&gt;
+    &lt;p&gt;Suppose you have a &lt;code&gt;cities&lt;/code&gt; table with latitude and longitude points representing the center of each city, and a &lt;code&gt;countries&lt;/code&gt; table with a column containing a polygon of the country's geographic boundaries.&lt;/p&gt;
+    &lt;p&gt;Here are a few rows from the &lt;code&gt;cities&lt;/code&gt; table:&lt;/p&gt;
+    &lt;code&gt;ââââââââââââââââ¬ââââââââââââââââââââââââââââââââ
+â     name     â            geometry           â
+â   utf8view   â      geometry &amp;lt;epsg:4326&amp;gt;     â
+ââââââââââââââââªââââââââââââââââââââââââââââââââ¡
+â Vatican City â POINT(12.4533865 41.9032822)  â
+ââââââââââââââââ¼ââââââââââââââââââââââââââââââââ¤
+â San Marino   â POINT(12.4417702 43.9360958)  â
+ââââââââââââââââ¼ââââââââââââââââââââââââââââââââ¤
+â Vaduz        â POINT(9.5166695 47.1337238)   â
+ââââââââââââââââ¼ââââââââââââââââââââââââââââââââ¤
+&lt;/code&gt;
+    &lt;p&gt;And here are a few rows from the countries table:&lt;/p&gt;
+    &lt;code&gt;âââââââââââââââââââââââââââââââ¬ââââââââââââââââ¬âââââââââââââââââââââââââââââââââââââââââââââââââââââ
+â             name            â   continent   â                      geometry                      â
+â           utf8view          â    utf8view   â                geometry &amp;lt;epsg:4326&amp;gt;                â
+âââââââââââââââââââââââââââââââªââââââââââââââââªâââââââââââââââââââââââââââââââââââââââââââââââââââââ¡
+â Fiji                        â Oceania       â MULTIPOLYGON(((180 -16.067132663642447,180 -16.55â¦ â
+âââââââââââââââââââââââââââââââ¼ââââââââââââââââ¼âââââââââââââââââââââââââââââââââââââââââââââââââââââ¤
+â United Republic of Tanzania â Africa        â POLYGON((33.90371119710453 -0.9500000000000001,34â¦ â
+âââââââââââââââââââââââââââââââ¼ââââââââââââââââ¼âââââââââââââââââââââââââââââââââââââââââââââââââââââ¤
+â Western Sahara              â Africa        â POLYGON((-8.665589565454809 27.656425889592356,-8â¦ â
+âââââââââââââââââââââââââââââââ¼ââââââââââââââââ¼âââââââââââââââââââââââââââââââââââââââââââââââââââââ¤
+&lt;/code&gt;
+    &lt;p&gt;Hereâs how to perform a spatial join to compute the country of each city:&lt;/p&gt;
+    &lt;code&gt;sd.sql(
+    """
+select
+    cities.name as city_name,
+    countries.name as country_name,
+    continent
+from cities
+join countries
+where ST_Intersects(cities.geometry, countries.geometry)
+"""
+).show(3)
+&lt;/code&gt;
+    &lt;p&gt;The code utilizes &lt;code&gt;ST_Intersects&lt;/code&gt; to determine if a city is contained within a given country.&lt;/p&gt;
+    &lt;p&gt;Here's the result of the query:&lt;/p&gt;
+    &lt;code&gt;âââââââââââââââââ¬ââââââââââââââââââââââââââââââ¬ââââââââââââ
+â   city_name   â         country_name        â continent â
+â    utf8view   â           utf8view          â  utf8view â
+âââââââââââââââââªââââââââââââââââââââââââââââââªââââââââââââ¡
+â Suva          â Fiji                        â Oceania   â
+âââââââââââââââââ¼ââââââââââââââââââââââââââââââ¼ââââââââââââ¤
+â Dodoma        â United Republic of Tanzania â Africa    â
+âââââââââââââââââ¼ââââââââââââââââââââââââââââââ¼ââââââââââââ¤
+â Dar es Salaam â United Republic of Tanzania â Africa    â
+âââââââââââââââââ´ââââââââââââââââââââââââââââââ´ââââââââââââ
+&lt;/code&gt;
+    &lt;p&gt;The example above performs a point-in-polygon join, mapping city locations (points) to the countries they fall within (polygons). SedonaDB executes these joins efficiently by leveraging spatial indices where beneficial and dynamically adapting join strategies at runtime using input data samples. While many general-purpose engines struggle with the performance of such operations, SedonaDB is purpose-built for spatial workloads and delivers consistently fast results.&lt;/p&gt;
+    &lt;head rend="h2"&gt;ð Apache Sedona SpatialBench¶&lt;/head&gt;
+    &lt;p&gt;To test our work on SedonaDB, we also needed to develop a mechanism to evaluate its performance and speed. This led us to develop Apache Sedona SpatialBench, a benchmark for assessing geospatial SQL analytics query performance across database systems.&lt;/p&gt;
+    &lt;p&gt;Let's compare the performance of SedonaDB vs. GeoPandas and DuckDB Spatial for some representative spatial queries as defined in SpatialBench.&lt;/p&gt;
+    &lt;p&gt;Here are the results from SpatialBench v0.1 for Queries 1â12 at scale factor 1 (SF1) and scale factor 10 (SF10).&lt;/p&gt;
+    &lt;p&gt;SedonaDB demonstrates balanced performance across all query types and scales effectively to SF 10. DuckDB excels at spatial filters and some geometric operations but faces challenges with complex joins and KNN queries. GeoPandas, while popular in the Python ecosystem, requires manual optimization and parallelization to handle larger datasets effectively. An in-depth performance analysis can be found in the SpatialBench website.&lt;/p&gt;
+    &lt;p&gt;Hereâs an example of the SpatialBench Query #8 that works for SedonaDB and DuckDB:&lt;/p&gt;
+    &lt;code&gt;SELECT b.b_buildingkey, b.b_name, COUNT(*) AS nearby_pickup_count
+FROM trip t JOIN building b ON ST_DWithin(ST_GeomFromWKB(t.t_pickuploc), ST_GeomFromWKB(b.b_boundary), 0.0045) -- ~500m
+GROUP BY b.b_buildingkey, b.b_name
+ORDER BY nearby_pickup_count DESC
+&lt;/code&gt;
+    &lt;p&gt;This query intentionally performs a distance-based spatial join between points and polygons, followed by an aggregation of the results.&lt;/p&gt;
+    &lt;p&gt;Here's what the query returns:&lt;/p&gt;
+    &lt;code&gt;âââââââââââââââââ¬âââââââââââ¬ââââââââââââââââââââââ
+â b_buildingkey â  b_name  â nearby_pickup_count â
+â     int64     â utf8view â        int64        â
+âââââââââââââââââªâââââââââââªââââââââââââââââââââââ¡
+â          3779 â linen    â                  42 â
+âââââââââââââââââ¼âââââââââââ¼ââââââââââââââââââââââ¤
+â         19135 â misty    â                  36 â
+âââââââââââââââââ¼âââââââââââ¼ââââââââââââââââââââââ¤
+â          4416 â sienna   â                  26 â
+âââââââââââââââââ´âââââââââââ´ââââââââââââââââââââââ
+&lt;/code&gt;
+    &lt;p&gt;Hereâs the equivalent GeoPandas code:&lt;/p&gt;
+    &lt;code&gt;trips_df = pd.read_parquet(data_paths["trip"])
+trips_df["pickup_geom"] = gpd.GeoSeries.from_wkb(
+    trips_df["t_pickuploc"], crs="EPSG:4326"
+)
+pickups_gdf = gpd.GeoDataFrame(trips_df, geometry="pickup_geom", crs="EPSG:4326")
+
+buildings_df = pd.read_parquet(data_paths["building"])
+buildings_df["boundary_geom"] = gpd.GeoSeries.from_wkb(
+    buildings_df["b_boundary"], crs="EPSG:4326"
+)
+buildings_gdf = gpd.GeoDataFrame(
+    buildings_df, geometry="boundary_geom", crs="EPSG:4326"
+)
+
+threshold = 0.0045  # degrees (~500m)
+result = (
+    buildings_gdf.sjoin(pickups_gdf, predicate="dwithin", distance=threshold)
+    .groupby(["b_buildingkey", "b_name"], as_index=False)
+    .size()
+    .rename(columns={"size": "nearby_pickup_count"})
+    .sort_values(["nearby_pickup_count", "b_buildingkey"], ascending=[False, True])
+    .reset_index(drop=True)
+)
+&lt;/code&gt;
+    &lt;head rend="h2"&gt;ðºï¸ SedonaDB CRS management¶&lt;/head&gt;
+    &lt;p&gt;SedonaDB manages the CRS when reading/writing files, as well as in DataFrames, making your pipelines safer and saving you from manual work.&lt;/p&gt;
+    &lt;p&gt;Let's compute the number of buildings in the state of Vermont to highlight the CRS management features embedded in SedonaDB.&lt;/p&gt;
+    &lt;p&gt;Start by reading in a FlatGeobuf file that uses the EPSG 32618 CRS with GeoPandas and then convert it to a SedonaDB DataFrame:&lt;/p&gt;
+    &lt;code&gt;import geopandas as gpd
+
+path = "https://raw.githubusercontent.com/geoarrow/geoarrow-data/v0.2.0/example-crs/files/example-crs_vermont-utm.fgb"
+gdf = gpd.read_file(path)
+vermont = sd.create_data_frame(gdf)
+&lt;/code&gt;
+    &lt;p&gt;Letâs check the schema of the &lt;code&gt;vermont&lt;/code&gt; DataFrame:&lt;/p&gt;
+    &lt;code&gt;vermont.schema
+
+SedonaSchema with 1 field:
+  geometry: wkb &amp;lt;epsg:32618&amp;gt;
+&lt;/code&gt;
+    &lt;p&gt;We can see that the &lt;code&gt;vermont&lt;/code&gt; DataFrame maintains the CRS thatâs specified in the FlatGeobuf file.  SedonaDB doesnât have a native FlatGeobuf reader yet, but itâs easy to use the GeoPandas FlatGeobuf reader and then convert it to a SedonaDB DataFrame with a single line of code.&lt;/p&gt;
+    &lt;p&gt;Now read a GeoParquet file into a SedonaDB DataFrame.&lt;/p&gt;
+    &lt;code&gt;buildings = sd.read_parquet(
+    "https://github.com/geoarrow/geoarrow-data/releases/download/v0.2.0/microsoft-buildings_point_geo.parquet"
+)
+&lt;/code&gt;
+    &lt;p&gt;Check the schema of the DataFrame:&lt;/p&gt;
+    &lt;code&gt;buildings.schema
+
+SedonaSchema with 1 field:
+  geometry: geometry &amp;lt;ogc:crs84&amp;gt;
+&lt;/code&gt;
+    &lt;p&gt;Letâs expose these two tables as views and run a spatial join to see how many buildings are in Vermont:&lt;/p&gt;
+    &lt;code&gt;buildings.to_view("buildings", overwrite=True)
+vermont.to_view("vermont", overwrite=True)
+
+sd.sql(
+    """
+select count(*) from buildings
+join vermont
+where ST_Intersects(buildings.geometry, vermont.geometry)
+"""
+).show()
+&lt;/code&gt;
+    &lt;p&gt;This command correctly errors out because the tables have different CRSs. For safety, SedonaDB errors out rather than give you the wrong answer! Here's the error message that's easy to debug:&lt;/p&gt;
+    &lt;code&gt;SedonaError: type_coercion
+caused by
+Error during planning: Mismatched CRS arguments: ogc:crs84 vs epsg:32618
+Use ST_Transform() or ST_SetSRID() to ensure arguments are compatible.
+&lt;/code&gt;
+    &lt;p&gt;Letâs rewrite the spatial join to convert the &lt;code&gt;vermont&lt;/code&gt; CRS to EPSG:4326, so itâs compatible with the &lt;code&gt;buildings&lt;/code&gt; CRS.&lt;/p&gt;
+    &lt;code&gt;sd.sql(
+    """
+select count(*) from buildings
+join vermont
+where ST_Intersects(buildings.geometry, ST_Transform(vermont.geometry, 'EPSG:4326'))
+"""
+).show()
+&lt;/code&gt;
+    &lt;p&gt;We now get the correct result!&lt;/p&gt;
+    &lt;code&gt;ââââââââââââ
+â count(*) â
+â   int64  â
+ââââââââââââ¡
+â   361856 â
+ââââââââââââ
+&lt;/code&gt;
+    &lt;p&gt;SedonaDB tracks the CRS when reading/writing files, converting to/from GeoPandas DataFrames, or when performing DataFrame operations, so your spatial computations run safely and correctly!&lt;/p&gt;
+    &lt;head rend="h2"&gt;ð¯ Realistic example with SedonaDB¶&lt;/head&gt;
+    &lt;p&gt;Let's now turn our attention to a KNN join, which is a more complex spatial operation.&lt;/p&gt;
+    &lt;p&gt;Suppose you're analyzing ride-sharing data and want to identify which buildings are most commonly near pickup points, helping understand the relationship between trip origins and nearby landmarks, businesses, or residential structures that might influence ride demand patterns.&lt;/p&gt;
+    &lt;p&gt;This query finds the five closest buildings to each trip pickup location using spatial nearest neighbor analysis. For every trip, it identifies the five buildings that are geographically closest to where the passenger was picked up and calculates the exact distance to each of those buildings.&lt;/p&gt;
+    &lt;p&gt;Hereâs the query:&lt;/p&gt;
+    &lt;code&gt;WITH trip_with_geom AS (
+    SELECT t_tripkey, t_pickuploc, ST_GeomFromWKB(t_pickuploc) as pickup_geom
+    FROM trip
+),
+building_with_geom AS (
+    SELECT b_buildingkey, b_name, b_boundary, ST_GeomFromWKB(b_boundary) as boundary_geom
+    FROM building
+)
+SELECT
+    t.t_tripkey,
+    t.t_pickuploc,
+    b.b_buildingkey,
+    b.b_name AS building_name,
+    ST_Distance(t.pickup_geom, b.boundary_geom) AS distance_to_building
+FROM trip_with_geom t JOIN building_with_geom b
+ON ST_KNN(t.pickup_geom, b.boundary_geom, 5, FALSE)
+ORDER BY distance_to_building ASC, b.b_buildingkey ASC
+&lt;/code&gt;
+    &lt;p&gt;Here are the results of the query:&lt;/p&gt;
+    &lt;code&gt;âââââââââââââ¬ââââââââââââââââââââââââââââââââ¬ââââââââââââââââ¬ââââââââââââââââ¬âââââââââââââââââââââââ
+â t_tripkey â          t_pickuploc          â b_buildingkey â building_name â distance_to_building â
+â   int64   â             binary            â     int64     â      utf8     â        float64       â
+âââââââââââââªââââââââââââââââââââââââââââââââªââââââââââââââââªââââââââââââââââªâââââââââââââââââââââââ¡
+â   5854027 â 01010000001afa27b85825504001â¦ â            79 â gainsboro     â                  0.0 â
+âââââââââââââ¼ââââââââââââââââââââââââââââââââ¼ââââââââââââââââ¼ââââââââââââââââ¼âââââââââââââââââââââââ¤
+â   3326828 â 01010000001bfcc5b8b7a95d4083â¦ â           466 â deep          â                  0.0 â
+âââââââââââââ¼ââââââââââââââââââââââââââââââââ¼ââââââââââââââââ¼ââââââââââââââââ¼âââââââââââââââââââââââ¤
+â   1239844 â 0101000000ce471770d6ce2a40f9â¦ â           618 â ivory         â                  0.0 â
+âââââââââââââ´ââââââââââââââââââââââââââââââââ´ââââââââââââââââ´ââââââââââââââââ´âââââââââââââââââââââââ
+&lt;/code&gt;
+    &lt;p&gt;This is one of the queries from SpatialBench.&lt;/p&gt;
+    &lt;head rend="h2"&gt;ð¦ Why SedonaDB was built in Rust¶&lt;/head&gt;
+    &lt;p&gt;SedonaDB is built in Rust, a high-performance, memory-safe language that offers fine-grained memory management and a mature ecosystem of data libraries. It takes full advantage of this ecosystem by integrating with projects such as Apache DataFusion, GeoArrow, and georust/geo.&lt;/p&gt;
+    &lt;p&gt;While Spark provides extension points that let SedonaSpark optimize spatial queries in distributed settings, DataFusion offers stable APIs for pruning, spatial operators, and optimizer rules on a single node. This enabled us to embed deep spatial awareness into the engine while preserving full non-spatial functionality. Thanks to the DataFusion project and community, the experience was both possible and enjoyable.&lt;/p&gt;
+    &lt;head rend="h2"&gt;âï¸ Why SedonaDB and SedonaSpark are Both Needed¶&lt;/head&gt;
+    &lt;p&gt;SedonaSpark is well-suited for large-scale geospatial workloads or environments where Spark is already part of your production stack. For instance, joining a 100 GB vector dataset with a large raster dataset. For smaller datasets, however, Spark's distributed architecture can introduce unnecessary overhead, making it slower to run locally, harder to install, and more difficult to tune.&lt;/p&gt;
+    &lt;p&gt;SedonaDB is better for smaller datasets and when running computations locally. The SedonaDB spatial functions are compatible with the SedonaSpark functions, so SQL chunks that work for one engine will usually work for the other. Over time, we will ensure that both project APIs are fully interoperable. Here's an example of a chunk to analyze the Overture buildings table that works for both engines.&lt;/p&gt;
+    &lt;code&gt;nyc_bbox_wkt = (
+    "POLYGON((-74.2591 40.4774, -74.2591 40.9176, -73.7004 40.9176, -73.7004 40.4774, -74.2591 40.4774))"
+)
+
+sd.sql(f"""
+SELECT
+    id,
+    height,
+    num_floors,
+    roof_shape,
+    ST_Centroid(geometry) as centroid
+FROM
+    buildings
+WHERE
+    is_underground = FALSE
+    AND height IS NOT NULL
+    AND height &amp;gt; 20
+    AND ST_Intersects(geometry, ST_SetSRID(ST_GeomFromText('{nyc_bbox_wkt}'), 4326))
+LIMIT 5;
+&lt;/code&gt;
+    &lt;head rend="h2"&gt;ð Next steps¶&lt;/head&gt;
+    &lt;p&gt;While SedonaDB is well-tested and provides a core set of features that can perform numerous spatial analyses, it remains an early-stage project with multiple opportunities for new features.&lt;/p&gt;
+    &lt;p&gt;Many more ST functions are required. Some are relatively straightforward, but others are complex.&lt;/p&gt;
+    &lt;p&gt;The community will add built-in support for other spatial file formats, such as GeoPackage and GeoJSON, to SedonaDB. You can read data in these formats into GeoPandas DataFrames and convert them to SedonaDB DataFrames in the meantime.&lt;/p&gt;
+    &lt;p&gt;Raster support is also on the roadmap, which is a complex undertaking, so it's an excellent opportunity to contribute if you're interested in solving challenging problems with Rust.&lt;/p&gt;
+    &lt;p&gt;Refer to the SedonaDB v0.2 milestone for more details on the specific tasks outlined for the next release. Additionally, feel free to create issues, comment on the Discord, or start GitHub discussions to brainstorm new features.&lt;/p&gt;
+    &lt;head rend="h2"&gt;ð¤ Join the community¶&lt;/head&gt;
+    &lt;p&gt;The Apache Sedona community has an active Discord community, monthly user meetings, and regular contributor meetings.&lt;/p&gt;
+    &lt;p&gt;SedonaDB welcomes contributions from the community. Feel free to request to take ownership of an issue, and we will be happy to assign it to you. You're also welcome to join the contributor meetings, and the other active contributors will be glad to help you get your pull request over the finish line!&lt;/p&gt;
+    &lt;p&gt;Info&lt;/p&gt;
+    &lt;p&gt;Weâre celebrating the launch of SedonaDB &amp;amp; SpatialBench with a special Apache Sedona Community Office Hour!&lt;/p&gt;
+    &lt;p&gt;ð October 7, 2025&lt;/p&gt;
+    &lt;p&gt;â° 8â9 AM Pacific Time&lt;/p&gt;
+    &lt;p&gt;ð Online&lt;/p&gt;
+    &lt;p&gt;ð Sign up here&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45362206</guid><pubDate>Wed, 24 Sep 2025 16:00:45 +0000</pubDate></item><item><title>New bacteria, and two potential antibiotics, discovered in soil</title><link>https://www.rockefeller.edu/news/38239-hundreds-of-new-bacteria-and-two-potential-antibiotics-found-in-soil/</link><description>&lt;doc fingerprint="7c5460762d250ab9"&gt;
+  &lt;main&gt;
+    &lt;head rend="h2"&gt;Hundreds of new bacteria, and two potential antibiotics, found in soil&lt;/head&gt;
+    &lt;p&gt;Most bacteria cannot be cultured in the lab—and that’s been bad news for medicine. Many of our frontline antibiotics originated from microbes, yet as antibiotic resistance spreads and drug pipelines run dry, the soil beneath our feet has a vast hidden reservoir of untapped lifesaving compounds.&lt;/p&gt;
+    &lt;p&gt;Now, researchers have developed a way to access this microbial goldmine. Their approach, published in Nature Biotechnology, circumvents the need to grow bacteria in the lab by extracting very large DNA fragments directly from soil to piece together the genomes of previously hidden microbes, and then mines resulting genomes for bioactive molecules.&lt;/p&gt;
+    &lt;p&gt;From a single forest sample, the team generated hundreds of complete bacterial genomes never seen before, as well as two new antibiotic leads. The findings offer a scalable way to scour unculturable bacteria for new drug leads—and expose the vast, uncharted microbial frontier that shapes our environment.&lt;/p&gt;
+    &lt;p&gt;“We finally have the technology to see the microbial world that have been previously inaccessible to humans,” says Sean F. Brady, head of the Laboratory of Genetically Encoded Small Molecules at Rockefeller. “And we’re not just seeing this information; we’re already turning it into potentially useful antibiotics. This is just the tip of the spear.”&lt;/p&gt;
+    &lt;p&gt;Microbial dark matter&lt;/p&gt;
+    &lt;p&gt;When hunting for bacteria, soil is an obvious choice. It’s the largest, most biodiverse reservoir of bacteria on the planet—a single teaspoon of it may contain thousands of different species. Many important therapeutics, including most of our antibiotic arsenal, were discovered in the tiny fraction of soil bacteria that can be grown in the laboratory. And soil is dirt cheap.&lt;/p&gt;
+    &lt;p&gt;Yet we know very little about the millions of microbes packed into the earth. Scientists suspect that these hidden bacteria hold not only an untapped reservoir of new therapeutics, but clues as to how microbes shape climate, agriculture, and the larger environment that we live in. “All over the world there’s this hidden ecosystem of microbes that could have dramatic effects on our lives,” Brady adds. “We wanted to finally see them.”&lt;/p&gt;
+    &lt;p&gt;Getting that glimpse involved weaving together several approaches. First, the team optimized a method for isolating large, high-quality DNA fragments directly from soil. Pairing this advance with emerging long-read nanopore sequencing allowed Jan Burian, a postdoctoral associate in the Brady lab, to produce continuous stretches of DNA that were tens of thousands of base pairs long—200 times longer than any previously existing technology could manage. Soil DNA contains a huge number of different bacteria; without such large DNA sequences to work with, resolving that complex genetic puzzle into complete and contiguous genomes for disparate bacteria proved exceedingly difficult.&lt;/p&gt;
+    &lt;p&gt;“It’s easier to assemble a whole genome out of bigger pieces of DNA, rather than the millions of tiny snippets that were available before,” Brady says. “And that makes a dramatic difference in your confidence in your results.”&lt;/p&gt;
+    &lt;p&gt;Unique small molecules, like antibiotics, that bacteria produce are called “natural products”. To convert the newly uncovered sequences into bioactive molecules, the team applied a synthetic bioinformatic natural products (synBNP) approach. They bioinformatically predicted the chemical structures of natural products directly from the genome data and then chemically synthesized them in the lab. With the synBNP approach, Brady and colleagues managed to turn the genetic blueprints from uncultured bacteria into actual molecules—including two potent antibiotics.&lt;/p&gt;
+    &lt;p&gt;Brady describes the method, which is scalable and can be adapted to virtually any metagenomic space beyond soil, as a three-step strategy that could kick off a new era of microbiology: “Isolate big DNA, sequence it, and computationally convert it into something useful.”&lt;/p&gt;
+    &lt;p&gt;Two new drug candidates, and counting&lt;/p&gt;
+    &lt;p&gt;Applied to their single forest soil sample, the team’s approach produced 2.5 terabase-pairs of sequence data—the deepest long-read exploration of a single soil sample to date. Their analysis uncovered hundreds of complete contiguous bacterial genomes, more than 99 percent of which were entirely new to science and identified members from 16 major branches of the bacterial family tree.&lt;/p&gt;
+    &lt;p&gt;The two lead compounds discovered could translate into potent antibiotics. One, called erutacidin, disrupts bacterial membranes through an uncommon interaction with the lipid cardiolipin and is effective against even the most challenging drug-resistant bacteria. The other, trigintamicin, acts on a protein-unfolding motor known as ClpX, a rare antibacterial target.&lt;/p&gt;
+    &lt;p&gt;Brady emphasizes that these discoveries are only the beginning. The study demonstrates that previously inaccessible microbial genomes can now be decoded and mined for bioactive molecules at scale without culturing the organisms. Unlocking the genetic potential of microbial dark matter may also provide new insights into the hidden microbial networks that sustain ecosystems.&lt;/p&gt;
+    &lt;p&gt;“We’re mainly interested in small molecules as therapeutics, but there are applications beyond medicine,” Burian says. “Studying culturable bacteria led to advances that helped shape the modern world and finally seeing and accessing the uncultured majority will drive a new generation of discovery.”&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45362254</guid><pubDate>Wed, 24 Sep 2025 16:03:42 +0000</pubDate></item><item><title>Better Curl Saul: a lightweight API testing CLI focused on UX and simplicity</title><link>https://github.com/DeprecatedLuar/better-curl-saul</link><description>&lt;doc fingerprint="292d1d585d87d1a0"&gt;
+  &lt;main&gt;
+    &lt;p&gt;In a nutshell, this is disgusting:&lt;/p&gt;
+    &lt;code&gt;curl -X POST https://api.github.com/repos/owner/repo/issues \
+  -H "Authorization: Bearer ghp_token123" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/vnd.github.v3+json" \
+  -d '{
+    "title": "Bug Report",
+    "body": "Something is broken",
+    "labels": ["bug", "priority-high"],
+    "assignees": ["developer1", "developer2"]
+  }'&lt;/code&gt;
+    &lt;code&gt;saul github set url https://api.github.com/repos/{?repo_owner}/{?repo_name}/{@endpoint}
+saul set method POST
+saul set header Authorization="Bearer {@token}" #Btw this {@} prompts you the first time, then you need to choose to update the variable with a flag on call
+saul set body title="Bug Report" body="Something is broken" labels=[bug,priority-high] assignees=[developer1,developer2]
+saul call&lt;/code&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Workspace-based - Each API gets its own organized folder&lt;/item&gt;
+      &lt;item&gt;Smart variables - &lt;code&gt;{@token}&lt;/code&gt;persists,&lt;code&gt;{?name}&lt;/code&gt;prompts every time&lt;/item&gt;
+      &lt;item&gt;Response filtering - Show only the fields you care about&lt;/item&gt;
+      &lt;item&gt;Git-friendly - TOML files version control beautifully&lt;/item&gt;
+      &lt;item&gt;Unix composable - Script it, pipe it, shell it&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Supports: Linux, macOS, Windows (I hope)&lt;/p&gt;
+    &lt;code&gt;curl -sSL https://raw.githubusercontent.com/DeprecatedLuar/better-curl-saul/main/install.sh | bash&lt;/code&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Download binary for your OS from releases&lt;/item&gt;
+      &lt;item&gt;Make executable: &lt;code&gt;chmod +x saul-*&lt;/code&gt;&lt;/item&gt;
+      &lt;item&gt;Move to PATH: &lt;code&gt;sudo mv saul-* /usr/local/bin/saul&lt;/code&gt;&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Note&lt;/p&gt;
+    &lt;p&gt;I have no idea how to use a windows shell so I expect you to have bash 👍&lt;/p&gt;
+    &lt;code&gt;git clone https://github.com/DeprecatedLuar/better-curl-saul.git
+cd better-curl-saul
+./other/install-local.sh  # Local development build&lt;/code&gt;
+    &lt;p&gt;Note&lt;/p&gt;
+    &lt;p&gt;One-line install automatically downloads pre-built binaries or builds from source as fallback so you don't get sad :(&lt;/p&gt;
+    &lt;code&gt;saul set url https://raw.githubusercontent.com/DeprecatedLuar/better-curl-saul/main/install.sh &amp;amp;&amp;amp; saul call --raw | bash # (Maybe works, who knows)&lt;/code&gt;
+    &lt;code&gt;# Create a test workspace
+saul demo set url https://jsonplaceholder.typicode.com/posts/1
+saul demo set method GET
+saul demo call
+
+# Try with variables
+saul api set url https://httpbin.org/post
+saul api set method POST
+saul api set body name={?your_name} message="Hello from Saul"
+saul api call
+
+# Oh... yeah, for nesting just use dot notation like obj.field=idk&lt;/code&gt;
+    &lt;p&gt;Alright so you can:&lt;/p&gt;
+    &lt;p&gt;&lt;code&gt;set&lt;/code&gt;, &lt;code&gt;check&lt;/code&gt;(will become get), &lt;code&gt;edit&lt;/code&gt;, &lt;code&gt;rm&lt;/code&gt; your
+&lt;code&gt;body&lt;/code&gt;, &lt;code&gt;header&lt;/code&gt;, &lt;code&gt;query&lt;/code&gt;, &lt;code&gt;request&lt;/code&gt;, &lt;code&gt;history&lt;/code&gt; or maybe even
+&lt;code&gt;response&lt;/code&gt;, also &lt;code&gt;url&lt;/code&gt;, &lt;code&gt;method&lt;/code&gt;, &lt;code&gt;timeout&lt;/code&gt;, &lt;code&gt;history&lt;/code&gt;&lt;/p&gt;
+    &lt;code&gt;# Configure your API workspace (or preset, same thing)
+saul [workspace] set url https://api.example.com
+saul set method POST
+saul set header Authorization="Bearer {@token}"
+saul set body user.name={?username} user.email=john@test.com
+
+# Execute the request
+saul call
+
+# Check your configuration, note that preset/workspace name keeps
+# stored in memory after first mention on syntax
+
+saul [anoter_workspace] check url
+saul check body
+
+# View response history
+saul check history&lt;/code&gt;
+    &lt;p&gt;Important note about variables mechanics:&lt;/p&gt;
+    &lt;p&gt;There are 2 variable types&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;soft variables {?} prompt you at EVERY call&lt;/item&gt;
+      &lt;item&gt;hard variables {@} require manual update by running a flag (not yet added sorry) or running &lt;code&gt;saul set variable varname value&lt;/code&gt;&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Start watchin Better Call Saul&lt;/item&gt;
+      &lt;item&gt;Think of a bad joke&lt;/item&gt;
+      &lt;item&gt;Workspace-based configuration&lt;/item&gt;
+      &lt;item&gt; Smart variable system (&lt;code&gt;{@}&lt;/code&gt;/&lt;code&gt;{?}&lt;/code&gt;)&lt;/item&gt;
+      &lt;item&gt;In line terminal field editing&lt;/item&gt;
+      &lt;item&gt;Response filtering&lt;/item&gt;
+      &lt;item&gt;Response history&lt;/item&gt;
+      &lt;item&gt;Terminal session memory&lt;/item&gt;
+      &lt;item&gt;Bulk operations&lt;/item&gt;
+      &lt;item&gt;Fix history response parsing and filtering&lt;/item&gt;
+      &lt;item&gt;GET specific response stuff from history (aka Headers/Body...)&lt;/item&gt;
+      &lt;item&gt;Flags, we've got none basically&lt;/item&gt;
+      &lt;item&gt;Stateless command support&lt;/item&gt;
+      &lt;item&gt;Support pasting raw JSON template&lt;/item&gt;
+      &lt;item&gt;User config system using the super cool github.com/DeprecatedLuar/toml-vars-letsgooo library&lt;/item&gt;
+      &lt;item&gt;Add the eastereggs&lt;/item&gt;
+      &lt;item&gt;Polish code&lt;/item&gt;
+      &lt;item&gt;Actual Documentation&lt;/item&gt;
+      &lt;item&gt;Touch Grass (not a priority)&lt;/item&gt;
+      &lt;item&gt;Think of more features&lt;/item&gt;
+      &lt;item&gt;Think of even more features&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Beta software - Core features work, documentation in progress.&lt;/p&gt;
+    &lt;p&gt;Bug or feedback? I will be very, very, very happy if you let me know your thoughts.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45362486</guid><pubDate>Wed, 24 Sep 2025 16:17:34 +0000</pubDate></item></channel></rss>
