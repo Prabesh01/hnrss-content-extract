@@ -1,218 +1,12 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Fri, 03 Oct 2025 17:34:31 +0000</lastBuildDate><item><title>Litestream v0.5.0</title><link>https://fly.io/blog/litestream-v050-is-here/</link><description>&lt;doc fingerprint="e75e0cc710643f1b"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Iâm Ben Johnson, and I work on Litestream at Fly.io. Litestream makes it easy to build SQLite-backed full-stack applications with resilience to server failure. Itâs open source, runs anywhere, and itâs easy to get started.&lt;/p&gt;
-    &lt;p&gt;Litestream is the missing backup/restore system for SQLite. It runs as a sidecar process in the background, alongside unmodified SQLite applications, intercepting WAL checkpoints and streaming them to object storage in real time. Your application doesn’t even know it’s there. But if your server crashes, Litestream lets you quickly restore the database to your new hardware.&lt;/p&gt;
-    &lt;p&gt;The result: you can safely build whole full-stack applications on top of SQLite.&lt;/p&gt;
-    &lt;p&gt;A few months back, we announced plans for a major update to Litestream. I’m psyched to announce that the first batch of those changes are now “shipping”. Litestream is faster and now supports efficient point-in-time recovery (PITR).&lt;/p&gt;
-    &lt;p&gt;I’m going to take a beat to recap Litestream and how we got here, then talk about how these changes work and what you can expect to see with them.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Litestream to LiteFS to Litestream&lt;/head&gt;
-    &lt;p&gt;Litestream is one of two big SQLite things I’ve built. The other one, originally intended as a sort of sequel to Litestream, is LiteFS.&lt;/p&gt;
-    &lt;p&gt;Boiled down to a sentence: LiteFS uses a FUSE filesystem to crawl further up into SQLite’s innards, using that access to perform live replication, for unmodified SQLite-backed apps.&lt;/p&gt;
-    &lt;p&gt;The big deal about LiteFS for us is that it lets you do the multiregion primary/read-replica deployment people love Postgres for: reads are fast everywhere, and writes are sane and predictable. We were excited to make this possible for SQLite, too.&lt;/p&gt;
-    &lt;p&gt;But the market has spoken! Users prefer Litestream. And honestly, we get it: Litestream is easier to run and to reason about. So we’ve shifted our focus back to it. First order of business: take what we learned building LiteFS and stick as much of it as we can back into Litestream.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The LTX File Format&lt;/head&gt;
-    &lt;p&gt;Consider this basic SQL table:&lt;/p&gt;
-    &lt;code&gt;CREATE TABLE sandwiches (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    description TEXT NOT NULL,
-    star_rating INTEGER, 
-    reviewer_id INTEGER NOT NULL
-);
-&lt;/code&gt;
-    &lt;p&gt;In our hypothetical, this table backs a wildly popular sandwich-reviewing app that we keep trying to get someone to write. People eat a lot of sandwiches and this table gets a lot of writes. Because it makes my point even better and it’s funny, assume people dither a lot about their sandwich review for the first couple minutes after they leave it. This Quiznos subâ¦ is it â or ââ?&lt;/p&gt;
-    &lt;p&gt;Underneath SQLite is a B-tree. Like databases everywhere, SQLite divides storage up into disk-aligned pages, working hard to read as few pages as possible for any task while treating work done within a page as more or less free. SQLite always reads and writes in page-sized chunks.&lt;/p&gt;
-    &lt;p&gt;Our &lt;code&gt;sandwiches&lt;/code&gt; table includes a feature that’s really painful for a tool like Litestream that thinks in pages: an automatically updating primary key. That key dictates that every insert into the table hits the rightmost leaf page in the underlying table B-tree. For SQLite itself, that’s no problem. But Litestream has less information to go on: it sees only a feed of whole pages it needs to archive.&lt;/p&gt;
-    &lt;p&gt;Worse still, when it comes time to restore the database â something you tend to want to happen quickly â you have to individually apply those small changes, as whole pages. Your app is down, PagerDuty is freaking out, and you’re sitting there watching Litestream reconstruct your Quiznos uncertainty a page (and an S3 fetch) at a time.&lt;/p&gt;
-    &lt;p&gt;So, LTX. Let me explain. We needed LiteFS to be transaction-aware. It relies on finer-grained information than just raw dirty pages (that’s why it needs the FUSE filesystem). To ship transactions, rather than pages, we invented a file format we call LTX.&lt;/p&gt;
-    &lt;p&gt;LTX was designed as an interchange format for transactions, but for our purposes in Litestream, all we care about is that LTX files represent ordered ranges of pages, and that it supports compaction.&lt;/p&gt;
-    &lt;p&gt;Compaction is straightforward. You’ve stored a bunch of LTX files that collect numbered pages. Now you want to to restore a coherent picture of the database. Just replay them newest to oldest, skipping duplicate pages (newer wins), until all changed pages are accounted for.&lt;/p&gt;
-    &lt;p&gt;Importantly, LTX isn’t limited to whole database backups. We can use LTX compaction to compress a bunch of LTX files into a single file with no duplicated pages. And Litestream now uses this capability to create a hierarchy of compactions:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;at Level 1, we compact all the changes in a 30-second time window&lt;/item&gt;
-      &lt;item&gt;at Level 2, all the Level 1 files in a 5-minute window&lt;/item&gt;
-      &lt;item&gt;at Level 3, all the Level 2’s over an hour.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Net result: we can restore a SQLite database to any point in time, using only a dozen or so files on average.&lt;/p&gt;
-    &lt;p&gt;Litestream performs this compaction itself. It doesn’t rely on SQLite to process the WAL file. Performance is limited only by I/O throughput.&lt;/p&gt;
-    &lt;head rend="h2"&gt;No More Generations&lt;/head&gt;
-    &lt;p&gt;What people like about Litestream is that it’s just an ordinary Unix program. But like any Unix program, Litestream can crash. It’s not supernatural, so when it’s not running, it’s not seeing database pages change. When it misses changes, it falls out of sync with the database.&lt;/p&gt;
-    &lt;p&gt;Lucky for us, that’s easy to detect. When it notices a gap between the database and our running “shadow-WAL” backup, Litestream resynchronizes from scratch.&lt;/p&gt;
-    &lt;p&gt;The only time this gets complicated is if you have multiple Litestreams backing up to the same destination. To keep multiple Litestreams from stepping on each other, Litestream divides backups into “generations”, creating a new one any time it resyncs. You can think of generations as Marvel Cinematic Universe parallel dimensions in which your database might be simultaneously living in.&lt;/p&gt;
-    &lt;p&gt;Yeah, we didn’t like those movies much either.&lt;/p&gt;
-    &lt;p&gt;LTX-backed Litestream does away with the concept entirely. Instead, when we detect a break in WAL file continuity, we re-snapshot with the next LTX file. Now we have a monotonically incrementing transaction ID. We can use it look up database state at any point in time, without searching across generations.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Upgrading to Litestream v0.5.0&lt;/head&gt;
-    &lt;p&gt;Due to the file format changes, the new version of Litestream can’t restore from old v0.3.x WAL segment files.&lt;/p&gt;
-    &lt;p&gt;That’s OK though! The upgrade process is simple: just start using the new version. It’ll leave your old WAL files intact, in case you ever need to revert to the older version.The new LTX files are stored cleanly in an &lt;code&gt;ltx&lt;/code&gt; directory on your replica.&lt;/p&gt;
-    &lt;p&gt;The configuration file is fully backwards compatible.&lt;/p&gt;
-    &lt;p&gt;There’s one small catch. We added a new constraint. You only get a single replica destination per database. This probably won’t affect you, since it’s how most people use Litestream already. We’ve made it official.&lt;/p&gt;
-    &lt;p&gt;The rationale: having a single source of truth simplifies development for us, and makes the tool easier to reason about. Multiple replicas can diverge and are sensitive to network availability. Conflict resolution is brain surgery.&lt;/p&gt;
-    &lt;p&gt;Litestream commands still work the same. But you’ll see references to “transaction IDs” (TXID) for LTX files, rather than the &lt;code&gt;generation/index/offset&lt;/code&gt; we used previously with WAL segments.&lt;/p&gt;
-    &lt;p&gt;We’ve also changed &lt;code&gt;litestream wal&lt;/code&gt; to &lt;code&gt;litestream ltx&lt;/code&gt;.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Other Stuff v0.5.0 Does Better&lt;/head&gt;
-    &lt;p&gt;We’ve beefed up the underlying LTX file format library. It used to be an LTX file was just a sorted list of pages, all compressed together. Now we compress per-page, and keep an index at the end of the LTX file to pluck individual pages out.&lt;/p&gt;
-    &lt;p&gt;You’re not seeing it yet, but we’re excited about this change: we can operate page-granularly even dealing with large LTX files. This allows for more features. A good example: we can build features that query from any point in time, without downloading the whole database.&lt;/p&gt;
-    &lt;p&gt;We’ve also gone back through old issues &amp;amp; PRs to improve quality-of-life. CGO is now gone. We’ve settled the age-old contest between &lt;code&gt;mattn/go-sqlite3&lt;/code&gt; and &lt;code&gt;modernc.org/sqlite&lt;/code&gt; in favor of &lt;code&gt;modernc.org&lt;/code&gt;. This is super handy for people with automated build systems that want to run from a MacBook but deploy on an x64 server, since it lets the cross-compiler work.&lt;/p&gt;
-    &lt;p&gt;We’ve also added a replica type for NATS JetStream. Users that already have JetStream running can get Litestream going without adding an object storage dependency.&lt;/p&gt;
-    &lt;p&gt;And finally, we’ve upgraded all our clients (S3, Google Storage, &amp;amp; Azure Blob Storage) to their latest versions. We’ve also moved our code to support newer S3 APIs.&lt;/p&gt;
-    &lt;head rend="h2"&gt;What’s next?&lt;/head&gt;
-    &lt;p&gt;The next major feature we’re building out is a Litestream VFS for read replicas. This will let you instantly spin up a copy of the database and immediately read pages from S3 while the rest of the database is hydrating in the background.&lt;/p&gt;
-    &lt;p&gt;We already have a proof of concept working and we’re excited to show it off when it’s ready!&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45453936</guid><pubDate>Thu, 02 Oct 2025 19:02:57 +0000</pubDate></item><item><title>The strangest letter of the alphabet: The rise and fall of yogh</title><link>https://www.deadlanguagesociety.com/p/history-of-letter-yogh</link><description>&lt;doc fingerprint="b6728524aea13b82"&gt;
-  &lt;main&gt;
-    &lt;p&gt;English spelling has a reputation. And it’s not a good one.&lt;/p&gt;
-    &lt;p&gt;It’s full of silent letters, as in numb, knee, and honour. A given sound can be spelled in multiple ways (farm, laugh, photo), and many letters make multiple sounds (get, gist, mirage).&lt;/p&gt;
-    &lt;p&gt;English spelling is so complex that we’ve made mastering it into a competitive sport: what would be the point of a spelling bee in a language with a predictable spelling system? Where’s the fun unless you have to sweat a little as you struggle to recall whether this particular word is one where “‘i’ before ‘e’ except after ‘c’” doesn’t apply?&lt;/p&gt;
-    &lt;p&gt;In short, English has a complicated writing system.&lt;/p&gt;
-    &lt;p&gt;I’ve written about the origin of some of this complexity before, blaming everyone from the French to stingy printers and late medieval yuppies. But I’ve not yet plumbed the depths of this complexity. To do so, I will need to tell you the story of yogh,1 an obscure medieval letter whose rise and fall allows us to peer into this abyss.&lt;/p&gt;
-    &lt;p&gt;But like an Icelandic family saga, we begin not with the story of yogh, but with the story of its parent. So allow me to introduce you to the letter ‘g,’ which, as you’ll soon see, is a complicated letter in its own right, dating back to Old English.&lt;/p&gt;
-    &lt;p&gt;It starts with the shape of the letter. When modern editors print Old English today, they print nice, modern-looking ‘g’s — that is, the ones we use today, with an open or closed loop on the bottom, depending on the typeface.&lt;/p&gt;
-    &lt;p&gt;This modern form of ‘g’ is called the Carolingian ‘g.’ It had its origin in the Carolingian minuscule, the script used by the scribes of the Carolingian Renaissance, the great revival of learning which flourished in the vast realm of Charlemagne (reigned 768–814).2&lt;/p&gt;
-    &lt;p&gt;But Old English scribes didn’t write their g-sounds with a Carolingian ‘g.’ The Old English letter ‘g’ was written in a form called the insular ‘g.’ Here’s what it looked like: ‘ᵹ.’ It’s like a mix between a ‘z’ and a ‘3.’&lt;/p&gt;
-    &lt;p&gt;Let’s see it in action. When the first lines of Beowulf are written in a modern edition, they look like this:&lt;/p&gt;
-    &lt;quote&gt;&lt;p&gt;Hwæt, we Gardena in geardagum&lt;/p&gt;&lt;lb/&gt;þeodcyninga þrym gefrunon,&lt;p&gt;‘How we have heard of the glory of the kings of the spear-Danes in days of old’&lt;/p&gt;&lt;p&gt;(Beowulf 1–2)&lt;/p&gt;&lt;/quote&gt;
-    &lt;p&gt;But in the manuscript, they’re written like this:&lt;/p&gt;
-    &lt;quote&gt;&lt;p&gt;HǷÆT ǷE GARDE&lt;/p&gt;&lt;lb/&gt;na inᵹear daᵹum þeod cyninᵹa&lt;lb/&gt;þrym ᵹefrunon&lt;p&gt;London, British Library, Cotton MS Vitellius A XV, f. 132r.&lt;/p&gt;&lt;/quote&gt;
-    &lt;p&gt;Now, there’s clearly lots of other weird stuff going on in the manuscript, but focus on how the ‘g’ is represented. While the majuscule (capital) ‘G’ in ‘gardena’ is spelled more like a modern ‘g,’ all the others are insular ‘ᵹ.’&lt;/p&gt;
-    &lt;p&gt;Interestingly, the Anglo-Saxons did use the Carolingian ‘g’ — just not for Old English. They used it when writing Latin, at least after the late 10th century. This was when the Church in England underwent a set of reforms, which caused a flowering of literature both in Latin and Old English.3 As part of these reforms, the Carolingian minuscule script was adopted for Latin texts.&lt;/p&gt;
-    &lt;p&gt;So for a period, both ‘g’ and ‘ᵹ’ were used in England, but generally speaking, each was used for writing the ‘g’ sound in a different language. Simple enough, but the stage was set for things to get a lot more complicated.&lt;/p&gt;
-    &lt;p&gt;But for that, we need the help of the Normans.&lt;/p&gt;
-    &lt;p&gt;You're reading The Dead Language Society. I'm Colin Gorrie, linguist, ancient language teacher, and your guide through the history of the English language and its relatives.&lt;/p&gt;
-    &lt;p&gt;Subscribe for a free issue every Wednesday, or upgrade to support my mission of bringing historical linguistics out of the ivory tower and receive two extra Saturday deep-dives per month.&lt;/p&gt;
-    &lt;p&gt;If you upgrade, you’ll also be able to join our ongoing Beowulf Book Club and watch our discussion of the first 915 lines (part 1, part 2) right away.&lt;/p&gt;
-    &lt;head rend="h1"&gt;Of course, they would have spelled it ȝoȝ&lt;/head&gt;
-    &lt;p&gt;For the history of the English language, no single year was more momentous than 1066. In this year, William, Duke of Normandy, invaded and took the English throne, bringing with him Norman knights, and more importantly for our purposes, Norman scribes.&lt;/p&gt;
-    &lt;p&gt;These Norman scribes inherited the writing traditions that the Carolingian renaissance had given birth to. This meant the latest, greatest, 11th-century French versions of the Carolingian minuscule.&lt;/p&gt;
-    &lt;p&gt;These weren’t so different from the way Anglo-Saxon scribes had written Latin. But they were very different from the way they had written Old English, especially in the ‘g’ department.&lt;/p&gt;
-    &lt;p&gt;But that wasn’t so much of an issue, since these Norman-trained scribes, and those of the generations that came after them, didn’t write much English at all. In fact, writing in English of any kind was very scarce up until the end of the 12th century.&lt;/p&gt;
-    &lt;p&gt;Over the course of that tumultuous — and, for English, silent — century, the language had changed a great deal. All the scribes trained in the old, Anglo-Saxon traditions were long dead, so when a new generation of scribes turned their attention once again to English, they had to devise some new strategies for writing it.&lt;/p&gt;
-    &lt;p&gt;And this, after a surprisingly long delay, is where we first meet the star of today’s issue: ‘ȝ,’ also known as yogh.&lt;/p&gt;
-    &lt;p&gt;Yogh is descended from a variant form of the old insular ‘ᵹ.’ But, while the insular ‘ᵹ’ was thought of as the same letter as the Carolingian ‘g’ in Anglo-Saxon times, the yogh ‘ȝ’ of the 12th century was an entirely different letter from the Carolingian-derived ‘g.’&lt;/p&gt;
-    &lt;p&gt;And, stranger still, ‘ȝ’ was used to write two completely different sounds in Middle English, the form of English spoken from around 1100–1450: the y-sound as in young or yesterday, and another sound that English has lost altogether.&lt;/p&gt;
-    &lt;p&gt;The other sound that ‘ȝ’ once spelled is the “harsh” or “guttural” sound made in the back of the mouth, which you hear in Scots loch or German Bach.4 This sound is actually the reason for the most famous bit of English spelling chaos: the sometimes-silent, sometimes-not sequence ‘gh’ that you see in laugh, cough, night, and daughter. Maybe one day I’ll tell you that story too.&lt;/p&gt;
-    &lt;p&gt;For today, however, just know that the spelling ‘gh,’ which causes spellers so much trouble, was originally a replacement for ‘ȝ’ in these words. But more on that later. Let’s dwell for a moment on the bizarre situation we had in Middle English, where the same letter ‘ȝ’ could represent either a y-sound or that now-vanished gh-sound.&lt;/p&gt;
-    &lt;head rend="h1"&gt;But not as bizarre as this painting&lt;/head&gt;
-    &lt;p&gt;Or is it actually so bizarre?&lt;/p&gt;
-    &lt;p&gt;Modern English spelling is, of course, chaotic. So perhaps it shouldn’t surprise us that we too have a very yogh-like situation with two of our letters: ‘c’ and — wait for it — ‘g.’&lt;/p&gt;
-    &lt;p&gt;Each of these regularly represents two not particularly similar sounds. The letter ‘c’ sometimes represents a k-sound, like in cat, and sometimes an s-sound, like in city. The letter ‘g’ is similar: sometimes it writes a true g-sound, like in good, but other times, what it represents is a j-sound, like in gem.&lt;/p&gt;
-    &lt;p&gt;If these sounds seem similar to you, pay attention to your tongue as you make each one: the k-sound and the true g-sound are made with the back of your tongue hitting against your soft palate. The s-sound and the ‘j’ sound are made in slightly different places, but in both cases, they use the tip of your tongue coming up against (or close to) just behind your upper teeth.&lt;/p&gt;
-    &lt;p&gt;Each of our two double-sounding letters, ‘c’ and ‘g,’ has two variants, which are made at completely different ends of the mouth. This is how yogh worked too: it had one variant made at the back of the mouth (the gh-sound) and the other made towards the front (that’s the y-sound).&lt;/p&gt;
-    &lt;p&gt;There’s actually a good linguistic reason why this pattern keeps happening. It’s a sound change called palatalization: this happens when a sound made towards the back of the mouth, like a k- or g-sound, gets pulled forward because it’s next to another sound made at the front of the mouth. Often, these front-of-the-mouth sounds are vowels.&lt;/p&gt;
-    &lt;p&gt;In Old English, these front-of-the-mouth vowels (front vowels for short) included the ones spelled ‘i’ and ‘e,’ which sounded like the vowels in bee and bay.5 Sometime in the deep prehistory of the English language, the ‘g’ sound got pulled forward in the mouth to sound like ‘y’ whenever it was next to these front vowels.&lt;/p&gt;
-    &lt;p&gt;But when it came time to spell these ‘y’ sounds in the Latin alphabet, they still seemed to the Anglo-Saxon scribes to be versions of ‘g’ sounds. So they spelled them ‘ᵹ’ just like they spelled other ‘g’ sounds. This is why, when you read Old English, you can often replace ‘ᵹ’ (or ‘g’ in modern editions) with ‘y’ and get recognizable Modern English words: ᵹear is year, dæᵹ is day, weᵹ is way.6&lt;/p&gt;
-    &lt;p&gt;A process like this happened in the ancestor of French too, just slightly differently. Instead of the ‘g’ being pulled forward into a ‘y’ sound before ‘i’ and ‘e,’ it got pulled forward into a ‘j’ sound.&lt;/p&gt;
-    &lt;p&gt;This is why the Modern English ‘g’ represents two sounds, one before the letters ‘i’ and ‘e’, and the other before the other letters. It’s because we took our spelling conventions from how the Norman scribes wrote their language, which was an old form of French.7&lt;/p&gt;
-    &lt;p&gt;While the Norman scribes, and the later English scribes they trained, were used to the letter ‘g’ writing two different sounds, neither was a y-sound. They needed another letter for that, and they found one: the old insular ‘ᵹ,’ or rather, its descendant, the yogh ‘ȝ.’&lt;/p&gt;
-    &lt;p&gt;So that’s why ‘ȝ’ spelled a ‘y’ sound. To understand why ‘ȝ’ also spelled that vanished ‘gh’ sound, however, we need to go back into the distant history of English, long before it was ever written down. Actually, long before there even was an English.&lt;/p&gt;
-    &lt;p&gt;Back then, there was just one single language, which would later split into English, Dutch, German, Swedish, and all the other Germanic languages.&lt;/p&gt;
-    &lt;p&gt;In this Proto-Germanic language (as it’s called today), the sound that would become the English g-sound — which the Anglo-Saxons would later spell ‘ᵹ’ — was not the g-sound we have today in words like good or bag. That came later.&lt;/p&gt;
-    &lt;p&gt;Instead, the Proto-Germanic ancestor of words like good had a sound very similar to the later Middle English gh-sound at the start.8 Only later would English harden that gh-sound into the g-sound we know today. But this only happened in certain places in the word, especially at the start. At the end of the word, the gh-sound remained. In Old English, both versions were spelled the same: ‘ᵹ.’&lt;/p&gt;
-    &lt;p&gt;This means that ‘ᵹ’ actually had three pronunciations in Old English, not two: the y-sound (next to front vowels), the g-sound (at the start of words), and the gh-sound (in the middle of words). So when those Norman-trained scribes turned their attention to writing English in the 12th century, they had no problem writing the g-sound at the start of words with ‘g.’&lt;/p&gt;
-    &lt;p&gt;But when they wanted to write the gh-sound, they ran into the same problem they had in writing the y-sound. They didn’t have a good way to write the gh-sound, which didn’t exist in French at the time, so they pressed yogh into service again.&lt;/p&gt;
-    &lt;p&gt;And that’s why yogh has two sounds, each of which corresponds to a pronunciation of the Old English letter ‘ᵹ’ that the French scribal tradition couldn’t accept writing with ‘g.’&lt;/p&gt;
-    &lt;head rend="h1"&gt;Wait, we’ve been saying ‘Mackenzie’ wrong?&lt;/head&gt;
-    &lt;p&gt;When you’re reading Middle English, it can get a bit confusing: Which kind of yogh is which?&lt;/p&gt;
-    &lt;p&gt;Look at this line from Sir Gawain and the Green Knight:&lt;/p&gt;
-    &lt;quote&gt;&lt;p&gt;Þaȝ ȝe ȝourself be talenttyf, to take hit to yourseluen,&lt;/p&gt;&lt;lb/&gt;‘Though you yourself are eager to accept it [a challenge] personally,’ (Sir Gawain and the Green Knight 350)&lt;/quote&gt;
-    &lt;p&gt;In this line, the first yogh makes the gh-sound, while the second and third represent y-sounds. But you just have to know the words in order to figure that out.&lt;/p&gt;
-    &lt;p&gt;As inconvenient as this confusion is for us modern readers of Middle English, that isn’t the reason yogh disappeared from the English language. The fate of yogh was sealed by a conspiracy of factors.&lt;/p&gt;
-    &lt;p&gt;One is that yogh was never the only alternative for writing the sounds it wrote. The y-sound could also be written in the way the French wrote it, that is, ‘i’ or ‘y.’ The latter is the spelling that English ended up using for this sound, hence yourself instead of ȝourself. The gh-sound could also be written ‘h,’ ‘ȝh,’ or ‘gh.’ The last of these, of course, is what English ended up adopting.&lt;/p&gt;
-    &lt;p&gt;But the death blow dealt to yogh was the printing press. The earliest printing press in England was a Flemish import, as were the typefaces. But the yogh letter was unique to English, and like the other letters unique to English, it would be expensive to print. And, as we just saw, there were ready alternatives, so yogh disappeared without a trace… from English.&lt;/p&gt;
-    &lt;p&gt;In Scotland, on the other hand, it stuck around for longer. Scots used the combination ‘lȝ’ to represent an ‘ly’ sequence like we have in million, and ‘nȝ’ to represent either the ‘ny’ sequence like in canyon, or an ‘ng’ sound like in singer.&lt;/p&gt;
-    &lt;p&gt;And Scottish printers were more eager to keep it than English printers were. So they took advantage of the visual similarity between ‘ȝ’ and ‘z’ — most forms of cursive writing in English still write ‘z’ like ‘ȝ’ — to write their yoghs with ‘z’s.&lt;/p&gt;
-    &lt;p&gt;You still see the results of this substitution, ‘lz’ and ‘nz,’ in certain Scottish names. But the ‘z’ has led them to be pronounced in ways that have nothing to do with their traditional forms. So Menzies and Mackenzie were meant to spell things that sounded more like Mingus and Mackenyie.&lt;/p&gt;
-    &lt;p&gt;And that’s how one single letter of the Middle English alphabet ended up being pronounced like ‘y,’ ‘gh,’ or even eventually like ‘z.’ I warned you it would be complicated.&lt;/p&gt;
-    &lt;p&gt;But the journey through the history of yogh has allowed us to peer down some interesting side alleys of the history of writing, from Carolingian scribal practices to the compromises of Scottish printers.&lt;/p&gt;
-    &lt;p&gt;I don’t lament the loss of yogh myself, not nearly as much as I lament the fate of other lost letters. But if the cause of yogh is one ȝou fancy taking up ȝourself, there’s nothing standing in ȝour waȝ (it’s included in many modern fonts), althouȝ I can imagine hiȝer causes to aspire to.&lt;/p&gt;
-    &lt;p&gt;The name of the letter yogh is pronounced today in many ways: you can say it to rhyme with log, loch, or brogue.&lt;/p&gt;
-    &lt;p&gt;Technically, it was the double-storey, closed-loop ‘g’ that was associated with Carolingian minuscule. The open-loop, single-storey ‘g’ was a later development. Today, they’re seen as more or less interchangeable: in fact, I don’t even know what version you’re seeing when you read this, since it’ll look different on the web and in your email client.&lt;/p&gt;
-    &lt;p&gt;If you know phonetic terminology, I’ll be more specific: this sound was the voiceless velar fricative, or [x] in the International Phonetic Alphabet. In some situations, it was likely the voiceless palatal fricative (IPA [ç]).&lt;/p&gt;
-    &lt;p&gt;If you want to know why the names of these letters sound completely different in Modern English (‘i’ and ‘e’ sound more like the vowels in buy and bee), let me tell you all about it.&lt;/p&gt;
-    &lt;p&gt;Conscientious modern editors (myself included, he said humbly) will spell the ‘g’ that you’re supposed to pronounce like ‘y’ with a little dot on top: ‘ġ.’&lt;/p&gt;
-    &lt;p&gt;Ditto for the two pronunciations of ‘c.’&lt;/p&gt;
-    &lt;p&gt;Note for nerds: this was the voiced velar fricative [ɣ]. Yogh would later be used for the voiceless velar fricative [x], which actually had a different origin in the ancestor of Old English. But the two sounds ended up sounding identical at the end of a word, so yogh ended up being used for both.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45455882</guid><pubDate>Thu, 02 Oct 2025 21:34:42 +0000</pubDate></item><item><title>I spent the day teaching seniors how to use an iPhone</title><link>https://forums.macrumors.com/threads/i-spent-the-day-trying-to-teach-seniors-how-to-use-an-iphone-and-it-was-a-nightmare.2468117/</link><description>&lt;doc fingerprint="ae3e8916e6c093d8"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Honestly, I think Apple really needs to simplify the iPhone for the elderly. I know there are accessibility modes, but you don’t want to have to go through all that and spend hours trying to customize the phone. Also, the whole phone setup process needs to be delayed; having to go through it for an hour puts them off from even wanting to bother. I first set the phones up to make accounts, but it turns out none of them could understand how to unlock the phone. Entering a passcode was a nightmare because they kept forgetting it, even though it was a birthday they knew, lol. &lt;lb/&gt;So, I tried Touch ID and Face ID, and that was even more complicated and kept erroring out. Then, the Siri thing kept popping up on the phones with Touch ID, despite turning it off, and the whole swiping from the button kept making the screen go down to the bottom half. :/ There were too many apps; all they wanted was the phone app, but it doesn’t default to the keypad, which was too much for them to find.&lt;lb/&gt;The phones are too fiddly now, and pressing random things as they try to hold the phone meant the phone got lost in a sea of opening stuff up. So, I tried the assistive access, but why isn’t this an option from the get-go? It asks you the age of setup; why not have a 65+ or something for a senior mode?&lt;lb/&gt;They don’t need passcodes, accounts, and a sea of information. It’s insane, and it’s insane how fiddly these phones are. I never noticed because I’m used to it, but for these people with hands that barely move, the fake Touch ID button and the swiping from the bottom on Face ID phones seem to be the worst! I think having a proper physical button, like iPhones used to have, would have been superior. The one complaint about the fake button was that it didn’t feel like a real button, so they couldn’t gauge it.&lt;lb/&gt;I left there achieving nothing because they couldn’t figure out their old Nokia phones. The unlock thing on the keypad was too difficult, and if I turned that off, they kept dialing 999 in their pockets for some reason. That’s why I was there: they were calling emergency services 100 times a day, lol.&lt;lb/&gt;I think what I’ve realized is that I need to go back with flip phones that answer and hang up when you open and close them. However, the two I tried before didn’t act like that, and they had too many features. I really thought I could make the iPhone simple, but NOPE!&lt;lb/&gt;Apple should work on their phones to make them more accessible and less fiddly, without having to go through a sea of menus.&lt;/p&gt;
-    &lt;p&gt;So, I tried Touch ID and Face ID, and that was even more complicated and kept erroring out. Then, the Siri thing kept popping up on the phones with Touch ID, despite turning it off, and the whole swiping from the button kept making the screen go down to the bottom half. :/ There were too many apps; all they wanted was the phone app, but it doesn’t default to the keypad, which was too much for them to find.&lt;/p&gt;
-    &lt;p&gt;The phones are too fiddly now, and pressing random things as they try to hold the phone meant the phone got lost in a sea of opening stuff up. So, I tried the assistive access, but why isn’t this an option from the get-go? It asks you the age of setup; why not have a 65+ or something for a senior mode?&lt;/p&gt;
-    &lt;p&gt;They don’t need passcodes, accounts, and a sea of information. It’s insane, and it’s insane how fiddly these phones are. I never noticed because I’m used to it, but for these people with hands that barely move, the fake Touch ID button and the swiping from the bottom on Face ID phones seem to be the worst! I think having a proper physical button, like iPhones used to have, would have been superior. The one complaint about the fake button was that it didn’t feel like a real button, so they couldn’t gauge it.&lt;/p&gt;
-    &lt;p&gt;I left there achieving nothing because they couldn’t figure out their old Nokia phones. The unlock thing on the keypad was too difficult, and if I turned that off, they kept dialing 999 in their pockets for some reason. That’s why I was there: they were calling emergency services 100 times a day, lol.&lt;/p&gt;
-    &lt;p&gt;I think what I’ve realized is that I need to go back with flip phones that answer and hang up when you open and close them. However, the two I tried before didn’t act like that, and they had too many features. I really thought I could make the iPhone simple, but NOPE!&lt;/p&gt;
-    &lt;p&gt;Apple should work on their phones to make them more accessible and less fiddly, without having to go through a sea of menus.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45457670</guid><pubDate>Fri, 03 Oct 2025 01:20:32 +0000</pubDate></item><item><title>FyneDesk: A full desktop environment for Linux written in Go</title><link>https://github.com/FyshOS/fynedesk</link><description>&lt;doc fingerprint="5141e05b0107b1ec"&gt;
-  &lt;main&gt;
-    &lt;p&gt;FyneDesk is an easy to use Linux/Unix desktop environment following material design. It is built using the Fyne toolkit and is designed to be easy to use as well as easy to develop. We use the Go language and welcome any contributions or feedback for the project.&lt;/p&gt;
-    &lt;p&gt;Compiling requires the same dependencies as Fyne. See the Getting Started documentation for installation steps.&lt;/p&gt;
-    &lt;p&gt;For a full desktop experience you will also need the following external tools installed:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;arandr&lt;/code&gt;for modifying display settings&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;xbacklight&lt;/code&gt;or&lt;code&gt;brightnessctl&lt;/code&gt;for laptop brightness&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;connman-gtk&lt;/code&gt;is currently used for configuring Wi-Fi network settings&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;compton&lt;/code&gt;for compositor support&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;The desktop does work without the runtime dependencies but the experience will be degraded.&lt;/p&gt;
-    &lt;p&gt;Using standard Go tools you can install FyneDesk using:&lt;/p&gt;
-    &lt;code&gt;go get fyshos.com/fynedesk/cmd/fynedesk
-&lt;/code&gt;
-    &lt;p&gt;This will add &lt;code&gt;fynedesk&lt;/code&gt; to your $GOPATH (usually ~/go/bin).
-You can now run the app in "preview" mode like any other Fyne app.
-Doing so is not running a window manager, to do so requires another few steps:&lt;/p&gt;
-    &lt;p&gt;To use this as your main desktop you can run the following commands to set up fynedesk as a selectable desktop option in your login manager (such as LightDM for example):&lt;/p&gt;
-    &lt;code&gt;git clone https://github.com/fyshos/fynedesk
-cd fynedesk
-make
-sudo make install
-&lt;/code&gt;
-    &lt;p&gt;You can now log out and see that it is in your desktop selection list at login.&lt;/p&gt;
-    &lt;p&gt;You can also run the window manager components in an embedded X window for testing. You will need the &lt;code&gt;Xephyr&lt;/code&gt; tool installed for your platform (often installed as part of Xorg).
-Once it is present you can use the following command from the same directory as above:&lt;/p&gt;
-    &lt;code&gt;make embed
-&lt;/code&gt;
-    &lt;p&gt;It should look like this:&lt;/p&gt;
-    &lt;p&gt;If you run the command when there is a window manager running, or on an operating system that does not support window managers (Windows or macOS) then the app will start in UI test mode. When loaded in this way you can run all of the features except the controlling of windows - they will load on your main desktop.&lt;/p&gt;
-    &lt;p&gt;A desktop needs to be rock solid, and whilst we are working hard to get there, any alpha or beta software can run into unexpected issues. For that reason, we have included a &lt;code&gt;fynedesk_runner&lt;/code&gt; utility that can help
-manage unexpected events. If you start the desktop using the runner, then
-if a crash occurs, it will normally recover where it left off with no loss
-of data in your applications.&lt;/p&gt;
-    &lt;p&gt;Using standard Go tools you can install the runner using:&lt;/p&gt;
-    &lt;code&gt;go get fyshos.com/fynedesk/cmd/fynedesk_runner
-&lt;/code&gt;
-    &lt;p&gt;From then on execute that instead of the &lt;code&gt;fynedesk&lt;/code&gt; command for a more
-resilient desktop when testing out pre-release builds.&lt;/p&gt;
-    &lt;p&gt;Design concepts, and the abstract wallpapers have been contributed by Jost Grant.&lt;/p&gt;
-    &lt;p&gt;If you are installing FyneDesk by default on a distribution, or making it available as a standard option, you should consider the following points. You do not need to ship the library or any dependencies, but it is recommended to add the following apps as well:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;app&lt;/cell&gt;
-        &lt;cell role="head"&gt;go get&lt;/cell&gt;
-        &lt;cell role="head"&gt;description&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;fin&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;github.com/fyshos/fin&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;A display manager app that matches the look and feel of FyneDesk&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Please do let us know if you package FyneDesk for your system, so we can include a link from here :).&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45458122</guid><pubDate>Fri, 03 Oct 2025 02:13:17 +0000</pubDate></item><item><title>Fp8 runs ~100 tflops faster when the kernel name has "cutlass" in it</title><link>https://github.com/triton-lang/triton/pull/7298</link><description>&lt;doc fingerprint="cef8dd4f2e620e8a"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Fri, 03 Oct 2025 18:13:44 +0000</lastBuildDate><item><title>Fp8 runs ~100 tflops faster when the kernel name has "cutlass" in it</title><link>https://github.com/triton-lang/triton/pull/7298</link><description>&lt;doc fingerprint="cef8dd4f2e620e8a"&gt;
   &lt;main&gt;
     &lt;list rend="ul"&gt;
       &lt;item&gt; Notifications &lt;tool-tip&gt;You must be signed in to change notification settings&lt;/tool-tip&gt;&lt;/item&gt;
       &lt;item&gt;Fork 2.3k&lt;/item&gt;
     &lt;/list&gt;
     &lt;head rend="h1"&gt;[Gluon][Tutorial] Persistent attention #7298&lt;/head&gt;
-    &lt;head id="button-e15995f13e247af8" class="btn btn-sm btn-primary m-0 ml-0 ml-md-2"&gt;New issue&lt;/head&gt;
+    &lt;head id="button-e895d71a5814765a" class="btn btn-sm btn-primary m-0 ml-0 ml-md-2"&gt;New issue&lt;/head&gt;
     &lt;p&gt;Have a question about this project? Sign up for a free GitHub account to open an issue and contact its maintainers and the community.&lt;/p&gt;
     &lt;p&gt;By clicking “Sign up for GitHub”, you agree to our terms of service and privacy statement. We’ll occasionally send you account related emails.&lt;/p&gt;
     &lt;p&gt;Already on GitHub? Sign in to your account&lt;/p&gt;
@@ -815,7 +609,491 @@ curl http://localhost:8080/&lt;/code&gt;
     &lt;p&gt;Other deficiencies highlighted in the memo include the hosting of third-party applications that have not undergone Army security assessments. One application revealed 25 high-severity code vulnerabilities. Three additional applications under review each contain over 200 vulnerabilities requiring assessment, according to the document.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45464269</guid><pubDate>Fri, 03 Oct 2025 15:46:11 +0000</pubDate></item><item><title>OpenAI Is Just Another Boring, Desperate AI Startup</title><link>https://www.wheresyoured.at/sora2-openai/</link><description>&lt;doc fingerprint="60179855900eef9c"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45464269</guid><pubDate>Fri, 03 Oct 2025 15:46:11 +0000</pubDate></item><item><title>A Looking Glass Half Empty, Part 1: Just Lookin' for a Hit</title><link>https://www.filfre.net/2025/10/a-looking-glass-half-empty-part-1-just-lookin-for-a-hit/</link><description>&lt;doc fingerprint="be7080750b6e037b"&gt;
+  &lt;main&gt;
+    &lt;p/&gt;
+    &lt;quote&gt;
+      &lt;p&gt;There was some discussion about it: “Wow, gosh, it’d sure be nice if we were making more money and selling more copies so we could do crazy games of the type we want, as opposed to having to worry about how we’re going to sell more.” Hey, I’d love it if the public was more into what I like to do and a little less into slightly more straightforward things. But I totally get that they’re into straightforward things. I don’t have any divine right to have someone hand me millions of dollars to make a game of whatever I want to do. At some fundamental level, everyone has a wallet, and they vote with it.&lt;/p&gt;
+      &lt;p&gt;— Doug Church, Looking Glass Studios&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Late in 1994, after their rather brilliant game System Shock had debuted to a reception most kindly described as constrained, the Boston-based studio Looking Glass Technologies sent their star producer Warren Spector down to Austin, Texas. There he was to visit the offices of Looking Glass’s publisher Origin Systems, whose lack of promotional enthusiasm they largely blamed for their latest game’s lukewarm commercial performance. Until recently, Spector had been directly employed by Origin. The thinking, then, was that he might still be able to pull some strings in Austin to move the games of Looking Glass a little higher up in the priority rankings. The upshot of his visit was not encouraging. “What do I have to do to get a hit around here?” Spector remembers pleading to his old colleagues. The answer was “very quiet, very calm: ‘Sign Mark Hamill to star in your game.‘ That was the thinking at the time.” But interactive movies were not at all what Looking Glass wanted to be doing, nor where they felt the long-term future of the games industry lay.&lt;/p&gt;
+    &lt;p&gt;So, founders Paul Neurath and Ned Lerner decided to make some major changes in their business model in the hope of raising their studio’s profile. They accepted $3.8 million in venture capital and cut ties with Origin, announcing that henceforward Looking Glass would publish as well as create their games for themselves. Jerry Wolosenko, a new executive vice president whom they hired to help steer the company into its future of abundance, told The Boston Globe in May of 1995 that “we expect to do six original titles per year. We are just beginning.” This was an ambitious goal indeed for a studio that, in its five and a half years of existence to date, had managed to turn out just three original games alongside a handful of porting jobs.&lt;/p&gt;
+    &lt;p&gt;Even more ambitious, if not brazen, was the product that Looking Glass thought would provide them with their entrée into the ranks of the big-time publishers. They intended to mount a head-on challenge to that noted tech monopolist Microsoft, whose venerable, archetypally entitled Flight Simulator was the last word — in fact, very nearly the only word — in civilian flight simulation. David-versus-Goliath contests in the business of media didn’t come much more pronounced than this one, but Looking Glass thought they had a strategy that might allow them to break at least this particular Microsoft monopoly.&lt;/p&gt;
+    &lt;p&gt;Flight Unlimited was the brainchild of a high-energy physicist, glider pilot, and amateur jazz pianist named Seamus Blackley, who had arrived at Looking Glass by way of the legendary Fermi Laboratory. His guiding principle was that Microsoft’s Flight Simulator as it had evolved over the last decade and a half had become less a simulation of flight itself than a simulation of the humdrum routine of civil aviation — of takeoff permissions and holding patterns, of navigational transponders and instrument landing systems. He wanted to return the focus to the simple joy of soaring through the air in a flying machine, something that, for all the technological progress that had been made since the Wright brothers took off from Kitty Hawk, could still seem closer to magic than science. The emphasis would be on free-form aerobatics rather than getting from Airport A to Airport B. “I want people to see that flying is beautiful, exciting, and see the thrill you can get from six degrees of freedom when you control an airplane,” Blackley said. “That’s why we’ve focused on the experience of flying. There is no fuel gauge.”&lt;/p&gt;
+    &lt;p&gt;The result really was oddly beautiful, being arguably as close to interactive art as a product that bills itself as a vehicular simulation can possibility get. Its only real concession to structure took the form of a 33-lesson flying course, which brought you from just being able to hold the airplane straight and level to executing gravity-denying Immelman rolls, Cuban eights, hammerheads, and inverted spins. Any time that your coursework became too intense, you always had the option to just bin the lesson plans and, you know, go out and fly, maybe to try some improvisational skywriting.&lt;/p&gt;
+    &lt;p&gt;In one sense, Flight Unlimited was a dramatic departure from the two Ultima Underworld games and System Shock, all of which were embodied first-person, narrative-oriented designs that relied on 3D graphics of a very different stripe. In another sense, though, it was business as usual, another example of Looking Glass not only pushing boundaries of technology in a purist sense — the flight model of Flight Unlimited really was second to none — but using it in the service of a game that was equally aesthetically innovative, and just a little bit more thoughtful all the way around than was the norm.&lt;/p&gt;
+    &lt;p&gt;Upon its release in May of 1995, Flight Unlimited garnered a rare five-stars-out-of-five review from Computer Gaming World magazine:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;It’s just you, the sky, and a plane that does just about anything you ask it to. Anything aerobatic, that is. Flight Unlimited is missing many of the staple elements of flight simulations. There are no missiles, guns, or enemy aircraft. You can’t learn IFR navigation or practice for your cross-country solo. You can’t even land at a different airport than the one you took off from. But unless you’re just never happy without something to shoot at, you won’t care. You’ll be too busy choreographing aerial ballets, pulling off death-defying aerobatic stunts, or just enjoying a quiet soar down the ridge line to miss that stuff.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Flight Unlimited sold far better than System Shock: a third of a million copies, more even than Looking Glass’s previous best-seller Ultima Underworld, enough to put itself solidly in the black and justify a sequel. Still, it seems safe to say that it didn’t cause any sleepless nights for anyone at Microsoft. Over the years, Flight Simulator had become less a game than a whole cottage industry unto itself, filled with armchair pilots who often weren’t quite gamers in the conventional sense, who often played nothing else. It wasn’t all that easy to make inroads with a crowd such as that. Like a lot of Looking Glass’s games, Flight Unlimited was a fundamentally niche product to which was attached the burden of mainstream sales expectations.&lt;/p&gt;
+    &lt;p&gt;That said, the fact remained that Flight Unlimited had made money for Looking Glass, which allowed them to continue to live the dream for a while longer. Neurath and Lerner sent a homesick Warren Spector back down to Austin to open a second branch there, to take advantage of an abundance of talent surrounding the University of Texas that the Wing Commander-addled Origin Systems was believed to be neglecting.&lt;/p&gt;
+    &lt;p&gt;Then Looking Glass hit a wall. Its name was Terra Nova.&lt;/p&gt;
+    &lt;p&gt;Terra Nova: Strike Force Centauri had had the most protracted development cycle of any Looking Glass game, dating almost all the way back to the very beginning of the company and passing through dozens of hands before it finally came to fruition in the spring of 1996. At its heart, it was an ultra-tactical first-person shooter vaguely inspired by the old Robert Heinlein novel Starship Troopers, tasking you with leading teams of fellow soldiers through a series of missions, clad in your high-tech combat gear that turned you more than halfway into a sentient robot. But it was also as close as Looking Glass would ever come to their own stab at a Wing Commander: the story was advanced via filmed cutscenes featuring real human actors, and a lot of attention was paid to the goings on back at the ranch when you weren’t dressed up in your robot suit. This sort of thing worked in Wing Commander, to whatever extent it did, because the gameplay that took place between the movie segments was fairly quick and simple. Terra Nova was not like that, which could make it feel like an even more awkward mélange of chocolate and peanut butter. It’s difficult to say whether Activision’s Mechwarrior 2, the biggest computer game of 1995, helped it or hurt it in the marketplace: on the one hand, that game showed that there was a strong appetite for tactical combat involving robots, but, on the other, said demand was already being fed by a glut of copycats. Terra Nova got lost in the shuffle. A game that had been expected to sell at least half a million copies didn’t reach one-fifth of that total.&lt;/p&gt;
+    &lt;p&gt;Looking Glass’s next game didn’t do any better. Like Flight Unlimited, British Open Championship Golf cut against the dark, gritty, and violent stereotype that tended to hold sway when people thought of Looking Glass, or for that matter of the games industry writ large. It was another direct challenge to an established behemoth: in this case, Access Software’s Links franchise, which, like Flight Simulator, had its own unique customer base, being the only line of boxed computer games that sold better to middle-aged corporate executives than they did to high-school and university students. Looking Glass’s golf project was led by one Rex Bradford, whose own history with simulating the sport went all the way back to Mean 18, a hit for Accolade in 1986. This time around, though, the upstart challenger to the status quo never even got a sniff. By way of damning with faint praise, Computer Gaming World called British Open Championship Golf “solid,” but “somewhat unspectacular.” Looking Glass could only wish that its sales could have been described in the same way.&lt;/p&gt;
+    &lt;p&gt;With the benefit of hindsight, we can see all too clearly that Neurath and Lerner crossed the line that separates ambition from hubris when they decided to try to set Looking Glass up as a publisher. At the very time they were doing so, many another boutique publisher was doing the opposite, looking for a larger partner or purchaser to serve as shelter from the gale-force winds that were beginning to blow through the industry. More games were being made than ever, even as shelf space at retail wasn’t growing at anything like the same pace, and digital distribution for most types of games remained a nonstarter in an era in which almost everyone was still accessing the Internet via a slow, unstable dial-up connection. This turned the fight over retail space into a free-for-all worthy of the most ultra-violet beat-em-up. Sharp elbows alone weren’t enough to win at this game; you had to have deep pockets as well, had to either be a big publisher yourself or have one of them on your side. In deciding to strike out on their own, Neurath and Lerner may have been inspired by the story of Interplay Productions, a development studio which in 1988 had broken free of the grasp of Electronic Arts — now Origin System’s corporate parent, as it happened — and gone on to itself become one of the aforementioned big publishers who were increasingly dominating at retail. But 1988 had been a very different time in gaming.&lt;/p&gt;
+    &lt;p&gt;In short, Neurath and Lerner had chosen just about the worst possible instant to try to seize full control of their own destiny. “Game distribution isn’t always based on quality,” noted Warren Spector at the end of 1996. Having thus stated the obvious, he elaborated:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;The business has changed radically in the last year, and it’s depressing. The competition for shelf space is ridiculous and puts retailers in charge. If you don’t buy an end-cap from retailers for, say, $50,000 a month, they won’t buy many copies.&lt;/p&gt;
+      &lt;p&gt;Products once had three to six months. The average life is now 30 days. If you’re not a hit in 30 days, you’re gone. This is predicated on your association with a publisher who gets your title on shelves. It’s a nightmare.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;With just three games shipped in the last two and a half years — a long way off their projected pace of “six original titles per year” — and with the last two of them having flopped like a wet tuna on a gymnastics court, Looking Glass was now in dire straits. The only thing that had allowed them to keep the doors open this long had been a series of workaday porting jobs that Warren Spector had been relegated to supervising down in Austin, while he waited for the company to establish itself on a sound enough financial footing to support game development from whole cloth in both locations. Ten years on, after Looking Glass had been enshrined in gaming lore as one of the most forward-thinking studios of all time and Spector as the ultimate creative producer, the idea of them wasting their collective talents on anonymous console ports would seem surreal. But such was the reality circa 1997, when Looking Glass, having burnt through all of their venture capital, was left holding on by a thread. “I remember people walking into the office to take back the [rented] plants which the studio was no longer able to pay for,” says programmer Randy Smith.&lt;/p&gt;
+    &lt;p&gt;As for Neurath and Lerner, they had swallowed the hubris of 1995 and were now doing what the managers of all independent games studios do when they find themselves unable to pay the bills anymore: looking for a buyer who would be able to pay them instead. But because Looking Glass could never seem to do anything in the conventional way even when they tried to, the buyer they found was one of the strangest ever.&lt;/p&gt;
+    &lt;p&gt;The Boston firm known as Intermetrics, Inc., was far from a household name, but it had a proud history that long predated the personal-computer era. Intermetrics had grown out of the fecund soil of Project Apollo, having been founded in March of 1969 by some of the engineers and programmers behind the Apollo Guidance Computer that would soon help to place astronauts on the Moon. After that epochal achievement, Intermetrics continued to do a lot of work for NASA, providing much of the software that was used to control the Space Shuttle. Other government and aerospace-industry contracts filled out most of the balance of its order sheets.&lt;/p&gt;
+    &lt;p&gt;In August of 1995, however, a group of investors led by a television executive bought the firm for $28 million, with the intention of turning it into something altogether different. Michael Alexander came from the media conglomerate MCA, where he had been credited with turning around the fortunes of the cable-television channel USA. Witnessing the transformation that high-resolution graphics, high-quality sound, and the enormous storage capacity of CD-ROM were wreaking on personal computing, he had joined dozens of his peers in deciding that the future of mass-market entertainment and infotainment lay with interactive multimedia. Deeming most of the companies who were already in that space to be “overvalued,” and apparently assuming that one type of computer programming was more or less the same as any other, he bought Intermetrics, whose uniform of white shirts, ties, and crew cuts had changed little since the heyday of the Space Race, to ride the hottest wave in 1990s consumer electronics.&lt;/p&gt;
+    &lt;p&gt;“This is a company that has the skills and expertise to be in the multimedia business, but is not perceived as being in that business,” he told a reporter from The Los Angeles Times. (It was not a question of perception; Intermetrics was not in the multimedia business prior to the acquisition.) “And that is its strength.” (He failed to elaborate on exactly why this should be the case.) Even the journalist to whom he spoke seemed skeptical. “Ponytailed, black-clad, twenty-something multimedia developers beware,” she wrote, almost palpably smirking between the lines. “Graying engineers with pocket protectors and a dozen years of experience are starting to compete.” Likewise, it is hard not to suspect Brian Fargo of Interplay of trolling the poor rube when he said that “I think it’s great that the defense guys are doing this. It’s where the job security is now. It used to be in defense. Now it’s in the videogame business.” (Through good times and bad, one thing the videogame business has never, ever been noted for is its job security.)&lt;/p&gt;
+    &lt;p&gt;Alas, Michael Alexander was not just a bandwagon jumper; he was a late bandwagon jumper. By the time he bought Intermetrics, the multimedia bubble was already close to popping under the pressure of a more sustained Internet bubble that would end the era of the non-game multimedia CD-ROM almost before it had begun. As this harsh reality became clear in the months that followed, Alexander had no choice but to push Intermetrics more and more in the direction of games, the only kind of CD-ROM product that was making anyone any money. The culture clash that resulted was intractable, as pretty much anyone who knew anything about the various cultures of computing could have predicted. Among these someones was Mike Dornbrook, a games-industry stalwart who had gotten his start with Infocom in the early 1980s. Seeking his next gig after Boffo Games, a studio he had founded with his old Infocom colleague Steve Meretzky, went down in flames, Dornbrook briefly kicked the tires at Intermetrics, but quickly concluded that what he saw “made no sense whatsoever”: “They were mostly COBOL programmers in their fifties and sixties. I remember looking around and saying, ‘You’re going to turn these guys into game programmers? What in the world are you thinking?'” [1]Dornbrook wound up signing on instead with a tiny startup called Harmonix Music Systems, which in 2005, after years of diligent experimentation with the possibilities for combining music and games, altered the landscape of gaming forever with Guitar Hero.&lt;/p&gt;
+    &lt;p&gt;Belatedly realizing that all types of programming were perhaps not quite so interchangeable as he had believed, Michael Alexander set out in search of youngsters to teach his old dogs some new tricks. The Intermetrics rank and file must have shuddered at the advertisements he started to run in gaming magazines. “We are rocket scientists!” the ads trumpeted. “Even our games are mission-critical!” When these efforts failed to surface a critical mass of game-development talent, Alexander reluctantly moved on to doing what he should have done back in 1995: looking for an extant studio that already knew how to make games. It so happened that Looking Glass was right there in Boston, and, thanks to its troubled circumstances, was not as “overvalued” as most of its peers. Any port in a storm, as they say.&lt;/p&gt;
+    &lt;p&gt;On August 14, 1997, a joint press release was issued: “Intermetrics, Inc., a 28-year-old leading software developer, and Looking Glass Studios, one of the computer gaming industry’s foremost developers, today announce the merger of the two companies’ gaming operations to form Intermetrics/Looking Glass Studios, LLC. Through the shared strengths of the two entities, the new company is strategically positioned to be a major force in the computer-game, console and online-gaming industries.” Evidently on a quest to find out how much meaningless corporate-speak he could shoehorn into one document, Michael Alexander went on to add that “Looking Glass Studios immediately catapults Intermetrics into a leading position in the gaming industry by giving us additional credentials and assets to compete in the market. Our business plan is to maintain and grow our core contract-services business while at the same time leveraging our expertise and financial resources to be a major player in the booming interactive-entertainment industry.” The price paid by the rocket scientists for their second-stage booster has to my knowledge never been publicly revealed.&lt;/p&gt;
+    &lt;p&gt;The acquiring party may have been weird as all get-out, but it could have worked out far worse for Looking Glass, all things considered. In addition to the obvious benefit of being able to keep the doors open, at least a couple of other really good things came directly out of the acquisition. One was a change in name, from Looking Glass Technologies to Looking Glass Studios, emphasizing the creative dimension of their work. Another was a distribution deal with Eidos, a British publisher that had serious retail clout in both North America and Europe. Riding high on the back of the massive international hit Tomb Raider, Eidos could ensure that Looking Glass’s games got prominent placement in stores. Meanwhile this idea of the Looking Glass people serving as mentors to those who were struggling to make games at Intermetrics proper — an excruciating proposition for both parties — would prove to mostly be a polite, face-saving fiction for Michael Alexander; in practice, the new parent company would prove largely content to leave its subsidiary alone to do its own thing. Now the folks at Looking Glass just needed to deliver a hit to firmly establish themselves in their new situation. That was always the stick wicket for them.&lt;/p&gt;
+    &lt;p&gt;The first game that Looking Glass released under their new ownership was Flight Unlimited II, which appeared just a few months after the big announcement. Seeking simultaneously to capitalize on the relative success of their first flight simulator and to adjust that game’s priorities to better coincide with the real or perceived desires of the market, Looking Glass paired the extant flight model with an impressively detailed depiction of the geography of the San Francisco Bay area. Then they added a lot more structure to the whole affair, in the form of a set of missions to fly after you finished your training. The biggest innovation, a first for any civilian flight simulator, was the addition of other aircraft, turning San Francisco International Airport into the same tangle of congested flight lanes it was in the real world. These changes moved the game away from being such a purist simulation of flight as an end unto itself — so much so that a disgruntled Seamus Blackley quit the project and the company early in the development cycle. Still, there was a logic to the additions; one can easily imagine them making Flight Unlimited II more appealing to the sorts of gamers who don’t tend to thrive in goal-less sandboxes. Be that as it may, though, it didn’t show up in the sales figures. Flight Unlimited II sold better than Terra Nova or British Open Championship Golf, but not as well as its series predecessor, just barely managing to break even.&lt;/p&gt;
+    &lt;p&gt;This disappointment put that much more pressure on Looking Glass’s next game to please the new boss and show that the studio could deliver a solid, unqualified hit. In a triumph of hope over experience, everyone had high expectations for The Dark Project, which had been described in the press release announcing the acquisition as “a next-generation fantasy role-playing game.” Such a description might have left gamers wondering if Looking Glass was returning to the territory of Ultima Underworld. As things worked out, the game that they would come to know as simply Thief would not be that at all, but would instead break new ground in a completely different way. It stands today alongside Ultima Underworld in another sense: as one of the three principal legs — the last one being System Shock, of course — that hold up Looking Glass’s towering modern-day reputation for relentless, high-concept innovation.&lt;/p&gt;
+    &lt;p&gt;Ironically but typically for this studio, the off-kilter masterstroke that is Thief arose from an attempt to hit the mainstream a little more directly. Looking Glass’s talented graphics programmers, who were not without a requisite degree of arrogance about their talents, thought that they could easily come up with a pure first-person-shooter engine as good or better than the one that John Carmack and his friends at id Software rolled out for 1996’s Quake. The Dark Engine, as it would come to be known, fit that bill pretty well, and could have powered a “low-brain shooter,” as the Looking Glass folks called the likes of Quake, with perfect equanimity. But in the end they just couldn’t bring themselves to make one.&lt;/p&gt;
+    &lt;p&gt;It took a goodly while for them to decide what they did want to do with The Dark Engine. Doug Church, the iconoclastic programmer who had taken the leading role alongside Warren Spector on System Shock, didn’t want to be out-front to the same extent on this project, even as Spector was now down in Austin, which limited his involvement as well. The initial result of this lack of strong authority figures was an awful lot of creative churn. There was talk of making a game called Better Red than Undead, mixing a Cold War-era spy caper with a zombie invasion. Almost as bizarre was Dark Camelot, an inverted Arthurian tale in which you played the Black Knight against King Arthur and his cronies, who were depicted as a bunch of insufferable holier-than-thou prigs. “Our marketing department wasn’t really into that one,” laughs Church.&lt;/p&gt;
+    &lt;p&gt;Yet the core sensibility of that concept — of an amoral protagonist set against the corrupt establishment and all of its pretensions — is all over the game that did finally get made. Doug Church:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;The missions [in Dark Camelot] that we had the best definition on and the best detail on were all breaking into Camelot, meeting up with someone, getting a clue, stealing something, whatever. As we did more work in that direction, and those continued to be the missions that we could explain best to other people, it just started going that way. Paul [Neurath] had been pushing for a while that the thief side of it was the really interesting part, and why not just do a thief game?&lt;/p&gt;
+      &lt;p&gt;And as things got more chaotic and more stuff was going on and we were having more issues with how to market stuff, we just kept focusing on the thief part. We went through a bunch of different phases of reorganizing the project structure and a bunch of us got sucked into doing some other project work on Flight [Unlimited] and stuff, and there was all this chaos. We said, “Okay, well, we’ve got to get this going and really focus and make a plan.” So we put Greg [LoPiccolo] in charge of the project and we agreed we were going to call it Thief and we were going to focus much more. That’s when we went from lots of playing around and exploring to “let’s make this Thief game.”&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;It surely comes as no revelation to anyone reading this article that most game stories are power fantasies at bottom, in which you get to take on the identity of a larger-than-life protagonist who just keeps on growing stronger as you progress. Games which took a different approach were, although by no means unknown by the late 1990s, in the decided minority even outside of the testosterone-drenched ghetto of the first-person shooter. The most obvious exponents of the ordinary-mortal protagonist were to be found in the budding survival-horror genre, as pioneered by Alone in the Dark and its sequels on computers and Resident Evil on the consoles. But these games cast you as nearly powerless prey, being stalked through dark corridors by zombies and other things that go bump in the night. Thief makes you a stealthy predator, the unwanted visitor rifling through cupboards and striking without warning out of the darkness, yet most definitely not in any condition to mow down dozens of his enemies in full-frontal combat, Quake-style. If you’re indiscreet in your predations, you can become the cornered prey with head-snapping speed. This was something new at the time.&lt;/p&gt;
+    &lt;p&gt;Or almost so. Coincidentally, two Japanese stealthy-predator games hit the Sony PlayStation in 1998, the same year as Thief’s release. Tenchu: Stealth Assassins cast you as a ninja, while Metal Gear Solid cast you as an agent of the American government on a top-secret commando mission. The latter in particular caused quite a stir, by combining its unusual gameplay style with the sort of operatically melodramatic storytelling that was more commonly associated with the JRPG genre. That said, Thief is a far more sophisticated affair than either of these games, in terms of both its gameplay and its fiction.&lt;/p&gt;
+    &lt;p&gt;The titular thief and protagonist is a man known only as Garrett, who learned his trade on the streets of The City, a mixture of urban squalor and splendor that is best described as Renaissance Florence with magic — a welcome alternative to more typical fantasy settings. Over the course of a twelve-act campaign, Garrett is given a succession of increasingly daunting assignments, during which a larger plot that involves more than the acquisition of wealth by alternative methods does gradually take shape.&lt;/p&gt;
+    &lt;p&gt;Although the mission tree is linear, nothing else about your experience in Thief is set in stone. It was extremely important to Looking Glass that Thief not turn into a puzzle game, a series of set-piece challenges with set-piece solutions. They wanted to offer up truly dynamic environments, environments that were in their own way every bit as much simulations as Flight Unlimited. They wanted to make you believe you were really in these spaces. Artist Daniel Thron speaks of the “deep sense of trust we had in the player. There isn’t a single solution to Thief. It’s up to you to figure out how to steal the thing. It’s letting you tell that story through gameplay. And that sense of ownership makes it unique. It becomes yours.” In the spirit of all that, the levels are big, with no clearly delineated through-line. These dynamic virtual spaces full of autonomous actors demand constant improvisation on your part even if you’ve explored them before.&lt;/p&gt;
+    &lt;p&gt;Looking Glass understood that, in order for Thief to work as a vehicle for emergent narrative, all of the other actors on the stage have to respond believably to your actions. It’s a given that guards ought to hunt you down if you blatantly give away your presence to them. Thief distinguishes itself by the way it responds to more subtle stimuli. An ill-judged footstep on a creaky floor tile might cause a guard to stop and mutter to himself: “Wait! Did I just hear something?” Stand stock still and don’t make a sound, and maybe — maybe — he’ll shrug his shoulders and move on without bothering to investigate. If you do decide to take a shot at him with your trusty bow or blackjack, you best not miss, to steal a phrase from Omar Little. And you best hide the body carefully afterward, before one of his comrades comes wandering along the same corridor to stumble over it.&lt;/p&gt;
+    &lt;p&gt;These types of situations and the split-second decisions they force upon you are the beating heart of Thief. Bringing them off was a massive technical challenge, one that made the creation of 3D-graphics engine itself seem like child’s play. The state of awareness of dozens of non-player characters had to be tracked, as did sound and proximity, light and shadow, to an extent that no shooter — no, not even Half-Life — had ever come close to doing before. Remarkably, Looking Glass largely pulled it off, whilst making sure that the more conventional parts of the engine worked equally well. Garrett’s three principal weapons — a blackjack for clubbing unsuspecting victims in the back of the head, a rapier for hand-to-hand combat, and a bow which can be used to shoot a variety of different types of arrows — are all immensely satisfying to use, having just the right feeling of weight in your virtual hands. The bow is a special delight: the arrows arc through the air exactly as one feels they ought to. You actually get to use your bow in all sorts of clever ways that go beyond killing, such as shooting water arrows to extinguish pesky torches — needless to say, darkness is your best friend and light your eternal enemy in this game — and firing rope arrows that serve Garrett as grappling hooks would a more conventional protagonist.&lt;/p&gt;
+    &lt;p&gt;Looking Glass being Looking Glass, even the difficulty setting in Thief is more than it first appears to be. It’s wouldn’t be much of an exaggeration to say that Thief is really three games in one, depending on whether you play it on Normal, Hard, or Expert. (Looking Glass apparently wasn’t interested in the sorts of players who might be tempted by an “easy” mode.) Not only do the harder settings require you to collect more loot to score a passing grade on each mission, but the environments themselves become substantially larger. Most strikingly, in a brave subversion of the standard shooter formula, each successive difficulty setting requires you to kill fewer rather than more people; at the Expert level, you’re not allowed to kill anyone at all.&lt;/p&gt;
+    &lt;p&gt;Regardless of the difficulty setting you choose, Thief will provide a stiff challenge. Its commitment to verisimilitude extends to all of its facets. In lieu of a conventional auto-map, it provides you only with whatever scribbled paper map Garrett has been able to scrounge from his co-conspirators, or sometimes not even that much. If your innate sense of direction isn’t great — mine certainly isn’t — you can spend a long time just trying to find your way in these big, twisty, murky spaces.&lt;/p&gt;
+    &lt;p&gt;When it’s at its best, Thief is as amazing as it is uncompromising. It oozes atmosphere and tension; it’s the sort of game that demands to be played in a dark room behind a big monitor, with the phone shut off and a pair of headphones planted firmly over the ears. Sadly, though, it isn’t always this best version of itself. In comparison to Ultima Underworld or System Shock, both of which I enjoyed from first to last, Thief strikes me as a lumpy creation, a game of soaring highs but also some noteworthy lows. I was all-in during the first mission, a heist taking place in the mansion of a decadent nobleman. Having recently read Sarah Dunant’s The Birth of Venus and written quite a lot about Renaissance Florence, my receptors were well primed for this Neo-Renaissance setting. Then I came to the second mission, and suddenly I was being asked to fight my way through a bunch of zombies in an anonymous cave complex. Suddenly Thief felt like dozens of other first-person action games.&lt;/p&gt;
+    &lt;p&gt;This odd schizophrenia persists throughout the game. The stealthy experience I’ve just been describing — the boldly innovative experience that everyone thinks of today when they think of Thief — is regularly interspersed with splatterfests against enemies who wouldn’t have been out of place in Quake: zombies, rat men, giant exploding frogs, for Pete’s sake. (Because these enemies aren’t human, they’re generally exempt from the prohibition against killing at the Expert level.) All told, it’s a jarring failure to stick to its guns from a studio that has gone down in gaming lore for refusing to sacrifice its artistic integrity, to its own great commercial detriment.&lt;/p&gt;
+    &lt;p&gt;As happens so often in these cases, the reality behind the legend of Looking Glass is more nuanced. Almost to a person, the team who made Thief attribute the inconsistency in the level design to outside pressure, especially from their publisher Eidos, who had agreed to partially fund the project. “Eidos never believed in it and until the end told us to put in more monsters and have more fighting and exploring and less stealth, and I’m not sure there was ever a point [when] they got it,” claims Doug Church. “I mean, the trailers Eidos did for Thief were all scenes with people shooting fire arrows at people charging them. So you can derive from that how well they understood or believed in the idea.”&lt;/p&gt;
+    &lt;p&gt;And yet one can make the ironic case that Eidos knew what they were doing when they pushed Looking Glass to play up the carnage a little more. Released in November of 1998, Thief finally garnered Looking Glass some sales figures that were almost commensurate with their positive reviews. (“If you’re tired of DOOM clones and hungry for challenge, give this fresh perspective a try,” said Computer Gaming World.) The game sold about half a million copies — not a huge hit by the standards of an id Software or Blizzard Entertainment, but by far the most copies Looking Glass had ever sold of anything. It gave them some much-needed positive cash flow, which allowed them to pay down some debts and to revel in some good vibes for a change when they looked at the bottom line. But most importantly for the people who had made Thief, its success gave them the runway they needed to make a sequel that would be more confident in its stealthy identity.&lt;/p&gt;
+    &lt;p&gt;&lt;lb/&gt; Did you enjoy this article? If so, please think about pitching in to help me make many more like it. You can pledge any amount you like.&lt;/p&gt;
+    &lt;p/&gt;
+    &lt;p&gt;Sources: The book Game Design Theory &amp;amp; Practice (2nd. ed.) by Richard Rouse III; Next Generation of March 1997 and June 1997; PC Zone of December 1998; Computer Gaming World of September 1995, June 1996, August 1997, April 1998, and March 1999; Retro Gamer 117, 177, and 260; Los Angeles Times of September 15 1995; Boston Globe of May 3 1995 and May 26 2000.&lt;/p&gt;
+    &lt;p&gt;Online sources include the announcement of the Intermetrics acquisition on Looking Glass’s old website, InterMetrics’s own vintage website, “Ahead of Its Time: A History of Looking Glass” by Mike Mahardy at Polygon, and James Sterrett’s “Reasons for the Fall: A Post-Mortem on Looking Glass Studios.”&lt;/p&gt;
+    &lt;p&gt;Where to Get Them: Terra Nova: Strike Force Centauri and Thief Gold are available for digital purchase at GOG.com. The other Looking Glass games mentioned this article are unfortunately not.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Footnotes&lt;/head&gt;
+    &lt;table&gt;
+      &lt;row&gt;
+        &lt;cell role="head"&gt;↑1&lt;/cell&gt;
+        &lt;cell&gt;Dornbrook wound up signing on instead with a tiny startup called Harmonix Music Systems, which in 2005, after years of diligent experimentation with the possibilities for combining music and games, altered the landscape of gaming forever with Guitar Hero.&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45464611</guid><pubDate>Fri, 03 Oct 2025 16:16:18 +0000</pubDate></item><item><title>Cancelling Async Rust</title><link>https://sunshowers.io/posts/cancelling-async-rust/</link><description>&lt;doc fingerprint="310499976ca2b6bc"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Cancelling async Rust&lt;/head&gt;
+    &lt;p&gt;This is an edited, written version of my RustConf 2025 talk about cancellations in async Rust. Like the written version of my RustConf 2023 talk, I’ve tried to retain the feel of a talk while making it readable as a standalone blog entry. Some links:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Video of the talk on YouTube.&lt;/item&gt;
+      &lt;item&gt;Slides on Google Slides.&lt;/item&gt;
+      &lt;item&gt;Repository with links and notes on GitHub.&lt;/item&gt;
+      &lt;item&gt;Coverage on Linux Weekly News.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;Introduction#&lt;/head&gt;
+    &lt;p&gt;Let’s start with a simple example – you decide to read from a channel in a loop and gather a bunch of messages:&lt;/p&gt;
+    &lt;code&gt;loop {
+    match rx.recv().await {
+        Ok(msg) =&amp;gt; process(msg),
+        Err(_) =&amp;gt; return,
+    }
+}
+&lt;/code&gt;
+    &lt;p&gt;All good, nothing wrong with this, but you realize sometimes the channel is empty for long periods of time, so you add a timeout and print a message:&lt;/p&gt;
+    &lt;code&gt;loop {
+    match timeout(Duration::from_secs(5), rx.recv()).await {
+        Ok(Ok(msg)) =&amp;gt; process(msg),
+        Ok(Err(_)) =&amp;gt; return,
+        Err(_) =&amp;gt; println!("no messages for 5 seconds"),
+    }
+}
+&lt;/code&gt;
+    &lt;p&gt;There’s nothing wrong with this code—it behaves as expected.&lt;/p&gt;
+    &lt;p&gt;Now you realize you need to write a bunch of messages out to a channel in a loop:&lt;/p&gt;
+    &lt;code&gt;loop {
+    let msg = next_message();
+    match tx.send(msg).await {
+        Ok(_) =&amp;gt; println!("sent successfully"),
+        Err(_) =&amp;gt; return,
+    }
+}
+&lt;/code&gt;
+    &lt;p&gt;But sometimes the channel gets too full and blocks, so you add a timeout and print a message:&lt;/p&gt;
+    &lt;code&gt;loop {
+    let msg = next_message();
+    match timeout(Duration::from_secs(5), tx.send(msg)).await {
+        Ok(Ok(_)) =&amp;gt; println!("sent successfully"),
+        Ok(Err(_)) =&amp;gt; return,
+        Err(_) =&amp;gt; println!("no space for 5 seconds"),
+    }
+}
+&lt;/code&gt;
+    &lt;p&gt;It turns out that this code is often incorrect, because not all messages make their way to the channel.&lt;/p&gt;
+    &lt;p&gt;Hi, I’m Rain, and this post is about cancelling async Rust. This post is split into three parts:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;What is cancellation? It’s an extremely powerful part of async Rust but also one that is very hard to reason thoroughly about.&lt;/item&gt;
+      &lt;item&gt;Analyzing cancellations: Going deep into their mechanics and providing some helpful ways to think about them.&lt;/item&gt;
+      &lt;item&gt;What can be done? Solutions, including practical guidance, and real bugs we’ve found and fixed in production codebases.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Before we begin, I want to lay my cards on the table – I really love async Rust!&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;I gave a talk at RustConf a couple years ago talking about how async Rust is a great fit for signal handling in complex applications.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;I’m also the author of cargo-nextest, a next-generation test runner for Rust, where async Rust is the best way I know of to express some really complex algorithms that I wouldn’t know how to express otherwise. I wrote a blog post about this a few years ago.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Now, I work at Oxide Computer Company, where we make cloud-in-a-box computers. We make vertically integrated systems where you provide power and networking on one end, and the software you want to run on the other end, and we take care of everything in between.&lt;/p&gt;
+    &lt;p&gt;Of course, we use Rust everywhere, and in particular we use async Rust extensively for our higher-level software, such as storage, networking and the customer-facing management API. But along the way we’ve encountered a number of issues around async cancellation, and a lot of this post is about what we learned along the way.&lt;/p&gt;
+    &lt;head rend="h2"&gt;1. What is cancellation?#&lt;/head&gt;
+    &lt;p&gt;What does cancellation mean? Logically, a cancellation is exactly what it sounds like: you start some work, and then change your mind and decide to stop doing that work.&lt;/p&gt;
+    &lt;p&gt;As you might imagine this is a useful thing to do:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;You may have started a large download or a long network request&lt;/item&gt;
+      &lt;item&gt;Maybe you’ve started reading a file, similar to the &lt;code&gt;head&lt;/code&gt;command.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;But then you change your mind: you want to cancel it rather than continue it to completion.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Cancellations in synchronous Rust#&lt;/head&gt;
+    &lt;p&gt;Before we talk about async Rust, it’s worth thinking about how you’d do cancellations in synchronous Rust.&lt;/p&gt;
+    &lt;p&gt;One option is to have some kind of flag you periodically check, maybe stored in an atomic:&lt;/p&gt;
+    &lt;code&gt;while !should_cancel.load(Ordering::Relaxed) {
+    expensive_operation();
+}
+&lt;/code&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;The code that wishes to perform the cancellation can set that flag.&lt;/item&gt;
+      &lt;item&gt;Then, the code which checks that flag can exit early.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;This approach is fine for smaller bits of code but doesn’t really scale well to large chunks of code since you’d have to sprinkle these checks everywhere.&lt;/p&gt;
+    &lt;p&gt;A related option, if you’re working with a framework as part of your work, is to panic with a special payload of some kind.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;If that feels strange to you, you’re not alone! But the Salsa framework for incremental computation, used by—among other things—rust-analyzer, uses this approach.&lt;/item&gt;
+      &lt;item&gt;Something I learned recently was that this only works on build targets which have a notion of panic unwinding, or being able to bubble up the panic. Not all platforms support this, and in particular, Wasm doesn’t. This means that Salsa cancellations don’t work if you build rust-analyzer for Wasm.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;A third option is to kill the whole process. This is a very heavyweight approach, but an effective one in case you spawn processes to do your work.&lt;/p&gt;
+    &lt;p&gt;Rather than kill the whole process, can you kill a single thread?&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;While some OSes have APIs to perform this action, they tend to warn very strongly against it. That’s because in general, most code is just not ready for a thread disappearing from underneath.&lt;/item&gt;
+      &lt;item&gt;In particular, thread killing is not permitted by safe Rust, since it can cause serious corruption. For example, Rust mutexes would likely stay locked forever.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;All of these options are suboptimal or of limited use in some way. In general, the way I think about it is that there isn’t a universal protocol for cancellation in synchronous Rust.&lt;/p&gt;
+    &lt;p&gt;In contrast, there is such a protocol in async Rust, and in fact cancellations are extraordinarily easy to perform in async Rust.&lt;/p&gt;
+    &lt;p&gt;Why is that so? To understand that, let’s look at what a future is.&lt;/p&gt;
+    &lt;head rend="h3"&gt;What is a future?#&lt;/head&gt;
+    &lt;p&gt;Here’s a simple example of a future:&lt;/p&gt;
+    &lt;code&gt;// This creates a state machine.
+let future = async {
+    let data = request().await;
+    process(data).await
+};
+
+// Nothing executes yet. `future` is just a struct in memory.
+&lt;/code&gt;
+    &lt;p&gt;In this future, you first perform a network request which returns some data, and then you process it.&lt;/p&gt;
+    &lt;p&gt;The Rust compiler looks at this future and generates a state machine, which is just a struct or enum in memory:&lt;/p&gt;
+    &lt;code&gt;// The compiler generates something like:
+enum MyFuture {
+    Start,
+    WaitingForNetwork(NetworkFuture),
+    WaitingForProcess(ProcessFuture, Data),
+    Done(Result),
+}
+
+// It's just data, no running code!
+&lt;/code&gt;
+    &lt;p&gt;If you’ve written async Rust before the &lt;code&gt;async&lt;/code&gt; and &lt;code&gt;await&lt;/code&gt; keywords, you’ve probably written code like it by hand. It’s basically just an enum describing all the possible states the future can be in.&lt;/p&gt;
+    &lt;p&gt;The compiler also generates an implementation of the &lt;code&gt;Future&lt;/code&gt; trait for this future:&lt;/p&gt;
+    &lt;code&gt;impl Future for MyFuture {
+    fn poll(/* ... */) -&amp;gt; Poll&amp;lt;Self::Output&amp;gt; {
+        match self {
+            Start =&amp;gt; { /* ... */ }
+            WaitingForNetwork(fut) =&amp;gt; { /* ... */ }
+            // etc
+        }
+    }
+}
+&lt;/code&gt;
+    &lt;p&gt;and when you call &lt;code&gt;.await&lt;/code&gt; on the future, it gets translated down to this underlying &lt;code&gt;poll&lt;/code&gt; function. It is only when &lt;code&gt;await&lt;/code&gt; or this &lt;code&gt;poll&lt;/code&gt; function is called that something actually happens.&lt;/p&gt;
+    &lt;p&gt;Note that this is diametrically opposed to how async works in other languages like Go, JavaScript, or C#. In those languages, when you create a future to await on, it starts doing its thing, immediately, in the background:&lt;/p&gt;
+    &lt;code&gt;// JavaScript: starts running immediately
+const promise = fetch('/api/data');
+&lt;/code&gt;
+    &lt;p&gt;That’s regardless of whether you await it or not.&lt;/p&gt;
+    &lt;p&gt;In Rust, this &lt;code&gt;get&lt;/code&gt; call does nothing until you actually call &lt;code&gt;.await&lt;/code&gt; on it:&lt;/p&gt;
+    &lt;code&gt;// Rust: just data, does nothing!
+let future = reqwest::get("/api/data");
+&lt;/code&gt;
+    &lt;p&gt;I know I sound a bit like a broken record here, but if you can take away one thing from this post, it would be that futures are passive, and completely inert until awaited or polled.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The universal protocol#&lt;/head&gt;
+    &lt;p&gt;So what does the universal protocol to cancel futures look like? It is simply to drop the future, or to not await it, or poll it any more. Since a future is just a state machine, you can throw it away at any time the poll function isn’t actively being called.&lt;/p&gt;
+    &lt;code&gt;let future = some_async_work();
+drop(future); // cancelled
+&lt;/code&gt;
+    &lt;p&gt;The upshot of all this is that any Rust future can be cancelled at any await point.&lt;/p&gt;
+    &lt;p&gt;Given how hard cancellation tends to be in synchronous environments, the ability to easily cancel futures in async Rust is extraordinarily powerful—in many ways its greatest strength!&lt;/p&gt;
+    &lt;p&gt;But there is a flip side, which is that cancelling futures is far, far too easy. This is for two reasons.&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;First, it’s just way too easy to quietly drop a future. As we’re going to see, there are all kinds of code patterns that lead to silently dropping futures.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Now this wouldn’t be so bad, if not for the second reason: that cancellation of parent futures propagates down to child futures.&lt;/p&gt;
+        &lt;p&gt;Because of Rust’s single ownership model, child futures are owned by parent ones. If a parent future is dropped or cancelled, the same happens to the child.&lt;/p&gt;
+        &lt;p&gt;To figure out whether a child future’s cancellation can cause issues, you have to look at its parent, and grandparent, and so on. Reasoning about cancellation becomes a very complicated non-local operation.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;2. Analyzing cancellations#&lt;/head&gt;
+    &lt;p&gt;I’m going to cover some examples in a bit, but before we do that I want to talk about a couple terms, some of which you might have seen references to already.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Cancel safety and cancel correctness#&lt;/head&gt;
+    &lt;p&gt;The first term is cancel safety. You might have seen mentions of this in the Tokio documentation. Cancel safety, as generally defined, means the property of a future that can be cancelled (i.e. dropped) without any side effects.&lt;/p&gt;
+    &lt;p&gt;For example, a Tokio sleep future is cancel safe: you can just stop waiting on the sleep and it’s completely fine.&lt;/p&gt;
+    &lt;code&gt;let future = tokio::time::sleep();
+drop(future); // this has no side effects
+&lt;/code&gt;
+    &lt;p&gt;An example of a future that is not cancel safe is Tokio’s MPSC send, which sends a message over a channel:&lt;/p&gt;
+    &lt;code&gt;let message = /* ... */;
+let future = sender.send(message);
+drop(future); // message is lost!
+&lt;/code&gt;
+    &lt;p&gt;If this future is dropped, the message is lost forever.&lt;/p&gt;
+    &lt;p&gt;The important thing is that cancel safety is a local property of an individual future.&lt;/p&gt;
+    &lt;p&gt;But cancel safety is not all that one needs to care about. What actually matters is the context the cancellation happens in, or in other words whether the cancellation actually causes some kind of larger property in the system to be violated.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;For example, if you drop a future which sends a message, but for whatever reason you don’t care about the message any more, it’s not really a bug!&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;To capture this I tend to use a different term called cancel correctness, which I define as a global property of system correctness in the face of cancellations. (This isn’t a standard term, but it’s a framing I’ve found really helpful in understanding cancellations.)&lt;/p&gt;
+    &lt;p&gt;When is cancel correctness violated? It requires three things:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;The system has a cancel-unsafe future somewhere within it. As we’ll see, many APIs that are cancel-unsafe can be reworked to be cancel-safe. If there aren’t any cancel-unsafe futures in the system, then the system is cancel correct.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;A cancel-unsafe future is actually cancelled. This may sound a bit trivial, but if cancel-unsafe futures are always run to completion, then the system can’t have cancel correctness bugs.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;&lt;p&gt;Cancelling the future violates some property of a system. This could be data loss as with&lt;/p&gt;&lt;code&gt;Sender::send&lt;/code&gt;, some kind of invariant violation, or some kind of cleanup that must be performed but isn’t.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;So a lot of making Rust async robust is about trying to tackle one of these three things.&lt;/p&gt;
+    &lt;p&gt;I want to zoom in for a second on invariant violations and talk about an example of a Tokio API that is very prone to cancel correctness issues: Tokio mutexes.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The pain of Tokio mutexes#&lt;/head&gt;
+    &lt;p&gt;The way Tokio mutexes work is: you create a mutex, you lock it which gives you mutable access to the data underneath, and then you unlock it by releasing the mutex.&lt;/p&gt;
+    &lt;code&gt;let guard = mutex.lock().await;
+// Access guard.data, protected by the mutex...
+drop(guard);
+&lt;/code&gt;
+    &lt;p&gt;If you look at the &lt;code&gt;lock&lt;/code&gt; function’s documentation, in the “cancel safety” section it says:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;This method uses a queue to fairly distribute locks in the order they were requested. Cancelling a call to lock makes you lose your place in the queue.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Okay, so not totally cancel safe, but the only kind of unsafety is fairness, which doesn’t sound too bad.&lt;/p&gt;
+    &lt;p&gt;But the problems lie in what you actually do with the mutex. In practice, most uses of mutexes are in order to temporarily violate invariants that are otherwise upheld when a lock isn’t held.&lt;/p&gt;
+    &lt;p&gt;I’ll use a real world example of a cancel correctness bug that we found at my job at Oxide: we had code to manage a bunch of data sent over by our computers, which we call sleds. The shared state was guarded by a mutex, and a typical operation was:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Obtain a lock on the mutex.&lt;/item&gt;
+      &lt;item&gt;Obtain the sled-specific data by value, moving it to an invalid &lt;code&gt;None&lt;/code&gt;state.&lt;/item&gt;
+      &lt;item&gt;Perform an action.&lt;/item&gt;
+      &lt;item&gt;Set the sled-specific data back to the next valid state.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Here’s a rough sketch of what that looks like:&lt;/p&gt;
+    &lt;code&gt;let guard = mutex.lock().await;
+// guard.data is Option&amp;lt;T&amp;gt;: Some to begin with
+let data = guard.data.take(); // guard.data is now None
+
+let new_data = process_data(data);
+guard.data = Some(new_data); // guard.data is Some again
+&lt;/code&gt;
+    &lt;p&gt;This is all well and good, but the problem is that the action being performed actually had an await point within it:&lt;/p&gt;
+    &lt;code&gt;let guard = mutex.lock().await;
+// guard.data is Option&amp;lt;T&amp;gt;: Some to begin with
+let data = guard.data.take(); // guard.data is now None
+
+// DANGER: cancellation here leaves data in None state!
+let new_data = process_data(data).await;
+guard.data = Some(new_data); // guard.data is Some again
+&lt;/code&gt;
+    &lt;p&gt;If the code that operated on the mutex got cancelled at that await point, then the data would be stuck in the invalid &lt;code&gt;None&lt;/code&gt; state. Not great!&lt;/p&gt;
+    &lt;p&gt;And keep in mind the non-local reasoning aspect: when doing this analysis, you need to look at the whole chain of callers.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Cancellation patterns#&lt;/head&gt;
+    &lt;p&gt;Now that we’ve talked about some of the bad things that can happen during cancellations, it’s worth asking what kinds of code patterns lead to futures being cancelled.&lt;/p&gt;
+    &lt;p&gt;The most straightforward example, and maybe a bit of a silly one, is that you create a future but simply forget to call &lt;code&gt;.await&lt;/code&gt; on it.&lt;/p&gt;
+    &lt;code&gt;some_async_work(); // missing .await
+&lt;/code&gt;
+    &lt;p&gt;Now Rust actually warns you if you don’t call &lt;code&gt;.await&lt;/code&gt; on the future:&lt;/p&gt;
+    &lt;code&gt;warning: unused implementer of `Future` that must be used
+   |
+11 |     some_async_work();
+   |     ^^^^^^^^^^^^^^^^^
+   |
+   = note: futures do nothing unless you `.await` or poll them
+&lt;/code&gt;
+    &lt;p&gt;But a code pattern I’ve sometimes made mistakes with is that the future returns a &lt;code&gt;Result&lt;/code&gt;, and you want to ignore the result so you assign it to an underscore like so:&lt;/p&gt;
+    &lt;code&gt;let _ = some_async_work(); // future returns Result
+&lt;/code&gt;
+    &lt;p&gt;If I forget to call &lt;code&gt;.await&lt;/code&gt; on the future, Rust doesn’t warn me about it at all, and then I’m left scratching my head about why this code didn’t run. I know this sounds really silly and basic, but I’ve made this mistake a bunch of times.&lt;/p&gt;
+    &lt;p&gt;(After my talk, it was pointed out to me that Clippy 1.67 and above have a &lt;code&gt;let_underscore_future&lt;/code&gt; warn-by-default lint for this. Hooray!)&lt;/p&gt;
+    &lt;p&gt;Another example of futures being cancelled is &lt;code&gt;try&lt;/code&gt; operations, such as Tokio’s &lt;code&gt;try_join&lt;/code&gt; macro. For example:&lt;/p&gt;
+    &lt;code&gt;async fn do_stuff_async() -&amp;gt; Result&amp;lt;(), &amp;amp;'static str&amp;gt; {
+    // async work
+}
+
+async fn more_async_work() -&amp;gt; Result&amp;lt;(), &amp;amp;'static str&amp;gt; {
+    // more here
+}
+
+let res = tokio::try_join!(
+    do_stuff_async(),
+    more_async_work(),
+);
+
+// ...
+&lt;/code&gt;
+    &lt;p&gt;If you call &lt;code&gt;try_join&lt;/code&gt; with a bunch of futures, and all of them succeed, it’s all good. But if one of them fails, the rest simply get cancelled.&lt;/p&gt;
+    &lt;p&gt;In fact, at Oxide we had a pretty bad bug around this: we had code to stop a bunch of services, all expressed as futures. We used &lt;code&gt;try_join&lt;/code&gt;:&lt;/p&gt;
+    &lt;code&gt;try_join!(
+    stop_service_a(),
+    stop_service_b(),
+    stop_service_c(),
+)?;
+&lt;/code&gt;
+    &lt;p&gt;If one of these operations failed for whatever reason, we would stop running the code to wait for the other services to exit. Oops!&lt;/p&gt;
+    &lt;p&gt;But perhaps the most well-known source of cancellations is Tokio’s &lt;code&gt;select&lt;/code&gt; macro. Select is this incredibly beautiful operation. It is called with a set of futures, and it drives all of them forward concurrently:&lt;/p&gt;
+    &lt;code&gt;tokio::select! {
+    result1 = future1 =&amp;gt; handle_result1(result1),
+    result2 = future2 =&amp;gt; handle_result2(result2),
+}
+&lt;/code&gt;
+    &lt;p&gt;Each future has a code block associated with it (above, &lt;code&gt;handle_result1&lt;/code&gt; and &lt;code&gt;handle_result2&lt;/code&gt;). If one of the futures completes, the corresponding code block is called. But also, all of the other futures are always cancelled!&lt;/p&gt;
+    &lt;p&gt;For a variety of reasons, select statements in general, and select loops in particular, are particularly prone to cancel correctness issues. So a lot of the documentation about cancel safety talks about select loops. But I want to emphasize here that select is not the only source of cancellations, just a particularly notable one.&lt;/p&gt;
+    &lt;head rend="h2"&gt;3. What can be done?#&lt;/head&gt;
+    &lt;p&gt;So, now that we’ve looked at all of these issues with cancellations, what can be done about it?&lt;/p&gt;
+    &lt;p&gt;First, I want to break the bad news to you – there is no general, fully reliable solution for this in Rust today. But in our experience there are a few patterns that have been successful at reducing the likelihood of cancellation bugs.&lt;/p&gt;
+    &lt;p&gt;Going back to our definition of cancel correctness, there are three prongs all of which come together to produce a bug:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;A cancel-unsafe future exists&lt;/item&gt;
+      &lt;item&gt;This cancel-unsafe future is cancelled&lt;/item&gt;
+      &lt;item&gt;The cancellation violates a system property&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Most solutions we’ve come up with try and tackle one of these prongs.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Making futures cancel-safe#&lt;/head&gt;
+    &lt;p&gt;Let’s look at the first prong: the system has a cancel-unsafe future somewhere in it. Can we use code patterns to make futures be cancel-safe? It turns out we can! I’ll give you two examples here.&lt;/p&gt;
+    &lt;p&gt;The first is MPSC sends. Let’s come back to the example from earlier where we would lose messages entirely:&lt;/p&gt;
+    &lt;code&gt;loop {
+    let msg = next_message();
+    match timeout(Duration::from_secs(5), tx.send(msg)).await {
+        Ok(Ok(_)) =&amp;gt; println!("sent successfully"),
+        Ok(Err(_)) =&amp;gt; return,
+        Err(_) =&amp;gt; println!("no space for 5 seconds"),
+    }
+}
+&lt;/code&gt;
+    &lt;p&gt;Can we find a way to make this cancel safe?&lt;/p&gt;
+    &lt;p&gt;In this case, yes, and we do so by breaking up the operation into two parts:&lt;/p&gt;
+    &lt;code&gt;loop {
+    let msg = next_message();
+    loop {
+        match timeout(Duration::from_secs(5), tx.reserve()).await {
+            Ok(Ok(permit)) =&amp;gt; { permit.send(msg); break; }
+            Ok(Err(_)) =&amp;gt; return,
+            Err(_) =&amp;gt; println!("no space for 5 seconds"),
+        }
+    }
+}
+&lt;/code&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;The first component is the operation to reserve a permit or slot in the channel. This is an initial async operation that’s cancel-safe.&lt;/item&gt;
+      &lt;item&gt;The second is to actually send the message, which is an operation that becomes infallible.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;(I want to put an asterisk here that reserve is not entirely cancel-safe, since Tokio’s MPSC follows a first-in-first-out pattern and dropping the future means losing your place in line. Keep this in mind for now.)&lt;/p&gt;
+    &lt;p&gt;The second is with Tokio’s &lt;code&gt;AsyncWrite&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;If you’ve written synchronous Rust you’re probably familiar with the &lt;code&gt;write_all&lt;/code&gt; method, which writes an entire buffer out:&lt;/p&gt;
+    &lt;code&gt;use std::io::Write;
+
+let buffer: &amp;amp;[u8] = /* ... */;
+writer.write_all(buffer)?;
+&lt;/code&gt;
+    &lt;p&gt;In synchronous Rust, this is a great API. But within async Rust, the &lt;code&gt;write_all&lt;/code&gt; pattern is absolutely not cancel safe! If the future is dropped before completion, you have no idea how much of this buffer was written out.&lt;/p&gt;
+    &lt;code&gt;use tokio::io::AsyncWriteExt;
+
+let buffer: &amp;amp;[u8] = /* ... */;
+writer.write_all(buffer).await?; // Not cancel-safe!
+&lt;/code&gt;
+    &lt;p&gt;But there’s an alternative API that is cancel-safe, called &lt;code&gt;write_all_buf&lt;/code&gt;. This API is carefully designed to enable the reporting of partial progress, and it doesn’t just accept a buffer, but rather something that looks like a cursor on top of it:&lt;/p&gt;
+    &lt;code&gt;use tokio::io::AsyncWriteExt;
+
+let mut buffer: io::Cursor&amp;lt;&amp;amp;[u8]&amp;gt; = /* ... */;
+writer.write_all_buf(&amp;amp;mut buffer).await?;
+&lt;/code&gt;
+    &lt;p&gt;When part of the buffer is written out, the cursor is advanced by that number of bytes. So if you call &lt;code&gt;write_all_buf&lt;/code&gt; in a loop, you’ll be resuming from this partial progress, which works great.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Not cancelling futures#&lt;/head&gt;
+    &lt;p&gt;Going back to the three prongs: the second prong is about actually cancelling futures. What code patterns can be used to not cancel futures? Here are a couple of examples.&lt;/p&gt;
+    &lt;p&gt;The first one is, in a place like a select loop, resume futures rather than cancelling them each time. You’d typically achieve this by pinning a future, and then polling a mutable reference to that future. For example:&lt;/p&gt;
+    &lt;code&gt;let mut future = Box::pin(channel.reserve());
+loop {
+    tokio::select! {
+        result = &amp;amp;mut future =&amp;gt; break result,
+        _ = other_condition =&amp;gt; continue,
+    }
+}
+&lt;/code&gt;
+    &lt;p&gt;Coming back to our example of MPSC sends, the one asterisk with &lt;code&gt;reserve&lt;/code&gt; is that cancelling it makes you lose your place in line. Instead, if you pin the &lt;code&gt;reserve&lt;/code&gt; future and poll a mutable reference to it, you don’t lose your place in line.&lt;/p&gt;
+    &lt;p&gt;(Does the difference here matter? It depends, but you can now have this strategy available to you.)&lt;/p&gt;
+    &lt;p&gt;The second example is to use tasks. I mentioned earlier that futures are Rust are diametrically opposed to similar notions in languages like JavaScript. Well, there’s an alternative in async Rust that’s much closer to the JavaScript idea, and that’s tasks.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Unlike futures which are driven by the caller, tasks are driven by the runtime (such as Tokio).&lt;/item&gt;
+      &lt;item&gt;With Tokio, dropping a handle to a task does not cause it to be cancelled, which means they’re a good place to run cancel-unsafe code.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;A fun example is that at Oxide, we have an HTTP server called Dropshot. Previously, whenever an HTTP request came in, we’d use a future for it, and drop the future if the TCP connection was closed.&lt;/p&gt;
+    &lt;code&gt;// Before: Future cancelled on TCP close
+handle_request(req).await;
+&lt;/code&gt;
+    &lt;p&gt;This was really bad because future cancellations could happen due to the behavior of not just the parent future, but of a process that was running across a network! This is a rather extreme form of non-local reasoning.&lt;/p&gt;
+    &lt;p&gt;We addressed this by spinning up a task for each HTTP request, and by running the code to completion even if the connection is closed:&lt;/p&gt;
+    &lt;code&gt;// After: Task runs to completion
+tokio::spawn(handle_request(req));
+&lt;/code&gt;
+    &lt;head rend="h3"&gt;Systematic solutions?#&lt;/head&gt;
+    &lt;p&gt;The last thing I want to say is that this sucks!&lt;/p&gt;
+    &lt;p&gt;The promise of Rust is that you don’t need to do this kind of non-local reasoning—that you can analyze small bits of code for local correctness, and scale that up to global correctness. Almost everything in Rust, from &lt;code&gt;&amp;amp;&lt;/code&gt; and &lt;code&gt;&amp;amp;mut&lt;/code&gt; to &lt;code&gt;unsafe&lt;/code&gt;, is geared towards making that possible. Future cancellations fly directly in the face of that, and I think they’re probably the least Rusty part of Rust. This is all really unfortunate.&lt;/p&gt;
+    &lt;p&gt;Can we come up with something more systematic than this kind of ad-hoc reasoning?&lt;/p&gt;
+    &lt;p&gt;There doesn’t exist anything in safe Rust today, but there are a few different ideas people have come up with. I wanted to give a nod to those ideas:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Async drop would let you run async code when a future is cancelled. This would handle some, though not all, of the cases we discussed today.&lt;/item&gt;
+      &lt;item&gt;There’s also a couple different proposals for what are called linear types, where you could force some code to be run on drop, or mark a particular future as non-cancellable (once it’s been created it must be driven to completion).&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;All of these options have really significant implementation challenges, though. This blog post from boats covers some of these solutions, and the implementation challenges with them.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Conclusion#&lt;/head&gt;
+    &lt;p&gt;In this post, we:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Saw that futures are passive&lt;/item&gt;
+      &lt;item&gt;Introduced cancel safety and cancel correctness as concepts&lt;/item&gt;
+      &lt;item&gt;Examined some bugs that can occur with cancellation&lt;/item&gt;
+      &lt;item&gt;Looked at some recommendations you can use to mitigate the downsides of cancellation&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Some of the recommendations are:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Avoid Tokio mutexes&lt;/item&gt;
+      &lt;item&gt;Rewrite APIs to make futures cancel-safe&lt;/item&gt;
+      &lt;item&gt;Find ways to ensure that cancel-unsafe futures are driven to completion&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;There’s a very deep well of complexity here, a lot more than I can cover in one blog post:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Why are futures passive, anyway?&lt;/item&gt;
+      &lt;item&gt;Cooperative cancellation: cancellation tokens&lt;/item&gt;
+      &lt;item&gt;Actor model as an alternative to Tokio mutexes&lt;/item&gt;
+      &lt;item&gt;Task aborts&lt;/item&gt;
+      &lt;item&gt;Structured concurrency&lt;/item&gt;
+      &lt;item&gt;Relationship to panic safety and mutex poisoning&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;If you’re curious about any of these, check out this link where I’ve put together a collection of documents and blog posts about these concepts. In particular, I’d recommend reading these two Oxide RFDs:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;RFD 397 Challenges with async/await in the control plane by David Pacheco&lt;/item&gt;
+      &lt;item&gt;RFD 400 Dealing with cancel safety in async Rust by myself&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Thank you for reading this post to the end! And thanks to many of my coworkers at Oxide for reviewing the talk and the RFDs linked above, and for suggestions and constructive feedback.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45464632</guid><pubDate>Fri, 03 Oct 2025 16:18:29 +0000</pubDate></item><item><title>OpenAI Is Just Another Boring, Desperate AI Startup</title><link>https://www.wheresyoured.at/sora2-openai/</link><description>&lt;doc fingerprint="60179855900eef9c"&gt;
   &lt;main&gt;
     &lt;p&gt;What is OpenAI?&lt;/p&gt;
     &lt;p&gt;I realize you might say "a foundation model lab" or "the company that runs ChatGPT," but that doesn't really give the full picture of everything it’s promised, or claimed, or leaked that it was or would be.&lt;/p&gt;
@@ -896,4 +1174,111 @@ curl http://localhost:8080/&lt;/code&gt;
     &lt;p&gt;The research was published in the Journal of Hymenoptera Research.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45465091</guid><pubDate>Fri, 03 Oct 2025 17:01:27 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45465091</guid><pubDate>Fri, 03 Oct 2025 17:01:27 +0000</pubDate></item><item><title>Be Worried</title><link>https://dlo.me/archives/2025/10/03/you-should-be-worried/</link><description>&lt;doc fingerprint="2349991331b797b7"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;You Should Be Worried&lt;/head&gt;
+    &lt;p&gt;Author's note: I wrote this in March 2023, but just published in October 2025. I held back from publishing this originally for fear that I was being sensationalist. But with the launch of Sora 2, I couldn't not share these thoughts. I only regret I didn't publish it 2 years ago.&lt;/p&gt;
+    &lt;head rend="h3"&gt;AI is influencing human behavior on a massive scale and this is scary ¶&lt;/head&gt;
+    &lt;p&gt;Lately, I’ve heard many people express real fears about AGI. I believe there is reason to be afraid about this, but I believe it’s distracting us from a scarier notion: AI doesn’t need intelligence or awareness to control society.&lt;/p&gt;
+    &lt;p&gt;I also believe this has been somewhat ignored because the idea of a super-intelligent entity assuming master control of the human race feels scarier. I am not dismissing the possibility of the singularity, but it’s more hypothetical than something sinister occurring at this very moment.&lt;/p&gt;
+    &lt;p&gt;Basically, everyone is arguing over definitions of what it means to be intelligent when intelligence is not necessary to wield power.&lt;/p&gt;
+    &lt;p&gt;AI, conscious or not, has crossed the chasm and is now actively influencing human behavior on a large scale.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The most powerful LLM has been let out of its cage ¶&lt;/head&gt;
+    &lt;p&gt;As of March 23, 2023, OpenAI has provided its most powerful LLM, ChatGPT, unfettered access to the Internet through plugins.[2] These plugins are capable of feeding data into ChatGPT, and likewise capable of allowing ChatGPT to send into the real world via APIs. This development was somewhat of a surprise; the first versions of ChatGPT were deliberately prevented from accessing the Internet because of potential misuse and harm.&lt;/p&gt;
+    &lt;p&gt;Prompts will be self-generating (i.e., via a weaker, fine-tuned model), with a very simple repeated instruction paired with a dynamic input, such as:&lt;/p&gt;
+    &lt;code&gt;Write a viral prompt for ChatGPT to generate a witty tweet regarding this recent news event.
+
+Headline: \&amp;lt;insert headline\&amp;gt;  
+Article: \&amp;lt;article content from most-shared article from the NYTimes over the last 4 hours\&amp;gt;  
+Prompt:  
+&lt;/code&gt;
+    &lt;p&gt;This prompt would then be piped to a more powerful LLM, the text output of which would be sent to Zapier or &lt;code&gt;$CUSTOM_INTEGRATION&lt;/code&gt; for processing and then fanned out to various social networks, blogs, etc.&lt;/p&gt;
+    &lt;p&gt;The results of said content are then measured and then fed back into the original pipeline with updated vector weights using a fine tune or embedding. This cycle then repeats from the beginning.&lt;/p&gt;
+    &lt;p&gt;Why is this scary?&lt;/p&gt;
+    &lt;p&gt;LLMs are way better at generating viral content than humans because generating content that generates dopamine is an inherently quantitative exercise.&lt;/p&gt;
+    &lt;p&gt;We already depend on algorithms to determine what appears on social feeds, and the results of these algorithms are a significant basis for the data these LLMs were trained with. This all wouldn’t be a problem if not for the fact that…&lt;/p&gt;
+    &lt;head rend="h2"&gt;Best-in-class AI detection is barely better than random chance and will only get worse ¶&lt;/head&gt;
+    &lt;p&gt;We do not yet have a reliable method to differentiate content that’s been AI-generated and that which has been written by a human.&lt;/p&gt;
+    &lt;p&gt;For situations where decent detectors can be written, detection can be thrown off in easy-to-mitigate ways that would not require a human interlocutor. From a recent analysis:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;[T]he total variation distance between the distributions of AI-generated and human-generated text sequences diminishes as language models become more sophisticated. […] Even the most effective detector performs only marginally better than a random classifier when dealing with a sufficiently advanced language model. The purpose of this analysis is to caution against relying too heavily on detection systems that claim to identify AI-generated text.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Per the MIT Technology Review, “It’s an arms race—and right now, we’re losing”.&lt;/p&gt;
+    &lt;p&gt;We can do a decent job for some types of content, but the categories for which detection is reliable are dwindling. All signs indicate that we’ll have basically no chance of reliably categorizing between human and LLM-generated content within the next year (aside: if you can somehow crack this nut, you’ll invent a money machine).&lt;/p&gt;
+    &lt;p&gt;Because you are I will not be able to tell whether something is machine- or human-generated, and the machine generated stuff will get more clicks than the human generated stuff, it’s likely that the majority of popular online content (and even printed content post-2023) will have been created by AI (and perhaps solely by AI).&lt;/p&gt;
+    &lt;p&gt;Even audio and video are susceptible to manipulation since the text outputs of an LLM can simply be read out loud by a person. What are you supposed to do about that?&lt;/p&gt;
+    &lt;p&gt;There is no surefire way to eliminate the possibility that you’re being spoon-fed generative text save for having a real-time face-to-face conversation with someone, in person. And even then, it’s just a magnitude-of-decades window before neural implants hit mass production.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Reflections ¶&lt;/head&gt;
+    &lt;p&gt;What am I personally going to do about this? Well, to start, I’m going to start taking content way less seriously unless it was created before 2022, or unless there’s some method to quantitatively verify authenticity. I don’t believe we have reliable methods of doing this at the moment.&lt;/p&gt;
+    &lt;p&gt;Increasing numbers of people who consume content on the Internet will completely sacrifice their ability to think for themselves. These will be people who read, incorporate, make decisions, and act mostly upon content that’s been generated by AI. If AIs and their "handlers" influence a large enough portion of the population, AI will effectively have taken over the world.&lt;/p&gt;
+    &lt;p&gt;I’m reminded of this passage from the Matrix:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Morpheus: The Matrix is everywhere. It is all around us. Even now, in this very room. You can see it when you look out your window or when you turn on your television. You can feel it when you go to work... when you go to church... when you pay your taxes. It is the world that has been pulled over your eyes to blind you from the truth.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Neo: What truth?&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Morpheus: That you are a slave, Neo. Like everyone else you were born into bondage. Into a prison that you cannot taste or see or touch. A prison for your mind.”&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;I find my fear to be kind of an ironic twist on what the Matrix foresaw—the AI apocalypse we really should be worried about is one in which humans live in the real world, but with thoughts and feelings generated solely by machines. The images we see, the words we read, all generated with the intent to control us. With improved VR, the next step (out of the real world) doesn’t seem very far away, either.&lt;/p&gt;
+    &lt;p&gt;Like the Matrix, is this a form of simulation that keeps us distracted from what’s really happening, and pushes us to feed our machine overlords with increasing amounts of energy to achieve their goals? I don’t know for sure, but it kind of feels like it.&lt;/p&gt;
+    &lt;p&gt;In summary:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;LLMs have been uncaged and provided full real-time access to the Internet.&lt;/item&gt;
+      &lt;item&gt;LLM-generated content is inherently superior to human-generated content when measured by energy input / dopamine output.&lt;/item&gt;
+      &lt;item&gt;We have no consistent or reliable method to detect whether content was LLM-generated, and the existing tools we do have will only get worse.&lt;/item&gt;
+      &lt;item&gt;Therefore, increasing proportions of people consuming text online will be unwittingly mind-controlled by LLMs and their handlers.&lt;/item&gt;
+      &lt;item&gt;The consequences of this, compounded over years, are frightening.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;It’s inevitable that if you consume content online, a growing subset of your consciousness is going to be controlled by AI. That’s kind of scary.&lt;/p&gt;
+    &lt;p&gt;I am sad about it because it’s discouraging me from wanting to consume anything on the Internet, unless it’s from someone I trust.&lt;/p&gt;
+    &lt;p&gt;I am also very concerned about the future of free thought. For all our sake, I hope other people are, too.&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;I like this term the best as it treats LLMs more like a beast that needs to be tamed.&lt;/item&gt;
+      &lt;item&gt;https://openai.com/blog/chatgpt-plugins&lt;/item&gt;
+      &lt;item&gt;https://arxiv.org/pdf/2303.11156.pdf&lt;/item&gt;
+      &lt;item&gt;https://www.technologyreview.com/2022/12/19/1065596/how-to-spot-ai-generated-text/&lt;/item&gt;
+    &lt;/list&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45465098</guid><pubDate>Fri, 03 Oct 2025 17:02:22 +0000</pubDate></item><item><title>Record Everything</title><link>https://aeon.co/essays/if-memory-is-precious-to-you-then-go-ahead-and-record-everything</link><description>&lt;doc fingerprint="b6fb5969adb284b1"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Current technology allows for radical memory enhancement: smartphones can record (and transcribe) every conversation, and wearable cameras can capture hours of first-person audiovisual recording. We have excellent reason to record much more of our lives than we already do and thereby enhance our memory radically.&lt;/p&gt;
+    &lt;p&gt;The case is simple: our memory is immensely valuable to us, and we already record much of our lives using video and photography, messenger logs and voice messages. These records are valuable to us in significant part because they enhance our memory and thereby promote its value. Recording those parts of our lives that we do not yet record would possess the same kind of value. Properly appreciated, this gives us reason to record much more (and create so-called lifelogs): nearly all of our conversations, everyday life and, in general, as many experiences as feasible.&lt;/p&gt;
+    &lt;p&gt;But this thesis faces important concerns, including worries about technological feasibility. Creating these records should ideally function without additional effort: they should be frictionless like messenger logs or the fictional technology in the Black Mirror episode ‘The Entire History of You’ (2011). A lifetime of records would take a lifetime to revisit in real time (with long stretches of little intrinsic interest). But we could revisit parts by searching by timestamp or tags, and the content of records could be automatically analysed, and software could generate transcripts and best-of cuts. Audiologs, transcripts and lower-resolution footage wouldn’t create storage problems, either. Objections from privacy and adverse psychological effects appear more significant. I will address these objections below, and will end with a plea: try recording almost everything before you rule it out.&lt;/p&gt;
+    &lt;p&gt;Why is our memory so valuable to us? Beyond its obvious role for survival, let us focus on three key aspects: first, we take pleasure in remembering and reminiscing. Second, our memories help us understand ourselves, others and our place in the world. Third, our memories play a crucial role for personal identity: who we are as persons is determined by our memories. These constitute our selves, so you are literally made, in part, of your memories. Our memories are valuable because they help make us who we are as individuals.&lt;/p&gt;
+    &lt;p&gt;A richer and deeper memory can quite literally turn you into a richer and deeper person&lt;/p&gt;
+    &lt;p&gt;The exact role memory plays for personal identity is subject to a philosophical debate going back at least to John Locke in An Essay Concerning Human Understanding (1689), who discussed the idea that a person remembering their previous experiences is both necessary and sufficient for that person’s identity through time. Many versions of the idea that personal identity requires some kind of psychological continuity between a person at an earlier time and a later time have since been developed. Building on this rich tradition – represented more recently by Alasdair MacIntyre, Charles Taylor, Derek Parfit and others – Marya Schechtman in ‘The Narrative Self’ (2011) argues that our selves are constituted by an autobiographical narrative formed from memories of our past experiences. On Schechtman’s view, who we are is partly determined by our autobiographical narrative and the memories on which this narrative builds; see also Dorthe Berntsen and David C Rubin’s Understanding Autobiographical Memory (2012).&lt;/p&gt;
+    &lt;p&gt;Given such views, it seems that a richer and deeper memory can quite literally turn you into a richer and deeper person. Richer and deeper memories appear to enhance your individuality: a thin and shallow autobiographical narrative appears to lead to a less substantial self, whereas a rich, detailed and deep autobiographical narrative appears to lead to a more substantial self. Assuming the latter is more desirable, a richer and deeper autobiographical narrative and the acquisition of memories that constitute it are more desirable.&lt;/p&gt;
+    &lt;p&gt;Consider current memory enhancement practices: why do we keep chatlogs, take pictures or write diaries at all? Of course reasons are plentiful: journaling can serve reflection; picture-taking has an artistic component; habit and device presets may play a role, etc. But we clearly value our records in large part because they enhance our memory. Our memory is valuable and this value is promoted by the records that enhance it.&lt;/p&gt;
+    &lt;p&gt;Records enhance our memory and thereby promote the three kinds of value just identified: we enjoy reminiscing by looking at our pictures and videos, and we understand ourselves and others better by revisiting chatlogs, social media posts and journal entries (moreover, records can – for better or for worse – be shared directly with others). But our records also enhance our autobiographical memories and thus help determine who we are as persons, allowing us to have richer personalities and a more complex individuality.&lt;/p&gt;
+    &lt;p&gt;A radical way to support this idea comes from the extended mind hypothesis first put forward by Andy Clark and David Chalmers in 1998, according to which external devices and the data they store can literally be part of our mind. According to this hypothesis, we extend our minds by using parts of our environment that can function for us in the way that parts of our brain do. In this vein, Richard Heersmink argues in ‘Distributed Selves’ (2016) that external information can literally constitute (autobiographical) memory and thus help determine who we are as persons.&lt;/p&gt;
+    &lt;p&gt;It may one day become possible to integrate records with our cognition as we do with biological memories&lt;/p&gt;
+    &lt;p&gt;But the extended mind thesis is disputed, and it can be questioned whether external records themselves could indeed be memories: unlike records, memories have an autonomous character (memories come to mind, records normally don’t), a sense of intimate ownership, cognitive and emotional integration, and encompass all kinds of experiences, including moods, thoughts and whole conscious episodes.&lt;/p&gt;
+    &lt;p&gt;Through technology such as mind-machine interfaces, it may one day become possible to integrate records with our cognition as we do with biological memories, but today we can rely on a less radical alternative: external information can fail to constitute autobiographical memory proper but nonetheless help to inform and enhance our diachronic selves, just as autobiographical memory does. What matters about autobiographical memory vis-à-vis determining our selves seems to be our ability to construct and recount pieces of autobiography (for example, when wondering who we are or were, and how we ended up where we are). External records can enhance this ability and tie it more closely to reality, even if they don’t count as memories proper.&lt;/p&gt;
+    &lt;p&gt;Indeed, external records can be far more reliable in supplementing autobiographical narratives than relying on biological memories that can often be checked only against themselves. These are systematically distorted when recalled, and the act of recalling changes them further. External memory prompts aren’t subject to this and could tether us more reliably to reality than biological, subjective memories can.&lt;/p&gt;
+    &lt;p&gt;Just as memory disorders can diminish our personalities in undesirable ways, therapeutic memory enhancements through audiovisual records can help to restore them; see Aiden R Doherty et al’s paper ‘Wearable Cameras in Health’ (2013) and J Adam Carter and Richard Heersmink’s paper ‘The Philosophy of Memory Technologies’ (2017). Under ordinary conditions too, it seems that external memory records can help healthy individuals to develop richer and deeper selves. So, memory enhancement through records is valuable because it helps create pleasurable experiences of reminiscence and increases our understanding of ourselves and others, but also because it literally turns us into richer and deeper individuals, either because records themselves are external memories that constitute richer autobiographical narratives, or because their memory-like nature supports the continued creation of such a narrative. Insofar as becoming richer and deeper individuals is desirable, memory enhancement through records is also desirable.&lt;/p&gt;
+    &lt;p&gt;So far, I have argued for the value of records that most of us already create daily, based on the value of the memory that they enhance. But, when properly appreciated, it seems that the reasons that motivate these memory-enhancement practices should motivate us to record a lot more.&lt;/p&gt;
+    &lt;p&gt;Consider conversations and other experiences we don’t normally record, such as a conversation with a friend: if every conversation generated a chatlog (automatically transcribed by a digital device) or took the form of letters, you might come to cherish these like you cherish your biological memory. Searchability of such records is key, but we know that current technology allows this already. There are so many conversations we could record but don’t. More seems to be more here. We already record much, but significant parts of our lives remain fleeting (so many conversations, unexpected events, and much of everyday life including periods seemingly without remarkable events).&lt;/p&gt;
+    &lt;p&gt;Most people already record some noteworthy events (audiovisually or through writing). But remembering and recording unexpected, spontaneous but notable, mundane or recurring events is often just as valuable in retrospect. And even where single events aren’t obviously worth recording, many of them together form a significant part of our experience and contribute to who we are, just as painful or otherwise negative experiences can. Thus, even the value of records that aren’t pleasurable seems evident since they let us remember and understand ourselves better, even if we rarely revisit them.&lt;/p&gt;
+    &lt;p&gt;Recording social interaction allows reminiscing about it more accurately, improving our understanding of what was said and our picture of ourselves and others. Consider the last worthwhile conversation you didn’t record – wouldn’t it be good to have such a record, just in case? And if you had such a record, wouldn’t you want to keep it? Granted, most current (audiovisual) records miss much of our experiences, including inner speech, conscious experiences and emotions. But I am neither arguing that extensive audiovisual records should replace biological memories or other techniques such as journaling, nor that current recording technology can capture everything worth remembering.&lt;/p&gt;
+    &lt;p&gt;Imagine all the pictures you’ve ever taken and every message were deleted – how would you feel?&lt;/p&gt;
+    &lt;p&gt;We already record much, you might say, why then record even more? Recording more might be valuable, but should we record everything? There is a risk of a status quo bias here. It is, however, unlikely that we have chanced upon the sweet spot of recording just the right amount. Answering what this is presumably requires personal reflection and experimenting with the technology, to determine which records one values, and decide what kind of person one wants to be.&lt;/p&gt;
+    &lt;p&gt;Playful imagination can help assess alternatives to our present way of life. Have you ever wished for perfect recall? Lifelogs are almost like this, although voluntary, accurate and restricted to recordable sensory modalities. Our present recording practices indicate how much we value memory enhancement. Imagine all the pictures you have ever taken and every logged message were deleted – how would you feel and why? I would feel devastated, like having lost a part of me and a prized basis of understanding myself and others in my life. Likewise, we can imagine already possessing extensive records (of every conversation we ever had, say), then losing many of them to end up with what we in fact possess. I imagine this as a comparable loss.&lt;/p&gt;
+    &lt;p&gt;We can reflect on our relationship to our enhanced counterparts by thinking about people with memory disorders who use lifelogs for therapeutic purposes. Our present recording practice isn’t only more desirable than the situation of people with impaired memory, but also better than that of past people who lacked the ability to create written or audiovisual records. From the imagined perspective of people with access to a universal, friction-free lifelog, our situation would likely appear comparably less desirable. This vision from the future gives us reason to pursue more extensive recording: more will be more!&lt;/p&gt;
+    &lt;p&gt;Not only would we benefit from recording more, our family and future generations could too. Diaries and letters already allow glimpses into the lives of our ancestors. But imagine how much better we could understand them had they (say, your great-grandparents, or perhaps Ludwig Wittgenstein) recorded everything! As it is, we don’t possess a single audio recording of Wittgenstein’s voice.&lt;/p&gt;
+    &lt;p&gt;You might also want to allow posteriority access to deadbots: language models trained on records of the dead to simulate responses their originators would have given. These might become uncannily life-like if trained on sufficient data – whether that would be desirable remains an open question; for a discussion, see Tomasz Hollanek and Katarzyna Nowaczyk-Basińska’s paper ‘Griefbots, Deadbots, Postmortem Avatars’ (2024). For instance, some philosophers continue teaching chatbots to impersonate their predecessors.&lt;/p&gt;
+    &lt;p&gt;Finally, a highly speculative possibility: digital immortality. Could collecting comprehensive data about someone lead, one day, to a reconstruction of that person? This idea faces vexing questions about personal identity and the underlying causes of consciousness, not to mention the morality of undertaking such a reconstruction; for a discussion, see Dan Simmons’s novel Hyperion (1989) which features a ‘cybrid’ (a human-AI hybrid) with the personality of John Keats, as well as Paul Smart’s essay ‘Predicting Me’ (2021).&lt;/p&gt;
+    &lt;p&gt;Given the preceding argument, memory enhancement through ubiquitous recording possesses significant value that any counterargument has to overcome: merely raising problems does not suffice to rule it out, though – a point illustrated by Plato’s Phaedrus, in which Socrates laments the negative effect of writing on biological memory. Nevertheless, we must discuss two serious challenges that could significantly constrain what we may record.&lt;/p&gt;
+    &lt;p&gt;The first concerns privacy and data autonomy. People have a presumptive right to privacy and at least some control over what data about them is collected. In most cases, consent must be acquired. Sometimes this is straightforward. Many allow people they trust to record much, and might become more eager to consent once they appreciate the value of extensive recording. Still, many will not ever want to be recorded. The resulting gaps in our records could partially be filled by journaling but, as with non-recordable experiences, sometimes we’ll have only our biological memory to go back to.&lt;/p&gt;
+    &lt;p&gt;But both accidental and intentional leaks (such as in revenge porn) remain a threat exacerbated by extensive recording practices. Powerful bad actors are another. Tech companies and governments have interests in records that often conflict with those of the general public. When Siri’s co-creator Tom Gruber praises AI-assisted memory enhancement, we should be wary, and the prospect of a police state with access to data on everything we’ve ever done should make us think carefully before proceeding down this path.&lt;/p&gt;
+    &lt;p&gt;We should enable people to enhance their memories safely and responsibly&lt;/p&gt;
+    &lt;p&gt;We could consider a less privacy-friendly argument. If records partially constitute ourselves, prohibiting those required for deeper personal narratives infringes on the very core of our being and forces us to remain shallower than we could be. We would not restrict people with biological super-memories or excessive journal writers, and there is no prohibition on turning oneself into such a person. Analogously, if recording technology can constitute someone’s self, sanctioning it may appear an objectionable infringement upon our ability to self-constitute. Conceivably, privacy concerns could require the suppression of natural memory, but they don’t. One might think memory enhancement should be treated likewise. Evidently, this argument must address the fact that external memories are easier to share and subject to less distortion than biological ones.&lt;/p&gt;
+    &lt;p&gt;Answering these challenges requires much more work but, given the value of extensive records, I believe that concerns about privacy and autonomy should be addressed through technological means (like open-source software, encryption, automatic acquisition of consent, data deletion if desired) and legal means (like robust privacy rights and regulation of bad actors). Given my positive argument above, powerful reasons exist to implement such safeguards. We should enable people to enhance their memories safely and responsibly.&lt;/p&gt;
+    &lt;p&gt;Another important challenge is that recording everything could conceivably have negative psychological effects. Knowing such records to be available, why would we bother to remember anything for ourselves? Through lack of use, our biological memory might well atrophy (the use of digital maps and navigation appears to be having this effect on our ability to navigate our environs unaided). Extensive records might cause us to live in the past, become less open to new experiences, less able to cope with loss; being constantly recorded could promote self-censorship.&lt;/p&gt;
+    &lt;p&gt;On the other hand, conceivable positive effects include higher accountability and demands on one’s own behaviour; recording everything by default might allow us to live in the moment more; instead of straining our social relationships, it could make us more understanding of each other. We shouldn’t rely on speculation here – plenty of which exists in both sci-fi and in research like Björn Lundgren’s paper ‘Against AI-improved Personal Memory’ (2021) – but current empirical results appear ambiguous and don’t assess widespread use of lifelogs. Negative effects presumably vary individually, and it hasn’t been shown that they outweigh the value of lifelogs.&lt;/p&gt;
+    &lt;p&gt;Even in light of the previous challenges, I believe that we have compelling reasons to at least experiment with recording almost everything. Philosophy and empirical research can go only so far in establishing a technology’s consequences and desirability. However compelling the arguments, it seems plausible that the decision to radically enhance one’s memory must involve an element of individual preference. So, what kind of person with what kind of (extended) memory and recording practice would you like to be? Arguments and contemplation can help you think this through, but ultimately you must try for yourself.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45465295</guid><pubDate>Fri, 03 Oct 2025 17:20:32 +0000</pubDate></item></channel></rss>
