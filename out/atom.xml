@@ -1,5 +1,250 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-10-03T23:32:05.818240+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=45461500</id><title>Niri – A scrollable-tiling Wayland compositor</title><updated>2025-10-03T23:34:27.314762+00:00</updated><content>&lt;doc fingerprint="f76fe4761cb74b90"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-10-04T00:42:19.581932+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=45453936</id><title>Litestream v0.5.0</title><updated>2025-10-04T00:44:40.938793+00:00</updated><content>&lt;doc fingerprint="e75e0cc710643f1b"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Iâm Ben Johnson, and I work on Litestream at Fly.io. Litestream makes it easy to build SQLite-backed full-stack applications with resilience to server failure. Itâs open source, runs anywhere, and itâs easy to get started.&lt;/p&gt;
+    &lt;p&gt;Litestream is the missing backup/restore system for SQLite. It runs as a sidecar process in the background, alongside unmodified SQLite applications, intercepting WAL checkpoints and streaming them to object storage in real time. Your application doesn’t even know it’s there. But if your server crashes, Litestream lets you quickly restore the database to your new hardware.&lt;/p&gt;
+    &lt;p&gt;The result: you can safely build whole full-stack applications on top of SQLite.&lt;/p&gt;
+    &lt;p&gt;A few months back, we announced plans for a major update to Litestream. I’m psyched to announce that the first batch of those changes are now “shipping”. Litestream is faster and now supports efficient point-in-time recovery (PITR).&lt;/p&gt;
+    &lt;p&gt;I’m going to take a beat to recap Litestream and how we got here, then talk about how these changes work and what you can expect to see with them.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Litestream to LiteFS to Litestream&lt;/head&gt;
+    &lt;p&gt;Litestream is one of two big SQLite things I’ve built. The other one, originally intended as a sort of sequel to Litestream, is LiteFS.&lt;/p&gt;
+    &lt;p&gt;Boiled down to a sentence: LiteFS uses a FUSE filesystem to crawl further up into SQLite’s innards, using that access to perform live replication, for unmodified SQLite-backed apps.&lt;/p&gt;
+    &lt;p&gt;The big deal about LiteFS for us is that it lets you do the multiregion primary/read-replica deployment people love Postgres for: reads are fast everywhere, and writes are sane and predictable. We were excited to make this possible for SQLite, too.&lt;/p&gt;
+    &lt;p&gt;But the market has spoken! Users prefer Litestream. And honestly, we get it: Litestream is easier to run and to reason about. So we’ve shifted our focus back to it. First order of business: take what we learned building LiteFS and stick as much of it as we can back into Litestream.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The LTX File Format&lt;/head&gt;
+    &lt;p&gt;Consider this basic SQL table:&lt;/p&gt;
+    &lt;code&gt;CREATE TABLE sandwiches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    description TEXT NOT NULL,
+    star_rating INTEGER, 
+    reviewer_id INTEGER NOT NULL
+);
+&lt;/code&gt;
+    &lt;p&gt;In our hypothetical, this table backs a wildly popular sandwich-reviewing app that we keep trying to get someone to write. People eat a lot of sandwiches and this table gets a lot of writes. Because it makes my point even better and it’s funny, assume people dither a lot about their sandwich review for the first couple minutes after they leave it. This Quiznos subâ¦ is it â or ââ?&lt;/p&gt;
+    &lt;p&gt;Underneath SQLite is a B-tree. Like databases everywhere, SQLite divides storage up into disk-aligned pages, working hard to read as few pages as possible for any task while treating work done within a page as more or less free. SQLite always reads and writes in page-sized chunks.&lt;/p&gt;
+    &lt;p&gt;Our &lt;code&gt;sandwiches&lt;/code&gt; table includes a feature that’s really painful for a tool like Litestream that thinks in pages: an automatically updating primary key. That key dictates that every insert into the table hits the rightmost leaf page in the underlying table B-tree. For SQLite itself, that’s no problem. But Litestream has less information to go on: it sees only a feed of whole pages it needs to archive.&lt;/p&gt;
+    &lt;p&gt;Worse still, when it comes time to restore the database â something you tend to want to happen quickly â you have to individually apply those small changes, as whole pages. Your app is down, PagerDuty is freaking out, and you’re sitting there watching Litestream reconstruct your Quiznos uncertainty a page (and an S3 fetch) at a time.&lt;/p&gt;
+    &lt;p&gt;So, LTX. Let me explain. We needed LiteFS to be transaction-aware. It relies on finer-grained information than just raw dirty pages (that’s why it needs the FUSE filesystem). To ship transactions, rather than pages, we invented a file format we call LTX.&lt;/p&gt;
+    &lt;p&gt;LTX was designed as an interchange format for transactions, but for our purposes in Litestream, all we care about is that LTX files represent ordered ranges of pages, and that it supports compaction.&lt;/p&gt;
+    &lt;p&gt;Compaction is straightforward. You’ve stored a bunch of LTX files that collect numbered pages. Now you want to to restore a coherent picture of the database. Just replay them newest to oldest, skipping duplicate pages (newer wins), until all changed pages are accounted for.&lt;/p&gt;
+    &lt;p&gt;Importantly, LTX isn’t limited to whole database backups. We can use LTX compaction to compress a bunch of LTX files into a single file with no duplicated pages. And Litestream now uses this capability to create a hierarchy of compactions:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;at Level 1, we compact all the changes in a 30-second time window&lt;/item&gt;
+      &lt;item&gt;at Level 2, all the Level 1 files in a 5-minute window&lt;/item&gt;
+      &lt;item&gt;at Level 3, all the Level 2’s over an hour.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Net result: we can restore a SQLite database to any point in time, using only a dozen or so files on average.&lt;/p&gt;
+    &lt;p&gt;Litestream performs this compaction itself. It doesn’t rely on SQLite to process the WAL file. Performance is limited only by I/O throughput.&lt;/p&gt;
+    &lt;head rend="h2"&gt;No More Generations&lt;/head&gt;
+    &lt;p&gt;What people like about Litestream is that it’s just an ordinary Unix program. But like any Unix program, Litestream can crash. It’s not supernatural, so when it’s not running, it’s not seeing database pages change. When it misses changes, it falls out of sync with the database.&lt;/p&gt;
+    &lt;p&gt;Lucky for us, that’s easy to detect. When it notices a gap between the database and our running “shadow-WAL” backup, Litestream resynchronizes from scratch.&lt;/p&gt;
+    &lt;p&gt;The only time this gets complicated is if you have multiple Litestreams backing up to the same destination. To keep multiple Litestreams from stepping on each other, Litestream divides backups into “generations”, creating a new one any time it resyncs. You can think of generations as Marvel Cinematic Universe parallel dimensions in which your database might be simultaneously living in.&lt;/p&gt;
+    &lt;p&gt;Yeah, we didn’t like those movies much either.&lt;/p&gt;
+    &lt;p&gt;LTX-backed Litestream does away with the concept entirely. Instead, when we detect a break in WAL file continuity, we re-snapshot with the next LTX file. Now we have a monotonically incrementing transaction ID. We can use it look up database state at any point in time, without searching across generations.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Upgrading to Litestream v0.5.0&lt;/head&gt;
+    &lt;p&gt;Due to the file format changes, the new version of Litestream can’t restore from old v0.3.x WAL segment files.&lt;/p&gt;
+    &lt;p&gt;That’s OK though! The upgrade process is simple: just start using the new version. It’ll leave your old WAL files intact, in case you ever need to revert to the older version.The new LTX files are stored cleanly in an &lt;code&gt;ltx&lt;/code&gt; directory on your replica.&lt;/p&gt;
+    &lt;p&gt;The configuration file is fully backwards compatible.&lt;/p&gt;
+    &lt;p&gt;There’s one small catch. We added a new constraint. You only get a single replica destination per database. This probably won’t affect you, since it’s how most people use Litestream already. We’ve made it official.&lt;/p&gt;
+    &lt;p&gt;The rationale: having a single source of truth simplifies development for us, and makes the tool easier to reason about. Multiple replicas can diverge and are sensitive to network availability. Conflict resolution is brain surgery.&lt;/p&gt;
+    &lt;p&gt;Litestream commands still work the same. But you’ll see references to “transaction IDs” (TXID) for LTX files, rather than the &lt;code&gt;generation/index/offset&lt;/code&gt; we used previously with WAL segments.&lt;/p&gt;
+    &lt;p&gt;We’ve also changed &lt;code&gt;litestream wal&lt;/code&gt; to &lt;code&gt;litestream ltx&lt;/code&gt;.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Other Stuff v0.5.0 Does Better&lt;/head&gt;
+    &lt;p&gt;We’ve beefed up the underlying LTX file format library. It used to be an LTX file was just a sorted list of pages, all compressed together. Now we compress per-page, and keep an index at the end of the LTX file to pluck individual pages out.&lt;/p&gt;
+    &lt;p&gt;You’re not seeing it yet, but we’re excited about this change: we can operate page-granularly even dealing with large LTX files. This allows for more features. A good example: we can build features that query from any point in time, without downloading the whole database.&lt;/p&gt;
+    &lt;p&gt;We’ve also gone back through old issues &amp;amp; PRs to improve quality-of-life. CGO is now gone. We’ve settled the age-old contest between &lt;code&gt;mattn/go-sqlite3&lt;/code&gt; and &lt;code&gt;modernc.org/sqlite&lt;/code&gt; in favor of &lt;code&gt;modernc.org&lt;/code&gt;. This is super handy for people with automated build systems that want to run from a MacBook but deploy on an x64 server, since it lets the cross-compiler work.&lt;/p&gt;
+    &lt;p&gt;We’ve also added a replica type for NATS JetStream. Users that already have JetStream running can get Litestream going without adding an object storage dependency.&lt;/p&gt;
+    &lt;p&gt;And finally, we’ve upgraded all our clients (S3, Google Storage, &amp;amp; Azure Blob Storage) to their latest versions. We’ve also moved our code to support newer S3 APIs.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What’s next?&lt;/head&gt;
+    &lt;p&gt;The next major feature we’re building out is a Litestream VFS for read replicas. This will let you instantly spin up a copy of the database and immediately read pages from S3 while the rest of the database is hydrating in the background.&lt;/p&gt;
+    &lt;p&gt;We already have a proof of concept working and we’re excited to show it off when it’s ready!&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://fly.io/blog/litestream-v050-is-here/"/><published>2025-10-02T19:02:57+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45455164</id><title>Where it's at://</title><updated>2025-10-04T00:44:40.575155+00:00</updated><content>&lt;doc fingerprint="9e199d86dcdee5d6"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Where It's at://&lt;/head&gt;
+    &lt;p&gt;October 2, 2025&lt;/p&gt;
+    &lt;p&gt;You might have heard about the AT protocol (if not, read this!)&lt;/p&gt;
+    &lt;p&gt;Together, all servers speaking the AT protocol comprise the atmosphere—a web of hyperlinked JSON. Each piece of JSON on the atmosphere has its own &lt;code&gt;at://&lt;/code&gt; URI:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;code&gt;at://ruuuuu.de/app.bsky.feed.post/3lzy2ji4nms2z&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;at://danabra.mov/sh.tangled.feed.star/3m23ddgjpgn22&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;at://tessa.germnetwork.com/pub.leaflet.publication/3lzz6juivnc2d&lt;/code&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;But where do they point, exactly?&lt;/p&gt;
+    &lt;p&gt;Given an &lt;code&gt;at://&lt;/code&gt; URI, how do you locate the corresponding JSON?&lt;/p&gt;
+    &lt;p&gt;In this post, I’ll show you the exact process of resolving an &lt;code&gt;at://&lt;/code&gt; URI step by step. Turns out, this is also a great way to learn the details of how &lt;code&gt;at://&lt;/code&gt; works.&lt;/p&gt;
+    &lt;p&gt;Let’s start with the structure of a URI itself.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The User as the Authority&lt;/head&gt;
+    &lt;p&gt;As you might know, a URI often contains a scheme (for example, &lt;code&gt;https://&lt;/code&gt;), an authority (like &lt;code&gt;wikipedia.com&lt;/code&gt;), a path (like &lt;code&gt;/Main_Page&lt;/code&gt;), and maybe a query.&lt;/p&gt;
+    &lt;p&gt;In most protocols, including &lt;code&gt;https://&lt;/code&gt;, the authority part points at whoever’s hosting the data. Whoever created this data is either not present, or is in the path:&lt;/p&gt;
+    &lt;p&gt;The &lt;code&gt;at://&lt;/code&gt; protocol flips that around.&lt;/p&gt;
+    &lt;p&gt;In &lt;code&gt;at://&lt;/code&gt; URIs, whoever created the data is the authority, in the most literal sense:&lt;/p&gt;
+    &lt;p&gt;The user is the authority for their own data. Whoever’s hosting the data could change over time, and is not directly included in an &lt;code&gt;at://&lt;/code&gt; URI. To find out the actual physical server hosting that JSON, you’re gonna need to take a few steps.&lt;/p&gt;
+    &lt;head rend="h3"&gt;A Post in the Atmosphere&lt;/head&gt;
+    &lt;p&gt;Let’s try to resolve this &lt;code&gt;at://&lt;/code&gt; URI to the piece of JSON it represents:&lt;/p&gt;
+    &lt;p&gt;An easy way to resolve an &lt;code&gt;at://&lt;/code&gt; URI is to use an SDK or a client app. Let’s try an online client, for example, pdsls or Taproot or atproto-browser. They’ll figure out the physical server where its JSON is currently hosted, and show that JSON for you.&lt;/p&gt;
+    &lt;p&gt;The above &lt;code&gt;at://&lt;/code&gt; URI points at this JSON, wherever it is currently being hosted:&lt;/p&gt;
+    &lt;p&gt;You can guess by the &lt;code&gt;$type&lt;/code&gt; field being &lt;code&gt;"app.bsky.feed.post"&lt;/code&gt; that this is some kind of a post (which might explain why it has fields like &lt;code&gt;text&lt;/code&gt; and &lt;code&gt;langs&lt;/code&gt;).&lt;/p&gt;
+    &lt;p&gt;However, note that this piece of JSON represents a certain social media post itself, not a web page or a piece of some app. It’s pure data as a piece of JSON, not a piece of UI. You may think of the &lt;code&gt;$type&lt;/code&gt; stating the data format; the &lt;code&gt;app.bsky.*&lt;/code&gt; prefix tells us that the &lt;code&gt;bsky.app&lt;/code&gt; application might know something about what to do with it. Other applications may also consume and produce data in this format.&lt;/p&gt;
+    &lt;p&gt;A careful reader might notice that the &lt;code&gt;uri&lt;/code&gt; in the JSON block is also an &lt;code&gt;at://&lt;/code&gt; URI but it’s slightly different from the original &lt;code&gt;at://&lt;/code&gt; URI we requested:&lt;/p&gt;
+    &lt;p&gt;In particular, the short &lt;code&gt;ruuuuu.de&lt;/code&gt; authority has expanded into a longer &lt;code&gt;did:web:iam.ruuuuu.de&lt;/code&gt; authority. Maybe that’s the physical host?&lt;/p&gt;
+    &lt;p&gt;Actually, no, that’s not the physical host either—it’s something called an identity. Turns out, resolving an &lt;code&gt;at://&lt;/code&gt; URI is done in three distinct steps:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Resolve the handle to an identity (“who are you?”)&lt;/item&gt;
+      &lt;item&gt;Resolve that identity to a hosting (“who holds your data?”)&lt;/item&gt;
+      &lt;item&gt;Request the JSON from that hosting (“what is the data?”)&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Let’s go through each of these steps and see how they work.&lt;/p&gt;
+    &lt;head rend="h3"&gt;From Handles to Identities&lt;/head&gt;
+    &lt;p&gt;The &lt;code&gt;at://&lt;/code&gt; URIs you’ve seen earlier are fragile because they use handles.&lt;/p&gt;
+    &lt;p&gt;Here, &lt;code&gt;ruuuuu.de&lt;/code&gt;, &lt;code&gt;danabra.mov&lt;/code&gt;, and &lt;code&gt;tessa.germnetwork.com&lt;/code&gt; are handles:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;code&gt;at://ruuuuu.de/app.bsky.feed.post/3lzy2ji4nms2z&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;at://danabra.mov/sh.tangled.feed.star/3m23ddgjpgn22&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;at://tessa.germnetwork.com/pub.leaflet.publication/3lzz6juivnc2d&lt;/code&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;(Read more about domains as “internet handles” here.)&lt;/p&gt;
+    &lt;p&gt;The user may choose to change their &lt;code&gt;at://&lt;/code&gt; handle later, and it is important for that not to break any links between pieces of JSON already on the network.&lt;/p&gt;
+    &lt;p&gt;This is why, before you store an &lt;code&gt;at://&lt;/code&gt; URI, you should turn it into a canonical form by resolving the handle to something that never changes—an identity. An identity is like an account ID, but global and meant for the entire web. There are two mechanisms to resolve a handle to an identity (also known as a “DID”):&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Query the DNS TXT record at &lt;code&gt;_atproto.&amp;lt;handle&amp;gt;&lt;/code&gt;looking for&lt;code&gt;did=???&lt;/code&gt;&lt;/item&gt;
+      &lt;item&gt;Make an HTTPS GET to &lt;code&gt;https://&amp;lt;handle&amp;gt;/.well-known/atproto-did&lt;/code&gt;&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The thing you’re looking for, the DID, is going to have a shape like &lt;code&gt;did:something:whatever&lt;/code&gt;. (We’ll revisit what that means later.)&lt;/p&gt;
+    &lt;p&gt;For example, let’s try to resolve &lt;code&gt;ruuuuu.de&lt;/code&gt; via the DNS mechanism:&lt;/p&gt;
+    &lt;p&gt;Found it!&lt;/p&gt;
+    &lt;p&gt;The &lt;code&gt;ruuuuu.de&lt;/code&gt; handle claims to be owned by &lt;code&gt;did:web:iam.ruuuuu.de&lt;/code&gt;, whoever that may be. That’s all that we wanted to know at this point:&lt;/p&gt;
+    &lt;p&gt;Note this doesn’t prove their association yet. We’ll need to verify that whoever controls the &lt;code&gt;did:web:iam.ruuuuu.de&lt;/code&gt; identity “agrees” with &lt;code&gt;ruuuuu.de&lt;/code&gt; being their handle. The mapping is bidirectional. But we’ll confirm that in a later step.&lt;/p&gt;
+    &lt;p&gt;Now let’s try to resolve &lt;code&gt;danabra.mov&lt;/code&gt; using the DNS route:&lt;/p&gt;
+    &lt;p&gt;That also worked! The &lt;code&gt;danabra.mov&lt;/code&gt; handle claims to be owned by the &lt;code&gt;did:plc:fpruhuo22xkm5o7ttr2ktxdo&lt;/code&gt; identity, whoever that may be:&lt;/p&gt;
+    &lt;p&gt;This DID looks a bit different than what you saw earlier but it’s also a valid DID. Again, it’s important to emphasize we’ve not confirmed the association yet.&lt;/p&gt;
+    &lt;p&gt;Subdomains like &lt;code&gt;barackobama.bsky.social&lt;/code&gt; can also be handles.&lt;/p&gt;
+    &lt;p&gt;Let’s try to resolve it:&lt;/p&gt;
+    &lt;p&gt;The DNS mechanism didn’t work, so let’s try with HTTPS:&lt;/p&gt;
+    &lt;p&gt;That worked! This means that &lt;code&gt;barackobama.bsky.social&lt;/code&gt; handle claims to be owned by the &lt;code&gt;did:plc:5c6cw3veuqruljoy5ahzerfx&lt;/code&gt; identity, whoever that is:&lt;/p&gt;
+    &lt;p&gt;So you get the idea. When you see a handle, you can probe it with DNS and HTTPS to see if it claims to be owned by some identity (a DID). If you found a DID, you’ll then be able to (1) verify it actually owns that handle, and (2) locate the server that hosts the data for that DID. And that will be the server you’ll ask for the JSON.&lt;/p&gt;
+    &lt;p&gt;In practice, if you’re building with AT, you’ll likely want to either deploy your own handle/did resolution cache or hit an existing one. (Here’s one implementation.)&lt;/p&gt;
+    &lt;head rend="h3"&gt;AT Permalinks&lt;/head&gt;
+    &lt;p&gt;Now you know how handles resolve to identities, also known as DIDs. Unlike handles, which change over time, DIDs never change—they’re immutable.&lt;/p&gt;
+    &lt;p&gt;These &lt;code&gt;at://&lt;/code&gt; links, which use handles, are human-readable but fragile:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;code&gt;at://ruuuuu.de/app.bsky.feed.post/3lzy2ji4nms2z&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;at://danabra.mov/sh.tangled.feed.star/3m23ddgjpgn22&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;at://tessa.germnetwork.com/pub.leaflet.publication/3lzz6juivnc2d&lt;/code&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;They will break if one of us changes a handle again.&lt;/p&gt;
+    &lt;p&gt;In contrast, the &lt;code&gt;at://&lt;/code&gt; links below, which use DIDs, will not break until we either delete our accounts, delete these records, or permanently take down our hosting:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;code&gt;at://did:web:iam.ruuuuu.de/app.bsky.feed.post/3lzy2ji4nms2z&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;at://did:plc:fpruhuo22xkm5o7ttr2ktxdo/sh.tangled.feed.star/3m23ddgjpgn22&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;at://did:plc:ad4m72ykh2evfdqen3qowxmg/pub.leaflet.publication/3lzz6juivnc2d&lt;/code&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;So, really, this is the “true form” of an &lt;code&gt;at://&lt;/code&gt; URI:&lt;/p&gt;
+    &lt;p&gt;Think of &lt;code&gt;at://&lt;/code&gt; links with DIDs as “permalinks”. Any application storing &lt;code&gt;at://&lt;/code&gt; URIs should store them in this canonical form so that logical links between our pieces of JSON don’t break when we change our handles or change our hosting.&lt;/p&gt;
+    &lt;p&gt;Now that you know how to resolve a handle to a DID, you want to do two things:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Verify that whoever owns this DID actually goes by that handle.&lt;/item&gt;
+      &lt;item&gt;Find the server that hosts all the data for this DID.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;You can do both of these things by fetching a piece of JSON called the DID Document. You can think of it as sort of a “passport” for a given DID.&lt;/p&gt;
+    &lt;p&gt;How you do that depends on what kind of DID it is.&lt;/p&gt;
+    &lt;head rend="h3"&gt;From Identities to Hosting&lt;/head&gt;
+    &lt;p&gt;Currently, there are two kinds of DIDs, known as DID methods, supported by the AT protocol: &lt;code&gt;did:web&lt;/code&gt; (a W3C draft) and &lt;code&gt;did:plc&lt;/code&gt; (specified by Bluesky).&lt;/p&gt;
+    &lt;p&gt;Let’s compare them.&lt;/p&gt;
+    &lt;head rend="h4"&gt;
+      &lt;code&gt;did:web&lt;/code&gt;
+    &lt;/head&gt;
+    &lt;p&gt;The &lt;code&gt;ruuuuu.de&lt;/code&gt; handle claims to be owned by &lt;code&gt;did:web:iam.ruuuuu.de&lt;/code&gt;:&lt;/p&gt;
+    &lt;p&gt;To check this claim, let’s find the DID Document for &lt;code&gt;did:web:iam.ruuuuu.de&lt;/code&gt;. The &lt;code&gt;did:web&lt;/code&gt; method is a specification that specifies an algorithm for that.&lt;/p&gt;
+    &lt;p&gt;In short, you cut off the &lt;code&gt;did:web:&lt;/code&gt; from the DID, append &lt;code&gt;/.well-known/did.json&lt;/code&gt; to the end, and run an HTTPS GET request:&lt;/p&gt;
+    &lt;p&gt;This DID Document looks sleep-inducing but it tells us three important things:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;How to refer to them. The &lt;code&gt;alsoKnownAs&lt;/code&gt;field confirms that whoever controls&lt;code&gt;did:web:iam.ruuuuu.de&lt;/code&gt;indeed wants to use&lt;code&gt;@ruuuuu.de&lt;/code&gt;as a handle. ✅&lt;/item&gt;
+      &lt;item&gt;How to verify the integrity of their data. The &lt;code&gt;publicKeyMultibase&lt;/code&gt;field tells us the public key with which all changes to their data are signed.&lt;/item&gt;
+      &lt;item&gt;Where their data is stored. The &lt;code&gt;serviceEndpoint&lt;/code&gt;field tells us the actual server with their data. Rudy’s data is currently hosted at&lt;code&gt;https://blacksky.app&lt;/code&gt;.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;A DID Document really is like an internet passport for an identity: here’s their handle, here’s their signature, and here’s their location. It connects a handle to a hosting while letting the identity owner change either the handle or the hosting.&lt;/p&gt;
+    &lt;p&gt;Users who interact with &lt;code&gt;@ruuuuu.de&lt;/code&gt; on different apps in the atmosphere don’t need to know or care about his DID or about his current hosting (and whether it moves). From their perspective, his current handle is the only relevant identifier. As for developers, they’ll refer to him by DID, which conveniently never changes.&lt;/p&gt;
+    &lt;p&gt;All of this sounds great, but there is one big downside to the &lt;code&gt;did:web&lt;/code&gt; identity. If &lt;code&gt;did:web:iam.ruuuuu.de&lt;/code&gt; ever loses control of the &lt;code&gt;iam.ruuuuu.de&lt;/code&gt; domain, he will lose control over his DID Document, and thus over his entire identity.&lt;/p&gt;
+    &lt;p&gt;Let’s have a look at an alternative to &lt;code&gt;did:web&lt;/code&gt; that avoids this problem.&lt;/p&gt;
+    &lt;head rend="h4"&gt;
+      &lt;code&gt;did:plc&lt;/code&gt;
+    &lt;/head&gt;
+    &lt;p&gt;We already know the &lt;code&gt;danabra.mov&lt;/code&gt; handle claims to be owned by the &lt;code&gt;did:plc:fpruhuo22xkm5o7ttr2ktxdo&lt;/code&gt; identity (actually, that’s me!)&lt;/p&gt;
+    &lt;p&gt;To check this claim, let’s find the DID Document for &lt;code&gt;did:plc:fpruhuo22xkm5o7ttr2ktxdo&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;The &lt;code&gt;did:plc&lt;/code&gt; method is a specification that specifies an algorithm for that.&lt;/p&gt;
+    &lt;p&gt;Essentially, you need to hit the &lt;code&gt;https://plc.directory&lt;/code&gt; service with a &lt;code&gt;GET&lt;/code&gt;:&lt;/p&gt;
+    &lt;p&gt;The DID Document itself works exactly the same way. It specifies:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;How to refer to me. The &lt;code&gt;alsoKnownAs&lt;/code&gt;field confirms that whoever controls&lt;code&gt;did:plc:fpruhuo22xkm5o7ttr2ktxdo&lt;/code&gt;uses&lt;code&gt;@danabra.mov&lt;/code&gt;as a handle. ✅&lt;/item&gt;
+      &lt;item&gt;How to verify the integrity of my data. The &lt;code&gt;publicKeyMultibase&lt;/code&gt;field tells us the public key with which all changes to my data are signed.&lt;/item&gt;
+      &lt;item&gt;Where my data is stored. The &lt;code&gt;serviceEndpoint&lt;/code&gt;field tells us the actual server with my data. It’s currently at&lt;code&gt;https://morel.us-east.host.bsky.network&lt;/code&gt;.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Let’s visualize this:&lt;/p&gt;
+    &lt;p&gt;Although my handle is &lt;code&gt;@danabra.mov&lt;/code&gt;, the actual server storing my data is currently &lt;code&gt;https://morel.us-east.host.bsky.network&lt;/code&gt;. I’m happy to keep hosting it there but I’m thinking of moving it to a host I control in the future. I can change both my handle and my hosting without disruption to my social apps.&lt;/p&gt;
+    &lt;p&gt;Unlike Rudy, who has a &lt;code&gt;did:web&lt;/code&gt; identity, I stuck with &lt;code&gt;did:plc&lt;/code&gt; (which is the default one when you create an account on Bluesky) so that I’m not irrecovably tying myself to any web domain. “PLC” officially stands for a “Public Ledger of Credentials”—essentially, it is like an npm registry but for DID Documents. (Fun fact: originally PLC meant “placeholder” but they’ve decided it’s a good tradeoff.)&lt;/p&gt;
+    &lt;p&gt;The upside of a &lt;code&gt;did:plc&lt;/code&gt; identity is that I can’t lose my identity if I forget to renew a domain, or if something bad happens at the top level to my TLD.&lt;/p&gt;
+    &lt;p&gt;The downside of a &lt;code&gt;did:plc&lt;/code&gt; identity is that whoever operates the PLC registry has some degree of control over my identity. They can’t outright change it because every version is recursively signed with the hash of the previous version, every past version is queryable, and the hash of the initial version is the DID itself.&lt;/p&gt;
+    &lt;p&gt;However, in theory, whoever operates the PLC registry could deny my requests to update the DID Document, or refuse to serve some information about it. Bluesky is currently moving PLC to an independent legal entity in Switzerland to address some of these concerns. The AT community is also thinking and experimenting.&lt;/p&gt;
+    &lt;head rend="h3"&gt;From Hosting to JSON&lt;/head&gt;
+    &lt;p&gt;So far, you’ve learned how to:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Resolve a handle to a DID.&lt;/item&gt;
+      &lt;item&gt;Grab the DID Document for that DID.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;That actually tells you enough to get the JSON by its &lt;code&gt;at://&lt;/code&gt; URI!&lt;/p&gt;
+    &lt;p&gt;Each DID Document includes the &lt;code&gt;serviceEndpoint&lt;/code&gt; which is the actual hosting. That’s the service you can hit by HTTPS to grab any JSON record it stores.&lt;/p&gt;
+    &lt;p&gt;For example, the &lt;code&gt;@ruuuuu.de&lt;/code&gt; handle resolves to &lt;code&gt;did:web:iam.ruuuuu.de&lt;/code&gt;, and its DID Document has a &lt;code&gt;serviceEndpoint&lt;/code&gt; pointing at &lt;code&gt;https://blacksky.app&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;To get the &lt;code&gt;at://ruuuuu.de/app.bsky.feed.post/3lzy2ji4nms2z&lt;/code&gt; record, hit the &lt;code&gt;https://blacksky.app&lt;/code&gt; server with the &lt;code&gt;com.atproto.repo.getRecord&lt;/code&gt; endpoint, passing different parts of the &lt;code&gt;at://&lt;/code&gt; URI as parameters:&lt;/p&gt;
+    &lt;p&gt;And there it is:&lt;/p&gt;
+    &lt;p&gt;Now let’s get &lt;code&gt;at://danabra.mov/sh.tangled.feed.star/3m23ddgjpgn22&lt;/code&gt;:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;The &lt;code&gt;@danabra.mov&lt;/code&gt;handle resolves to&lt;code&gt;did:plc:fpruhuo22xkm5o7ttr2ktxdo&lt;/code&gt;.&lt;/item&gt;
+      &lt;item&gt;The DID Document for &lt;code&gt;did:plc:fpruhuo22xkm5o7ttr2ktxdo&lt;/code&gt;points at&lt;code&gt;https://morel.us-east.host.bsky.network&lt;/code&gt;as the current hosting.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Let’s hit it:&lt;/p&gt;
+    &lt;p&gt;And there you have it:&lt;/p&gt;
+    &lt;p&gt;And that’s how you resolve an &lt;code&gt;at://&lt;/code&gt; URI.&lt;/p&gt;
+    &lt;p&gt;Exercise: In the record above, the &lt;code&gt;subject&lt;/code&gt; is a link to another record. Figure out the handle of its owner and the contents of that record. Use pdsls to check your answer.&lt;/p&gt;
+    &lt;head rend="h3"&gt;In Conclusion&lt;/head&gt;
+    &lt;p&gt;To resolve an arbitrary &lt;code&gt;at://&lt;/code&gt; URI, you need to follow three steps:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Resolve the handle to an identity (using DNS and/or HTTPS).&lt;/item&gt;
+      &lt;item&gt;Resolve that identity to a hosting (using the DID Document).&lt;/item&gt;
+      &lt;item&gt;Request the JSON from that hosting (by hitting it with &lt;code&gt;getRecord&lt;/code&gt;).&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;If you’re building a client app or a small project, an SDK will handle all of this for you. However, for good performance, you’ll want to hit a resolution cache instead of doing DNS/HTTPS lookups on every request. QuickDID is one such cache. You can also check out the pdsls source to see how exactly it handles resolution.&lt;/p&gt;
+    &lt;p&gt;In practice, a lot of apps don’t end up needing to resolve &lt;code&gt;at://&lt;/code&gt; URIs or load JSON records because they receive data from the network via a websocket and aggregate it in a local database. If that’s your approach, you’ll still use the &lt;code&gt;at://&lt;/code&gt; URIs as unique identifiers for user-created data, but the data itself will get pushed to you rather than pulled by you. Still, it’s useful to know that you can fetch it on demand.&lt;/p&gt;
+    &lt;p&gt;The AT protocol is fundamentally an abstraction over HTTP, DNS, and JSON. But by standardizing how these pieces fit together—putting the user in the authority position, separating identity from hosting, and making data portable—it turns the web into a place where your content belongs to you, not to the apps that display it.&lt;/p&gt;
+    &lt;p&gt;There’s more to explore in the atmosphere, but now you know where it’s &lt;code&gt;at://&lt;/code&gt;.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://overreacted.io/where-its-at/"/><published>2025-10-02T20:31:43+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45461500</id><title>Niri – A scrollable-tiling Wayland compositor</title><updated>2025-10-04T00:44:40.082207+00:00</updated><content>&lt;doc fingerprint="f76fe4761cb74b90"&gt;
   &lt;main&gt;
     &lt;p&gt;A scrollable-tiling Wayland compositor.&lt;/p&gt;
     &lt;p&gt;Getting Started | Configuration | Setup Showcase&lt;/p&gt;
@@ -57,21 +302,7 @@
     &lt;p&gt;We also have a community Discord server: https://discord.gg/vT8Sfjy7sx&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/YaLTeR/niri"/><published>2025-10-03T11:08:42+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45462297</id><title>The Faroes</title><updated>2025-10-03T23:34:25.495184+00:00</updated><content>&lt;doc fingerprint="b6601c6e8caa7e9e"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;The Faroes (2025)&lt;/head&gt;
-    &lt;p&gt;The Faroe Islands are like the child that Denmark and Iceland had, but forgot to tell the world about. This group of eighteen small islands receives the least amount of sunshine in the world per year. Constant rain and heavy winds have always battered these lands.&lt;lb/&gt;Politically part of Denmark (for now) but fiercely independent in spirit, the Faroes exist in their own bubble of Nordic culture. Here, sheep outnumber humans two to one, villages of colorful houses cling to clifftops like they're holding on for dear life, and the weather can shift from apocalyptic storms to sunny calm in the space of an hour.&lt;/p&gt;
-    &lt;p&gt;Situated between Iceland, Norway and Scotland, the Faroes face the brunt of the North Atlantic weather system. Constant storms and crashing waves have sculpted the volcanic rock over millions of years into some of the most jaw-dropping (and vertigo-inducing) coastlines on Earth. These towering basalt cliffs can reach heights of over 400 meters, dropping straight into churning seas below.&lt;lb/&gt;What's most striking is how abruptly the land stops. There are no sandy beaches or gentle slopes here—the islands simply plunge headfirst into the Atlantic. One step you're on grass-covered clifftops, the next you're staring down hundreds of meters of sheer volcanic rock to where waves explode against the base far below.&lt;/p&gt;
-    &lt;p&gt;The weather here is unpredictable, and changes faster than you can put your raincoat on—one minute you're in thick fog, the next you're hit with winds and piercing rain that'll knock you sideways, then suddenly the clouds part to reveal views that'll make your camera work overtime.&lt;/p&gt;
-    &lt;p&gt;Meet the true locals of the Faroes. These wooly sheep have been roaming the islands for over a thousand years, and they outnumber people on the islands. They couldn't care less about your hiking plans and will casually block paths or graze on the edge of 200-meter cliffs like it's the most natural thing in the world.&lt;lb/&gt;Faroe's name comes from a combination of fær (sheep) and eyjar (islands). &lt;/p&gt;
-    &lt;p&gt;Unlike their farm-bound cousins elsewhere, Faroese sheep roam completely free across the islands, somehow always managing to find the most photogenic spots for an impromptu rest. This fellow right here is the only one that gave me any sort of attention. Otherwise, they are all busy grazing on all the grass they could ever ask for.&lt;/p&gt;
-    &lt;p&gt;Why fight the landscape? For over a millennium, islanders have been topping their huts with birch bark and soil and let the grass grow wild. They act as insulation, and the thick roots are an excellent waterproof seal against the weather.&lt;lb/&gt;The grass grows quickly and does need tending every once in a while. In typical Faroese fashion, the solution is simple: put a sheep on top for an afternoon.&lt;/p&gt;
-    &lt;p&gt;On the northern tip of Kalsoy lies the Kallur lighthouse. Like most regions on the islands, the land is privately owned. Hiking usually incurs a modest fee paid at the trailhead to the land owners, and the rest is up to you. Trails are just sheep paths, worn smooth by countless hooves over years rather than any official trail maintenance.&lt;/p&gt;
-    &lt;p&gt;There are no guardrails, no warning signs, and definitely no liability waivers - just you, the weather, and whatever route the sheep decided made sense. The approach to Kallur is particularly gnarly, following a knife-edge ridge with steep drops on both sides before reaching the lighthouse perched dramatically on sea cliffs.&lt;/p&gt;
-    &lt;p&gt;In No Time To Die (2021), Daniel Craig's James Bond meets his end at the villain's lair, which happened to be here on Kalsoy. The Faroese then followed through with the obvious next step.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://photoblog.nk412.com/Faroe2025/Faroes/n-cPCNFr"/><published>2025-10-03T12:41:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45463251</id><title>Webbol: A minimal static web server written in COBOL</title><updated>2025-10-03T23:34:25.296460+00:00</updated><content>&lt;doc fingerprint="11bcbc59fd061f87"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/YaLTeR/niri"/><published>2025-10-03T11:08:42+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45463251</id><title>Webbol: A minimal static web server written in COBOL</title><updated>2025-10-04T00:44:39.671122+00:00</updated><content>&lt;doc fingerprint="11bcbc59fd061f87"&gt;
   &lt;main&gt;
     &lt;p&gt;A minimal static web server written in COBOL using GnuCOBOL.&lt;/p&gt;
     &lt;list rend="ul"&gt;
@@ -170,7 +401,7 @@ curl http://localhost:8080/&lt;/code&gt;
     &lt;p&gt;Built with GnuCOBOL, demonstrating that COBOL can still be used for modern systems programming tasks.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/jmsdnns/webbol"/><published>2025-10-03T14:13:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45463319</id><title>I turned the Lego Game Boy into a working Game Boy</title><updated>2025-10-03T23:34:25.077022+00:00</updated><content>&lt;doc fingerprint="15cf6c54ebc4b5f9"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/jmsdnns/webbol"/><published>2025-10-03T14:13:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45463319</id><title>I turned the Lego Game Boy into a working Game Boy</title><updated>2025-10-04T00:44:39.283174+00:00</updated><content>&lt;doc fingerprint="15cf6c54ebc4b5f9"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;I turned the Lego Game Boy into a working Game Boy part. 1&lt;/head&gt;
     &lt;p&gt;Through my documentation of Game Boy boards, I have drawn up schematics of each device. I know them pretty well. Check out my board scan wiki https://wiki.nataliethenerd.com/&lt;/p&gt;
@@ -189,7 +420,29 @@ curl http://localhost:8080/&lt;/code&gt;
     &lt;p&gt;I am currently working on refining the board now I have the Lego build in my hands. This project will be released in full once I am finished with it - so stay tuned!&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://blog.nataliethenerd.com/i-turned-the-lego-game-boy-into-a-working-game-boy-part-1/"/><published>2025-10-03T14:18:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45464632</id><title>Cancelling async Rust</title><updated>2025-10-03T23:34:24.813262+00:00</updated><content>&lt;doc fingerprint="310499976ca2b6bc"&gt;
+&lt;/doc&gt;</content><link href="https://blog.nataliethenerd.com/i-turned-the-lego-game-boy-into-a-working-game-boy-part-1/"/><published>2025-10-03T14:18:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45464429</id><title>Jeff Bezos says AI is in a bubble but society will get 'gigantic' benefits</title><updated>2025-10-04T00:44:39.023734+00:00</updated><content>&lt;doc fingerprint="49cf831b4a053dfc"&gt;
+  &lt;main&gt;
+    &lt;p&gt;TURIN, Italy — Artificial intelligence is currently in an "industrial bubble" but the technology is "real" and will bring big benefits to society, Amazon Founder Jeff Bezos said on Friday.&lt;/p&gt;
+    &lt;p&gt;The term bubble usually refers to a period of inflated stock prices or valuations of companies that have disconnected from the fundamentals of a business. One of the most famous bubbles that burst was the 2000 dotcom crash where the value of internet companies plummeted.&lt;/p&gt;
+    &lt;p&gt;Exor CEO John Elkann asked Bezos on stage at Italian Tech Week in Turin, Italy whether there were signs that the current AI industry is in bubble.&lt;/p&gt;
+    &lt;p&gt;"This is a kind of industrial bubble," the Amazon founder said.&lt;/p&gt;
+    &lt;p&gt;Bezos laid out some of the key characteristics of bubbles, noting that when they happen, stock prices are "disconnected from the fundamentals" of a business.&lt;/p&gt;
+    &lt;p&gt;"The second thing that happens is that people get very excited like they are today about artificial intelligence," Bezos added.&lt;/p&gt;
+    &lt;p&gt;During bubbles, every experiment or idea gets funded, he told the audience.&lt;/p&gt;
+    &lt;p&gt;"The good ideas and the bad ideas. And investors have a hard time in the middle of this excitement, distinguishing between the good ideas and the bad ideas. And that's also probably happening today," Bezos said.&lt;/p&gt;
+    &lt;p&gt;"But that doesn't mean anything that is happening isn't real. AI is real, and it is going to change every industry."&lt;/p&gt;
+    &lt;p&gt;Bezos gave the example of a six-person company receiving billions of dollars of funding. This is "very unusual behavior" and yet this kind of activity is happening today, he said without making it clear what company he was referring to.&lt;/p&gt;
+    &lt;p&gt;The billionaire however, said that ultimately industrial bubbles could be positive. He pointed to the biotech and pharmaceutical company bubble in the 1990s, which led to the development of some life-saving drugs even though many companies eventually went bust.&lt;/p&gt;
+    &lt;p&gt;"The [bubbles] that are industrial are not nearly as bad, it can even be good, because when the dust settles and you see who are the winners, societies benefits from those inventions," Bezos said.&lt;/p&gt;
+    &lt;p&gt;"That is what is going to happen here too. This is real, the benefits to society from AI are going to be gigantic."&lt;/p&gt;
+    &lt;head rend="h2"&gt;AI bubble warnings grow&lt;/head&gt;
+    &lt;p&gt;Bezos is not the only major business figure warning about an AI bubble. In August, OpenAI CEO Sam Altman reportedly said the AI market is in a bubble, and many investors have also raised the issue.&lt;/p&gt;
+    &lt;p&gt;Goldman Sachs CEO David Solomon on Friday expressed some concerns about stock market levels amid the AI hype.&lt;/p&gt;
+    &lt;p&gt;"When [investors are] excited, they tend to think about the good things that can go right, and they diminish the things you should be skeptical about that can go wrong ... There will be a reset, there will be a check at some point, there will be a drawdown," Solomon said at Italian Tech Week. "The extent of that will depend on how long this [bull run] goes."&lt;/p&gt;
+    &lt;p&gt;Karim Moussalem, chief investment officer of equities at Selwood Asset Management, said last week that the "AI trade is beginning to resemble one of the great speculative manias of market history."&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://www.cnbc.com/2025/10/03/jeff-bezos-ai-in-an-industrial-bubble-but-society-to-benefit.html"/><published>2025-10-03T16:00:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45464632</id><title>Cancelling async Rust</title><updated>2025-10-04T00:44:38.704691+00:00</updated><content>&lt;doc fingerprint="310499976ca2b6bc"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Cancelling async Rust&lt;/head&gt;
     &lt;p&gt;This is an edited, written version of my RustConf 2025 talk about cancellations in async Rust. Like the written version of my RustConf 2023 talk, I’ve tried to retain the feel of a talk while making it readable as a standalone blog entry. Some links:&lt;/p&gt;
@@ -601,7 +854,7 @@ tokio::spawn(handle_request(req));
     &lt;p&gt;Thank you for reading this post to the end! And thanks to many of my coworkers at Oxide for reviewing the talk and the RFDs linked above, and for suggestions and constructive feedback.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://sunshowers.io/posts/cancelling-async-rust/"/><published>2025-10-03T16:18:29+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45465392</id><title>Email was the user interface for the first AI recommendation engines</title><updated>2025-10-03T23:34:24.479039+00:00</updated><content>&lt;doc fingerprint="a69329413b20cfa9"&gt;
+&lt;/doc&gt;</content><link href="https://sunshowers.io/posts/cancelling-async-rust/"/><published>2025-10-03T16:18:29+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45465392</id><title>Email was the user interface for the first AI recommendation engines</title><updated>2025-10-04T00:44:38.368940+00:00</updated><content>&lt;doc fingerprint="a69329413b20cfa9"&gt;
   &lt;main&gt;
     &lt;p&gt;Spinning the radio dials like mini roulette wheels was, in 1993, the best way to discover new music. Static, a snatch of a familiar song, a news report, then ah wait that sounds interesting. You’d walk into a record store with that song stuck in your head, and with any luck would walk out after a conversation with the clerk a few tapes richer, a few dozen dollars poorer.&lt;/p&gt;
     &lt;p&gt;One year later, everything had changed. For in 1994, the best way to discover new music was to email an AI.&lt;/p&gt;
@@ -660,7 +913,7 @@ tokio::spawn(handle_request(req));
     &lt;p&gt;Image Credits: Header image by Samuel Regan-Asante via Unsplash.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://buttondown.com/blog/ringo-email-as-an-ai-interface"/><published>2025-10-03T17:27:02+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45466086</id><title>PEP 810 – Explicit lazy imports</title><updated>2025-10-03T23:34:23.846617+00:00</updated><content>&lt;doc fingerprint="d0324610caa1e4dc"&gt;
+&lt;/doc&gt;</content><link href="https://buttondown.com/blog/ringo-email-as-an-ai-interface"/><published>2025-10-03T17:27:02+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45466086</id><title>PEP 810 – Explicit lazy imports</title><updated>2025-10-04T00:44:37.804911+00:00</updated><content>&lt;doc fingerprint="d0324610caa1e4dc"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;PEP 810 – Explicit lazy imports&lt;/head&gt;
     &lt;list rend="dl"&gt;
@@ -1481,7 +1734,7 @@ resolved modules.&lt;/p&gt;
     &lt;p&gt;Last modified: 2025-10-03 20:29:13 GMT&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://pep-previews--4622.org.readthedocs.build/pep-0810/"/><published>2025-10-03T18:24:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45466588</id><title>Jules, remote coding agent from Google Labs, announces API</title><updated>2025-10-03T23:34:23.602845+00:00</updated><content>&lt;doc fingerprint="2f246eb1ac650a9d"&gt;
+&lt;/doc&gt;</content><link href="https://pep-previews--4622.org.readthedocs.build/pep-0810/"/><published>2025-10-03T18:24:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45466588</id><title>Jules, remote coding agent from Google Labs, announces API</title><updated>2025-10-04T00:44:37.625552+00:00</updated><content>&lt;doc fingerprint="2f246eb1ac650a9d"&gt;
   &lt;main&gt;
     &lt;p&gt;You can now programmatically access Julesâs capabilities to automate your work and build powerful integrations. The Jules API is designed to help you seamlessly integrate Jules into your existing development workflows, unlocking new ways to automate and enhance the entire software development lifecycle.&lt;/p&gt;
     &lt;p&gt;With the API, you can:&lt;/p&gt;
@@ -1644,7 +1897,7 @@ resolved modules.&lt;/p&gt;
     &lt;p&gt;Once you give Jules a task, it spins up a fresh dev environment in a VM, installs dependencies, writes tests, makes the changes, runs the tests, and opens a pull request. Jules shows its work as it makes progress, so you never have to guess what code itâs writing, or what itâs thinking.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://jules.google/docs/changelog/"/><published>2025-10-03T19:08:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45466655</id><title>Procedural generation with Wave Function Collapse (2019)</title><updated>2025-10-03T23:34:23.059105+00:00</updated><content>&lt;doc fingerprint="209cca5d0f320be1"&gt;
+&lt;/doc&gt;</content><link href="https://jules.google/docs/changelog/"/><published>2025-10-03T19:08:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45466655</id><title>Procedural generation with Wave Function Collapse (2019)</title><updated>2025-10-04T00:44:37.037588+00:00</updated><content>&lt;doc fingerprint="209cca5d0f320be1"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Procedural Generation with Wave Function Collapse&lt;/head&gt;
     &lt;p&gt;(Edit 2022-05-03: I found out that the Wave Function Collapse algorithm was heavily inspired by an existing algorithm called “Model Synthesis”. I’ve added a section to further reading with links to the author’s website for more information.)&lt;/p&gt;
@@ -2576,7 +2829,7 @@ index 21ac889..03e6cc7 100644
 &lt;/code&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.gridbugs.org/wave-function-collapse/"/><published>2025-10-03T19:13:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45466865</id><title>Show HN: FLE v0.3 – Claude Code Plays Factorio</title><updated>2025-10-03T23:34:22.862081+00:00</updated><content>&lt;doc fingerprint="be5b9e59201494d8"&gt;
+&lt;/doc&gt;</content><link href="https://www.gridbugs.org/wave-function-collapse/"/><published>2025-10-03T19:13:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45466865</id><title>Show HN: FLE v0.3 – Claude Code Plays Factorio</title><updated>2025-10-04T00:44:36.911621+00:00</updated><content>&lt;doc fingerprint="be5b9e59201494d8"&gt;
   &lt;main&gt;&lt;p&gt;Claude builds factories in lab-play&lt;/p&gt;&lt;code&gt;# 1. Install FLE with uv
 uv add factorio-learning-environment
 
@@ -2772,17 +3025,17 @@ print(f"Refueled boiler")
 print("Belt connections complete - waiting for iron flow")&lt;/code&gt;&lt;p&gt; At each step, agents receive a structured &lt;code&gt;Observation&lt;/code&gt; object containing comprehensive information about the game state and with fields as described below:
             &lt;/p&gt;&lt;table&gt;&lt;row span="2"&gt;&lt;cell role="head"&gt;Field&lt;/cell&gt;&lt;cell role="head"&gt;Description&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;&lt;code&gt;raw_text&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;Standard output and error messages from the last action program execution, annotated with source code line numbers&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;&lt;code&gt;entities&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;List of all entities in the game world with their properties (position, type, orientation, inventory contents, warnings, etc.)&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;&lt;code&gt;inventory&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;The agent's personal inventory with item types and quantities&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;&lt;code&gt;research&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;Technology tree state with researched technologies, current research progress, and available technologies with prerequisites and costs&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;&lt;code&gt;game_info&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;Game timing information (tick count, elapsed time, game speed)&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;&lt;code&gt;flows&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;Production statistics tracking input/output rates, crafted items, harvested resources, and optional price lists for economic evaluation&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;&lt;code&gt;messages&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;Inter-agent communication messages for multi-agent coordination scenarios&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;&lt;code&gt;task_info&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;Task metadata including goal description, instructions, task identifier, and maximum trajectory length&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;&lt;code&gt;task_verification&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;Task-specific verification results indicating success/failure and metadata about progress toward objectives&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;&lt;code&gt;serialized_functions&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;Previously defined helper functions and abstractions stored in the agent's namespace for reuse across episodes&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;&lt;code&gt;map_image&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;Base64-encoded PNG rendering of the factory layout for visual agents (optional)&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;This rich observation space enables agents to maintain spatial awareness, track production metrics, debug errors, and plan multi-step automation strategies. The combination of structured data and human-readable text provides both programmatic access and interpretability. Agent implementations can utilize and format these fields as needed. The agent harness used for evaluation concatenates these fields into a formatted markdown string.&lt;/p&gt;&lt;p&gt;Lab-play is a highly constrained environment, where agents are given a fixed set of resources and a single target entity to maximize production throughput. This simple setting has only a tiny fraction of the complexity of open-play, where agents spawn in a procedurally generated map and must achieve a complex goal given no starting inventory and sparser resources. Agents write Python using the FLE API to interact with the game, and observe the standard outputs and error messages from their execution.&lt;/p&gt;&lt;p&gt;We replicate the methodology from the original FLE paper for the lab-play setting to evaluate the strongest models as of September 2025.&lt;/p&gt;&lt;p&gt;The standardized agent harness is minimal: it continuously appends environment interactions to a single conversational history, and when the token budget is nearing exhaustion, it invokes the agent to summarize the older history so it can continue reasoning while remaining aware of past interactions.&lt;/p&gt;&lt;p&gt;We do not evaluate agents with backtracking and/or reflection logic as we did in FLE 0.2.0, and instead we encourage the community to experiment with more advanced agent designs.&lt;/p&gt;&lt;code&gt;{"enabled": true}&lt;/code&gt;) for models that support reasoning.&lt;p&gt;Open source models have caught up to the SoTA performance observed in v0.2.0 (May 2025), with successes in electronic circuits, steel plate, sulfur and plastic automation. This is consistent with trends showing that the time for open source models to reach parity with closed source results is diminishing.&lt;/p&gt;&lt;p&gt;The latest generation of frontier models continues to advance the state of the art in FLE with substantial improvement compared to FLE v0.2.0 For the first time, models are able to achieve successes in the harder half of tasks which can utilize over a dozen ingredient dependencies.&lt;/p&gt;&lt;p&gt;FLE lab-play clearly differentiates between the capabilities of the frontier models. Notably, the rank and performance gaps between the most advanced models (Claude &amp;gt; GPT &amp;gt; Gemini &amp;gt; Grok) is most similar to GDPVal, a novel benchmark recently released to measure progress in automating economically valuable tasks. This is in contrast to many other static exam-like benchmarks including Humanity's Last Exam, AIME 25, GPQA and MMMU where weaker models in FLE achieve higher performance.&lt;/p&gt;&lt;p&gt;While successful agents achieve their throughput goals, many rely on semi-manual strategies rather than building robust automation for more complex tasks. This manifests in agents shuttling resources manually and using storage chests as resource buffers, instead of constructing fully automated logistics chains. Although this does achieve progress toward the target, it creates a local optimum where agents shortcut the more difficult but necessary step of full automation. Throughput is challenging to measure consistently due to these buffering effects. Agents can store items in intermediate buffers (like chests or belts) which temporarily satisfy throughput checks without true sustained production. We mitigate this by enforcing a holdout period during eval, in which an agent must leave their factory alone for 60 seconds before we test whether quotas are met. Higher throughput targets would make it infeasible to pass with manual logistics, forcing agents to build proper automation.&lt;/p&gt;&lt;p&gt;Although the FLE harness provides a Python namespace for defining helper functions and abstractions, agents rarely leverage this capability. Instead, they rely on primitive, out-of-the-box tools, which limits their ability to scale solutions to more complex tasks. We expect stronger coding models to define their own abstractions commonly in future. Currently, only Gemini 2.5 Pro takes this approach. Agents also struggle to maintain consistent mental models of the factory layout. Misplacement of entities often cascades into larger failures, since the agent is unable to recover efficiently or reorganize the environment once errors occur (see below).&lt;/p&gt;&lt;p&gt;Common failure patterns can be grouped by type:&lt;/p&gt;&lt;p&gt;The distribution of errors reveals notable model-specific patterns. Claude Opus 4.1 stands out with zero syntactic errors and almost entirely pragmatic errors (97.7%), indicating strong code generation but difficulties maintaining accurate mental models of game state. All other models - Gemini 2.5 Pro, Grok 4, and GPT-5 - exhibit API misunderstandings at noticeable rates (12-17%), suggesting challenges with correctly using the FLE API documentation. Additionally, GPT-5 and Grok 4 show surprisingly high rates of syntactic errors (21% and 17% respectively), failing to generate valid Python code more frequently than we might expect from frontier models with SoTA coding benchmark performance.&lt;/p&gt;&lt;p&gt;In human terms, frontier models are shockingly bad at playing Factorio. They find it difficult to represent and model dynamic environments, and rarely develop formal abstractions they can use as tools in future. Despite this, we observed a steady improvement in the capabilities of frontier models in lab-play during 2025.&lt;/p&gt;&lt;p&gt;It is our expectation that Factorio will resist saturation for the foreseeable future, while providing visibility into general model capabilities such as long-horizon planning, domain adaptation, world modeling and spatial reasoning.&lt;/p&gt;&lt;p&gt;FLE v0.3.0 establishes lab-play as our first formal benchmark, but this represents only the beginning of our planned research agenda.&lt;/p&gt;&lt;p&gt;Factorio is an exceptional platform for evaluating agents, due to its emphasis on system engineering and unbounded sandbox nature. FLE presents numerous research opportunities for evaluating agents with valuable system-level problem-solving abilities (our perspective is detailed in this position paper) - including:&lt;/p&gt;&lt;p&gt;The path from current performance to superhuman Factorio gameplay is long, but the skills developed along this path -- logistics optimization, system debugging, constraint satisfaction under uncertainty -- transfer directly to real-world world challenges.&lt;/p&gt;&lt;p&gt;This isn't another benchmark to saturate. It's an environment whose challenges scales with progress, offering no ceiling as agent capabilities mature. FLE is open source in code and mission. We need:&lt;/p&gt;&lt;p&gt;If you are interested in joining our team, you can find us on Discord. We look forward to seeing you!&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://jackhopkins.github.io/factorio-learning-environment/versions/0.3.0.html"/><published>2025-10-03T19:32:37+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45466980</id><title>WireGuard topologies for self-hosting at home</title><updated>2025-10-03T23:32:09.618570+00:00</updated><content>&lt;doc fingerprint="ae6a0c98694138e9"&gt;
+&lt;/doc&gt;</content><link href="https://jackhopkins.github.io/factorio-learning-environment/versions/0.3.0.html"/><published>2025-10-03T19:32:37+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45466980</id><title>WireGuard topologies for self-hosting at home</title><updated>2025-10-04T00:42:21.632835+00:00</updated><content>&lt;doc fingerprint="ae6a0c98694138e9"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;Arenas in Rust&lt;/head&gt; August 5, 2025 A fast way to start an argument in a room full of programmers: “How do you implement a doubly linked list in Rust?” &lt;p&gt; At one level, this question is not very fair, because an answer to it as stated would be that one simply does not use doubly linked lists. They have been popular in introductory computer science lectures because they are a neat way to explain pointers in a data structure that's easy to draw on a whiteboard, but they are not a good match to modern hardware. The last time I used one was in the nineties. I know the Linux kernel uses them, but that design was also laid down in the nineties; if you were designing a kernel from scratch today, you would probably not do it that way. &lt;/p&gt;&lt;p&gt; At another level, it is fair because it is a simple, familiar proxy for all data structures with any kind of circular references. Consider a compiler holding a set of modules that may refer to each other. Or a game where objects may refer to their container. Or a graphic user interface where widgets may refer to a parent window. It might be reasonable to say some particular such structure is not the best solution in some particular case, but it is not reasonable to say that about all such structures in all cases. &lt;/p&gt;&lt;p&gt; And they are tricky in Rust because the language is founded on the idea that memory management should in general, be done by ownership. Essentially, Rust is an answer to the question, what happens if you start with C++ and encode the common ownership/RAII design patterns into the type system so fallible human brains don't need to enforce them. (And while we're at it, drop some of the legacy C baggage. And sprinkle in some features from ML family languages. And... okay, it's never really just one thing. But memory management is the focus here.) Circular references don't necessarily break ownership, but they do break the ability of the type system to keep track of it. &lt;/p&gt;&lt;p&gt; There are several ways to solve this problem. One way is to avoid using direct references to the particular class of objects at all. Instead, allocate a big array of objects, and refer to them with integer indexes into that array. There are several names that have been used for such arrays and indexes; let's call them arenas and handles. &lt;/p&gt;&lt;p&gt; At this point, smart programmers will spot what's going on. Essentially you are bypassing the notion of pointers provided directly by the hardware, only to reimplement your own address space, and your own notion of pointers within it. The next step of course is to write your own equivalents of &lt;code&gt;malloc&lt;/code&gt; and &lt;code&gt;free&lt;/code&gt; to allocate and deallocate objects within the arena.
 
 &lt;/p&gt;&lt;p&gt; Doesn't that mean you are throwing out all the memory safety properties you were hoping to achieve by using Rust in the first place? Wouldn't you be as well off to just go back to C and at least be honest about the fact that you have reverted to purely manual memory management? &lt;/p&gt;&lt;p&gt; That argument sounds logical, but it's not actually correct. &lt;/p&gt;&lt;p&gt; Consider: why were we so scared of memory unsafety in the first place? What's so bad about memory safety bugs that it was considered worth inventing a whole new language to fix them? (Yes, as I mentioned earlier, Rust has some other nice properties, but those would not have sufficed to drive a movement to replace C++ with a new language. They are bonuses. Memory safety was the driving force behind Rust.) &lt;/p&gt;&lt;p&gt; Memory safety bugs have two properties that make them scarier than most other kinds. &lt;/p&gt;&lt;head rend="h2"&gt;Nondeterminism&lt;/head&gt; An array overflow, or use after free, is likely to manifest as an intermittent crash with no clear connection to the cause. Try to reproduce the problem in a debug build, maybe it goes away. Recompile with a couple of extra logging statements, maybe the crash goes away. Rerun the same binary with the same inputs, and thanks to ASLR, maybe the crash goes away. Maybe one day it shows a minute after the triggering cause, maybe another day it shows an hour after, or not at all. &lt;p&gt; Handles are deterministic. If a bug made your program crash on the last run, it will crash the same way on this run. &lt;/p&gt;&lt;head rend="h2"&gt;Security&lt;/head&gt; This one is even bigger. &lt;p&gt; If there exists an input that will cause a given C program to crash with a segmentation fault, what's the probability there exists another input that will allow remote code execution? In practice, the answer tends to be high, more than even expert intuition started off expecting. &lt;/p&gt;&lt;p&gt; And if the program is, say, a web browser, that can be bad. (It's not a coincidence Rust was invented by a browser company.) &lt;/p&gt;&lt;p&gt; There was a time you could say, okay but that only applies to the special category of security-critical programs. But these days (setting aside little scripts for personal use, assuming we are talking about published software), it's programs that don't have to cope with adversarial input, that are the special and shrinking category. This is true even of embedded systems; it's rare nowadays to find a smart device that doesn't expect to be connected to the Internet. &lt;/p&gt;&lt;p&gt; Given that the arena will still be subject to array bounds checking, handle bugs won't allow an attacker to overwrite arbitrary memory the way pointer bugs do. So using handles for your memory management, preserves the property, that bugs in your Rust code may lead to denial of service, but they are much less likely to lead to remote code execution. &lt;/p&gt;&lt;p&gt; And that is why, though arena memory management is isomorphic to old-fashioned manual memory management, it does not keep the particularly bad failure modes that motivated the move to Rust in the first place. &lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://garrido.io/notes/wireguard-topologies-for-self-hosting-at-home/"/><published>2025-10-03T19:43:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45467032</id><title>Arenas in Rust</title><updated>2025-10-03T23:32:09.392522+00:00</updated><content>&lt;doc fingerprint="ae6a0c98694138e9"&gt;
+&lt;/doc&gt;</content><link href="https://garrido.io/notes/wireguard-topologies-for-self-hosting-at-home/"/><published>2025-10-03T19:43:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45467032</id><title>Arenas in Rust</title><updated>2025-10-04T00:42:21.449770+00:00</updated><content>&lt;doc fingerprint="ae6a0c98694138e9"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;Arenas in Rust&lt;/head&gt; August 5, 2025 A fast way to start an argument in a room full of programmers: “How do you implement a doubly linked list in Rust?” &lt;p&gt; At one level, this question is not very fair, because an answer to it as stated would be that one simply does not use doubly linked lists. They have been popular in introductory computer science lectures because they are a neat way to explain pointers in a data structure that's easy to draw on a whiteboard, but they are not a good match to modern hardware. The last time I used one was in the nineties. I know the Linux kernel uses them, but that design was also laid down in the nineties; if you were designing a kernel from scratch today, you would probably not do it that way. &lt;/p&gt;&lt;p&gt; At another level, it is fair because it is a simple, familiar proxy for all data structures with any kind of circular references. Consider a compiler holding a set of modules that may refer to each other. Or a game where objects may refer to their container. Or a graphic user interface where widgets may refer to a parent window. It might be reasonable to say some particular such structure is not the best solution in some particular case, but it is not reasonable to say that about all such structures in all cases. &lt;/p&gt;&lt;p&gt; And they are tricky in Rust because the language is founded on the idea that memory management should in general, be done by ownership. Essentially, Rust is an answer to the question, what happens if you start with C++ and encode the common ownership/RAII design patterns into the type system so fallible human brains don't need to enforce them. (And while we're at it, drop some of the legacy C baggage. And sprinkle in some features from ML family languages. And... okay, it's never really just one thing. But memory management is the focus here.) Circular references don't necessarily break ownership, but they do break the ability of the type system to keep track of it. &lt;/p&gt;&lt;p&gt; There are several ways to solve this problem. One way is to avoid using direct references to the particular class of objects at all. Instead, allocate a big array of objects, and refer to them with integer indexes into that array. There are several names that have been used for such arrays and indexes; let's call them arenas and handles. &lt;/p&gt;&lt;p&gt; At this point, smart programmers will spot what's going on. Essentially you are bypassing the notion of pointers provided directly by the hardware, only to reimplement your own address space, and your own notion of pointers within it. The next step of course is to write your own equivalents of &lt;code&gt;malloc&lt;/code&gt; and &lt;code&gt;free&lt;/code&gt; to allocate and deallocate objects within the arena.
 
 &lt;/p&gt;&lt;p&gt; Doesn't that mean you are throwing out all the memory safety properties you were hoping to achieve by using Rust in the first place? Wouldn't you be as well off to just go back to C and at least be honest about the fact that you have reverted to purely manual memory management? &lt;/p&gt;&lt;p&gt; That argument sounds logical, but it's not actually correct. &lt;/p&gt;&lt;p&gt; Consider: why were we so scared of memory unsafety in the first place? What's so bad about memory safety bugs that it was considered worth inventing a whole new language to fix them? (Yes, as I mentioned earlier, Rust has some other nice properties, but those would not have sufficed to drive a movement to replace C++ with a new language. They are bonuses. Memory safety was the driving force behind Rust.) &lt;/p&gt;&lt;p&gt; Memory safety bugs have two properties that make them scarier than most other kinds. &lt;/p&gt;&lt;head rend="h2"&gt;Nondeterminism&lt;/head&gt; An array overflow, or use after free, is likely to manifest as an intermittent crash with no clear connection to the cause. Try to reproduce the problem in a debug build, maybe it goes away. Recompile with a couple of extra logging statements, maybe the crash goes away. Rerun the same binary with the same inputs, and thanks to ASLR, maybe the crash goes away. Maybe one day it shows a minute after the triggering cause, maybe another day it shows an hour after, or not at all. &lt;p&gt; Handles are deterministic. If a bug made your program crash on the last run, it will crash the same way on this run. &lt;/p&gt;&lt;head rend="h2"&gt;Security&lt;/head&gt; This one is even bigger. &lt;p&gt; If there exists an input that will cause a given C program to crash with a segmentation fault, what's the probability there exists another input that will allow remote code execution? In practice, the answer tends to be high, more than even expert intuition started off expecting. &lt;/p&gt;&lt;p&gt; And if the program is, say, a web browser, that can be bad. (It's not a coincidence Rust was invented by a browser company.) &lt;/p&gt;&lt;p&gt; There was a time you could say, okay but that only applies to the special category of security-critical programs. But these days (setting aside little scripts for personal use, assuming we are talking about published software), it's programs that don't have to cope with adversarial input, that are the special and shrinking category. This is true even of embedded systems; it's rare nowadays to find a smart device that doesn't expect to be connected to the Internet. &lt;/p&gt;&lt;p&gt; Given that the arena will still be subject to array bounds checking, handle bugs won't allow an attacker to overwrite arbitrary memory the way pointer bugs do. So using handles for your memory management, preserves the property, that bugs in your Rust code may lead to denial of service, but they are much less likely to lead to remote code execution. &lt;/p&gt;&lt;p&gt; And that is why, though arena memory management is isomorphic to old-fashioned manual memory management, it does not keep the particularly bad failure modes that motivated the move to Rust in the first place. &lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://russellw.github.io/arenas"/><published>2025-10-03T19:47:53+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45467166</id><title>AMD's EPYC 9355P: Inside a 32 Core Zen 5 Server Chip</title><updated>2025-10-03T23:32:09.224515+00:00</updated><content>&lt;doc fingerprint="6ef3d4bf70380ac1"&gt;
+&lt;/doc&gt;</content><link href="https://russellw.github.io/arenas"/><published>2025-10-03T19:47:53+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45467166</id><title>AMD's EPYC 9355P: Inside a 32 Core Zen 5 Server Chip</title><updated>2025-10-04T00:42:21.289883+00:00</updated><content>&lt;doc fingerprint="6ef3d4bf70380ac1"&gt;
   &lt;main&gt;
     &lt;p&gt;High core count chips are headline grabbers. But maxing out the metaphorical core count slider isn’t the only way to go. Server players like Intel, AMD, and Arm aim for scalable designs that cover a range of core counts. Not all applications can take advantage of the highest core count models in their lineups, and per-core performance still matters.&lt;/p&gt;
     &lt;p&gt;AMD’s EPYC 9355P is a 32 core part. But rather than just being a lower core count part, the 9355P pulls levers to let each core count for more. First, it clocks up to 4.4 GHz. AMD has faster clocking chips in its server lineup, but 4.4 GHz is still a good bit higher than the 3.7 or 4.1 GHz that 128 or 192 core Zen 5 SKUs reach. Then, AMD uses eight CPU dies (CCDs) to house those 32 cores. Each CCD only has four cores enabled out of the eight physically present, but still has its full 32 MB of L3 cache usable. That provides a high cache capacity to core count ratio. Finally, each CCD connects to the IO die using a “GMI-Wide” setup, giving each CCD 64B/cycle of bandwidth to the rest of the system in both the read and write directions. GMI here stands for Global Memory Interconnect. Zen 5’s server IO die has 16 GMI links to support up to 16 CCDs for high core count parts, plus some xGMI (external) links to allow a dual socket setup. GMI-Wide uses two links per CCD, fully utilizing the IO die’s GMI links even though the EPYC 9355P only has eight CCDs.&lt;/p&gt;
@@ -2819,7 +3072,7 @@ print("Belt connections complete - waiting for iron flow")&lt;/code&gt;&lt;p&gt;
     &lt;p&gt;If you like the content then consider heading over to the Patreon or PayPal if you want to toss a few bucks to Chips and Cheese. Also consider joining the Discord.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://chipsandcheese.com/p/amds-epyc-9355p-inside-a-32-core"/><published>2025-10-03T20:01:36+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45467500</id><title>Offline card payments should be possible no later than 1 July 2026</title><updated>2025-10-03T23:32:08.666468+00:00</updated><content>&lt;doc fingerprint="cb8cfa25092dfffd"&gt;
+&lt;/doc&gt;</content><link href="https://chipsandcheese.com/p/amds-epyc-9355p-inside-a-32-core"/><published>2025-10-03T20:01:36+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45467500</id><title>Offline card payments should be possible no later than 1 July 2026</title><updated>2025-10-04T00:42:20.975787+00:00</updated><content>&lt;doc fingerprint="cb8cfa25092dfffd"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Offline card payments should be possible no later than 1 July 2026&lt;/head&gt;
     &lt;p&gt;Press release The Riksbank and representatives from the payment market have today reached an agreement to increase the possibility to make offline card payments for essential goods. The agreement is an important step in the work to strengthen Sweden's payment preparedness and increase resilience to disruptions in the digital payments system. The goal is for the measures to be in place no later than 1 July 2026.&lt;/p&gt;
@@ -2829,105 +3082,7 @@ print("Belt connections complete - waiting for iron flow")&lt;/code&gt;&lt;p&gt;
     &lt;p&gt;The online function shall apply to physical payment cards and accompanying PIN code when purchasing essential goods such as food, medicine and fuel. The Riksbank will continue its work on enabling offline payments for other payment methods after 1 July 2026.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.riksbank.se/en-gb/press-and-published/notices-and-press-releases/press-releases/2025/offline-card-payments-should-be-possible-no-later-than-1-july-2026/"/><published>2025-10-03T20:36:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45467503</id><title>Fast SSIMULACRA2 Implementation in Zig</title><updated>2025-10-03T23:32:08.177879+00:00</updated><content>&lt;doc fingerprint="2f859a3d6f1b7098"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Fast SSIMULACRA2 derivative implementation in Zig.&lt;/p&gt;
-    &lt;code&gt;fssimu2 | [version]
-
-usage:
-  fssimu2 [options] &amp;lt;reference&amp;gt; &amp;lt;distorted&amp;gt;
-
-options:
-  --json               output result as json
-  --err-map &amp;lt;out&amp;gt;      save error map to .png/.tga
-  -h, --help           show this help
-  -v, --version        show version information
-
-sRGB PNG, PAM, JPEG, WebP, or AVIF input expected&lt;/code&gt;
-    &lt;p&gt;Example output:&lt;/p&gt;
-    &lt;code&gt;$ ./ssimu2 ref.png dst.png
-79.83781132&lt;/code&gt;
-    &lt;p&gt;Performance tested on the Intel Core i7 13700k using a 3840x2160 test image. The numbers indicate that this implementation is up to 23% faster and uses ~40% less memory compared to the reference implementation.&lt;/p&gt;
-    &lt;code&gt;poop "ssimulacra2 medium.png dst.png" "./ssimu2 medium.png dst.png"
-Benchmark 1 (7 runs): ssimulacra2 medium.png dst.png
-  measurement          mean ± σ            min … max           outliers         delta
-  wall_time           809ms ± 46.8ms     760ms …  857ms          0 ( 0%)        0%
-  peak_rss           1.34GB ± 1.51MB    1.34GB … 1.34GB          0 ( 0%)        0%
-  cpu_cycles         3.90G  ±  243M     3.65G  … 4.15G           0 ( 0%)        0%
-  instructions       9.33G  ± 3.00M     9.32G  … 9.33G           1 (14%)        0%
-  cache_references    118M  ± 1.33M      116M  …  119M           0 ( 0%)        0%
-  cache_misses       60.0M  ± 3.00M     57.0M  … 63.4M           0 ( 0%)        0%
-  branch_misses      16.6M  ±  101K     16.5M  … 16.8M           0 ( 0%)        0%
-Benchmark 2 (9 runs): ./ssimu2 medium.png dst.png
-  measurement          mean ± σ            min … max           outliers         delta
-  wall_time           618ms ± 10.4ms     603ms …  631ms          0 ( 0%)        ⚡- 23.6% ±  4.2%
-  peak_rss            817MB ±  118KB     816MB …  817MB          0 ( 0%)        ⚡- 39.1% ±  0.1%
-  cpu_cycles         3.05G  ± 45.1M     2.99G  … 3.10G           0 ( 0%)        ⚡- 21.7% ±  4.5%
-  instructions       6.17G  ± 24.8M     6.11G  … 6.18G           3 (33%)        ⚡- 33.8% ±  0.2%
-  cache_references   74.7M  ± 13.7K     74.7M  … 74.7M           1 (11%)        ⚡- 36.6% ±  0.8%
-  cache_misses       34.9M  ±  686K     34.1M  … 35.8M           0 ( 0%)        ⚡- 41.9% ±  3.7%
-  branch_misses      11.4M  ±  138K     11.0M  … 11.5M           1 (11%)        ⚡- 31.2% ±  0.8%
-&lt;/code&gt;
-    &lt;p&gt;Conformance to the reference SSIMULACRA2 implementation can be tested with &lt;code&gt;validate.py&lt;/code&gt; by supplying the &lt;code&gt;ssimu2&lt;/code&gt; binary.&lt;/p&gt;
-    &lt;p&gt;&lt;code&gt;validate.py&lt;/code&gt; requires &lt;code&gt;uv&lt;/code&gt; and &lt;code&gt;libjxl&lt;/code&gt;.&lt;/p&gt;
-    &lt;code&gt;validate.py --custom ~/git-cloning/fssimu2/zig-out/bin/ssimu2 ~/git-cloning/gb82-image-set/png/*&lt;/code&gt;
-    &lt;p&gt;Output on the gb82 image set invoking the above command:&lt;/p&gt;
-    &lt;code&gt;SAMPLES: 75
-LEVELS: 1.0 2.0 4.0
-
-== custom vs ref ==
- pairs: 75
- ref mean: 77.5116  std: 10.6899
- custom mean: 76.9932  std: 11.1606
- mean diff (other - ref): -0.518406
- diff stddev: 0.541576
- diff stderr: 0.0625359
- percentage error (mean diff / ref mean): 0.669%
- max absolute error: 1.9165
-
-== correlation ==
- PCC (Pearson): 0.999700
- SRCC (Spearman): 0.999403
- KRCC (Kendall): 0.987748
-&lt;/code&gt;
-    &lt;p&gt;The &lt;code&gt;ssimu2&lt;/code&gt; binary optionally allows specifying an error map output image as either an uncompressed &lt;code&gt;.tga&lt;/code&gt; (Targa) or PNG.&lt;/p&gt;
-    &lt;p&gt;Error maps use the Turbo color map for error visualization, which emphasizes visually obvious errors well.&lt;/p&gt;
-    &lt;p&gt;An example output is provided here, generated using &lt;code&gt;./ssimu2 --err-map map.png ref.png dst_bad.png&lt;/code&gt; which resulted in a score of &lt;code&gt;49.37005220&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;Compilation requires:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Zig (version 0.15.1)&lt;/item&gt;
-      &lt;item&gt;libjpeg-turbo&lt;/item&gt;
-      &lt;item&gt;libwebp&lt;/item&gt;
-      &lt;item&gt;libavif&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Run &lt;code&gt;zig build --release=fast&lt;/code&gt;, and the binary will emit to &lt;code&gt;zig-out/bin/ssimu2&lt;/code&gt;. The library will emit to &lt;code&gt;zig-out/lib/libssimu2.so&lt;/code&gt; (or .dylib on macOS, .dll on Windows) and the include will be moved to &lt;code&gt;zig-out/include/ssimu2.h&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;&lt;code&gt;fssimu2&lt;/code&gt; provides a C-compatible ABI with the &lt;code&gt;ssimu2.h&lt;/code&gt; include file.&lt;/p&gt;
-    &lt;p&gt;The exposed functionality is as follows:&lt;/p&gt;
-    &lt;code&gt;// Compute a SSIMULACRA2 score
-// The caller must ensure that the reference and distorted buffers
-// are at least (width * height * channels) bytes long. If not,
-// could lead to UB in ReleaseFast
-int ssimulacra2_score(
-    const uint8_t *reference,
-    const uint8_t *distorted,
-    const unsigned width,
-    const unsigned height,
-    const unsigned channels,
-    const double *out_score
-);&lt;/code&gt;
-    &lt;p&gt;An example C program is provided in the &lt;code&gt;c_abi_example/&lt;/code&gt; directory, featuring a simple PAM decoder and SSIMULACRA2 computation. See the &lt;code&gt;test.c&lt;/code&gt; file for usage.&lt;/p&gt;
-    &lt;p&gt;In order to build the test example, enter the &lt;code&gt;c_abi_example/&lt;/code&gt; dir and run:&lt;/p&gt;
-    &lt;code&gt;cc test.c pam_dec.c -I../zig-out/include -L../zig-out/lib -lssimu2 -o test
-# Set library path for Linux
-LD_LIBRARY_PATH=../zig-out/lib ./test ref.pam dst.pam
-# Set library path for macOS
-DYLD_LIBRARY_PATH=../zig-out/lib ./test ref.pam dst.pam&lt;/code&gt;
-    &lt;p&gt;When fssimu2 is properly installed system-wide, the library path specifier isn't needed.&lt;/p&gt;
-    &lt;p&gt;This project is under the Apache 2.0 license. More details in LICENSE.&lt;/p&gt;
-    &lt;p&gt;This project uses code from libspng, libminiz, and vapoursynth-zip. Special thanks to the authors. Licenses for third party code are included in the &lt;code&gt;legal/&lt;/code&gt; folder.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/gianni-rosato/fssimu2"/><published>2025-10-03T20:36:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45467543</id><title>Interstellar Object 3I/Atlas Passed Mars Last Night</title><updated>2025-10-03T23:32:07.889411+00:00</updated><content>&lt;doc fingerprint="fc5cf18231e00f9b"&gt;
+&lt;/doc&gt;</content><link href="https://www.riksbank.se/en-gb/press-and-published/notices-and-press-releases/press-releases/2025/offline-card-payments-should-be-possible-no-later-than-1-july-2026/"/><published>2025-10-03T20:36:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45467543</id><title>Interstellar Object 3I/Atlas Passed Mars Last Night</title><updated>2025-10-04T00:42:20.708004+00:00</updated><content>&lt;doc fingerprint="fc5cf18231e00f9b"&gt;
   &lt;main&gt;
     &lt;p&gt;The world’s 3rd known interstellar object – 3I/ATLAS – has made its closest approach to Mars. The approach took place at 4 UTC on October 3, 2025 (11 p.m. CDT on October 2). At that time, the comet was approximately 18 million miles (29 million kilometers) from Mars. It was the object’s closest approach to any planet during its one-time journey through our solar system.&lt;/p&gt;
     &lt;p&gt;As of this writing (10 UTC on October 3), we have not seen any new images from the pass. But multiple space agencies, including NASA and the European Space Agency (ESA), are coordinating observations using various spacecraft and orbiters around Mars. Instruments on ESA’s Mars Express and ExoMars Trace Gas Orbiter, as well as NASA’s Mars Reconnaissance Orbiter, are focusing on capturing detailed data from this interstellar visitor. In an October 2 story from AP, Marcia Dunn reported:&lt;/p&gt;
@@ -2993,7 +3148,7 @@ DYLD_LIBRARY_PATH=../zig-out/lib ./test ref.pam dst.pam&lt;/code&gt;
     &lt;p&gt;Bottom line: Interstellar object 3I/ATLAS swept closest to Mars at 11 p.m. CDT on October 2 (4 UTC on October 3). Read about plans to observe it with spacecraft.&lt;lb/&gt; Via:&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://earthsky.org/space/new-interstellar-object-candidate-heading-toward-the-sun-a11pl3z/"/><published>2025-10-03T20:40:52+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45467717</id><title>TrueVault (YC W14) Is Hiring a BDR (Ex-ECommerce Manager)</title><updated>2025-10-03T23:32:07.284096+00:00</updated><content>&lt;doc fingerprint="2d0ed018ae96a6ad"&gt;
+&lt;/doc&gt;</content><link href="https://earthsky.org/space/new-interstellar-object-candidate-heading-toward-the-sun-a11pl3z/"/><published>2025-10-03T20:40:52+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45467717</id><title>TrueVault (YC W14) Is Hiring a BDR (Ex-ECommerce Manager)</title><updated>2025-10-04T00:42:20.155825+00:00</updated><content>&lt;doc fingerprint="2d0ed018ae96a6ad"&gt;
   &lt;main&gt;
     &lt;p&gt;We make Privacy Software for SMBs.&lt;/p&gt;
     &lt;p&gt;We’re looking for a Business Development Rep with real DTC eCommerce experience to help brands simplify privacy compliance. If you’ve been an eCommerce Manager before and want to pivot into SaaS sales, this is your chance to turn that experience into a revenue-driving role at a Y Combinator–backed startup.&lt;/p&gt;
@@ -3019,55 +3174,68 @@ DYLD_LIBRARY_PATH=../zig-out/lib ./test ref.pam dst.pam&lt;/code&gt;
     &lt;p&gt;TrueVault builds software tools that help businesses comply with consumer data privacy laws. We believe if businesses have access to products that make getting and staying compliant simple, straightforward, and fully automated, respecting consumers' data privacy becomes the sensible default. And we all benefit from that.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.ycombinator.com/companies/truevault/jobs/FaC8Apo-ecommerce-manager-bdr"/><published>2025-10-03T21:00:32+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45468145</id><title>Show HN: Powerful Visual Programming Language (Book)</title><updated>2025-10-03T23:32:07.000042+00:00</updated><content>&lt;doc fingerprint="55821e2b83b9ffd1"&gt;
+&lt;/doc&gt;</content><link href="https://www.ycombinator.com/companies/truevault/jobs/FaC8Apo-ecommerce-manager-bdr"/><published>2025-10-03T21:00:32+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45468698</id><title>Zig builds are getting faster</title><updated>2025-10-04T00:42:20.041112+00:00</updated><content>&lt;doc fingerprint="adc8b06e29012720"&gt;
   &lt;main&gt;
-    &lt;p&gt;"Pipe"&lt;/p&gt;
-    &lt;p&gt; Learn This Visual Programming Language &lt;lb/&gt; To Enhance Your AI Coding Capabilities &lt;/p&gt;
-    &lt;p&gt;Maximizing productivity of AI-driven software development&lt;/p&gt;
-    &lt;head rend="h2"&gt;Open visual language&lt;/head&gt;
-    &lt;p&gt;Developers can create or modify visual components exactly to their requirements and specifications.&lt;/p&gt;
-    &lt;head rend="h2"&gt;General-purpose visual language&lt;/head&gt;
-    &lt;p&gt;Pipe contains only general-purpose elements not limited to narrow domain-specific concepts.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Compact &amp;amp; powerful language&lt;/head&gt;
-    &lt;p&gt;Pipe provides relatively few elements and concepts still allowing implemenation of complex algorithms.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Complete &amp;amp; detailed specification&lt;/head&gt;
-    &lt;p&gt;Complete and detailed language specification allows building entire virtual machine for Pipe flowchart execution.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Practical visual language&lt;/head&gt;
-    &lt;p&gt;Pipe does not replace non-visual programming languages but rather complements them.&lt;/p&gt;
-    &lt;head rend="h2"&gt;API for non-visual languages&lt;/head&gt;
-    &lt;p&gt;Complete API specification is provided for integration with non-visual programming languages.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Statically-typed language&lt;/head&gt;
-    &lt;p&gt;Pipe is a statically-typed visual language similar to top-tier non-visual programming languages.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Multiple levels of usage&lt;/head&gt;
-    &lt;p&gt;No need to know the full Pipe specification to start development using visual language Pipe.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Integration with AI code generation&lt;/head&gt;
-    &lt;p&gt;Pipe can play a role of an integration layer for AI-generated code converted into visual components.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Low-code platforms&lt;/head&gt;
-    &lt;p&gt;Using Pipe for visual integration of AI-generated components can inspire the next generation of low-code platforms.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Long-term vision&lt;/head&gt;
-    &lt;p&gt;There are tons of new ideas and features already planned for future versions of Pipe language.&lt;/p&gt;
-    &lt;p&gt;Feature-rich visual language with highly detailed design all the way down to API level&lt;/p&gt;
-    &lt;head rend="h1"&gt;From our blog&lt;/head&gt;
-    &lt;p&gt;Stay connected with our curated content that brings you the latest innovations, success stories, and expert guidance from our team.&lt;/p&gt;
-    &lt;head rend="h5"&gt;A Book About New General-Purpose Visual Programming Language "Pipe" Is Published&lt;/head&gt;
-    &lt;p&gt;Book "General-Purpose Visual Programming Language Pipe" has been published and it is now available for purchase.&lt;/p&gt;
-    &lt;head rend="h5"&gt;New Language "Pipe" Makes General-Purpose Visual Programming a Reality&lt;/head&gt;
-    &lt;p&gt;New visual programming language "Pipe" brings many novel concepts and unique features. It was created to challenge dominance of text-based programming.&lt;/p&gt;
-    &lt;head rend="h5"&gt;Visual Language "Pipe" as Integration Layer of AI-Generated Components&lt;/head&gt;
-    &lt;p&gt;Visual programming language "Pipe" was designed to work as extension of AI code generation tools by placing generated code inside Pipe visual components.&lt;/p&gt;
+    &lt;head rend="h1"&gt;Mitchell Hashimoto&lt;/head&gt;
+    &lt;head rend="h1"&gt;Zig Builds Are Getting Faster&lt;/head&gt;
+    &lt;p&gt;Andrew Kelley famously (or infamously, depending on your views) said "the compiler is too damn slow, that's why we have bugs."1&lt;/p&gt;
+    &lt;p&gt;As a result, one of the primary stated goals of Zig for years has been faster compile times. The Zig team has been working on extremely hard problems to make this a reality (such as yeeting LLVM, writing their own code generation backends, building their own linkers, and marching towards incremental compilation in general).2&lt;/p&gt;
+    &lt;p&gt;The fruits of this multi-year labor are finally starting to show with Zig 0.15.1. The Ghostty project just completed upgrading to Zig 0.15.1, and I'd like to share some real-world build times.3&lt;/p&gt;
+    &lt;head rend="h2"&gt;Build Script Compilation&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Zig 0.14: 7sec 167ms&lt;/item&gt;
+      &lt;item&gt;Zig 0.15: 1sec 702ms&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;This is the time it takes to build the &lt;code&gt;build.zig&lt;/code&gt; script itself. The
+times above were measured by running &lt;code&gt;zig build --help&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;A well-written build script should only rebuild itself rarely. However, this is a cost every new uncached source build will pay (e.g. a user downloading the project to build from source one time). As such, it directly impacts the time to build a usable binary.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Full Uncached Ghostty Binary&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Zig 0.14: 41sec&lt;/item&gt;
+      &lt;item&gt;Zig 0.15: 32sec&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;This includes the time to build the build script itself. Given the prior results, Zig 0.15 is building everything else ~2 seconds faster. But, you can still see in wall time the change in this initial build time.&lt;/p&gt;
+    &lt;p&gt;Important: most of this is still using LLVM. Ghostty still can't fully build and link using the self-hosted x86_64 backend, since the backend still has bugs. So, this just shows the general improvements in the Zig compiler itself, even with LLVM in the picture.&lt;/p&gt;
+    &lt;p&gt;Once Ghostty can use the self-hosted x86_64 backend completely, I expect this time to plummet to around 25 seconds or less, fully half the time it would take with Zig 0.14.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Incremental Build (Ghostty Executable)&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Zig 0.14: 19sec&lt;/item&gt;
+      &lt;item&gt;Zig 0.15: 16sec&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;This is the time it takes to rebuild Ghostty after a one-line change to the most core terminal emulation code (adding a log function call to the escape sequence parser).&lt;/p&gt;
+    &lt;p&gt;This build has a fully cached build script and dependency graph, so it is only rebuilding what it needs to. Incremental compilation in Zig isn't functional yet, so this still recompiles a considerable amount of code. Additionally, as with the prior section, this is still using LLVM. By simply dropping LLVM out of the picture, I expect this time to drop to around 12 seconds or so (less the time LLVM is emitting).&lt;/p&gt;
+    &lt;p&gt;Going further, once Zig supports incremental compilation, I expect we'll be able to measure incremental builds like this within milliseconds at worst. But, let's wait and see when that is reality.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Incremental Build (libghostty-vt)&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Zig 0.14: 2sec 884ms&lt;/item&gt;
+      &lt;item&gt;Zig 0.15: 975ms&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;This is the time it takes to rebuild only libghostty-vt after a one-line change. Unlike the Ghostty executable, &lt;code&gt;libghostty-vt&lt;/code&gt;
+is fully functional with the self-hosted x86_64 backend, so this
+shows the differences in build times without LLVM in the picture.&lt;/p&gt;
+    &lt;p&gt;Similar to the Ghostty executable, this is still rebuilding the full Zig module for &lt;code&gt;libghostty-vt&lt;/code&gt;, since incremental compilation isn't
+fully functional yet. I expect this to also drop to single-digit milliseconds
+at worst once incremental compilation is a reality.&lt;/p&gt;
+    &lt;p&gt;But still, a sub-second build time for a non-trivial library is amazing. This is the library I'm spending most of my time working on right now, and even in a few short days since upgrading to Zig 0.15.1, I've felt a huge difference in my workflow. Previously, I might tab out to read an email between builds or tests, but now its so fast I can stay in flow in my terminal.&lt;/p&gt;
+    &lt;p&gt;This improvement is most indicative of what's to come in the short term. The self-hosted x86_64 backend is already stable enough to build all debug builds by default and the aarch64 backend is getting there, too. We aren't able to build the full Ghostty executable yet, but I bet this will get ironed out within months.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Faster Builds Are Here&lt;/head&gt;
+    &lt;p&gt;As you can see, building Ghostty with Zig 0.15.1 is faster in every single scenario, despite the fact that a lot of Ghostty still can't even take advantage of the self-hosted backend! And despite the fact that incremental compilation isn't functional yet!&lt;/p&gt;
+    &lt;p&gt;I've loved betting on Zig for Ghostty, and I love that they're focusing on compile times. These improvements are real, and they're here now. And I suspect in the next couple years, the results posted today will look downright slow. 😜&lt;/p&gt;
+    &lt;head rend="h2"&gt;Footnotes&lt;/head&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Timestamped link: https://youtu.be/5eL_LcxwwHg?t=565 ↩&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;This ignores an astronomical amount of work that has gone into making every aspect of the Zig compiler faster, more parallelizable, etc. ↩&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;All measurements done on the same x86_64 Linux machine. ↩&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.pipelang.com"/><published>2025-10-03T21:42:42+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45468418</id><title>Tesla Cybertruck Isn't Allowed in Germany, Not Even the US Army Can Change That</title><updated>2025-10-03T23:32:06.655341+00:00</updated><content>&lt;doc fingerprint="ece891b43a40421b"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Tesla's stainless-steel wedge known as the Cybertruck won't be prowling the streets of Germany anytime soon—and not even the might of the U.S. military can change that. According to a U.S. Army Customs Agency news release that surfaced on Reddit's r/teslamotors forum, the Cybertruck does not qualify for the usual rules exemption that applies to American service members.&lt;/p&gt;
-    &lt;p&gt;Why did the German government deny the Army's request? It turns out there are several reasons—and most of them relate to safety. According to the release, the regulator flagged the truck's sharp-edged body and massive curb weight as violations of passive safety rules designed to protect vulnerable road users like cyclists, pedestrians, and motorcyclists.&lt;/p&gt;
-    &lt;p&gt;EU standards require impact protection zones, prohibit dangerous exterior edges, and mandate speed limiters on vehicles that weigh over 3.5 tons. The U.S. Army admitted that the truck doesn't meet those standards, according to the document, but requested an exemption anyway. That's not all that shocking, given that the German Federal Ministry of Transport (FMoT) allows U.S. forces members to import some non-EU-compliant cars through a system that belongs to a part of the Army known as USAREUR-AF.&lt;/p&gt;
-    &lt;p&gt;In this case, though, the ministry denied the request, saying that the Tesla “not only fails to meet the EU legal requirements but deviates significantly from them,” adding that a safe operation in German public road traffic could not be ensured.&lt;/p&gt;
-    &lt;p&gt;Interestingly, the unusual styling came under fire as well. Officials noted that the Cybertruck's distinctive design and known lack of legal standing in Germany would make it stand out in traffic; that might sound like no big deal, but essentially, it would make it very clear when a U.S. military service member was in traffic, potentially compromising security and placing members of the armed forces at risk.&lt;/p&gt;
-    &lt;p&gt;The decision leaves U.S. military personnel in Germany with little recourse. If they already own a Cybertruck, it'll need to stay Stateside. Otherwise, it'll end up as little more than a big paperweight in Europe.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.roadandtrack.com/news/a68133176/us-armed-forces-service-members-no-tesla-cybertruck/"/><published>2025-10-03T22:10:54+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45468781</id><title>When private practices merge with hospital systems, costs go up</title><updated>2025-10-03T23:32:06.505493+00:00</updated><content>&lt;doc fingerprint="a50c91982cb30596"&gt;
+&lt;/doc&gt;</content><link href="https://mitchellh.com/writing/zig-builds-getting-faster"/><published>2025-10-03T22:45:28+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45468781</id><title>When private practices merge with hospital systems, costs go up</title><updated>2025-10-04T00:42:19.935792+00:00</updated><content>&lt;doc fingerprint="a50c91982cb30596"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;When Private Practices Merge with Hospital Systems, Costs Go Up&lt;/head&gt;
     &lt;p&gt;Private practices are vanishing as more doctors join large hospital systems. This increasing consolidation is reducing competition and raising prices, according to a study co-authored by Yale SOM’s Fiona Scott Morton.&lt;/p&gt;
