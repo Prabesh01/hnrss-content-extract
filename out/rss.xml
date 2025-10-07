@@ -1,382 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Tue, 07 Oct 2025 21:08:42 +0000</lastBuildDate><item><title>Erlang ARM32 JIT is born</title><link>https://www.grisp.org/blog/posts/2025-10-07-jit-arm32.3</link><description>&lt;doc fingerprint="ea279a502acd05f8"&gt;
-  &lt;main&gt;
-    &lt;p&gt;A blog series recounting our adventures in the quest to port the BEAM JIT to the ARM32-bit architecture.&lt;/p&gt;
-    &lt;p&gt;This work is made possible thanks to funding from the Erlang Ecosystem Foundation and the ongoing support of its Embedded Working Group.&lt;/p&gt;
-    &lt;head rend="h1"&gt;The Erlang ARM32 JIT is born!&lt;/head&gt;
-    &lt;p&gt;This week we finally achieved our first milestone in developing the ARM32 JIT. We executed our first Erlang function through JITted ARM32 machine code!&lt;/p&gt;
-    &lt;code&gt;    ~/arm32-jit$ qemu-arm -L /usr/arm-linux-gnueabihf ./otp/RELEASE/erts-15.0/bin/beam.smp -S 1:1 -SDcpu 1:1 -SDio 1 -JDdump true -JMsingle     true -- -root /home/arm32-jit/otp/RELEASE -progname erl -home /home
-    ~/arm32-jit$ echo $?
-    42&lt;/code&gt;
-    &lt;p&gt;The BEAM successfully runs and terminates with error code 42! That 42 comes from an Erlang function, just-in-time compiled by our ARM32 JIT!&lt;/p&gt;
-    &lt;p&gt;Announcement is done! All code is available at https://github.com/stritzinger/otp/tree/arm32-jit&lt;/p&gt;
-    &lt;p&gt;Keep reading for a lot of interesting details!&lt;/p&gt;
-    &lt;head rend="h2"&gt;The first piece of Erlang code&lt;/head&gt;
-    &lt;code&gt;-module(hello).
--export([start/2]).
-
-start(_BootMod, _BootArgs) -&amp;gt;
-    halt(42, [{flush, false}]).&lt;/code&gt;
-    &lt;p&gt;This is &lt;code&gt;hello.erl&lt;/code&gt; that contains a &lt;code&gt;start/2&lt;/code&gt; function. The function head mimics the &lt;code&gt;erl_init:start/2&lt;/code&gt; function, which is the entry point of the first Erlang process. We replaced &lt;code&gt;erl_init:start/2&lt;/code&gt; with &lt;code&gt;hello:start/2&lt;/code&gt; in the &lt;code&gt;erl_init.c&lt;/code&gt; module of the BEAM VM. This way, we forced the runtime to execute this Erlang function.&lt;/p&gt;
-    &lt;p&gt;&lt;code&gt;hello:start/2&lt;/code&gt; is very simple as it just calls the &lt;code&gt;erlang:halt/2&lt;/code&gt;. This function is a BIF (Built-in Function) that executes C code, part of the BEAM VM. This code executes an ordered shutdown of the BEAM and allows us to customize the error code, in this case: &lt;code&gt;42&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;(Why &lt;code&gt;{flush, false}&lt;/code&gt;? At the time I am writing this, letting it be true causes a segmentation fault EHEH)&lt;/p&gt;
-    &lt;p&gt;Obviously, we need to compile this Erlang module, but I will also generate the BEAM assembly so we can have a look at what we will have to deal with.&lt;/p&gt;
-    &lt;code&gt;{module, hello}.  %% version = 0
-{exports, [{module_info,0},{module_info,1},{start,2}]}.
-{attributes, []}.
-{labels, 7}.
-
-{function, start, 2, 2}.
-  {label,1}.
-    {line,[{location,"erts/preloaded/src/hello.erl",74}]}.
-    {func_info,{atom,hello},{atom,start},2}.
-  {label,2}.
-    {move,{literal,[{flush,false}]},{x,1}}.
-    {move,{integer,42},{x,0}}.
-    {line,[{location,"erts/preloaded/src/hello.erl",76}]}.
-    {call_ext_only,2,{extfunc,erlang,halt,2}}.
-
-{function, module_info, 0, 4}.
-  {label,3}.
-    {line,[]}.
-    {func_info,{atom,hello},{atom,module_info},0}.
-  {label,4}.
-    {move,{atom,hello},{x,0}}.
-    {call_ext_only,1,{extfunc,erlang,get_module_info,1}}.
-
-{function, module_info, 1, 6}.
-  {label,5}.
-    {line,[]}.
-    {func_info,{atom,hello},{atom,module_info},1}.
-  {label,6}.
-    {move,{x,0},{x,1}}.
-    {move,{atom,hello},{x,0}}.
-    {call_ext_only,2,{extfunc,erlang,get_module_info,2}}.&lt;/code&gt;
-    &lt;p&gt;You can spot the start function and the two standard module_info functions that all Erlang modules have. We do not care much about those right now as we discovered that they are not executed and are not required to work, for now.&lt;/p&gt;
-    &lt;p&gt;We can see that the core of the start function is just two &lt;code&gt;move&lt;/code&gt; operations and one &lt;code&gt;call_ext_only&lt;/code&gt;. But bear in mind that the BEAM loader will transmute these Generic BEAM Operations into Specific operations. More complexity will pop up!&lt;/p&gt;
-    &lt;head rend="h2"&gt;Execution&lt;/head&gt;
-    &lt;p&gt;We are using &lt;code&gt;qemu-arm&lt;/code&gt; to emulate &lt;code&gt;Arm32&lt;/code&gt; and we are directly using &lt;code&gt;beam.smp&lt;/code&gt; to run the BEAM.&lt;/p&gt;
-    &lt;code&gt;    ~/arm32-jit$ qemu-arm -L /usr/arm-linux-gnueabihf ./otp/RELEASE/erts-15.0/bin/beam.smp -S 1:1 -SDcpu 1:1 -SDio 1 -JDdump true -JMsingle     true -- -root /home/vagrant/arm32-jit/otp/RELEASE -progname erl -home /home/vagrant&lt;/code&gt;
-    &lt;head rend="h3"&gt;JIT initialization&lt;/head&gt;
-    &lt;p&gt;At boot, the BEAM initializes the JIT if enabled. The JIT leverages the AsmJit library to emit all machine code instructions.&lt;/p&gt;
-    &lt;head rend="h4"&gt;Emission of all global shared fragments&lt;/head&gt;
-    &lt;p&gt;There are 90+ code snippets that are shared among all modules. The JIT loads them one single time and sets up jumps to them in every other module. It is like a global library for all modules.&lt;/p&gt;
-    &lt;p&gt;We skipped most of these because just the shared fragments involved in the &lt;code&gt;hello:start/2&lt;/code&gt; execution were needed.&lt;/p&gt;
-    &lt;head rend="h4"&gt;Emission of the erts_beamasm module&lt;/head&gt;
-    &lt;p&gt;As part of the JIT initialization, &lt;code&gt;erts_beamasm&lt;/code&gt; is emitted. This module is an internal hardcoded module that exists only when BEAM is using the JIT. It holds 7 fundamental instructions used to manage the Erlang process executions.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;run_process - The main process execution entry point&lt;/item&gt;
-      &lt;item&gt;normal_exit - Normal process termination&lt;/item&gt;
-      &lt;item&gt;continue_exit - Continue after exit handling&lt;/item&gt;
-      &lt;item&gt;exception_trace - Exception tracing functionality&lt;/item&gt;
-      &lt;item&gt;return_trace - Return value tracing&lt;/item&gt;
-      &lt;item&gt;return_to_trace - Return to tracing state&lt;/item&gt;
-      &lt;item&gt;call_trace_return - Call tracing return handling&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h3"&gt;Preloaded modules&lt;/head&gt;
-    &lt;p&gt;The &lt;code&gt;hello.erl&lt;/code&gt; module has been compiled and put as first and single Erlang module in the list of preloaded modules. Preloaded modules are Erlang fundamental modules that are always loaded by the BEAM before the first Erlang process can start. They implement, in Erlang, the core features of the Erlang Runtime System (ERTS). The OTP build scripts group all &lt;code&gt;ebin&lt;/code&gt; files into a single C header that is then linked into the executable. This makes the Erlang binaries available as a static C array in the BEAM source code. These are then loaded one by one after the BEAM VM is initialized.&lt;/p&gt;
-    &lt;p&gt;Cool, let's nuke all these modules and leave just our &lt;code&gt;hello.erl&lt;/code&gt;. It does not need many BEAM instructions and we can easily verify that it executes. To do the substitution we just need to change this build variable in otp/erts/emulator/Makefile.in&lt;/p&gt;
-    &lt;p&gt;We are running BEAMASM with &lt;code&gt;-JDdump true&lt;/code&gt; so &lt;code&gt;asmjit&lt;/code&gt; will dump all ARM32 assembly for each module! This is incredibly useful if monitored while executing with a debugger, as we can see the assembler being printed line by line by our code.&lt;/p&gt;
-    &lt;code&gt;~/arm32-jit$ cat hello.asm 
-L6:
-.byte 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-# i_flush_stubs
-# func_line_I
-# aligned_label_Lt
-label_1:
-# i_func_info_IaaI
-# hello:start/2
-    blx L8
-.byte 0x00, 0x00, 0x00, 0x00
-.byte 0x0B, 0x4F, 0x00, 0x00, 0x0B, 0xA4, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00
-# aligned_label_Lt
-start/2:
-# i_breakpoint_trampoline
-    str lr, [r7, -4]!
-    b L9
-    bl L11
-L9:
-# i_test_yield
-    adr r2, start/2
-    subs r9, r9, 1
-    b.le L13
-# i_move_sd
-    ldr r12, [L14]
-    str r12, [r4, 68]
-# i_move_sd
-    movw r12, 687
-    str r12, [r4, 64]
-# line_I
-# allocate_tt
-# call_light_bif_be
-L15:
-    ldr r3, [L16]
-    movw r1, 10188
-    movt r1, 16432
-    adr r2, L15
-# BIF: erlang:halt/2
-    sub r12, r7, 4
-    cmp r10, r12
-    b.ls L17
-    udf 48879
-L17:
-    movw r12, 12424
-    add r12, r4, r12
-    ldr r12, [r12]
-    cmp sp, r12
-    b.eq L18
-    udf 57005
-L18:
-    bl L20
-# deallocate_t
-    movw r0, 64676
-    movt r0, 16480
-    blx L22
-# return
-    movw r0, 61636
-    movt r0, 16480
-    blx L22
-# i_flush_stubs
-# func_line_I
-# aligned_label_Lt
-label_3:
-# i_func_info_IaaI
-# hello:module_info/0
-    blx L8
-.byte 0x00, 0x00, 0x00, 0x00
-.byte 0x0B, 0x4F, 0x00, 0x00, 0x4B, 0x6B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-# aligned_label_Lt
-module_info/0:
-# i_breakpoint_trampoline
-    str lr, [r7, -4]!
-    b L23
-    bl L11
-L23:
-# i_test_yield
-    adr r2, module_info/0
-    subs r9, r9, 1
-    b.le L13
-# i_move_sd
-    movw r12, 20235
-    str r12, [r4, 64]
-# allocate_tt
-# call_light_bif_be
-L24:
-    ldr r3, [L25]
-    movw r1, 4772
-    movt r1, 16425
-    adr r2, L24
-# BIF: erlang:get_module_info/1
-    sub r12, r7, 4
-    cmp r10, r12
-    b.ls L26
-    udf 48879
-L26:
-    movw r12, 12424
-    add r12, r4, r12
-    ldr r12, [r12]
-    cmp sp, r12
-    b.eq L27
-    udf 57005
-L27:
-    bl L20
-# deallocate_t
-    movw r0, 64676
-    movt r0, 16480
-    blx L22
-# return
-    movw r0, 61636
-    movt r0, 16480
-    blx L22
-# i_flush_stubs
-# func_line_I
-# aligned_label_Lt
-label_5:
-# i_func_info_IaaI
-# hello:module_info/1
-    blx L8
-.byte 0x00, 0x00, 0x00, 0x00
-.byte 0x0B, 0x4F, 0x00, 0x00, 0x4B, 0x6B, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00
-# aligned_label_Lt
-module_info/1:
-# i_breakpoint_trampoline
-    str lr, [r7, -4]!
-    b L28
-    bl L11
-L28:
-# i_test_yield
-    adr r2, module_info/1
-    subs r9, r9, 1
-    b.le L13
-# i_move_sd
-    ldr r12, [r4, 64]
-    str r12, [r4, 68]
-# i_move_sd
-    movw r12, 20235
-    str r12, [r4, 64]
-# allocate_tt
-# call_light_bif_be
-L29:
-    ldr r3, [L30]
-    movw r1, 4868
-    movt r1, 16425
-    adr r2, L29
-# BIF: erlang:get_module_info/2
-    sub r12, r7, 4
-    cmp r10, r12
-    b.ls L31
-    udf 48879
-L31:
-    movw r12, 12424
-    add r12, r4, r12
-    ldr r12, [r12]
-    cmp sp, r12
-    b.eq L32
-    udf 57005
-L32:
-    bl L20
-# deallocate_t
-    movw r0, 64676
-    movt r0, 16480
-    blx L22
-# return
-    movw r0, 61636
-    movt r0, 16480
-    blx L22
-# int_code_end
-L33:
-    movw r0, 18576
-    movt r0, 16480
-    blx L22
-L13:
-L12:
-    movw r12, 1968
-    movt r12, 14656
-    blx r12
-L22:
-L21:
-    movw r12, 29192
-    movt r12, 16399
-    blx r12
-L11:
-L10:
-    movw r12, 1752
-    movt r12, 14656
-    blx r12
-L20:
-L19:
-    movw r12, 680
-    movt r12, 14656
-    blx r12
-L8:
-L7:
-    movw r12, 1824
-    movt r12, 14656
-    blx r12
-# Begin stub section
-L14:
-.xword 0x000000007FFFFFFF
-L16:
-.xword 0x000000007FFFFFFF
-L25:
-.xword 0x000000007FFFFFFF
-L30:
-.xword 0x000000007FFFFFFF
-# End stub section
-L34:
-.section .rodata {#1}
-md5:
-.byte 0x6D, 0xC4, 0x1E, 0xF1, 0x13, 0x1E, 0xBF, 0xF2, 0x4B, 0xF5, 0xC0, 0x41, 0x57, 0x86, 0xDF, 0xD5
-.section .text {#0}
-; CODE_SIZE: 632&lt;/code&gt;
-    &lt;p&gt;Bear in mind, this assembler is not what hello should look like. We are missing a lot of things.&lt;/p&gt;
-    &lt;p&gt;You can spot many sequences like:&lt;/p&gt;
-    &lt;code&gt;    movw r0, 64676
-    movt r0, 16480
-    blx L22 # &amp;lt;---- branch to NYI&lt;/code&gt;
-    &lt;p&gt;This is a call to &lt;code&gt;nyi&lt;/code&gt; (Not Yet Implemented) function and the argument loaded to R0 is the pointer to a string that contains the name of the BEAM instruction that should have been emitted instead. You can spot many of these since we are only emitting the code to reach halt. Everything after that is not important now as halt will never return!&lt;/p&gt;
-    &lt;p&gt;There are many more comments we could make around all the details in this assembler dump, but let's move on.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Jumping into Jitted code!&lt;/head&gt;
-    &lt;p&gt;Later in the BEAM initialization the first Erlang process will be allocated and started.&lt;/p&gt;
-    &lt;p&gt;We swap the module and function with hello in erts/emulator/beam/erl_init.c&lt;/p&gt;
-    &lt;code&gt;    erl_spawn_system_process(&amp;amp;parent, am_hello, am_start, args, &amp;amp;so);&lt;/code&gt;
-    &lt;p&gt;One BEAM scheduler thread will jump to the &lt;code&gt;process_main&lt;/code&gt; function. You can find it here in the source code. This is emitted by our JIT and is the first emitted code that will run.&lt;/p&gt;
-    &lt;p&gt;Here we need to handle the Erlang processes scheduling by calling BEAM routines that implement the algorithms of Erlang concurrency, like &lt;code&gt;erts_schedule&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;&lt;code&gt;erts_schedule&lt;/code&gt; will return the pointer to the &lt;code&gt;Process&lt;/code&gt; C structure that holds all information about the process that is going to execute. We then load all necessary data inside registers and then we branch to the exact point where the program execution stopped.&lt;/p&gt;
-    &lt;head rend="h3"&gt;The first Erlang function call&lt;/head&gt;
-    &lt;p&gt;In this case we are calling &lt;code&gt;hello:start/2&lt;/code&gt; so the first instruction to execute is &lt;code&gt;apply_only&lt;/code&gt; that does a few things but ends up calling the C &lt;code&gt;apply&lt;/code&gt; routine.&lt;/p&gt;
-    &lt;p&gt;The routine processes the Module-Function-Arity information to get the address where the function code resides in memory.&lt;/p&gt;
-    &lt;p&gt;What follows is the Erlang function prologue. You can see it in the assembler code section above. For example, all functions have these instructions in their prologue:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;i_breakpoint_trampoline: handle breakpoints for the &lt;code&gt;debugger&lt;/code&gt;app&lt;/item&gt;
-      &lt;item&gt;i_test_yield: checks if the function should yield and go back to the scheduler&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;We have minimal or partial implementations of these since we do not really need them. We have to emit them though, as the C++ generated loader functions from the BEAM are expanding the Erlang function call Operation into a more specific and complex function prologue sequence.&lt;/p&gt;
-    &lt;p&gt;After that, we added support for the &lt;code&gt;call_light_bif&lt;/code&gt; operation that precedes the call to the halt_2 BIF routine. This implementation is also minimal.&lt;/p&gt;
-    &lt;p&gt;Question for later: did you notice that we put a &lt;code&gt;42&lt;/code&gt; as a number in the code? Numeric constants are printed as decimals in the dump, but we cannot spot any 42!?&lt;/p&gt;
-    &lt;p&gt;After the call, we see two other operations:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;dealloc&lt;/item&gt;
-      &lt;item&gt;return&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;These are just calls to NYI as we will never reach this code! So for now, we can skip them...&lt;/p&gt;
-    &lt;head rend="h3"&gt;Let's roll the JIT!&lt;/head&gt;
-    &lt;code&gt;    ~/arm32-jit$ qemu-arm -L /usr/arm-linux-gnueabihf ./otp/RELEASE/erts-15.0/bin/beam.smp -S 1:1 -SDcpu 1:1 -SDio 1 -JDdump true -JMsingle     true -- -root /home/arm32-jit/otp/RELEASE -progname erl -home /home
-    ~/arm32-jit$&lt;/code&gt;
-    &lt;p&gt;Impressive, the program returns immediately without even saying "Hi" ... and without Segmentation Fault!!&lt;/p&gt;
-    &lt;p&gt;But let's check the program return code!&lt;/p&gt;
-    &lt;code&gt;~/arm32-jit$ echo $?
-42
-&lt;/code&gt;
-    &lt;p&gt;We can safely say that number is not there by accident! This is a great achievement as from now on we will be able to incrementally add Erlang instructions.&lt;/p&gt;
-    &lt;p&gt;Every Erlang line we add will trigger new Opcodes. By emitting them and running the code we will have immediate feedback on everything.&lt;/p&gt;
-    &lt;p&gt;The next goal now is to complete the &lt;code&gt;hello&lt;/code&gt; module to host all possible beam instructions!&lt;/p&gt;
-    &lt;head rend="h4"&gt;Hey where is 42???&lt;/head&gt;
-    &lt;p&gt;One interesting thing I spotted looking at the assembly: You cannot find the number &lt;code&gt;42&lt;/code&gt; in there. Or actually, you can, it is just hidden in plain sight. To understand you need to know how we are using ARM32 registers.&lt;/p&gt;
-    &lt;p&gt;In particular the register &lt;code&gt;r4&lt;/code&gt;, a callee-saved register. We are using it to store the pointer to the &lt;code&gt;ErtsSchedulerRegisters&lt;/code&gt; struct. The &lt;code&gt;ErtsSchedulerRegisters&lt;/code&gt; contains the X register array. When a function is called, X registers are used to store the arguments of the call.&lt;/p&gt;
-    &lt;p&gt;This becomes more obvious if we compare the Erlang assembly to the Arm32 assembly.&lt;/p&gt;
-    &lt;code&gt;# i_move_sd                       &amp;lt;---- {move,{literal,[{flush,false}]},{x,1}}. % List at X[1]
-    ldr r12, [L14]
-    str r12, [r4, 68]
-# i_move_sd                       &amp;lt;---- {move,{integer,42},{x,0}}. % 42 at X[0]
-    movw r12, 687 
-    str r12, [r4, 64]
-# line_I
-# allocate_tt
-# call_light_bif_be
-L15:
-    ldr r3, [L16]
-    movw r1, 10188
-    movt r1, 16432
-    adr r2, L15
-# BIF: erlang:halt/2
-# ...&lt;/code&gt;
-    &lt;p&gt;42 is stored at &lt;code&gt;r4&lt;/code&gt;+64.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;r4: pointer to the &lt;code&gt;ErtsSchedulerRegisters&lt;/code&gt;struct&lt;/item&gt;
-      &lt;item&gt;64: base offset from the beginning of the struct to the beginning of the &lt;code&gt;x_reg_array&lt;/code&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;The list is stored at &lt;code&gt;r4&lt;/code&gt;+68.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;68: is the base offset + the size of one &lt;code&gt;Eterm&lt;/code&gt;(4 bytes on ARM32)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;But why in assembly do we see 687 and not 42?&lt;/p&gt;
-    &lt;p&gt;Converting both numbers to hex we get:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;42 -&amp;gt; 2A&lt;/item&gt;
-      &lt;item&gt;687 -&amp;gt; 2AF !!&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Yep, this is an example of a Tagged Value. If we consult the BEAM book we can learn about the Tagging Scheme:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;00 11 Pid&lt;/item&gt;
-      &lt;item&gt;01 11 Port&lt;/item&gt;
-      &lt;item&gt;10 11 Immediate 2&lt;/item&gt;
-      &lt;item&gt;11 11 Small integer&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;42 is tagged with &lt;code&gt;1111&lt;/code&gt; at the low end. So the BEAM can quickly recognize during a pattern match that this Erlang Term is a Small Integer!&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45502543</guid><pubDate>Tue, 07 Oct 2025 13:00:25 +0000</pubDate></item><item><title>Tcl-Lang Showcase</title><link>https://wiki.tcl-lang.org/page/Showcase</link><description>&lt;doc fingerprint="598b77957e6a418d"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Tue, 07 Oct 2025 21:32:25 +0000</lastBuildDate><item><title>Tcl-Lang Showcase</title><link>https://wiki.tcl-lang.org/page/Showcase</link><description>&lt;doc fingerprint="598b77957e6a418d"&gt;
   &lt;main&gt;&lt;p&gt;Canvas3d&lt;/p&gt;Canvas3d wiki page&lt;p&gt;HP-15 Simulation&lt;/p&gt;HP-15 Simulation wiki page&lt;p&gt;By clicking on the image, an interactive demonstration of the Tcl/Tk application is launched using CloudTk. Over 100 Tcl/Tk applications listed from this wiki are demonstrated here . To view the Tcl/Tk Widget Demonstration, go to the "Playground" from the menu above and then select "Demos" in the "Tcl-Playground" - Console menu.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
 &lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45502784</guid><pubDate>Tue, 07 Oct 2025 13:25:33 +0000</pubDate></item><item><title>Show HN: MARS – Personal AI robot for builders (&lt; $2k)</title><link>https://news.ycombinator.com/item?id=45504127</link><description>&lt;doc fingerprint="f1df9a7b68a781cd"&gt;
@@ -734,67 +357,7 @@ nx build docs&lt;/code&gt;
 &lt;p&gt;To understand why, let's look at how entries are inserted. To make space for a new element, existing entries must be shifted to the right. With our low-level memory layout, this is done using bitwise copy, as the following implementation shows.&lt;/p&gt;&lt;code&gt;bool Insert(const KeyValuePair &amp;amp;element, KeyValuePair *pos) {&lt;/code&gt;
 &lt;p&gt;The use of &lt;code&gt;std::memmove&lt;/code&gt; introduces a hidden constraint: &lt;code&gt;KeyValuePair&lt;/code&gt; must be trivially copyable. This means the implementation only works correctly for simple, C-style data structures despite its generic-looking interface.&lt;/p&gt;&lt;p&gt;Using &lt;code&gt;std::memmove&lt;/code&gt; on a &lt;code&gt;std::string&lt;/code&gt; object creates a shallow copy. We now have two &lt;code&gt;std::string&lt;/code&gt; objects whose internal pointers both point to the same character buffer on the heap. When the destructor of the original string is eventually called, it deallocates that buffer. The copied string is now left with a dangling pointer to freed memory, leading to use-after-free errors or a double-free crash when its own destructor runs.&lt;/p&gt;&lt;head rend="h2"&gt;Conclusion&lt;/head&gt;&lt;p&gt;The initial hurdle when implementing a B+Tree implementation is solving the contiguous memory layout puzzle avoiding heap indirection. The solution is flexible array members, which makes it possible to compile the program when the number of entries in the B+Tree node is dynamic, and a runtime value.&lt;/p&gt;&lt;p&gt;However, the implementation complexity goes up because of manual memory management, lack of inheritance, and hidden data type constraints. This is unavoidable for high performance.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45505398</guid><pubDate>Tue, 07 Oct 2025 16:39:13 +0000</pubDate></item><item><title>Pigeon (YC W23) is hiring a lead full stack engineer</title><link>https://www.ycombinator.com/companies/pigeon/jobs/sjuJOg3-lead-full-stack-software-engineer-remote-us</link><description>&lt;doc fingerprint="aa9be2aaf687b428"&gt;
-  &lt;main&gt;
-    &lt;div&gt;
-      &lt;div&gt;
-        &lt;head rend="h1"&gt;Lead Full Stack Software Engineer at Pigeon (YC W23)&lt;/head&gt;
-        &lt;p&gt;Pigeon (YC W23) is looking for a motivated Lead Full Stack Software Engineer to join our engineering team. You can work from our NYC office or remotely if you’re not local.&lt;/p&gt;
-        &lt;p&gt;As a Lead Full Stack Software Engineer at Pigeon, you will help lead a small and fast-paced engineering team and spearhead the development of new features and systems from the ground up. You will be given a unique opportunity to shape our stack, processes, and culture while making a tangible impact on our technology and our customers.&lt;/p&gt;
-        &lt;head rend="h3"&gt;Why Join Pigeon&lt;/head&gt;
-        &lt;list rend="ul"&gt;
-          &lt;item&gt;Impact: You will own high-value features for Pigeon’s entire customer base that will help shape their everyday business processes.&lt;/item&gt;
-          &lt;item&gt;Culture: You will help shape how we work on a day-to-day basis and inform core values as we grow.&lt;/item&gt;
-          &lt;item&gt;Leadership: You will be placed in a key leadership position with the opportunity to contribute to our direction, goals, and vision.&lt;/item&gt;
-          &lt;item&gt;Learning: You will be encouraged to experiment with new methods and technologies to enable innovative experiences for customers.&lt;/item&gt;
-        &lt;/list&gt;
-        &lt;head rend="h3"&gt;What You’ll Do&lt;/head&gt;
-        &lt;list rend="ul"&gt;
-          &lt;item&gt;Own core services, APIs, and integrations with third-party systems&lt;/item&gt;
-          &lt;item&gt;Build and scale our AI-powered document processing system&lt;/item&gt;
-          &lt;item&gt;Ship new features end-to-end - from conception to implementation to deployment&lt;/item&gt;
-        &lt;/list&gt;
-        &lt;head rend="h3"&gt;What We’re Looking For&lt;/head&gt;
-        &lt;list rend="ul"&gt;
-          &lt;item&gt;5+ years experience as a full-stack software engineer&lt;/item&gt;
-          &lt;item&gt;Comfortable with fast-paced development environment and early-stage ambiguity&lt;/item&gt;
-          &lt;item&gt;Ability to take full ownership of projects (scoping, system design, implementation, QA, deployment, and maintenance)&lt;/item&gt;
-        &lt;/list&gt;
-        &lt;head rend="h3"&gt;Our Stack&lt;/head&gt;
-        &lt;list rend="ul"&gt;
-          &lt;item&gt;AWS, Kubernetes, Vercel&lt;/item&gt;
-          &lt;item&gt;Python, Flask, FastAPI, SqlAlchemy&lt;/item&gt;
-          &lt;item&gt;NextJS, Javascript/Typescript, React, CSS, Tailwind&lt;/item&gt;
-        &lt;/list&gt;
-        &lt;head rend="h3"&gt;Benefits:&lt;/head&gt;
-        &lt;list rend="ul"&gt;
-          &lt;item&gt;Healthcare (Medical, Vision, and Dental)&lt;/item&gt;
-          &lt;item&gt;OneMedical&lt;/item&gt;
-          &lt;item&gt;401(k)&lt;/item&gt;
-          &lt;item&gt;Unlimited PTO&lt;/item&gt;
-          &lt;item&gt;16” Macbook Pro (M2 Chip)&lt;/item&gt;
-          &lt;item&gt;Free Pigeon Merchandise (shop.pigeondocuments.com)&lt;/item&gt;
-        &lt;/list&gt;
-      &lt;/div&gt;
-    &lt;/div&gt;
-    &lt;div&gt;
-      &lt;p&gt;Pigeon automates the entire document lifecycle: collecting documents from clients, reviewing and extracting data with AI, and syncing with CRMs or storage systems. Pigeon eliminates the manual back-and-forth of document handling and eliminates thousands of hours of manual tasks.&lt;/p&gt;
-      &lt;p&gt;We're growing fast, and want someone who can help join our team as we prepare for the next stage of growth.&lt;/p&gt;
-      &lt;head rend="h3"&gt;Team&lt;/head&gt;
-      &lt;p&gt;We are a team of 4 who previously worked at Google, Squarespace, Deloitte, and HonorLock.&lt;/p&gt;
-      &lt;head rend="h3"&gt;Funding Status&lt;/head&gt;
-      &lt;p&gt;We closed a $3.5M Seed round post-YC.&lt;/p&gt;
-      &lt;head rend="h3"&gt;About our Technology:&lt;/head&gt;
-      &lt;p&gt;Our Stack:&lt;/p&gt;
-      &lt;list rend="ul"&gt;
-        &lt;item&gt;AWS, Kubernetes, Vercel&lt;/item&gt;
-        &lt;item&gt;Python, Flask, SqlAlchemy&lt;/item&gt;
-        &lt;item&gt;NextJS, Javascript/Typescript, React, CSS, Tailwind&lt;/item&gt;
-      &lt;/list&gt;
-    &lt;/div&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45505666</guid><pubDate>Tue, 07 Oct 2025 17:00:09 +0000</pubDate></item><item><title>Doing Rails Wrong</title><link>https://www.bananacurvingmachine.com/articles/you-re-doing-rails-wrong</link><description>&lt;doc fingerprint="2cd7f1377fc53f68"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45505398</guid><pubDate>Tue, 07 Oct 2025 16:39:13 +0000</pubDate></item><item><title>Doing Rails Wrong</title><link>https://www.bananacurvingmachine.com/articles/you-re-doing-rails-wrong</link><description>&lt;doc fingerprint="2cd7f1377fc53f68"&gt;
   &lt;main&gt;
     &lt;head rend="h2"&gt; You're doing Rails wrong. copy link &lt;/head&gt;
     &lt;head rend="h6"&gt;Tuesday, 07 October 2025&lt;/head&gt;
@@ -1068,9 +631,9 @@ nx build docs&lt;/code&gt;
     &lt;p&gt;This is based on fuel costs ranging from $600 to $1000 per tonne.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45507398</guid><pubDate>Tue, 07 Oct 2025 19:07:07 +0000</pubDate></item><item><title>Banning controversy reveals Bluesky's decentralized aspiration isn't reality</title><link>https://plus.flux.community/p/banning-controversy-reveals-blueskys</link><description>&lt;doc fingerprint="bc98df1bb92e86dd"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45507398</guid><pubDate>Tue, 07 Oct 2025 19:07:07 +0000</pubDate></item><item><title>Banning controversy reveals Bluesky's decentralized aspiration isn't reality</title><link>https://plus.flux.community/p/banning-controversy-reveals-blueskys</link><description>&lt;doc fingerprint="bc98df1bb92e82dd"&gt;
   &lt;main&gt;
-    &lt;head rend="h1"&gt;Banning controversy reveals Bluesky’s decentralized aspiration isn’t reality&lt;/head&gt;
+    &lt;head rend="h1"&gt;User ban controversy reveals Bluesky’s decentralized aspiration isn’t reality&lt;/head&gt;
     &lt;head rend="h3"&gt;Bluesky’s protocol is so complicated that not even the biggest alternative network has figured out how to become independent&lt;/head&gt;
     &lt;p&gt;When it launched in 2023 in private beta, Bluesky was pitched as a different kind of social network, one that placed openness and user-friendliness at its core. It came along at just the right moment as Elon Musk’s purchase and takeover of Twitter led millions of users head toward any type of exit.&lt;/p&gt;
     &lt;p&gt;The initial destination for many was Mastodon, but its Linux geek ethos and system of numerous “federated” servers that communicate via the open-source ActivityPub protocol proved to be too complicated for people who just wanted to crack jokes. Acting on the opportunity, Bluesky opened up to the public in February 2024 and saw a rapid influx of users.&lt;/p&gt;
@@ -1087,7 +650,10 @@ nx build docs&lt;/code&gt;
     &lt;p&gt;Due to the complexity of the Bluesky software stack, whether its federation model actually works in practice has not really been put to the test. While ActivityPub has several instances with millions of users (like Facebook Threads, Flipboard, and even Donald Trump’s Truth Social), it also has many much smaller ones run by small organizations and individuals.&lt;/p&gt;
     &lt;p&gt;As of this writing, however, the only completely independent implementation of ATProto is Bluesky. But that isn’t for want of trying on the part of Rudy Fraser, the creator of Blacksky, an alternative service that he unveiled in May of 2023 in response to Black American users’ complaints about Bluesky’s moderation policies.&lt;/p&gt;
     &lt;p&gt;Despite Fraser’s efforts to implement his own PDS, Relay, and App View, however, Blacksky still remains partially dependent upon Bluesky’s application server, largely because while the code to implement the dataplane of posts and users within an application server is released, the open-source version is slower. As a result, Blacksky is dependent on Bluesky’s application server to give users a fast experience, which also means that it is dependent on Bluesky’s labeling system and its moderation choices.&lt;/p&gt;
-    &lt;p&gt;Blacksky’s continued dependency on Bluesky came into focus on Sunday after a Blacksky user going by the handle “Link” suddenly found himself unable to view his own posts on the alternative site.&lt;/p&gt;
+    &lt;p&gt;The labeling software, called Ozone, also has issues, according to Bluesky engineer Bryan Newbold.&lt;/p&gt;
+    &lt;p&gt;“Making it easier to run moderation services is something we want to do. we invested a lot of time and effort in Ozone, but have not been able to focus on making it usable/accessible for independent folks,” he wrote in an Oct. 3 post, adding that “we are looking at funding folks to fork or re-implement it for community use-case.”&lt;/p&gt;
+    &lt;p&gt;This limitation is likely to be another reason why Blacksky relies on Bluesky's AppView. Without it, Blacksky’s independent moderators couldn't actually perform their task. (Fraser did not respond to repeated attempts to contact him for comment.)&lt;/p&gt;
+    &lt;p&gt;Blacksky’s continued dependency on Bluesky came into focus on Sunday after a Blacksky user going by the handle Link suddenly found himself unable to view his own posts on the alternative site.&lt;/p&gt;
     &lt;p&gt;“My account was taken down without any explanation for almost a full day,” Link told me in a Signal message, showing me a screenshot indicating that he had been banned even as his Blacksky account remained capable of viewing others’ posts and changing preferences. Unbeknownst to him, Link’s account had been banned by Bluesky’s moderators and this meant that even though he was in good standing at Blacksky, no one there, including himself, was able to read his posts. (They are visible within the ATProto firehose feed, however, as several sharp-eyed users soon discovered.)&lt;/p&gt;
     &lt;p&gt;Link’s banning came at a very bad moment for Bluesky, just weeks after it had banned or suspended several users following the Sept. 10 murder of far-right activist Charlie Kirk, which many Republican officials have sought to use as a tool for government censorship.&lt;/p&gt;
     &lt;p&gt;Federal Communications Commission Brendan Carr’s threats against late night comedian Jimmy Kimmel led to his temporary suspension by ABC, and he was far from the only Republican to issue them. Louisiana Rep. Clay Higgins, chair of the House subcommittee on federal law enforcement, sent a menacing letter to Bluesky and other social media networks demanding that they identify and ban anyone deemed to be celebrating Kirk’s killing.&lt;/p&gt;
@@ -1111,6 +677,7 @@ nx build docs&lt;/code&gt;
     &lt;p&gt;Help may be on the horizon, however. As developers are becoming more aware of the power of ATProto, they are building increasingly complex projects on it, including a promising service called Slices, which aims to make it easy to build and deploy custom AppViews, a feature Blacksky and other Bluesky alternatives could certainly use. Bluesky execs have said they are working hard to make federation easier.&lt;/p&gt;
     &lt;p&gt;Meanwhile, Link is caught in limbo.&lt;/p&gt;
     &lt;p&gt;“Now my account is not viewable on either Blacksky or Bluesky,” he notes. “I’m fortunate that I moved over to Blacksky and I think that is the only reason I still have access to my account and data…Bluesky claims to want decentralization and composable moderation, but they still enjoy abusing the power of arbitrary banishment.”&lt;/p&gt;
+    &lt;p&gt;This story has been updated to include a post from Bluesky developer Bryan Newbold.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
 &lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45507880</guid><pubDate>Tue, 07 Oct 2025 19:44:00 +0000</pubDate></item><item><title>Gemini 2.5 Computer Use model</title><link>https://blog.google/technology/google-deepmind/gemini-computer-use-model/</link><description>&lt;doc fingerprint="b97269db1c538405"&gt;
@@ -1163,4 +730,73 @@ nx build docs&lt;/code&gt;
     &lt;p&gt;Tiny Recursion Model (TRM) recursively improves its predicted answer y with a tiny network. It starts with the embedded input question x and initial embedded answer y and latent z. For up to K improvements steps, it tries to improve its answer y. It does so by i) recursively updating n times its latent z given the question x, current answer y, and current latent z (recursive reasoning), and then ii) updating its answer y given the current answer y and current latent z. This recursive process allows the model to progressively improve its answer (potentially addressing any errors from its previous answer) in an extremely parameter-efficient manner while minimizing overfitting.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45508213</guid><pubDate>Tue, 07 Oct 2025 20:11:58 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45508213</guid><pubDate>Tue, 07 Oct 2025 20:11:58 +0000</pubDate></item><item><title>Metriport (YC S22) is hiring a founding recruiter</title><link>https://www.ycombinator.com/companies/metriport/jobs/uq6CuhA-founding-recruiter</link><description>&lt;doc fingerprint="b75c73b3cc765a6c"&gt;
+  &lt;main&gt;
+    &lt;div&gt;
+      &lt;p&gt;Metriport helps healthcare organizations access, analyze, and exchange patient data in real-time. Our open-source data intelligence platform integrates with all major healthcare IT systems in the US, and taps into comprehensive medical data for 300M+ individuals. Concretely, check out the following resources to learn more about what we actually do:&lt;/p&gt;
+      &lt;p&gt;If you want to do work that matters and has a direct impact on people’s lives, you should consider joining us - there’s a good chance that this will be some of the most fulfilling, interesting, and impactful work you do in your career.&lt;lb/&gt; We are looking for our first in-house recruiter to lead efforts of scaling our team with formidable talent, end-to-end. You will be recruiting across all company functions - from engineering, to customer success, to design, and so on.&lt;/p&gt;
+      &lt;head rend="h2"&gt;About us&lt;/head&gt;
+      &lt;p&gt;The following points are an assortment of the most relevant bits that will give you the gist of where we’re at, why we’ll win, and our company culture:&lt;/p&gt;
+      &lt;list rend="ul"&gt;
+        &lt;item&gt;Series A (unannounced), found PMF, multi-million ARR, 90+ customers (including Strive Health, Circle Medical, and Brightside Health), funded by top VCs and angels, have years of runway - and we’re just getting started.&lt;/item&gt;
+        &lt;item&gt;We’re a tight-knit, high performing, and passionate team - we work with a consistent intensity and have become a leader in our industry with a fraction of the resources of our competitors. &lt;list rend="ul"&gt;&lt;item&gt;Consistency means we push as hard as humanly possible, while keeping our health and personal lives in check.&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
+        &lt;item&gt;Meaningful work is what gets us out of bed, and we just wouldn’t be satisfied by building yet another CRM company.&lt;/item&gt;
+        &lt;item&gt;By pedigree, we’re a group of underdogs - we don’t hire based on prestige, but on demonstrated competence and perceived potential.&lt;/item&gt;
+        &lt;item&gt;We operate as a relatively flat structure with little red tape, forced structure, or bureaucracy. We just opt to get shit done and foster a collaborative environment with high autonomy - our GitHub commit history and product velocity is a testament to this.&lt;/item&gt;
+        &lt;item&gt;The founders set the pace by working 6 days a week in our SF office, but everyone is given full freedom to craft a schedule that’s best for both the team and themselves - team output is measured, “butts in seats” are not.&lt;/item&gt;
+      &lt;/list&gt;
+      &lt;head rend="h2"&gt;About you&lt;/head&gt;
+      &lt;p&gt;In a nutshell, we're looking for a founding “full-stack recruiter” with the following specific qualities:&lt;/p&gt;
+      &lt;list rend="ul"&gt;
+        &lt;item&gt;You want to work at a fast-paced startup.&lt;/item&gt;
+        &lt;item&gt;You’re excited by working in the intersection of healthcare, data, and AI.&lt;/item&gt;
+        &lt;item&gt;You have a strong sense of ownership over your work, and have demonstrated ability to lead others.&lt;/item&gt;
+        &lt;item&gt;You’re entrepreneurial minded, and you don’t need a defined playbook to be successful in your role - you’re able to create and own your own systems.&lt;/item&gt;
+        &lt;item&gt;When someone scopes out an assignment with a target ETA of 3 weeks, you ask yourself "why can't it be done in 3 days?".&lt;/item&gt;
+        &lt;item&gt;You feel that you have a good “taste” for startup talent, developed through your prior recruiting experience.&lt;/item&gt;
+        &lt;item&gt;Bonus: you have an engineering background that allows you to vet technical talent thoroughly.&lt;/item&gt;
+      &lt;/list&gt;
+      &lt;head rend="h2"&gt;What you'll be doing&lt;/head&gt;
+      &lt;p&gt;From day 1, you’ll be ramped up quickly to expert-level domain knowledge in the healthcare data IT space to help you understand the context of what we’re working towards, all of the projects that our team is currently working on, and what we’ll be working on in the future.&lt;lb/&gt; Every day, you'll be working towards moving the needle on all things related to ensuring we are working with the best talent possible, while reaching aggressive growth goals. Generally, this will look like:&lt;/p&gt;
+      &lt;list rend="ul"&gt;
+        &lt;item&gt;Making the world a better place (but actually).&lt;/item&gt;
+        &lt;item&gt;Talent Brand Management: create and manage our public hiring presence - our job site, listings, social media posts, etc.&lt;/item&gt;
+        &lt;item&gt;Sourcing: using traditional outreach tools, as well as your own creative approaches, get the best talent possible in our recruiting funnel.&lt;/item&gt;
+        &lt;item&gt;Interviewing: schedule, run, and organize multi-stage interviews, including coordinating any travel necessary.&lt;/item&gt;
+        &lt;item&gt;Closing: writing offer letters and ensuring they close.&lt;/item&gt;
+        &lt;item&gt;Onboarding: help with onboarding new employees when they start and making sure they have everything they need to hit the round running.&lt;/item&gt;
+        &lt;item&gt;Payroll/HR: as needed, perform a variety of payroll and HR related tasks like reimbursements, purchase requests, device provisioning, etc.&lt;/item&gt;
+        &lt;item&gt;Attending a daily 30 minute remote stand-up at 7:30am PST Mon-Fri (our only regular mandatory meeting).&lt;/item&gt;
+      &lt;/list&gt;
+      &lt;head rend="h2"&gt;Requirements&lt;/head&gt;
+      &lt;list rend="ul"&gt;
+        &lt;item&gt;You have enough technical knowledge to be able to understand our product, what our team is working towards, and where we fit into the healthcare landscape.&lt;/item&gt;
+        &lt;item&gt;You’ve worked with, or can quickly learn how to operate, tools like: Surfe, Gem, LinkedIn Recruiter, Pave, Levels, Notion, Slack, Zapier, Excel, etc.&lt;/item&gt;
+        &lt;item&gt;You have excellent communication skills, and ideally some prior consulting experience.&lt;/item&gt;
+        &lt;item&gt;You’re located in San Francisco or the Bay Area (or willing to relocate).&lt;/item&gt;
+      &lt;/list&gt;
+      &lt;head rend="h2"&gt;Benefits&lt;/head&gt;
+      &lt;list rend="ul"&gt;
+        &lt;item&gt;Competitive equity + compensation package 🚀&lt;/item&gt;
+        &lt;item&gt;Top tier full family health insurance, dental, and vision coverage 🦷&lt;/item&gt;
+        &lt;item&gt;401(k) retirement plan + matching 💰&lt;/item&gt;
+        &lt;item&gt;Flexible work from home or in-office 🏢 &lt;list rend="ul"&gt;&lt;item&gt;Healthy lunches are complimentary when working in-office (and breakfast + dinners as needed) 🍏&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
+        &lt;item&gt;Quarterly company off-sites with the team ⛷️&lt;/item&gt;
+        &lt;item&gt;MacBook provided by us 💻&lt;/item&gt;
+        &lt;item&gt;Unlimited PTO (we work hard, but trust you to take time you need to be at your best) 🧘♂️&lt;/item&gt;
+      &lt;/list&gt;
+    &lt;/div&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45508811</guid><pubDate>Tue, 07 Oct 2025 21:00:51 +0000</pubDate></item><item><title>No more loud commercials: Governor Newsom signs SB 576</title><link>https://www.gov.ca.gov/2025/10/06/no-more-loud-commercials-governor-newsom-signs-sb-576/</link><description>&lt;doc fingerprint="b0e9441173abf679"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;No more loud commercials: Governor Newsom signs SB 576&lt;/head&gt;
+    &lt;p&gt;What you need to know: Governor Newsom today signed legislation ensuring the volume of commercials no longer rises to a level louder than the original programming.&lt;/p&gt;
+    &lt;p&gt;SACRAMENTO – Governor Gavin Newsom today signed SB 576 by Senator Thomas Umberg (D-Santa Ana) to turn down the volume of commercials that rise to a level louder than the primary video content being watched. Building on Congress’ Commercial Advertisement Loudness Mitigation (CALM) Act passed in 2010 – which applied to broadcast television stations and cable operators – the law Governor Newsom signed today will also apply to streaming services, which have skyrocketed in popularity over the past decade.&lt;/p&gt;
+    &lt;head rend="h4"&gt;“We heard Californians loud and clear, and what’s clear is that they don’t want commercials at a volume any louder than the level at which they were previously enjoying a program. By signing SB 576, California is dialing down this inconvenience across streaming platforms, which had previously not been subject to commercial volume regulations passed by Congress in 2010.”&lt;/head&gt;
+    &lt;p&gt;Governor Gavin Newsom&lt;/p&gt;
+    &lt;p&gt;“This bill was inspired by baby Samantha and every exhausted parent who’s finally gotten a baby to sleep, only to have a blaring streaming ad undo all that hard work,” said Senator Thomas Umberg. “SB 576 brings some much-needed peace and quiet to California households by making sure streaming ads aren’t louder than the shows we actually want to watch.”&lt;/p&gt;
+    &lt;p&gt;For full text of the bill, visit: http://leginfo.legislature.ca.gov.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45508944</guid><pubDate>Tue, 07 Oct 2025 21:12:37 +0000</pubDate></item></channel></rss>
