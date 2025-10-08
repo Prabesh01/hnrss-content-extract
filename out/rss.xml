@@ -1,544 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 08 Oct 2025 14:41:59 +0000</lastBuildDate><item><title>Show HN: I'm building a browser for reverse engineers</title><link>https://nullpt.rs/reverse-engineering-browser</link><description>&lt;doc fingerprint="aa009620a90d26e8"&gt;
-  &lt;main&gt;
-    &lt;head rend="h2"&gt;Preamble&lt;/head&gt;
-    &lt;p&gt;In the expanding world of AI my heart still lies in AST transforms, browser fingerprinting, and anti-bot circumvention. In fact, that's the majority of this blog's content. But my workflow always felt... primitive. I was still manually sifting through page scripts, pasting suspicious snippets into an editor, and writing bespoke deobfuscators by hand. Tools like Webcrack and deobfuscate.io help, but the end-to-end loop still felt slow and manual. I wanted to build a tool that would be my web reverse-engineering Swiss Army knife&lt;/p&gt;
-    &lt;p&gt;If you're just curious about what it looks like and don't care about how it works then here's a quick showcase:&lt;/p&gt;
-    &lt;head rend="h2"&gt;Humble Beginnings&lt;/head&gt;
-    &lt;p&gt;My first idea was simple: make a browser extension. For an MVP I wanted to hook an arbitrary function like &lt;code&gt;Array.prototype.push&lt;/code&gt; as early as possible and log every call to it.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Hooking functions in JavaScript&lt;/head&gt;
-    &lt;p&gt;In JavaScript, it's trivial to hook into and override existing functions because you can reassign references at runtime. A common pattern is to stash the original function, replace it with a wrapper that does whatever instrumentation you want, and then call the original so the page keeps behaving normally:&lt;/p&gt;
-    &lt;code&gt;const _origPush = Array.prototype.push;
-Array.prototype.push = function (...args) {
-  console.log('Array.push called on', this, 'with', args);
-  return _origPush.apply(this, args);
-};
-&lt;/code&gt;
-    &lt;p&gt;Here's what that looks like in Chrome's devtools:&lt;/p&gt;
-    &lt;p&gt;This technique should make it pretty straightforward to build a Chrome extension that hooks arbitrary global functions on page load and surfaces calls in a small UI.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Content Scripts&lt;/head&gt;
-    &lt;p&gt;Chrome's content scripts are files that run in the context of web pages, which we can use to install our hooks early.&lt;/p&gt;
-    &lt;p&gt;The idea is simple, we create a content script that runs at document_start that injects a tiny bit of code that replaces &lt;code&gt;Array.prototype.push&lt;/code&gt; with a wrapper that logs and then calls the original.&lt;/p&gt;
-    &lt;code&gt;{
- "name": "My extension",
- "content_scripts": [
-   {
-     "run_at": "document_start", // Script is injected after any files from css, but before any other DOM is constructed or any other script is run.
-     "matches": ["&amp;lt;all_urls&amp;gt;"],
-     "js": ["content-script.js"]
-   }
- ]
-}
-&lt;/code&gt;
-    &lt;code&gt;const _origPush = Array.prototype.push;
-Array.prototype.push = function (...args) {
-  console.log('Array.push called on', this, 'with', args);
-  return _origPush.apply(this, args);
-};
-&lt;/code&gt;
-    &lt;p&gt;Running this on a page that clearly used Array.push gave me... absolutely nothing. At first, I thought it had to be an execution order issue. Maybe my hook was loading too late? But after another read through the docs, I found this painfully obvious note staring me right in the face:&lt;/p&gt;
-    &lt;p&gt;âContent scripts live in an isolated world, allowing a content script to make changes to its JavaScript environment without conflicting with the page or other extensionsâ content scripts.â&lt;/p&gt;
-    &lt;p&gt;In hindsight, of course that makes sense. Still, it sucked. I wasnât ready to give up yet, though. I had a potentially clever workaround: injecting a &lt;code&gt;&amp;lt;script&amp;gt;&lt;/code&gt; tag directly into the page with my hook inside. But, naturally, it could never be that easy.&lt;/p&gt;
-    &lt;p&gt;I knew if I wanted to get this done, I would have to go down a layer.&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;Editor's Note: Some readers have kindly pointed out to me that this is actually possible to accomplish from an extension. However, the custom browser approach still has benefits explained later in the post :-)&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;head rend="h2"&gt;Chrome Devtools Protocol&lt;/head&gt;
-    &lt;p&gt;The Chrome DevTools Protocol (CDP) is the low-level bridge for instrumenting, inspecting, and debugging Chromium-based browsers. Itâs what automation tools like Selenium and Playwright use under the hood. CDP exposes a large set of methods and events split across domains. The docs publish a convenient, comprehensive list of them.&lt;/p&gt;
-    &lt;p&gt;While reading the domains, one method jumped out: &lt;code&gt;Page.addScriptToEvaluateOnNewDocument&lt;/code&gt;. Its description "Evaluates given script in every frame upon creation (before loading frame's scripts)" sounded like exactly the hook we needed: run code before the pageâs own scripts so we can win the prototype race.&lt;/p&gt;
-    &lt;p&gt;To prove the idea I built a tiny test: a page with a script that pushes a secret value into an array, and a CDP-injected hook that tries to observe that push. If the hook sees the secret, the technique works. I chose to prototype this using Electron. I could have spoken directly to the browser over raw CDP, but Electron made wiring up a UI, IPC, and a quick demo app way faster for a weekend PoC.&lt;/p&gt;
-    &lt;code&gt;const { app, BrowserWindow } = require("electron/main");
-
-function createWindow() {
-  const win = new BrowserWindow({
-    width: 800,
-    height: 600,
-  });
-
-  const dbg = win.webContents.debugger;
-  dbg.attach("1.3");
-  // Enables the Page domain so we can run the script on new document command after
-  dbg.sendCommand("Page.enable");
-  dbg.sendCommand("Page.addScriptToEvaluateOnNewDocument", {
-    source: `(() =&amp;gt; {
-        const _origPush = Array.prototype.push;
-        Array.prototype.push = function (...args) {
-            console.log('Array.push called on', this, 'with', args);
-            return _origPush.apply(this, args);
-        };
-})();`,
-  });
-  win.webContents.openDevTools();
-  win.loadURL("file:///Users/veritas/demo/index.html");
-}
-
-app.whenReady().then(() =&amp;gt; {
-  createWindow();
-});
-&lt;/code&gt;
-    &lt;p&gt;The result?:&lt;/p&gt;
-    &lt;p&gt;It worked! I knew this PoC could take me far. I could hook any arbitrary global function or property and log (or spoof!) arguments and return values. The next step was building a user interface around it.&lt;/p&gt;
-    &lt;p&gt;Since this started as a fun weekend project, I wanted the fastest path to a working demo. In true open-source fashion I searched for âelectron web browserâ and stumbled across electron-browser-shell by Samuel Maddock.&lt;/p&gt;
-    &lt;p&gt;That project gave me an address bar, tabs, and a basic IPC-ready shell bridging the webview environment and my browser UI.&lt;/p&gt;
-    &lt;p&gt;From there I added a sidebar that would display hooked function events as they fired.&lt;/p&gt;
-    &lt;p&gt;To make things more interesting I needed to hook more than Array.push. A favorite target of fingerprinting scripts is the Canvas API. Sites can draw a static image to a &lt;code&gt;&amp;lt;canvas&amp;gt;&lt;/code&gt;, call &lt;code&gt;toDataURL()&lt;/code&gt; (or read pixel data), and use the resulting hash to fingerprint your GPU using subtle rendering differences. By correlating canvas hashes with other signals (user agent, installed fonts, etc.), trackers can build a surprisingly robust fingerprint. Watching and optionally spoofing these kind of calls is extremely useful for this kind of RE work.&lt;/p&gt;
-    &lt;p&gt;The result looked as follows:&lt;/p&gt;
-    &lt;p&gt;I was pretty happy with the direction the project was taking. The PoC actually felt useful. Remembering my previous work reverse-engineering TikTokâs web collector and how aggressively those collectors scrape client-side signals, I couldnât resist testing the hook there. I fired up the demo, pointed it at TikTok, and watched the UI for activity.&lt;/p&gt;
-    &lt;p&gt;The site was pulling a decent amount of telemetry. Canvas calls (like &lt;code&gt;toDataURL&lt;/code&gt;), WebGL stats, font and plugin probes, and other subtle signals that, when combined, paint a detailed fingerprint. Seeing those calls appear in my sidebar made this project feel immediately worthwhile.&lt;/p&gt;
-    &lt;p&gt;I even made sure to include all canvas operations in a secrion of the detail pane to be able to recreate a canvas if necessary.&lt;/p&gt;
-    &lt;p&gt;I wanted to run this against more anti-bots. Out of curiosity I pointed the demo at a site using Cloudflareâs Turnstile. I knew Turnstile was collecting various browser signals, but to my surprise, my sidebar showed nothing. Why was I seeing zero logs?&lt;/p&gt;
-    &lt;head rend="h2"&gt;OOPif(S) I did it again&lt;/head&gt;
-    &lt;p&gt;Cloudflare renders the Turnstile widget inside a sandboxed iframe tucked into a closed shadow root. This iframe is an OOPIF (out-of-process iframe). It lives in a different renderer process so page-level scripts (and our injected hooks) simply wonât run there, thus, no logs.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Hopping the Turnstile&lt;/head&gt;
-    &lt;quote&gt;
-      &lt;p&gt;In 2024, the M.T.A. reports to have lost a combined $568 million in unpaid bus fares and $350 million in unpaid subway fares, wait, wrong turnstile.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;We needed a way to run our hooks inside those out-of-process frames. While scanning CDP I noticed the &lt;code&gt;Target.attachedToTarget&lt;/code&gt; event. It fires when the debugger auto-attaches to a new target or when you explicitly call &lt;code&gt;attachToTarget&lt;/code&gt;. This was the key: if we tell CDP to auto-attach to targets, it will notify us (and give us a &lt;code&gt;sessionId&lt;/code&gt;) for every new frame/process as it appears. With that target/session info we can evaluate code in the correct context so our hook actually runs inside OOPIFs as they spawn.&lt;/p&gt;
-    &lt;code&gt;const dbg = view.webContents.debugger
-dbg.on('message', async (_, method, params) =&amp;gt; {
-    if (method === 'Target.attachedToTarget') {
-        const { sessionId, targetInfo } = params
-        // Prepare child session
-        dbg.sendCommand('Runtime.enable', {}, sessionId).catch(() =&amp;gt; {})
-        dbg.sendCommand('Page.enable', {}, sessionId).catch(() =&amp;gt; {})
-        // Inject hook script into child frames (iframes)
-        dbg.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: hook }, sessionId)
-    }
-})
-&lt;/code&gt;
-    &lt;p&gt;Tada, we have events!&lt;/p&gt;
-    &lt;p&gt;Iâm not the first to hook common globals and dynamically analyze page scripts. Anti-bots are well aware of this trick and will use a variety of techniques to detect runtime JS patches, so you canât assume your wrappers will stay hidden.&lt;/p&gt;
-    &lt;p&gt;How is this possible?&lt;/p&gt;
-    &lt;head rend="h2"&gt;toString theory&lt;/head&gt;
-    &lt;p&gt;In JavaScript, functions contain a &lt;code&gt;toString&lt;/code&gt; instance method. Let's try calling this on a native function:&lt;/p&gt;
-    &lt;code&gt;const mapToString = Array.prototype.map.toString()
-// returns 'function map() { [native code] }'
-&lt;/code&gt;
-    &lt;p&gt;This means that the implementation of this function is provided by the browser's native code. How does this look like with our hook applied?:&lt;/p&gt;
-    &lt;code&gt;const _origPush = Array.prototype.push;
-Array.prototype.push = function (...args) {
-  console.log('Array.push called on', this, 'with', args);
-  return _origPush.apply(this, args);
-};
-const pushToString = Array.prototype.push.toString(); // Returns "function (...args) {\n  console.log('Array.push called on', this, 'with', args);\n  return _origPush.apply(this, args);\n}"
-&lt;/code&gt;
-    &lt;p&gt;Oh no, our hook has been discovered! Luckily for us, this is easily patched&lt;/p&gt;
-    &lt;code&gt;Array.prototype.push.toString = () =&amp;gt; "function push() { [native code] }";
-&lt;/code&gt;
-    &lt;p&gt;Phew, that was close.&lt;/p&gt;
-    &lt;code&gt;const haha = Array.prototype.push.toString.toString(); // '() =&amp;gt; "function push() { [native code] }"'
-&lt;/code&gt;
-    &lt;p&gt;Oh no, another leak!&lt;/p&gt;
-    &lt;code&gt;Array.prototype.push.toString.toString = () =&amp;gt; "function toString() { [native code] }"; // Yay it's fixed
-&lt;/code&gt;
-    &lt;p&gt;Ahhh! Another one!&lt;/p&gt;
-    &lt;code&gt;const haha = Array.prototype.push.toString.toString.toString.toString.toString.toString();
-&lt;/code&gt;
-    &lt;p&gt;Wait, you can do what now!?&lt;/p&gt;
-    &lt;code&gt;const youCantEscape = Function.toString.call(Array.prototype.push); // Returns "function (...args) {\n  console.log('Array.push called on', this, 'with', args);\n  return _origPush.apply(this, args);\n}"
-&lt;/code&gt;
-    &lt;p&gt;These JS runtime patches turned out to be frustratingly leaky. Patch one hole and another opens. Fixes were possible, but every patch felt like a bandaid that introduced new detection vectors. see:&lt;/p&gt;
-    &lt;code&gt;const _origPush = Array.prototype.push;
-Array.prototype.push = function (...args) {
-  console.log('Array.push called on', this, 'with', args);
-  return _origPush.apply(this, args);
-};
-
-// Yay, we patched this
-Array.prototype.push.toString = () =&amp;gt; "function push() { [native code] }";
-Array.prototype.push.toString.toString = () =&amp;gt; "function toString() { [native code] }";
-
-// *facepalm*
-const anotherLeak = Array.prototype.push.name; // returns "" instead of "push"
-&lt;/code&gt;
-    &lt;p&gt;Those runtime patches were very brittle. Targets we were analyzing could detect the instrumentation and change behavior or even self destruct if they noticed they were being watched. Fixing each leak felt like an endless game of whack-a-mole, so I decided to go a layer deeper.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Forking Chromium&lt;/head&gt;
-    &lt;p&gt;At this point I knew I wanted to fork Chromium. I still planned to use Electron, at least for now, since Iâd already built a decent UI and didnât feel like rewriting it all in native C++. The idea was simple: fork Electron (and by extension Chromium), patch into the Blink layer where these API calls happen, and expose them somehow.&lt;/p&gt;
-    &lt;p&gt;I didnât spend too long figuring out how Iâd surface those events. I was already using CDP, so why not create my own custom CDP domain and emit events from there? That way my existing Electron app could just subscribe to them like any other CDP event.&lt;/p&gt;
-    &lt;p&gt;Luckily, Electron has a well-documented guide for building from source. Unluckily, building it took more than three hours on my M2 Pro Mac Mini. To make things worse, macOS 26 had broken parts of the build chain. The Metal toolchain wasnât being detected no matter what I had tried. Eventually, I hardcoded the path into the build script just to move forward. After several hours of C++ compilation errors and boredom, I finally had a locally built Electron binary running from source.&lt;/p&gt;
-    &lt;p&gt;Now came the hard part: creating a custom CDP domain. The &lt;code&gt;devtools-frontend&lt;/code&gt; repository actually provides documentation on defining new protocol domains.&lt;/p&gt;
-    &lt;p&gt;The gist is that protocols are defined in a &lt;code&gt;.pdl&lt;/code&gt; (Protocol Definition Language) file, specifically &lt;code&gt;browser_protocol.pdl&lt;/code&gt;. To add your own domain, you simply declare it there alongside the existing ones.&lt;/p&gt;
-    &lt;p&gt;I decided to name my new domain &lt;code&gt;Snitch&lt;/code&gt;, and defined it like this:&lt;/p&gt;
-    &lt;code&gt;experimental domain Snitch
-  command disable
-  command enable
-  event toDataURLCalled
-    parameters
-      string dataURL
-      optional string frameId
-      optional string contextId
-&lt;/code&gt;
-    &lt;p&gt;Next, you include your new protocol files in Blinkâs build configuration, found in &lt;code&gt;third_party/blink/renderer/core/inspector/BUILD.gn&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;From there, you define an agent, the bridge that connects Blinkâs internals to the DevTools Protocol so your new CDP domain can send and receive events.&lt;/p&gt;
-    &lt;p&gt;Iâll be honest, the documentation for this part was pretty lacking. The only promising link in the documentation pointed to a locked Google Doc presumably restricted to Chrome team members. They say there's no better documentation than the source code itself! By dissecting existing domains like &lt;code&gt;DOMStorage&lt;/code&gt;, &lt;code&gt;Network&lt;/code&gt;, and others, I reverse-engineered how they registered and dispatched events, then adapted that pattern for my own &lt;code&gt;Snitch&lt;/code&gt; domain.&lt;/p&gt;
-    &lt;p&gt;I eventually landed on this:&lt;/p&gt;
-    &lt;p&gt;snitch_agent.h&lt;/p&gt;
-    &lt;code&gt;#ifndef THIRD_PARTY_BLINK_RENDERER_CORE_INSPECTOR_SNITCH_AGENT_H_
-#define THIRD_PARTY_BLINK_RENDERER_CORE_INSPECTOR_SNITCH_AGENT_H_
-#include &amp;lt;optional&amp;gt;
-
-#include "third_party/blink/renderer/core/core_export.h"
-#include "third_party/blink/renderer/core/inspector/inspector_base_agent.h"
-#include "third_party/blink/renderer/core/inspector/protocol/snitch.h"
-
-namespace blink {
-
-class InspectedFrames;
-
-class CORE_EXPORT SnitchAgent final
-    : public InspectorBaseAgent&amp;lt;protocol::Snitch::Metainfo&amp;gt; {
- public:
-  SnitchAgent(InspectedFrames*);
-  SnitchAgent(const SnitchAgent&amp;amp;) = delete;
-  SnitchAgent&amp;amp; operator=(const SnitchAgent&amp;amp;) = delete;
-  ~SnitchAgent() override;
-
-  void Trace(Visitor*) const override;
-  protocol::Response enable() override;
-  protocol::Response disable() override;
-
-  void DidCanvasToDataURL(ExecutionContext*, const String&amp;amp; data_url,
-                          const String&amp;amp; frame_id,
-                          const String&amp;amp; context_id);
-
- private:
-  Member&amp;lt;InspectedFrames&amp;gt; inspected_frames_;
-  InspectorAgentState::Boolean enabled_;
-};
-
-}  // namespace blink
-
-#endif  // THIRD_PARTY_BLINK_RENDERER_CORE_INSPECTOR_SNITCH_AGENT_H_
-
-&lt;/code&gt;
-    &lt;p&gt;snitch_agent.cpp&lt;/p&gt;
-    &lt;code&gt;#include "third_party/blink/renderer/core/inspector/snitch_agent.h"
-#include "third_party/blink/renderer/core/inspector/inspected_frames.h"
-
-namespace blink {
-
-SnitchAgent::SnitchAgent(
-  InspectedFrames* inspected_frames)
-  : inspected_frames_(inspected_frames),
-    enabled_(&amp;amp;agent_state_, /*default_value=*/false) {}
-
-
-SnitchAgent::~SnitchAgent() = default;
-
-void SnitchAgent::Trace(Visitor* visitor) const {
-  visitor-&amp;gt;Trace(inspected_frames_);
-  InspectorBaseAgent::Trace(visitor);
-}
-
-protocol::Response SnitchAgent::enable() {
-  enabled_.Set(true);
-  instrumenting_agents_-&amp;gt;AddSnitchAgent(this);
-  return protocol::Response::Success();
-}
-
-protocol::Response SnitchAgent::disable() {
-  enabled_.Clear();
-  instrumenting_agents_-&amp;gt;RemoveSnitchAgent(this);
-  return protocol::Response::Success();
-}
-
-void SnitchAgent::DidCanvasToDataURL(ExecutionContext* context, const String&amp;amp; data_url,
-                                     const String&amp;amp; frame_id,
-                                     const String&amp;amp; context_id) {
-
-  if (!enabled_.Get()) {
-    return;
-  }
-
-  std::optional&amp;lt;String&amp;gt; maybe_frame;
-  if (!frame_id.empty()) {
-    maybe_frame = frame_id;
-  }
-
-  std::optional&amp;lt;String&amp;gt; maybe_ctx;
-  if (!context_id.empty()) {
-    maybe_ctx = context_id;
-  }
-
-  GetFrontend()-&amp;gt;toDataURLCalled(data_url, maybe_frame, maybe_ctx);
-}
-
-}  // namespace blink
-
-&lt;/code&gt;
-    &lt;p&gt;Now I needed a way to trigger my new event from the native C++ implementation of &lt;code&gt;toDataURL&lt;/code&gt;. The implementation for that function lives in &lt;code&gt;src/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;While digging through how other events were dispatched, I noticed something interesting. The agents werenât called directly. Instead, events were emitted through probes. These probes act as intermediary hooks that Blink uses to fire instrumentation events into the DevTools pipeline.&lt;/p&gt;
-    &lt;p&gt;Hereâs a comment from that same class showing how a probe fires when a canvas element is created:&lt;/p&gt;
-    &lt;code&gt;CanvasRenderingContext* HTMLCanvasElement::GetCanvasRenderingContextInternal(
-    ExecutionContext* execution_context,
-    const String&amp;amp; type,
-    const CanvasContextCreationAttributesCore&amp;amp; attributes) {
-  CanvasRenderingContext::CanvasRenderingAPI rendering_api =
-      CanvasRenderingContext::RenderingAPIFromId(type);
-
-  // ...
-
-  CanvasRenderingContextFactory* factory =
-      GetRenderingContextFactory(static_cast&amp;lt;int&amp;gt;(rendering_api));
-
-  // Tell the debugger about the attempt to create a canvas context
-  // even if it will fail, to ease debugging.
-  probe::DidCreateCanvasContext(&amp;amp;GetDocument());
-  // ...
-}  
-&lt;/code&gt;
-    &lt;p&gt;These probes are defined in a file called &lt;code&gt;core_probes.pidl&lt;/code&gt;. The comment at the top of this file states:&lt;/p&gt;
-    &lt;code&gt;/*
- * make_instrumenting_probes.py uses this file as a source to generate
- * core_probes_inl.h, core_probes_impl.cc and core_probe_sink.h.
- *
- * The code below is not a correct IDL but a mix of IDL and C++.
- *
- * The syntax for an instrumentation method is as follows:
- *
- *    returnValue methodName([paramAttr1] param1, [paramAttr2] param2, ...)
-&lt;/code&gt;
-    &lt;p&gt;Following this syntax, I added my custom probe:&lt;/p&gt;
-    &lt;code&gt;void DidCanvasToDataURL([Keep] ExecutionContext*, String&amp;amp; data_url, String&amp;amp; frame_id, String&amp;amp; context_id);
-&lt;/code&gt;
-    &lt;p&gt;A similarly named &lt;code&gt;core_probes.json5&lt;/code&gt; holds the mappings of which agents are responsible for which probes. We can add our entry as such:&lt;/p&gt;
-    &lt;code&gt;{
-    observers: {
-        // ...,
-        SnitchAgent: {
-            probes: ["DidCanvasToDataURL"]
-        }
-        // ...
-    }
-}
-&lt;/code&gt;
-    &lt;p&gt;The final step in adding our custom domain is to register the agent in &lt;code&gt;WebDevToolsAgentImpl::AttachSession&lt;/code&gt; like so:&lt;/p&gt;
-    &lt;code&gt;session-&amp;gt;CreateAndAppend&amp;lt;SnitchAgent&amp;gt;(inspected_frames);
-&lt;/code&gt;
-    &lt;p&gt;and actually calling it in the implementation of &lt;code&gt;toDataURL&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;String HTMLCanvasElement::toDataURL(const String&amp;amp; mime_type,
-                                    const ScriptValue&amp;amp; quality_argument,
-                                    ExceptionState&amp;amp; exception_state) const {
-  // ...
-  String data_url = ToDataURLInternal(mime_type, quality, kBackBuffer,
-                                      ReadbackType::kWebExposed);
-
-  // // Hook up call to our new CDP event (Snitch.toDataURLCalled)
-  probe::DidCanvasToDataURL(GetExecutionContext(), data_url, frame_id, context_id);
-
-  return data_url;
-}
-&lt;/code&gt;
-    &lt;p&gt;After accidentally nuking my local repository and having to restart the entire process, including sitting through another 3 hour compilation ð¥², it was ready to test!&lt;/p&gt;
-    &lt;p&gt;We can create a simple Electron test application:&lt;/p&gt;
-    &lt;code&gt;const { app, BrowserWindow } = require("electron/main");
-
-function createWindow() {
-  const win = new BrowserWindow({
-    width: 800,
-    height: 600,
-  });
-
-  const dbg = win.webContents.debugger;
-  dbg.attach("1.3");
-  dbg.sendCommand("Snitch.enable");
-  dbg.on("message", (_, method, { dataURL }) =&amp;gt; {
-    if (method === "Snitch.toDataURLCalled") {
-      console.log("toDataURL called", dataURL);
-    }
-  });
-  win.loadURL("https://demo.fingerprint.com/playground");
-}
-
-app.whenReady().then(() =&amp;gt; {
-  createWindow();
-});
-&lt;/code&gt;
-    &lt;p&gt;and run it pointing to our custom Electron build:&lt;/p&gt;
-    &lt;code&gt;$ /Users/veritas/electron/src/out/Testing/Electron.app/Contents/MacOS/Electron demo.js
-&lt;/code&gt;
-    &lt;p&gt;Drumroll, please!&lt;/p&gt;
-    &lt;p&gt;It worked! We can see our custom CDP event firing and returning to us the result of a toDataURL call on FingerprintJS' playground. We can now use these stealthy CDP events and not leak the fact that we're instrumenting these functions.&lt;/p&gt;
-    &lt;p&gt;Note: Depending on what we do in these hooks, it may still be possible to detect us through any side-effects we introduce or potentially through timing checks (Is the function slower than it would usually be?).&lt;/p&gt;
-    &lt;head rend="h2"&gt;Extras&lt;/head&gt;
-    &lt;p&gt;This was powerful, but I wanted more. I needed a few extra tools to make this thing a real web reverse-engineering Swiss Army knife.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Deobfuscation&lt;/head&gt;
-    &lt;p&gt;One of the biggest time sinks in this kind of work is dealing with obfuscated scripts. I wanted a built-in tool that could automatically detect and attempt to deobfuscate scripts as they load. Using CDPâs &lt;code&gt;Network&lt;/code&gt; domain, I intercept incoming JavaScript files and run a few lightweight heuristics to score their likelihood of being obfuscated. Suspicious ones are displayed in a separate tab, where I integrate tools like bensbâs deobfuscate.io to automatically try recovering a more readable version. The plan is to add more tools such as Webcrack and even custom deobfuscators of my own.&lt;/p&gt;
-    &lt;p&gt;I also added a section that extracts and displays recovered string literals from the processed script for added speed.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Overwriting properties and functions&lt;/head&gt;
-    &lt;p&gt;Hooking and reading is fun, but sometimes you want to change behavior. You now know that doing so in a browser environment, across OOPIFs and with anti-tamper checks is non-trivial. I built an Overrides tab where you can define custom JavaScript snippets that overwrite functions or properties across all frames. These execute without triggering common integrity checks, giving a clean way to spoof or alter these values.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Fingerprint payload decryption&lt;/head&gt;
-    &lt;p&gt;My bread and butter is dissecting anti-bot and fingerprinting scripts. These scripts often encrypt or encode their payloads before sending them to backend validators, which makes analysis painful. To make life easier, I added a feature that detects known collectors and automatically intercepts their outbound requests. It decrypts (or decodes) the payloads and displays both the plaintext and structured data in a neat table view.&lt;/p&gt;
-    &lt;p&gt;Of course, each collector still needs to be reverse-engineered beforehand. Maybe this is where AI-assisted payload analysis could step in someday? Maybe, but for now I will continue to hand-roll my own parsers :-)&lt;/p&gt;
-    &lt;head rend="h2"&gt;Next steps&lt;/head&gt;
-    &lt;p&gt;Iâm really happy with how this project has evolved. Itâs gone from my quick weekend curiosity to a genuinely useful research tool. Still, I have a few major goals remain before I can say I'm truly proud:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;&lt;p&gt;Abandon Electron&lt;/p&gt;&lt;lb/&gt;Electron was great for rapid prototyping, but it is heavy and adds its own leaks. Theyâre fixable, sure, but the cleaner path is to embed the UI directly inside Chromium. Iâm looking into how other Chromium forks (like Brave) integrate their native UIs and exploring whether I can do the same.&lt;/item&gt;
-      &lt;item&gt;&lt;p&gt;Hook all the things&lt;/p&gt;&lt;lb/&gt;Iâve already implemented a broad set of hooks. Canvas, WebGL, audio fingerprinting,&lt;code&gt;navigator&lt;/code&gt;accessors, document and window properties, and more. But can we hook everything?&lt;lb/&gt;Iâve experimented with injecting hooks deeper in V8 where function calls are dispatched, however, V8âs optimizations quickly complicate things. Disabling those optimizations would work but at the cost of performance (and thus introducing timing leaks). Another idea is to modify the IDL code generator to automatically insert hooks during buildtime. This is likely the approach I will take.&lt;/item&gt;
-      &lt;item&gt;&lt;p&gt;Release?&lt;/p&gt;&lt;lb/&gt;I havenât decided what to do once itâs ready. Maybe open source it? Would others find it useful? Was this all built into Chromium this entire time under some obscure setting that I missed? Who knows.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;And with that, I present to you a gallery of canvas fingerprint images that I've collected during this project.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Fingerprint Gallery&lt;/head&gt;
-    &lt;head rend="h3"&gt;Tiktok&lt;/head&gt;
-    &lt;head&gt;Canvas operations:&lt;/head&gt;
-    &lt;code&gt;const canvas = document.createElement('canvas')
-const context = canvas.getContext("2d")
-const gradient0 = context.createLinearGradient(10, 0, 180, 1)
-gradient0.addColorStop(0, "red")
-gradient0.addColorStop(0.1, "white")
-gradient0.addColorStop(0.2, "blue")
-gradient0.addColorStop(0.3, "yellow")
-gradient0.addColorStop(0.4, "purple")
-gradient0.addColorStop(0.7, "orange")
-gradient0.addColorStop(1, "magenta")
-context.fillStyle = gradient0
-context.fillRect(0, 10, 100, 6)
-const gradient1 = context.createLinearGradient(0, 0, 100, 100)
-gradient1.addColorStop(0, "green")
-gradient1.addColorStop(0.5, "yellow")
-gradient1.addColorStop(0.7, "orange")
-gradient1.addColorStop(1, "magenta")
-context.beginPath()
-context.fillStyle = gradient1
-context.arc(50, 10, 25, 0, 6.283185307179586)
-context.stroke()
-context.fillStyle = "rgba(150, 32, 170, .97)"
-context.font = "12px Sans"
-context.textBaseline = "top"
-context.fillText("*+(}#?ð¼ ð", 18, 18)
-context.shadowBlur = 1
-context.fillStyle = "rgba(47, 211, 69, .99)"
-context.font = "14px Sans"
-context.textBaseline = "top"
-context.fillText("ð¼OynG@%tp$", 3, 3)
-context.beginPath()
-context.arc(30, 10, 20, 0, 6.283185307179586)
-context.strokeStyle = "rgba(255, 12, 220, 1)"
-context.stroke()
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;FingerprintJS&lt;/head&gt;
-    &lt;head&gt;Canvas operations:&lt;/head&gt;
-    &lt;code&gt;const canvas = document.createElement('canvas')
-const context = canvas.getContext("2d")
-context.rect(0, 0, 10, 10)
-context.rect(2, 2, 6, 6)
-context.isPointInPath(5, 5, "evenodd")
-context.textBaseline = "alphabetic"
-context.fillStyle = "#f60"
-context.fillRect(100, 1, 62, 20)
-context.fillStyle = "#069"
-context.font = "11pt \"Times New Roman\""
-context.fillText("Cwm fjordbank gly ð", 2, 15)
-context.fillStyle = "rgba(102, 204, 0, 0.2)"
-context.font = "18pt Arial"
-context.fillText("Cwm fjordbank gly ð", 4, 45)
-&lt;/code&gt;
-    &lt;head&gt;Canvas operations:&lt;/head&gt;
-    &lt;code&gt;const canvas = document.createElement('canvas')
-const context = canvas.getContext("2d")
-context.globalCompositeOperation = "multiply"
-context.fillStyle = "#f2f"
-context.beginPath()
-context.arc(40, 40, 40, 0, 6.283185307179586, true)
-context.closePath()
-context.fill()
-context.fillStyle = "#2ff"
-context.beginPath()
-context.arc(80, 40, 40, 0, 6.283185307179586, true)
-context.closePath()
-context.fill()
-context.fillStyle = "#ff2"
-context.beginPath()
-context.arc(60, 80, 40, 0, 6.283185307179586, true)
-context.closePath()
-context.fill()
-context.fillStyle = "#f9c"
-context.arc(60, 60, 60, 0, 6.283185307179586, true)
-context.arc(60, 60, 20, 0, 6.283185307179586, true)
-context.fill("evenodd")
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;Cloudflare&lt;/head&gt;
-    &lt;head&gt;Canvas operations:&lt;/head&gt;
-    &lt;code&gt;const canvas = document.createElement('canvas')
-const context = canvas.getContext("2d")
-const gradient0 = context.createRadialGradient(33, 18, 8, 42, 10, 226)
-gradient0.addColorStop(0, "#809900")
-gradient0.addColorStop(1, "#404041")
-context.fillStyle = gradient0
-context.shadowBlur = 11
-context.shadowColor = "#F38020"
-context.beginPath()
-context.moveTo(9, 14)
-context.quadraticCurveTo(93, 48, 116, 111)
-context.stroke()
-context.fill()
-context.shadowBlur = 0
-const gradient1 = context.createRadialGradient(77, 98, 2, 27, 30, 206)
-gradient1.addColorStop(0, "#809900")
-gradient1.addColorStop(1, "#404041")
-context.fillStyle = gradient1
-context.beginPath()
-context.ellipse(58, 55, 31, 28, 1.4441705959829747, 0.5401125108618993, 4.052233984744969)
-context.stroke()
-context.fill()
-context.shadowBlur = 0
-const gradient2 = context.createRadialGradient(108, 12, 10, 65, 118, 169)
-gradient2.addColorStop(0, "#1AB399")
-gradient2.addColorStop(1, "#E666B3")
-context.fillStyle = gradient2
-context.shadowBlur = 16
-context.shadowColor = "#809980"
-context.font = "27.77777777777778px aanotafontaa"
-context.fillText("Ry", 13, 67)
-context.shadowBlur = 0
-const gradient3 = context.createRadialGradient(46, 47, 0, 101, 108, 207)
-gradient3.addColorStop(0, "#4DB380")
-gradient3.addColorStop(1, "#FF4D4D")
-context.fillStyle = gradient3
-context.shadowBlur = 3
-context.shadowColor = "#FF6633"
-context.beginPath()
-context.moveTo(54, 5)
-context.bezierCurveTo(54, 90, 32, 74, 71, 120)
-context.stroke()
-context.fill()
-context.shadowBlur = 0
-const gradient4 = context.createRadialGradient(119, 123, 3, 109, 90, 137)
-gradient4.addColorStop(0, "#E6B333")
-gradient4.addColorStop(1, "#3366E6")
-context.fillStyle = gradient4
-context.shadowBlur = 4
-context.shadowColor = "#B3B31A"
-context.beginPath()
-context.moveTo(76, 0)
-context.bezierCurveTo(1, 49, 103, 67, 49, 125)
-context.stroke()
-context.fill()
-context.shadowBlur = 0
-const gradient5 = context.createRadialGradient(34, 47, 1, 37, 59, 245)
-gradient5.addColorStop(0, "#809900")
-gradient5.addColorStop(1, "#404041")
-context.fillStyle = gradient5
-context.beginPath()
-context.ellipse(56, 57, 14, 8, 1.2273132071162383, 4.1926143018618225, 2.8853539230051624)
-context.stroke()
-context.fill()
-context.shadowBlur = 0
-context.shadowBlur = 14
-context.shadowColor = "#809900"
-context.font = "11.904761904761905px aanotafontaa"
-context.strokeText("@H1", 30, 73)
-context.shadowBlur = 0;
-&lt;/code&gt;
-    &lt;head rend="h2"&gt;Until next time&lt;/head&gt;
-    &lt;p&gt;I'd love to know if you found this even remotely interesting or think it's just a giant waste of time :-) I certainly had fun building it and had even more fun using it&lt;/p&gt;
-    &lt;head rend="h2"&gt;Credits&lt;/head&gt;
-    &lt;p&gt;pimothyxd: Helped with the design of the UI! Always someone I can depend on.&lt;/p&gt;
-    &lt;p&gt;bensb: Used his deobfuscator for the scripts tab. Also very knowledgable and a great person to chat ideas with.&lt;/p&gt;
-    &lt;p&gt;samuelmaddock: Your electron-browser-shell project made it very easy to get this spun up.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45492489</guid><pubDate>Mon, 06 Oct 2025 15:32:32 +0000</pubDate></item><item><title>Nobel Prize in Physics 2025</title><link>https://www.nobelprize.org/prizes/physics/2025/popular-information/</link><description>&lt;doc fingerprint="715db15f2195d5ea"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 08 Oct 2025 15:10:52 +0000</lastBuildDate><item><title>Nobel Prize in Physics 2025</title><link>https://www.nobelprize.org/prizes/physics/2025/popular-information/</link><description>&lt;doc fingerprint="715db15f2195d5ea"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Popular information&lt;/head&gt;
     &lt;p&gt;Popular science background: Quantum properties on a human scale (pdf)&lt;lb/&gt;Populärvetenskaplig information: Kvantegenskaper på mänsklig skala (pdf)&lt;/p&gt;
@@ -581,7 +42,7 @@ context.shadowBlur = 0;
     &lt;p&gt;Don't miss the Nobel Prize announcements 6–13 October. All announcements are streamed live here on nobelprize.org.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45501189</guid><pubDate>Tue, 07 Oct 2025 09:50:49 +0000</pubDate></item><item><title>Qualcomm to acquire Arduino</title><link>https://www.qualcomm.com/news/releases/2025/10/qualcomm-to-acquire-arduino-accelerating-developers--access-to-i</link><description>&lt;doc fingerprint="e10fcdab2cdf53e4"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45501189</guid><pubDate>Tue, 07 Oct 2025 09:50:49 +0000</pubDate></item><item><title>The evolution of Lua, continued [pdf]</title><link>https://www.lua.org/doc/cola.pdf</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45502502</guid><pubDate>Tue, 07 Oct 2025 12:54:14 +0000</pubDate></item><item><title>Qualcomm to acquire Arduino</title><link>https://www.qualcomm.com/news/releases/2025/10/qualcomm-to-acquire-arduino-accelerating-developers--access-to-i</link><description>&lt;doc fingerprint="e10fcdab2cdf53e4"&gt;
   &lt;main&gt;
     &lt;p&gt;You need to enable JavaScript to run this app.&lt;/p&gt;
   &lt;/main&gt;
@@ -628,7 +89,286 @@ context.shadowBlur = 0;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45503867</guid><pubDate>Tue, 07 Oct 2025 14:55:14 +0000</pubDate></item><item><title>IKEA Catalogs 1951-2021</title><link>https://ikeamuseum.com/en/explore/ikea-catalogue/</link><description>&lt;doc fingerprint="71c3125f48ed4455"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45503867</guid><pubDate>Tue, 07 Oct 2025 14:55:14 +0000</pubDate></item><item><title>Launch HN: LlamaFarm (YC W22) – Open-source framework for distributed AI</title><link>https://github.com/llama-farm/llamafarm</link><description>&lt;doc fingerprint="ed1fa4511bbd11f2"&gt;
+  &lt;main&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Build powerful AI locally, extend anywhere.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;LlamaFarm is an open-source framework for building retrieval-augmented and agentic AI applications. It ships with opinionated defaults (Ollama for local models, Chroma for vector storage) while staying 100% extendable—swap in vLLM, remote OpenAI-compatible hosts, new parsers, or custom stores without rewriting your app.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Local-first developer experience with a single CLI (&lt;code&gt;lf&lt;/code&gt;) that manages projects, datasets, and chat sessions.&lt;/item&gt;
+      &lt;item&gt;Production-ready architecture that mirrors server endpoints and enforces schema-based configuration.&lt;/item&gt;
+      &lt;item&gt;Composable RAG pipelines you can tailor through YAML, not bespoke code.&lt;/item&gt;
+      &lt;item&gt;Extendable everything: runtimes, embedders, databases, extractors, and CLI tooling.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;📺 Video demo (90 seconds): https://youtu.be/W7MHGyN0MdQ&lt;/p&gt;
+    &lt;p&gt;Prerequisites:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Install the CLI&lt;/p&gt;
+        &lt;p&gt;macOS / Linux&lt;/p&gt;
+        &lt;code&gt;curl -fsSL https://raw.githubusercontent.com/llama-farm/llamafarm/main/install.sh | bash&lt;/code&gt;
+        &lt;p&gt;Windows (via winget)&lt;/p&gt;
+        &lt;code&gt;winget install LlamaFarm.CLI&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Adjust Ollama context window&lt;/p&gt;
+        &lt;list rend="ul"&gt;
+          &lt;item&gt;Open the Ollama app, go to Settings → Advanced, and set the context window to match production (e.g., 100K tokens).&lt;/item&gt;
+          &lt;item&gt;Larger context windows improve RAG answers when long documents are ingested.&lt;/item&gt;
+        &lt;/list&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Create and run a project&lt;/p&gt;
+        &lt;quote&gt;lf init my-project # Generates llamafarm.yaml using the server template lf start # Spins up Docker services &amp;amp; opens the dev chat UI&lt;/quote&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Start an interactive project chat or send a one-off message&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;code&gt;# Interactive project chat (auto-detects namespace/project from llamafarm.yaml)
+lf chat
+
+# One-off message
+lf chat "Hello, LlamaFarm!"&lt;/code&gt;
+    &lt;p&gt;Need the full walkthrough with dataset ingestion and troubleshooting tips? Jump to the Quickstart guide.&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Prefer building from source? Clone the repo and follow the steps in Development &amp;amp; Testing.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Run services manually (without Docker auto-start):&lt;/p&gt;
+    &lt;code&gt;git clone https://github.com/llama-farm/llamafarm.git
+cd llamafarm
+
+# Install Nx globally and bootstrap the workspace
+npm install -g nx
+nx init --useDotNxInstallation --interactive=false
+
+# Option 1: start both server and RAG worker with one command
+nx dev
+
+# Option 2: start services in separate terminals
+# Terminal 1
+nx start rag
+# Terminal 2
+nx start server&lt;/code&gt;
+    &lt;p&gt;Open another terminal to run &lt;code&gt;lf&lt;/code&gt; commands (installed or built from source). This is equivalent to what &lt;code&gt;lf start&lt;/code&gt; orchestrates automatically.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Own your stack – Run small local models today and swap to hosted vLLM, Together, or custom APIs tomorrow by changing &lt;code&gt;llamafarm.yaml&lt;/code&gt;.&lt;/item&gt;
+      &lt;item&gt;Battle-tested RAG – Configure parsers, extractors, embedding strategies, and databases without touching orchestration code.&lt;/item&gt;
+      &lt;item&gt;Config over code – Every project is defined by YAML schemas that are validated at runtime and easy to version control.&lt;/item&gt;
+      &lt;item&gt;Friendly CLI – &lt;code&gt;lf&lt;/code&gt;handles project bootstrapping, dataset lifecycle, RAG queries, and non-interactive chats.&lt;/item&gt;
+      &lt;item&gt;Built to extend – Add a new provider or vector store by registering a backend and regenerating schema types.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;Task&lt;/cell&gt;
+        &lt;cell role="head"&gt;Command&lt;/cell&gt;
+        &lt;cell role="head"&gt;Notes&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Initialize a project&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;lf init my-project&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Creates &lt;code&gt;llamafarm.yaml&lt;/code&gt; from server template.&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Start dev stack + chat TUI&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;lf start&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Spins up server, rag worker, monitors Ollama/vLLM.&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Interactive project chat&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;lf chat&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Opens TUI using project from &lt;code&gt;llamafarm.yaml&lt;/code&gt;.&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Send single prompt&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;lf chat "Explain retrieval augmented generation"&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Uses RAG by default; add &lt;code&gt;--no-rag&lt;/code&gt; for pure LLM.&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Preview REST call&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;lf chat --curl "What models are configured?"&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Prints sanitized &lt;code&gt;curl&lt;/code&gt; command.&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Create dataset&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;lf datasets create -s pdf_ingest -b main_db research-notes&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Validates strategy/database against project config.&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Upload files&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;lf datasets upload research-notes ./docs/*.pdf&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Supports globs and directories.&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Process dataset&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;lf datasets process research-notes&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Streams heartbeat dots during long processing.&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Semantic query&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;lf rag query --database main_db "What did the 2024 FDA letters require?"&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Use &lt;code&gt;--filter&lt;/code&gt;, &lt;code&gt;--include-metadata&lt;/code&gt;, etc.&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;See the CLI reference for full command details and troubleshooting advice.&lt;/p&gt;
+    &lt;p&gt;LlamaFarm provides a comprehensive REST API (compatible with OpenAI's format) for integrating with your applications. The API runs at &lt;code&gt;http://localhost:8000&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;Chat Completions (OpenAI-compatible)&lt;/p&gt;
+    &lt;code&gt;curl -X POST http://localhost:8000/v1/projects/{namespace}/{project}/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "What are the FDA requirements?"}
+    ],
+    "stream": false,
+    "rag_enabled": true,
+    "database": "main_db"
+  }'&lt;/code&gt;
+    &lt;p&gt;RAG Query&lt;/p&gt;
+    &lt;code&gt;curl -X POST http://localhost:8000/v1/projects/{namespace}/{project}/rag/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "clinical trial requirements",
+    "database": "main_db",
+    "top_k": 5
+  }'&lt;/code&gt;
+    &lt;p&gt;Dataset Management&lt;/p&gt;
+    &lt;code&gt;# Upload file
+curl -X POST http://localhost:8000/v1/projects/{namespace}/{project}/datasets/{dataset}/data \
+  -F "file=@document.pdf"
+
+# Process dataset
+curl -X POST http://localhost:8000/v1/projects/{namespace}/{project}/datasets/{dataset}/process&lt;/code&gt;
+    &lt;p&gt;Check your &lt;code&gt;llamafarm.yaml&lt;/code&gt;:&lt;/p&gt;
+    &lt;code&gt;name: my-project        # Your project name
+namespace: my-org       # Your namespace&lt;/code&gt;
+    &lt;p&gt;Or inspect the file system: &lt;code&gt;~/.llamafarm/projects/{namespace}/{project}/&lt;/code&gt;&lt;/p&gt;
+    &lt;p&gt;See the complete API Reference for all endpoints, request/response formats, Python/TypeScript clients, and examples.&lt;/p&gt;
+    &lt;p&gt;&lt;code&gt;llamafarm.yaml&lt;/code&gt; is the source of truth for each project. The schema enforces required fields and documents every extension point.&lt;/p&gt;
+    &lt;code&gt;version: v1
+name: fda-assistant
+namespace: default
+
+runtime:
+  provider: openai                   # "openai" for any OpenAI-compatible host, "ollama" for local Ollama
+  model: qwen2.5:7b
+  base_url: http://localhost:8000/v1 # Point to vLLM, Together, etc.
+  api_key: sk-local-placeholder
+  instructor_mode: tools             # Optional: json, md_json, tools, etc.
+
+prompts:
+  - role: system
+    content: &amp;gt;-
+      You are an FDA specialist. Answer using short paragraphs and cite document titles when available.
+
+rag:
+  databases:
+    - name: main_db
+      type: ChromaStore
+      default_embedding_strategy: default_embeddings
+      default_retrieval_strategy: filtered_search
+      embedding_strategies:
+        - name: default_embeddings
+          type: OllamaEmbedder
+          config:
+            model: nomic-embed-text:latest
+      retrieval_strategies:
+        - name: filtered_search
+          type: MetadataFilteredStrategy
+          config:
+            top_k: 5
+  data_processing_strategies:
+    - name: pdf_ingest
+      parsers:
+        - type: PDFParser_LlamaIndex
+          config:
+            chunk_size: 1500
+            chunk_overlap: 200
+      extractors:
+        - type: HeadingExtractor
+        - type: ContentStatisticsExtractor
+
+datasets:
+  - name: research-notes
+    data_processing_strategy: pdf_ingest
+    database: main_db&lt;/code&gt;
+    &lt;p&gt;Configuration reference: Configuration Guide • Extending LlamaFarm&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Swap runtimes by pointing to any OpenAI-compatible endpoint (vLLM, Mistral, Anyscale). Update &lt;code&gt;runtime.provider&lt;/code&gt;,&lt;code&gt;base_url&lt;/code&gt;, and&lt;code&gt;api_key&lt;/code&gt;; regenerate schema types if you add a new provider enum.&lt;/item&gt;
+      &lt;item&gt;Bring your own vector store by implementing a store backend, adding it to &lt;code&gt;rag/schema.yaml&lt;/code&gt;, and updating the server service registry.&lt;/item&gt;
+      &lt;item&gt;Add parsers/extractors to support new file formats or metadata pipelines. Register implementations and extend the schema definitions.&lt;/item&gt;
+      &lt;item&gt;Extend the CLI with new Cobra commands under &lt;code&gt;cli/cmd&lt;/code&gt;; the docs include guidance on adding dataset utilities or project tooling.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Check the Extending guide for step-by-step instructions.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;Example&lt;/cell&gt;
+        &lt;cell role="head"&gt;What it Shows&lt;/cell&gt;
+        &lt;cell role="head"&gt;Location&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;FDA Letters Assistant&lt;/cell&gt;
+        &lt;cell&gt;Multi-document PDF ingestion, RAG queries, reference-style prompts&lt;/cell&gt;
+        &lt;cell&gt;&lt;code&gt;examples/fda_rag/&lt;/code&gt; &amp;amp; Docs&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Raleigh UDO Planning Helper&lt;/cell&gt;
+        &lt;cell&gt;Large ordinance ingestion, long-running processing tips, geospatial queries&lt;/cell&gt;
+        &lt;cell&gt;&lt;code&gt;examples/gov_rag/&lt;/code&gt; &amp;amp; Docs&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Run &lt;code&gt;lf datasets&lt;/code&gt; and &lt;code&gt;lf rag query&lt;/code&gt; commands from each example folder to reproduce the flows demonstrated in the docs.&lt;/p&gt;
+    &lt;code&gt;# Python server + RAG tests
+cd server
+uv sync
+uv run --group test python -m pytest
+
+# CLI tests
+cd ../cli
+go test ./...
+
+# RAG tooling smoke tests
+cd ../rag
+uv sync
+uv run python cli.py test
+
+# Docs build (ensures navigation/link integrity)
+cd ..
+nx build docs&lt;/code&gt;
+    &lt;p&gt;Linting: &lt;code&gt;uv run ruff check --fix .&lt;/code&gt; (Python), &lt;code&gt;go fmt ./...&lt;/code&gt; and &lt;code&gt;go vet ./...&lt;/code&gt; (Go).&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Discord – chat with the team, share feedback, find collaborators.&lt;/item&gt;
+      &lt;item&gt;GitHub Issues – bug reports and feature requests.&lt;/item&gt;
+      &lt;item&gt;Discussions – ideas, RFCs, roadmap proposals.&lt;/item&gt;
+      &lt;item&gt;Contributing Guide – code style, testing expectations, doc updates, schema regeneration steps.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Want to add a new provider, parser, or example? Start a discussion or open a draft PR—we love extensions!&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Licensed under the Apache 2.0 License.&lt;/item&gt;
+      &lt;item&gt;Built by the LlamaFarm community and inspired by the broader open-source AI ecosystem. See CREDITS for detailed acknowledgments.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Build locally. Deploy anywhere. Own your AI.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45504388</guid><pubDate>Tue, 07 Oct 2025 15:30:20 +0000</pubDate></item><item><title>IKEA Catalogs 1951-2021</title><link>https://ikeamuseum.com/en/explore/ikea-catalogue/</link><description>&lt;doc fingerprint="71c3125f48ed4455"&gt;
   &lt;main&gt;
     &lt;p&gt;Good question! We know that a lot of people are curious about what the IKEA catalogue has looked like through the ages. The catalogue has always reflected the age and its views on interior design and everyday living, especially in Sweden, but in recent decades also internationally. The catalogue was in print for 70 years, and by digitising all the catalogues we could make them available to everybody. Making the story of IKEA available to as many people as possible is our main task at IKEA Museum. So we hope that the catalogues will bring some joy and nostalgia, and maybe even a few surprises.&lt;/p&gt;
     &lt;head rend="h1"&gt;IKEA catalogue&lt;/head&gt;
@@ -987,70 +727,7 @@ context.shadowBlur = 0;
     &lt;p&gt;Don't miss the Nobel Prize announcements 6–13 October. All announcements are streamed live here on nobelprize.org.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45514164</guid><pubDate>Wed, 08 Oct 2025 09:49:36 +0000</pubDate></item><item><title>A Clausewitzian Lens on Modern Urban Warfare</title><link>https://mwi.westpoint.edu/a-clausewitzian-lens-on-modern-urban-warfare/</link><description>&lt;doc fingerprint="faa359510591dbb3"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Among Carl von Clausewitz’s many poignant dictums, the most commonly cited is undoubtedly that “war is not merely an act of policy but a true political instrument, a continuation of political intercourse, carried on by other means.” While Clausewitz never fought in a city like Fallujah, Kyiv, or Gaza if the Prussian general and philosopher of war could visit the battlefields of the twenty-first century, he would recognize modern urban warfare’s core challenges—and would find that his theories about war’s objective and the considerations needed for victory remain strikingly relevant.&lt;/p&gt;
-    &lt;p&gt;Clausewitz wrote that “war is more than a true chameleon that slightly adapts its characteristics to the given case.” Its essential elements—violence, chance and probability, and subordination to policy—form what he famously described as a wunderliche Dreifaltigkeit, or “remarkable trinity.” Rather than being in conflict, these elements interact dynamically and, in successful systems like that of Napoleonic France, can operate in harmony. Clausewitz and his fellow Prussian reformers admired how the French system aligned popular will, military force, and political direction. Nowhere is the need for such harmony more acute than in modern urban warfare, where civilians, combatants, and national objectives share the same congested terrain. This environment tests the limits of military doctrine, challenges the notion of strategic clarity, and often leaves combatants with ambiguous definitions of victory.&lt;/p&gt;
-    &lt;p&gt;In my work on urban warfare, from my book Understanding Urban Warfare to the numerous case studies I have authored and the field research I have conducted, I’ve seen the truths Clausewitz described play out on concrete streets and in bombed-out buildings. Urban warfare has become the norm, not the exception, and Clausewitz’s insights are not relics of Napoleonic Europe—they are essential tools for understanding the future of conflict.&lt;/p&gt;
-    &lt;p&gt;Historical Context: Urban Warfare in Clausewitz’s Era&lt;/p&gt;
-    &lt;p&gt;While Clausewitz never commanded modern urban battles, his military career immersed him in conflicts where cities played central strategic and symbolic roles. As a young officer in the Prussian Army, he fought in the Rhine campaigns (1793–1794), including the siege of Mainz, where revolutionary France defended the city against a Prussian-Austrian coalition. This early exposure to urban siege warfare—marked by fortified positions, complex logistics, and the suffering of civilians—gave Clausewitz firsthand insight into the unique challenges of fighting in and around cities.&lt;/p&gt;
-    &lt;p&gt;Clausewitz’s later experiences reinforced the political and psychological weight of urban centers. As aide-de-camp to Prussian Prince Augustus Ferdinand, he was present during Napoleon’s 1806 victory in the battles of Jena and Auerstedt, which led to the French occupation of Berlin. He later served with the Russian Army during France’s 1812 invasion of Russia, taking part in the Battle of Borodino—a prelude to the burning of Moscow that serves as a powerful example of a capital’s strategic and symbolic significance. In 1815, having reentered Prussian service, he participated in the Battles of Ligny and Wavre, fighting on terrain where towns, roads, and rivers constrained operations and shaped outcomes.&lt;/p&gt;
-    &lt;p&gt;Clausewitz drew clear conclusions from these experiences. In Principles of War, he argued that “public opinion is won through great victories and the occupation of the enemy’s capital.” He understood cities not only as symbolic centers of national will but also as logistical and operational hubs, writing of the importance of targeting “principal cities, storehouses, and large fortresses.” Though he did not witness the dense, protracted urban warfare of the modern era, Clausewitz’s strategic emphasis on cities foreshadowed many of the dynamics seen in today’s urban battles.&lt;/p&gt;
-    &lt;p&gt;The Urban Trinity, Fog, and Friction: Clausewitz’s Theories in Concrete and Steel&lt;/p&gt;
-    &lt;p&gt;Clausewitz’s “remarkable trinity”—violence and hatred (the people), chance and probability (in military action), and reason and policy (the government)—finds its most visceral expression in urban warfare. Cities collapse these elements into a single, compact battlespace. Unlike operations in open terrain, urban warfare places civilians, combatants, and political objectives in constant, physical contact. The Clausewitzian trinity becomes spatially literal: civilians live among the fight, military action is hyperlocalized and constrained, and every movement carries political weight.&lt;/p&gt;
-    &lt;p&gt;Clausewitz also famously wrote, “No one starts a war—or rather, no one in his senses ought to do so—without first being clear in his mind what he intends to achieve by that war and how he intends to conduct it.” He noted, therefore, that “the first, the supreme, the most far-reaching act of judgment that the statesman and commander have to make is to establish . . . the kind of war on which they are embarking.”&lt;/p&gt;
-    &lt;p&gt;This act of judgment is especially difficult in cities, where the kind of war one is fighting can shift from block to block. Is the objective to destroy an entrenched enemy force? To hold key, vital, or symbolic terrain? To safeguard a civilian population? In urban warfare the answer is often all of the above.&lt;/p&gt;
-    &lt;p&gt;Clausewitz’s dictum that war is a continuation of politics by other means is vividly realized in urban combat. Tactical decisions in cities reverberate at strategic levels. Urban warfare does not allow separation between military action and political consequence—they are fused.&lt;/p&gt;
-    &lt;p&gt;But Clausewitz reminds us that strategy is not made of battlefield maneuvers alone—it is also made of will. He defined war as “an act of force to compel our enemy to do our will.”&lt;/p&gt;
-    &lt;p&gt;Victory, then, is not always the annihilation of enemy forces—it is the collapse of the enemy’s will to resist. And in modern urban warfare, maintaining the will of one’s own people (or of your ally’s population)—to support the fight or to accept the moral and political costs—is just as critical. Clausewitz considered these moral forces among the most decisive in war, writing that they “constitute the spirit that permeates war as a whole.” In cities under siege or attack, public opinion, national resolve, and leadership cohesion become as important as any tactical maneuver.&lt;/p&gt;
-    &lt;p&gt;Urban warfare places enormous pressure on the internal willpower of a combatant nation and that of its involved and invested allies. The proximity of civilians, the visibility of destruction, and the speed at which information spreads can erode public support even as military objectives are met. A video, a collapsed building, or a failed operation can shift the strategic balance—not through force, but by weakening the political object that gives war its purpose. Clausewitz warned, “The political object is the goal, war is the means of reaching it, and means can never be considered in isolation from their purpose.”&lt;/p&gt;
-    &lt;p&gt;This relationship between political objectives, military action, and national will is especially fragile in urban combat. When will breaks—on either side—the war may be lost regardless of battlefield gains.&lt;/p&gt;
-    &lt;p&gt;Yet even the clearest strategy must contend with the inherent chaos of war. “War is the realm of uncertainty,” Clausewitz cautioned. “Three quarters of the factors on which action in war is based are wrapped in a fog of greater or lesser uncertainty.” This fog of war—its confusion, unpredictability, and lack of reliable information—is magnified in dense urban environments where lines between civilian and combatant blur and information spreads instantly and globally. Commanders must make high-stakes decisions in environments where clarity is fleeting.&lt;/p&gt;
-    &lt;p&gt;Compounding this is what Clausewitz called friction—the accumulation of countless small obstacles that derail even the best-laid plans. As he wrote:&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;Everything in war is very simple, but the simplest thing is difficult. The difficulties accumulate and end by producing a kind of friction that is inconceivable unless one has experienced war. . . . Friction is the only concept that more or less corresponds to the factors that distinguish real war from war on paper.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;Friction in cities is not theoretical—it’s tactical and visceral. Streets canalize movement. Buildings obscure lines of sight. Civilians become obstacles or allies. The environment itself resists clean execution. Urban warfare reveals Clausewitz’s insights not just as philosophical musings, but as hard realities in concrete and steel.&lt;/p&gt;
-    &lt;p&gt;Urban Warfare in Iraq: Lessons from Baghdad and ISIS&lt;/p&gt;
-    &lt;p&gt;The US campaigns in Iraq and the broader fight against the Islamic State of Iraq and Syria (ISIS) offer a laboratory of Clausewitzian warfare in cities—where tactical success frequently collided with political complexity, and where the will of the population, not battlefield metrics, often defined the limits of victory.&lt;/p&gt;
-    &lt;p&gt;The 2003 “Thunder Run” into Baghdad was more than a demonstration of military power—it was a calculated strike at the enemy’s political center of gravity. Recall Clausewitz’s observation that “public opinion is won through great victories and the occupation of the enemy’s capital.” Taking Baghdad had immediate strategic effects: It overthrew Saddam Hussein and dismantled the Ba’athist regime. But it did not yield strategic clarity. Once the political objective shifted from regime removal to establishing a new political order—that is, nation-building—the occupation of the capital no longer compelled the enemy to do our will. Instead, it ushered in a new phase of resistance—fought not by conventional armies, but by insurgents embedded in the population. The Clausewitzian trinity fractured, and the fog of war deepened.&lt;/p&gt;
-    &lt;p&gt;The 2004 First and Second Battles of Fallujah posed a different Clausewitzian challenge: how to reestablish control over a city that had become both a symbol and a stronghold of insurgent defiance. The battles exposed the full weight of friction. Every block was contested. Civilian presence, urban density, and improvised defenses neutralized many of the coalition’s technological advantages. Clausewitz’s observation rang true: The simplest thing became difficult. But beyond the tactical grind, Fallujah also heightened the strategic burden of fighting in cities under global media scrutiny. Images of destruction and civilian displacement reverberated internationally, influencing Iraqi public opinion, straining allied cohesion, and testing the will of the Iraqi government itself. Tactical brilliance could not guarantee strategic clarity—and each gain came at political and moral cost.&lt;/p&gt;
-    &lt;p&gt;Clausewitz’s theories are no less relevant in the fight against ISIS. The battles for Mosul, Raqqa, and Aleppo offer vivid examples of Clausewitzian dynamics playing out in dense urban terrain.&lt;/p&gt;
-    &lt;p&gt;The Battle of Mosul (2016–2017), the largest urban combat operation since World War II, marked both the height and unraveling of ISIS’s territorial control. The city—where ISIS declared its caliphate—was a living example of Clausewitz’s trinity: ideological violence among the people, unpredictable chance in military operations, and the overarching influence of policy and statecraft. ISIS weaponized the city’s geography to negate coalition advantages. Each alley and rooftop became a node of Clausewitzian friction, where the fog of war was compounded by hidden explosives, civilian shields, and the media theater of terror.&lt;/p&gt;
-    &lt;p&gt;The struggle to recapture Raqqa (2017) similarly underscored Clausewitz’s emphasis on the strategic value of cities—but also on the cost of capturing them. Coalition forces had to balance the immediate tactical need for firepower with the long-term strategic imperative of minimizing civilian casualties and preserving infrastructure. Raqqa’s fall signaled not just military defeat for ISIS, but the collapse of its political narrative of governance and legitimacy.&lt;/p&gt;
-    &lt;p&gt;Aleppo (2012–2016) offered a final case study in how urban warfare reshapes Clausewitzian dynamics. The regime of Bashar al-Assad, with Russian support, waged a prolonged campaign of attrition to reclaim the city. Aleppo’s recapture was not just a battlefield event—it was a strategic and psychological victory that reshaped the regional balance. Clausewitz’s insight that war is always shaped by the interaction of violence, politics, and chance was on full display. In Aleppo, military power served political ends—but at enormous humanitarian and reputational cost.&lt;/p&gt;
-    &lt;p&gt;The Battle of Kyiv: A Clausewitzian Struggle&lt;/p&gt;
-    &lt;p&gt;The 2022 Battle of Kyiv illustrates many of Clausewitz’s core principles. Russian forces launched a lightning assault on the capital, aiming to swiftly decapitate Ukraine’s political leadership and seize its strategic center of gravity. But what they encountered was not just a military defense, but a national resistance. The people, military, and government acted as one cohesive trinity. And President Volodymyr Zelenskyy’s decision to remain in Kyiv was not just political theater—it was a deliberate act of strategic will.&lt;/p&gt;
-    &lt;p&gt;The defenders of Kyiv skillfully leveraged the urban environment to neutralize Russia’s advantages and impose costs at every level of engagement. What followed was a textbook display of Clausewitzian friction: stalled armored columns, logistical failures, intelligence breakdowns, and a general underestimation of local resistance. Citizen volunteers, guided by their knowledge of terrain and empowered by social networks, became a force multiplier against a numerically and technologically superior invader. Even simple tactical objectives—securing key intersections or resupplying units—became unexpectedly complex under the weight of terrain, resistance, and human error. This was the very essence of what Clausewitz warned distinguishes real war from war on paper.&lt;/p&gt;
-    &lt;p&gt;Russia’s inability to capture the capital—the symbolic heart of the Ukrainian state—had cascading effects. It allowed Ukraine to garner international support, secure military resupply, and build momentum on the strategic level. In urban warfare, just holding out can be a victory. The defense of a city like Kyiv can serve not only to blunt an assault but to buy time for political conditions to shift, for alliances to strengthen, and for strategic clarity to emerge. In such contexts, endurance becomes its own form of offense.&lt;/p&gt;
-    &lt;p&gt;This was not just a tactical defeat for Russia—it was a strategic failure born of a fundamental mismatch between political ambition and military means. The objective—seizing Kyiv—was politically clear, but Russia failed to align its resources, capabilities, and assumptions with that goal. Clausewitz’s admonition echoed loudly as Russian columns stalled short of the capital: “The political object is the goal, war is the means of reaching it, and means can never be considered in isolation from their purpose.” The Battle of Kyiv proved that even with overwhelming force, war conducted without coherence between ends and means is destined to fail.&lt;/p&gt;
-    &lt;p&gt;Gaza and the Israel Defense Forces: Tactical Success, Strategic Strain&lt;/p&gt;
-    &lt;p&gt;If Kyiv is a case study of Clausewitzian alignment of war and policy, Israel’s ongoing operations in Gaza provide another example of the dangers when the alignment falters.&lt;/p&gt;
-    &lt;p&gt;The Israel Defense Forces are one of the most experienced militaries in urban warfare in the world. Israeli military operations are precise, intelligence-driven, and supported by technological superiority. Yet even these capabilities cannot eliminate the strategic dilemma of fighting in cities densely packed with civilians, under intense global scrutiny, and against nonstate actors that use the urban fabric—cities’ terrain and their people—as both shield and weapon.&lt;/p&gt;
-    &lt;p&gt;Clausewitz emphasized that war is not an isolated act but part of a “continuous interaction”—including, notably, interaction with political objectives. In Gaza, the Israel Defense Forces face a situation where the tactical destruction of enemy infrastructure—tunnels, command nodes, rocket sites—does not necessarily translate to strategic success of all the war’s political goals. Every collapsed apartment building and every civilian casualty reverberates globally. The moral forces Clausewitz emphasized—public opinion and will—are not abstract; they are measurable in diplomatic isolation or support, domestic cohesion, and battlefield morale.&lt;/p&gt;
-    &lt;p&gt;This is not to say the Israeli military lacks clarity in its objectives, but rather that the urban environment imposes costs and constraints that can undermine strategic coherence. As I argued in Understanding Urban Warfare, a city can be the greatest ally or the worst foe, depending on how it is approached. Clausewitz would remind any military leader that the means employed must remain proportionate and consistent with the political purpose.&lt;/p&gt;
-    &lt;p&gt;Clausewitz also cautioned against rigid formulas. “Every age,” he wrote, “[has] had its own kind of war, its own limiting conditions, and its own peculiar preconceptions”. Urban warfare in the twenty-first century demands adaptation, and nowhere is this more evident than in the lessons derived from Gaza.&lt;/p&gt;
-    &lt;p&gt;For the Israel Defense Forces operating in Gaza, every strike, pause, or maneuver is interpreted through political, humanitarian, and informational lenses. This is enhanced by the magnified friction of fighting in dense urban terrain. Streets can canalize movement, buildings and tunnels can conceal threats, and civilians can either support or sabotage operations.&lt;/p&gt;
-    &lt;p&gt;Clausewitz, with his emphasis on uncertainty, chance, and moral forces, would have found urban warfare like that seen in Gaza to be the ultimate test of the statesman’s clarity and the commander’s judgment. In today’s information environment, that friction is amplified—a single video or narrative about the use (or misuse) of force, whether true or fabricated, can influence entire populations and political bodies. This aligns with Clausewitz’s trinity of wills—the people, the military, and the government, all three of which must be in balance for coherent strategy. In cities, that balance is constantly tested in real time and often in front of a global audience.&lt;/p&gt;
-    &lt;p&gt;The Strategic Center of Gravity is Urban&lt;/p&gt;
-    &lt;p&gt;Clausewitz’s concept of the “center of gravity”—the source of power that holds everything in war together—was one of his most important strategic insights. He described it as the “hub of all power and movement, on which everything depends.” In his time, contending military with the center of gravity often meant the destruction of the enemy’s main army or the occupation of its capital. But in modern warfare—especially in urban environments—the center of gravity is rarely a fixed physical point. It is dynamic, psychological, and deeply political.&lt;/p&gt;
-    &lt;p&gt;Today, the center of gravity often resides in urban areas, not just as terrain to be seized but as spaces where power is concentrated: political authority, public opinion, information control, and the will of the people. Cities like Kyiv, Gaza City, Mosul, or Aleppo are not merely battlefields—they are arenas where military action collides with political meaning. Clausewitz would recognize these dynamics, because for him, the essence of war was not tactical victory but the pursuit of a political object shaped by what he called moral forces.&lt;/p&gt;
-    &lt;p&gt;Again, Clausewitz wrote, “The moral elements are among the most important in war. They constitute the spirit that permeates war as a whole.” He was referring to intangible but decisive factors—public support, national will, leadership cohesion, and belief in the cause. These forces are especially visible in cities, where every strike and every image can either strengthen or fracture the political foundations of the war effort. What we might now call legitimacy in modern strategy—credibility in the eyes of a population or the international community—can be understood as the sum of these moral forces. Clausewitz didn’t use the term, but he clearly grasped its meaning and importance.&lt;/p&gt;
-    &lt;p&gt;In Kyiv, the city itself became the center of gravity—not only for its political and logistical importance, but for what it symbolized. Its defense became an act of national will. In Gaza, the battle shifts between tactical objectives and a struggle over public opinion, both local and global.&lt;/p&gt;
-    &lt;p&gt;In today’s urban conflicts, the political object—the goal, in Clausewitz’s terms, which must not be separated from war as the means of reaching it—is constantly under pressure. This pressure comes not just from the enemy, but also from how one’s own population, allies, and adversaries perceive the use of force. A commander may win the battle for terrain and still lose the war if public opinion collapses or the political object becomes unsustainable.&lt;/p&gt;
-    &lt;p&gt;This is why the center of gravity in modern warfare often runs through the city—not because of what is physically located there, but because of what is at stake symbolically, psychologically, and politically. In cities, Clausewitz’s theory finds its sharpest edge: Moral forces meet material realities, and the balance of war can shift not through firepower alone, but through the will of those watching, enduring, or resisting.&lt;/p&gt;
-    &lt;p&gt;Clausewitz in the Urban Century&lt;/p&gt;
-    &lt;p&gt;Cities have become the default terrain of modern war. From Kyiv to Gaza, the battles fought today are not anomalies—they are signals. Urban warfare is not an exception to Clausewitz’s theory; it is its most vivid and volatile expression.&lt;/p&gt;
-    &lt;p&gt;Cities compress all the elements Clausewitz identified as fundamental to war: violence, chance, political purpose, friction, and uncertainty. They bring the political object, the will of the people, and military action into immediate proximity—requiring a level of harmony among these forces that is difficult to achieve but critical to sustaining strategic coherence. In this space, tactical actions instantly reverberate across strategic and political spheres. Every strike is a message, every misstep a liability.&lt;/p&gt;
-    &lt;p&gt;Clausewitz would demand that today’s commanders and policymakers understand that war in cities is not just about maneuver and firepower—it is about narrative, perception, endurance, and will. Modern urban warfare is fought in full view of the world, under moral scrutiny, and amid civilian populations whose support or suffering can shape the outcome as much as any weapon system.&lt;/p&gt;
-    &lt;p&gt;Victory in this environment requires more than technological superiority. It demands clarity of purpose, coherence between means and ends, disciplined execution, and moral restraint—the very fundamentals Clausewitz insisted upon. These are not optional in the urban century. They are decisive.&lt;/p&gt;
-    &lt;p&gt;Clausewitz offers no checklist for success in cities, but rather something more valuable. What he offers is a way to think clearly, to adapt amid chaos, and to confront the true nature of war—a contest of wills, shaped by politics, distorted by chance, and fought in the dense, contested, and morally fraught terrain of the modern city.&lt;/p&gt;
-    &lt;p&gt;John Spencer is chair of urban warfare studies at the Modern War Institute, codirector of MWI’s Urban Warfare Project, and host of the Urban Warfare Project Podcast. He served twenty-five years as an infantry soldier, which included two combat tours in Iraq. He is the author of the book Connected Soldiers: Life, Leadership, and Social Connections in Modern War and coauthor of Understanding Urban Warfare.&lt;/p&gt;
-    &lt;p&gt;The views expressed are those of the author and do not reflect the official position of the United States Military Academy, Department of the Army, or Department of Defense.&lt;/p&gt;
-    &lt;p&gt;Image credit: Staff Sgt. Jason Hull, US Army&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45515146</guid><pubDate>Wed, 08 Oct 2025 11:56:06 +0000</pubDate></item><item><title>Legal Contracts Built for AI Agents</title><link>https://paid.ai/blog/ai-agents/paid-gitlaw-introducing-legal-contracts-built-for-ai-agents</link><description>&lt;doc fingerprint="3d14491969fbea31"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45514164</guid><pubDate>Wed, 08 Oct 2025 09:49:36 +0000</pubDate></item><item><title>Legal Contracts Built for AI Agents</title><link>https://paid.ai/blog/ai-agents/paid-gitlaw-introducing-legal-contracts-built-for-ai-agents</link><description>&lt;doc fingerprint="3d14491969fbea31"&gt;
   &lt;main&gt;
     &lt;head rend="h3"&gt;Insights straight to your inbox&lt;/head&gt;
     &lt;p&gt;Join 10,000+ subscribers getting the latest insights on AI monetization.&lt;/p&gt;
@@ -1152,7 +829,53 @@ context.shadowBlur = 0;
 &lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45515783</guid><pubDate>Wed, 08 Oct 2025 13:10:19 +0000</pubDate></item><item><title>Bank of England flags risk of 'sudden correction' in tech stocks inflated by AI</title><link>https://www.ft.com/content/fe474cff-564c-41d2-aaf7-313636a83e5b</link><description>&lt;doc fingerprint="8e7b00715b9acbe9"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;&lt;quote&gt;IMF and BoE warn AI boom risks ‘abrupt’ stock market correction&lt;/quote&gt;&lt;/head&gt;&lt;head rend="h2"&gt;Save 40% on Standard Digital&lt;/head&gt;was $540 now $319 for your first year&lt;p&gt;Save now on essential digital access to quality FT journalism on any device. Saving based on monthly annualised price.&lt;/p&gt;&lt;head rend="h2"&gt;Explore more offers.&lt;/head&gt;&lt;head rend="h3"&gt;Trial&lt;/head&gt;&lt;p&gt;Then $75 per month. Complete digital access to quality FT journalism on any device. Cancel or change your plan anytime during your trial.&lt;/p&gt;&lt;head rend="h3"&gt;Premium Digital&lt;/head&gt;&lt;p&gt;Complete digital access to quality FT journalism with expert analysis from industry leaders. Pay a year upfront and save 20%.&lt;/p&gt;&lt;head rend="h3"&gt;FT Digital Edition&lt;/head&gt;&lt;p&gt;FT Digital Edition: today’s FT, cover to cover on any device. This subscription does not include access to ft.com or the FT App.&lt;/p&gt;&lt;p&gt;Check whether you already have access via your university or organisation.&lt;/p&gt;&lt;p&gt;Terms &amp;amp; Conditions apply&lt;/p&gt;&lt;head rend="h2"&gt;Explore our full range of subscriptions.&lt;/head&gt;&lt;head rend="h3"&gt;For individuals&lt;/head&gt;&lt;p&gt;Discover all the plans currently available in your country&lt;/p&gt;&lt;head rend="h3"&gt;For multiple readers&lt;/head&gt;&lt;p&gt;Digital access for organisations. Includes exclusive features and content.&lt;/p&gt;&lt;head rend="h2"&gt;Why the FT?&lt;/head&gt;&lt;p&gt;See why over a million readers pay to read the Financial Times.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45516265</guid><pubDate>Wed, 08 Oct 2025 13:55:27 +0000</pubDate></item><item><title>Samsung released a 7M model that achieved 45% on ARC-AGI-1</title><link>https://arxiv.org/abs/2510.04871</link><description>&lt;doc fingerprint="3cbf352bcdf5c28f"&gt;
-  &lt;main&gt;&lt;head rend="h1"&gt;Computer Science &amp;gt; Machine Learning&lt;/head&gt;&lt;p&gt; [Submitted on 6 Oct 2025]&lt;/p&gt;&lt;head rend="h1"&gt;Title:Less is More: Recursive Reasoning with Tiny Networks&lt;/head&gt;View PDF HTML (experimental)&lt;quote&gt;Abstract:Hierarchical Reasoning Model (HRM) is a novel approach using two small neural networks recursing at different frequencies. This biologically inspired method beats Large Language models (LLMs) on hard puzzle tasks such as Sudoku, Maze, and ARC-AGI while trained with small models (27M parameters) on small data (around 1000 examples). HRM holds great promise for solving hard problems with small networks, but it is not yet well understood and may be suboptimal. We propose Tiny Recursive Model (TRM), a much simpler recursive reasoning approach that achieves significantly higher generalization than HRM, while using a single tiny network with only 2 layers. With only 7M parameters, TRM obtains 45% test-accuracy on ARC-AGI-1 and 8% on ARC-AGI-2, higher than most LLMs (e.g., Deepseek R1, o3-mini, Gemini 2.5 Pro) with less than 0.01% of the parameters.&lt;/quote&gt;&lt;head rend="h2"&gt;Submission history&lt;/head&gt;From: Alexia Jolicoeur-Martineau [view email]&lt;p&gt;[v1] Mon, 6 Oct 2025 14:58:08 UTC (259 KB)&lt;/p&gt;&lt;head rend="h3"&gt;References &amp;amp; Citations&lt;/head&gt;&lt;p&gt; export BibTeX citation Loading... &lt;/p&gt;&lt;head rend="h1"&gt;Bibliographic and Citation Tools&lt;/head&gt;&lt;p&gt; Bibliographic Explorer (What is the Explorer?) &lt;/p&gt;&lt;p&gt; Connected Papers (What is Connected Papers?) &lt;/p&gt;&lt;p&gt; Litmaps (What is Litmaps?) &lt;/p&gt;&lt;p&gt; scite Smart Citations (What are Smart Citations?) &lt;/p&gt;&lt;head rend="h1"&gt;Code, Data and Media Associated with this Article&lt;/head&gt;&lt;p&gt; alphaXiv (What is alphaXiv?) &lt;/p&gt;&lt;p&gt; CatalyzeX Code Finder for Papers (What is CatalyzeX?) &lt;/p&gt;&lt;p&gt; DagsHub (What is DagsHub?) &lt;/p&gt;&lt;p&gt; Gotit.pub (What is GotitPub?) &lt;/p&gt;&lt;p&gt; Hugging Face (What is Huggingface?) &lt;/p&gt;&lt;p&gt; Papers with Code (What is Papers with Code?) &lt;/p&gt;&lt;p&gt; ScienceCast (What is ScienceCast?) &lt;/p&gt;&lt;head rend="h1"&gt;Demos&lt;/head&gt;&lt;head rend="h1"&gt;Recommenders and Search Tools&lt;/head&gt;&lt;p&gt; Influence Flower (What are Influence Flowers?) &lt;/p&gt;&lt;p&gt; CORE Recommender (What is CORE?) &lt;/p&gt;&lt;p&gt; IArxiv Recommender (What is IArxiv?) &lt;/p&gt;&lt;head rend="h1"&gt;arXivLabs: experimental projects with community collaborators&lt;/head&gt;&lt;p&gt;arXivLabs is a framework that allows collaborators to develop and share new arXiv features directly on our website.&lt;/p&gt;&lt;p&gt;Both individuals and organizations that work with arXivLabs have embraced and accepted our values of openness, community, excellence, and user data privacy. arXiv is committed to these values and only works with partners that adhere to them.&lt;/p&gt;&lt;p&gt;Have an idea for a project that will add value for arXiv's community? Learn more about arXivLabs.&lt;/p&gt;&lt;/main&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45516265</guid><pubDate>Wed, 08 Oct 2025 13:55:27 +0000</pubDate></item><item><title>How To Start Bug Bounties (2021)</title><link>https://ozguralp.medium.com/how-to-start-bug-bounties-101-how-to-make-a-million-in-4-years-e15ee62d6f4</link><description>&lt;doc fingerprint="c618e257093157bd"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;How to Start Bug Bounties 101 &amp;amp; How to Make a Million in 4 Years&lt;/head&gt;
+    &lt;p&gt;I got lots of questions and requests especially from new beginners to the area, so wanted to prepare a blog post regarding how to start at bug hunting and how to be successful.&lt;/p&gt;
+    &lt;p&gt;Firstly, I want to say as there is no only true way exist to became successful in any area including this one. Every person has their own personality, characteristics, speciality and qualifications so this criteria could differ from one to another. I am only telling my story and mental methodology here, which directed me to earn $1 million through 4 years.&lt;/p&gt;
+    &lt;head rend="h3"&gt;How (not) to start at first place?&lt;/head&gt;
+    &lt;p&gt;If you are a person who is consistently asking other people about how to become successful in bug bounty sector or being mentor to them, I can surely tell you that as this is not the right way. Nobody has a simple formula to become successful in any area. So first thing to do in here could be stopping to ask people generic “how to” questions. Instead of it; you can do your homework, do some research about the area and find out your way yourself which will really help you later in terms of gaining bug hunting mindset.&lt;/p&gt;
+    &lt;p&gt;When I was lecturing “Cyber Security 101” class at the Istanbul Bilgi University for 4 years, my first slide of the presentation for the first term was this one:&lt;/p&gt;
+    &lt;p&gt;This concept could be expanded &amp;amp; adapted to any area. In terms of bug hunting:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;“Learning how to use Google” is super essential. I use nearly 50-100 times per day for the last 4 years of my time. If you know how to use if efficiently, you can find what you are looking for faster and smarter. If you want to know how to use it efficiently, you can start Googling about it.&lt;/item&gt;
+      &lt;item&gt;If your native language is not English, then learning it is super essential as using Google. The most international accepted language for 2021 is English and nearly all resources can be found within it.&lt;/item&gt;
+      &lt;item&gt;I mentioned Turkish (as native language) on my original slide because knowing your native language is an important thing to become successful in any area. If you cannot know your native language well at first place, then you cannot use/learn/know other languages well too. In addition to that, we are using our language as a gateway to the outer world. Applying it to bug hunting: To understand what you are reading/researching, to speak with other people on same interests, to write a good report, to make a discussion with the report reviewer/triager; you need to know your native language + English good. There is a concept exist as Sapir–Whorf hypothesis regarding to the subject as: “a principle suggesting that the structure of a language affects its speakers’ worldview or cognition, and thus people’s perceptions are relative to their spoken language.”. which I highly believe as it is really effecting our perspective of lives including our approaches to any subject. So knowing your language better + an extra language might bring a new different point of view to the human being. (If you are into the topic, I also can recommend the 2016 Sci-Fi movie Arrival which had a different unique approach to this hypothesis.)&lt;/item&gt;
+      &lt;item&gt;“Finding your own area/speciality” is actually important on the long run to become expertise and unique in the industry. As a real world example, Tommy tells it all the time as he made nearly all of his bug bounty payouts from a single vulnerability category, SSRF, which is a good proof to what some focused working can put into your wallet.&lt;/item&gt;
+      &lt;item&gt;“Technical knowledge &amp;amp; experience” is all you can put into this area. Comparing to the other working concepts/practices (such as winemaking, having nearly 1000 years of history and experience), bug hunting (as well as nearly all IT topics) is still a new topic which changes everyday. So adding some value to it is easy comparing to other disciplines.&lt;/item&gt;
+      &lt;item&gt;I am not going to talk in details about “Keeping up-to date” in here, because as it is obvious that information technologies are updated every day and without having that, your bugs could be out-of-date :)&lt;/item&gt;
+      &lt;item&gt;In terms of bug hunting, “Expanding your network/social skills” is not too important comparing to the prior items, however having those still can bring you new opportunities. Human beings are known as social living creatures from beginning and working as a community always brings positive developments.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h3"&gt;How to become successful?&lt;/head&gt;
+    &lt;p&gt;From both my experience and observations of other bug hunters’ career paths/resumes; I can say that if you have a penetration test/offensive security research experience on your back then it is easier to getting adapted on bug hunting discipline. But as I said, there is no point of generalizing and I do personally know lots of successful bug hunters even if they didn’t go into the university at all or yet. So this really depends on the person. You could become successful when you are at your 14 or could fail even after you have your PhD in Computer Sciences.&lt;/p&gt;
+    &lt;p&gt;Firstly, definition of “being success” in here is really important and it also depends from person to person too. Most of the times, success is came down to the salary/payout/money; however I can say that there are more success items exist in bug bounty hunting comparing to the regular day job. From my point of view, I am choosing bug hunting over regular working due to those earnings of successes:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Being own your boss: If you have a really good self-discipline and really do not like illogical duties coming from your superior, than this is definitely it for you. This is the uttermost thing that I love about bug hunting. You are your own boss.&lt;/item&gt;
+      &lt;item&gt;Performance basis payouts: If you are eager of earning more money, instead of changing your job, you can work for extra bucks over the night :)&lt;/item&gt;
+      &lt;item&gt;Flexible working: Most of the new IT jobs has this as a benefit but still taking a day or month off without asking to anyone for approval is still awesome.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;So without having the same salary on a daily job, I would still prefer hunting as those advantages. Having those is a success for me rather than huge payouts :) To sum up; for becoming successful, a person needs to define their own success criteria at first.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Ok, my success criteria is 🤑. So how to make a million?&lt;/head&gt;
+    &lt;p&gt;Now as a starting point, it differs within various experience levels:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;If you are starting without any IT experience, then this is the toughest one to achieve. For becoming successful in this area, one should really know the basics of the IT such as networks, hosts, software, protocols etc. basically everything. Without knowing them, finding vulnerabilities would be really hard. I could suggest to understand those technologies at first; e.g. installing a web service, creating a DNS server, learning a programming language etc. then afterwards focusing on security field.&lt;/item&gt;
+      &lt;item&gt;If you are starting with IT experience but without a pentest experience; then this is still hard for you but not the toughest. The main thing in here is actually learning about security principles. Why do we need security? What are we trying to protect? Who are protecting from? How can we protect that? What could be entry points? What are the attack types? If you can start answering those questions on all case by case, then the basics of the offensive security could be start shaping on you.&lt;/item&gt;
+      &lt;item&gt;If you are coming from pentest experience like me; I can say that bug hunting discipline is really different than pentest and a little bit hard to getting used to. Instead of the pentest projects (finding every vulnerability including all levels), you need to focus nearly to find exploitable vulnerabilities rather than theoretical ones. I remember as we were reporting SQLi’s on the pentest projects within having errors as &lt;code&gt;'&lt;/code&gt;characters or reporting&lt;code&gt;&amp;lt;&amp;gt;&lt;/code&gt;escapes on the responses of the HTML’s without trying to actually dump an information from DB or bypassing WAF for a successful XSS attack. So this is the time that you need to focus on finding actual vulnerabilities within real world scenarios &amp;amp; impacts.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;I personally prefer and suggest to start into bug hunting after learning the security concepts + having online trainings. You can still find vulnerabilities without having extreme technical skills but most of the times they would happen within temporary lucky findings/reports which could make you struggle in the future.&lt;/p&gt;
+    &lt;p&gt;After starting actively bug hunting, this is my mental applied methodology for both short/long term:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Being consistent: Especially for the first years, consistency is really important. Some days while you are getting some valid reports, some days you will get nothing. So within consistency you will increase your chances to find valid reports per day/week.&lt;/item&gt;
+      &lt;item&gt;Goals &amp;amp; motivation: Demotivation is really common especially at the first days/months of hunting. I personally felt like thousands of times demotivated when cannot find any bugs during the day. What I found as a solution is focusing of the both short/long term realistic goals instead of daily wins. The important thing in here is actually what you achieve per average. Setting weekly/monthly/yearly achievable goals and actually achieving them is really good for intrinsic satisfaction.&lt;/item&gt;
+      &lt;item&gt;Variety in bugs: If you are focused only on XSS bugs, then you can only report XSS bugs. :) especially for the beginners, having different set of categories testing is really important. For my first year on hunting; I can say that I looked and reported for all kind of bugs. Within this, you will start to have more valid reports comparing to the lesser diversified testing which will reduce the stress both in terms of payouts &amp;amp; fear of not finding anything.&lt;/item&gt;
+      &lt;item&gt;Focusing on some categories: As the prior Tommy &amp;amp; SSRF example, especially after some time; focusing on some categories and increasing the technical knowledge about them &amp;amp; being expertise on them will really create difference in the industry. Especially after my 2nd year at the hunting, I started focusing on some of the categories that I love such as Authorization/Authentication. Read everything about them. Apply everything you learn about them in the real world. Manually analyze every request and response. In some step, you will catch those special ones unique to you!&lt;/item&gt;
+      &lt;item&gt;Learn platforms/mentality: Every bug bounty platform, target, program, triager etc. has a huge difference of approaches comparing to others. For last 4.5 years (All of my bug hunting journey), I mostly worked (80–85%) on a single platform which bringed me succeed. While I was testing mostly new systems/targets per week on my first years; especially for the last 2 years, I started testing my old targets again per 6 months which I earned most of my payouts. On this period, I found out that application owners creates lots of different vulnerabilities while patching the reported ones which are overlooked most of the times. Also testing/getting used to same technologies will collect more deep/technical information regarding those which makes it possible to report more complex and unhidden bugs. So while testing different applications/targets extends &amp;amp; diversifies your knowledge, testing the same ones from time to time provides new discoveries that goes unnoticed.&lt;/item&gt;
+      &lt;item&gt;Have your own mental methodology: Every successful bug hunter I met has a unique approach of testing, which is shaped after some time. So find the methodologies that suits best for you and improve them on your way.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h3"&gt;Last thoughts&lt;/head&gt;
+    &lt;p&gt;As I said on the prolog section of the post: “There is no only true way exist to became successful in any area.”. Every human being has their own journey. We will always use others’ experiences for self-development as on the history, however will also determine our self-journeys within individual efforts and diligence.&lt;/p&gt;
+    &lt;p&gt;Stay safe and be luck on your side :)&lt;/p&gt;
+  &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45516346</guid><pubDate>Wed, 08 Oct 2025 14:04:40 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45516556</guid><pubDate>Wed, 08 Oct 2025 14:25:19 +0000</pubDate></item></channel></rss>
