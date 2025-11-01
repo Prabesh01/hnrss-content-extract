@@ -1,791 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 01 Nov 2025 13:37:14 +0000</lastBuildDate><item><title>The Impossible Optimization, and the Metaprogramming to Achieve It</title><link>https://verdagon.dev/blog/impossible-optimization</link><description>&lt;doc fingerprint="af999a132e6d33ad"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Every once in a while, you come across an optimization that is so mind-blowingly weird, that you feel like you're peering into some sort of alternate dimension.&lt;/p&gt;
-    &lt;p&gt;Until recently, I believed that metaprogramming is basically just normal C++ templates with a few neat features like constexpr thrown on top. I thought it was just "writing code that writes code", like we've been doing with PHP since the dawn of time. Simple stuff, right?&lt;/p&gt;
-    &lt;p&gt;If you believe that like I did, buckle up! I'm going to show you how metaprogramming can be used to unlock what I call the impossible optimization.&lt;/p&gt;
-    &lt;p&gt;And I don't just mean little 5% optimizations. I'm talking about crazy optimizations that make your code ten times faster.&lt;/p&gt;
-    &lt;p&gt;Imagine that you had a program using a simple regex function, and you wanted to use it to verify emails: 0&lt;/p&gt;
-    &lt;code&gt;fn main():
-    email_regex =
-        Regex("\w+(\+\w*)?@(\d+\.\d+\.\d+\.\d+|\w+\.\w+)")
-
-    print(matches(email_regex, "user@example.com"))      # Prints True
-    print(matches(email_regex, "uexample.com"))          # Prints False
-    print(matches(email_regex, "user@ecom"))             # Prints False
-    print(matches(email_regex, "user+tag@example.com"))  # Prints True
-    print(matches(email_regex, "user@100"))              # Prints False
-    print(matches(email_regex, "howdy123@1.2.3.4"))      # Prints True
-    print(matches(email_regex, "howdy1231.2.3.4"))       # Prints False
-    print(matches(email_regex, "howdy123@1/2/3/4"))      # Prints False&lt;/code&gt;
-    &lt;p&gt;We all know that regex is pretty slow, because it basically has to run a whole interpreter. Or, if we "precompile" a Regex, it would be interpreting an AST (or a DFA), which is still pretty slow. 1&lt;/p&gt;
-    &lt;p&gt;When you really need speed, you skip regex entirely and make a hand-written matches function like this:&lt;/p&gt;
-    &lt;code&gt;fn matches(text: String) -&amp;gt; Bool:
-    var total_consumed = 0
-    var pos = 0
-    var text_len = len(text)
-    var word_matches = 0
-    var word_total_consumed = 0
-    while True:
-        if pos &amp;gt;= text_len:
-            break
-        var ch = text[pos]
-        alias char_class = "word"
-        var char_matches = False
-        char_matches = (
-            (ord("a") &amp;lt;= ord(ch) &amp;lt;= ord("z"))
-            or (ord("A") &amp;lt;= ord(ch) &amp;lt;= ord("Z"))
-            or (ord("0") &amp;lt;= ord(ch) &amp;lt;= ord("9"))
-            or ch == "_"
-        )
-        if not char_matches:
-            break
-        var chars_consumed = 1
-        if chars_consumed == 0:
-            break
-        word_matches += 1
-        word_total_consumed += chars_consumed
-        pos += chars_consumed
-    if word_matches &amp;lt; 1:
-        return False
-    total_consumed += word_total_consumed
-    ...  # much more code, for the rest of the pattern&lt;/code&gt;
-    &lt;p&gt;This is about 10.5x faster in my benchmarks. 2&lt;/p&gt;
-    &lt;p&gt;It makes you wonder, can an optimizer somehow do this for us?&lt;/p&gt;
-    &lt;p&gt;Unfortunately, no. There are a lot of challenges in the way, as I'll explain below.&lt;/p&gt;
-    &lt;p&gt;...which is a TERRIBLE idea and you should never do it (see this page) but what's life without a little regex-related sin!&lt;/p&gt;
-    &lt;p&gt;Real regex engines typically parse patterns into ASTs first, then compile them to state machines (DFAs/NFAs) that process input with state transitions. This toy implementation uses a recursive AST interpreter instead, which has function call overhead at every node, but it much better illustrates the powers of this technique: all the overhead is eliminated.&lt;/p&gt;
-    &lt;p&gt;Tested on M2 Macbook Pro, run 200,000,000 times, more details below.&lt;/p&gt;
-    &lt;p&gt;The problem is that matches is kind of like an interpreter. It takes in a constant tree of nodes, like this:&lt;/p&gt;
-    &lt;p&gt;...and it also takes in the user's string which is only known at run-time.&lt;/p&gt;
-    &lt;p&gt;It then navigates up and down the tree according to what character is next in the user's string.&lt;/p&gt;
-    &lt;p&gt;To illustrate, here's the top-level matches function:&lt;/p&gt;
-    &lt;code&gt;
-@no_inline
-fn matches(regex: Regex, text: String) -&amp;gt; Bool:
-    var result = _match_node(regex.nodes, regex.root_idx, text, 0)
-    return result.matched and result.chars_consumed == len(text)&lt;/code&gt;
-    &lt;p&gt;...which really just calls into the (recursive) _match_node function:&lt;/p&gt;
-    &lt;code&gt;fn _match_node(
-    nodes: List[RegexNode], node_idx: Int, text: String, start_pos: Int
-) -&amp;gt; MatchResult:
-    var node = nodes[node_idx]
-    if node.isa[LiteralNode]():
-        ref literal_node = node[LiteralNode]
-        return _match_literal(nodes, literal_node, text, start_pos)
-    elif node.isa[RepeatNode]():
-        ref repeat_node = node[RepeatNode]
-        return _match_repeat(nodes, repeat_node, text, start_pos)
-    elif ...&lt;/code&gt;
-    &lt;p&gt;...which calls various functions, like the below _match_repeat function. This function checks the repeating parts of the regular expression, like how how email regex's \w+ uses + to repeat the \w.&lt;/p&gt;
-    &lt;code&gt;fn _match_repeat(
-    nodes: List[RegexNode],  # All the regex nodes
-    node: LiteralNode,       # Which node we're currently on
-    text: String,            # User's string
-    start_pos: Int           # Where in the user's string we're at
-) -&amp;gt; MatchResult:
-    var matches = 0
-    var total_consumed = 0
-    var pos = start_pos
-    while True:
-        if node.maximum_times &amp;gt;= 0 and matches &amp;gt;= node.maximum_times:
-            break
-        var result = _match_node(nodes, node.repeated, text, pos)
-        if not result.matched:
-            break
-        if result.chars_consumed == 0:
-            break
-        matches += 1
-        total_consumed += result.chars_consumed
-        pos += result.chars_consumed
-    if matches &amp;gt;= node.minimum_times:
-        return MatchResult(True, total_consumed)
-    else:
-        return MatchResult(False, 0)&lt;/code&gt;
-    &lt;p&gt;One benefit of the recursive approach is that it's very flexible. It can execute an arbitrary tree of nodes; it can execute an arbitrary regular expression. The hand-written version doesn't have that flexibility, it's coded up-front.&lt;/p&gt;
-    &lt;p&gt;But of course, the flexibility has a cost: recursion requires more function calls than the hand-written version, and function calls have overhead. Every time we call a function, that's pushing and popping on the stack. The hand-written version is faster because it doesn't have that problem.&lt;/p&gt;
-    &lt;p&gt;Another problem is that this general regex code has extra flexibility that the hand-written one doesn't need. Look at this condition from above:&lt;/p&gt;
-    &lt;code&gt;    if node.maximum_times &amp;gt;= 0 and matches &amp;gt;= node.maximum_times:
-        break&lt;/code&gt;
-    &lt;p&gt;This code is only relevant when we want a maximum number of matches, as if we said \w{,7} to mean maximum 7 matches. But our particular email regex has things like \w+ with no upper limit, to match any number of \w characters. So it's unfortunate that this useless code is in here, slowing things down. The hand-written version is faster because it doesn't have that problem.&lt;/p&gt;
-    &lt;p&gt;The hand-written version is also theoretically more optimizable because everything is in one function, as if we inlined all these recursive _match_node, _match_repeat, etc calls. Optimizers generally do better when everything is in one function.&lt;/p&gt;
-    &lt;p&gt;Is there a way to get these benefits for our general Regex code?&lt;/p&gt;
-    &lt;p&gt;I had to hold myself back from adding even more interesting features to it, like SIMD. This implementation also doesn't support backtracking, which real regex engines need for more complex patterns.&lt;/p&gt;
-    &lt;p&gt;Above, I said that the hand-written function is almost as if we inlined all these recursive _match_node calls.&lt;/p&gt;
-    &lt;p&gt;So the obvious question: can we inline _match_node?&lt;/p&gt;
-    &lt;p&gt;Let's try it, by throwing a @always_inline on it:&lt;/p&gt;
-    &lt;code&gt;@always_inline
-fn _match_node(
-    nodes: List[RegexNode], node_idx: Int, text: String, start_pos: Int
-) -&amp;gt; MatchResult:
-    ...&lt;/code&gt;
-    &lt;p&gt;But of course, trying to inline a recursive call causes a compile error:&lt;/p&gt;
-    &lt;code&gt;main_rt_inlined.mojo:19:4: error: function has recursive call to 'always_inline' function
-fn _match_node(
-   ^
-main_rt_inlined.mojo:28:29: note: through call here
-        return _match_repeat(nodes, repeat_node, text, start_pos)
-                            ^
-main_rt_inlined.mojo:119:4: note: to function marked 'always_inline' here
-fn _match_repeat(
-   ^
-main_rt_inlined.mojo:128:33: note: call here recurses
-        var result = _match_node(nodes, node.repeated, text, pos)
-                                ^
-main_rt_inlined.mojo:19:4: note: back to function here
-fn _match_node(
-   ^&lt;/code&gt;
-    &lt;p&gt;So let's table this line of thinking for now. We might come back to it later.&lt;/p&gt;
-    &lt;p&gt;I promised something mind-blowingly weird, so let's make things weird.&lt;/p&gt;
-    &lt;p&gt;We're going to do some multi-stage programming to get similar effects to the first Futamura projection, 4 or as it's known to some, "the three steps of Futamura sorcery". 5&lt;/p&gt;
-    &lt;p&gt;We'll:&lt;/p&gt;
-    &lt;p&gt;...and then something amazing happens.&lt;/p&gt;
-    &lt;p&gt;Specifically, we're specializing an interpreter for a specific program, though we'll use a few explicit staging annotations (alias and square brackets) rather than automatic partial evaluation.&lt;/p&gt;
-    &lt;p&gt;By "some", I mean like three people. Two if you don't count me.&lt;/p&gt;
-    &lt;p&gt;Most Regex implementations first parse the regular expression into a list of nodes. If we could move that parsing to compile time, we can save some run-time.&lt;/p&gt;
-    &lt;p&gt;To parse the Regex into nodes at compile time, we simply need to change the var regex to alias regex.&lt;/p&gt;
-    &lt;p&gt;Before:&lt;/p&gt;
-    &lt;code&gt;# Parse the regex (at runtime)
-var regex = Regex("w+(+w*)?@(d+.d+.d+.d+|w+.w+)")
-regex.match(regex.nodes, regex.root_node, user_string, 0)&lt;/code&gt;
-    &lt;p&gt;After:&lt;/p&gt;
-    &lt;code&gt;# Parse the regex (at compile time)
-alias regex = Regex("w+(+w*)?@(d+.d+.d+.d+|w+.w+)")
-_match_node[regex.nodes, regex.root_node](user_string, 0)&lt;/code&gt;
-    &lt;p&gt;alias is Mojo-speak for "compile-time variable". 6&lt;/p&gt;
-    &lt;p&gt;"But wait Evan, that's a lot of code to run at compile time, can compilers really execute general code at compile-time?"&lt;/p&gt;
-    &lt;p&gt;They can! This is one of the nicer features of Mojo (and a few other languages like D, Nim, Zig, etc.). A simple keyword (alias) can lift almost any computation 7 to compile time, and the same code can be run at compile-time or run-time depending on how it's used (like var vs alias).&lt;/p&gt;
-    &lt;p&gt;In this case, the compiler is running a whole little parser, with its own recursion, heap allocation, all sorts of stuff. And now it's happening at compile-time.&lt;/p&gt;
-    &lt;p&gt;"Wait Evan, did you say heap allocation? Isn't heap allocation at compile-time impossible?"&lt;/p&gt;
-    &lt;p&gt;It's rare, but not impossible! Mojo, D, Nim, and Zig can do it, and C++ as of C++20. There are likely some other languages that can do it, but these are the only ones that can truly run normal run-time code at compile time, as opposed to requiring compile-time calculations to be expressed in a different dialect. Though, I'd bet that some Lisps were doing all this back in the 60s and 70s too, as is usually the case!&lt;/p&gt;
-    &lt;p&gt;Deep inside the Mojo compiler, there's a compile-time interpreter that works closely with the instantiator (the "elaborator", which monomorphizes all generics), which runs all expressions inside generic arguments ([...]) and inside alias statements. This compile-time interpreter can execute pretty much any operation that a normal CPU could execute, including malloc and free.&lt;/p&gt;
-    &lt;p&gt;I kind of wish Mojo had a comptime keyword like Zig, but alas!&lt;/p&gt;
-    &lt;p&gt;I say almost because there are things a language shouldn't allow at compile time, like reading from stdin, etc.&lt;/p&gt;
-    &lt;p&gt;We just created this Regex at compile time.&lt;/p&gt;
-    &lt;p&gt;Do we read it at run-time? Do we put it into a global or something?&lt;/p&gt;
-    &lt;p&gt;No! We're going to only read it at compile-time.&lt;/p&gt;
-    &lt;p&gt;"But Evan, we need to read the Regex at run-time! Otherwise, how does the run-time program even know what to do? How does it know what functions to call, what branches to take, etc.?"&lt;/p&gt;
-    &lt;p&gt;Great question! The answer is that we can make all those decisions at compile time.&lt;/p&gt;
-    &lt;p&gt;I know that doesn't make any sense, but bear with me.&lt;/p&gt;
-    &lt;p&gt;Here's how we change our program.&lt;/p&gt;
-    &lt;p&gt;Before:&lt;/p&gt;
-    &lt;code&gt;fn _match_node(
-    nodes: List[RegexNode],
-    node_idx: Int,
-    text: String,
-    start_pos: Int
-) -&amp;gt; MatchResult:
-    var node = nodes[node_idx]
-    if node.isa[LiteralNode]():
-        ref literal_node = node[LiteralNode]
-        return _match_literal(nodes, literal_node, text, start_pos)
-    elif node.isa[RepeatNode]():
-        ref repeat_node = node[RepeatNode]
-        return _match_repeat(nodes, repeat_node, text, start_pos)
-    elif ...&lt;/code&gt;
-    &lt;p&gt;After:&lt;/p&gt;
-    &lt;code&gt;fn _match_node[nodes: List[RegexNode], node_idx: Int](
-    text: String,
-    start_pos: Int
-) -&amp;gt; MatchResult:
-    alias node = nodes[node_idx]
-    @parameter
-    if node.isa[LiteralNode]():
-        alias literal_node = node[LiteralNode]
-        return _match_literal[nodes, literal_node](text, start_pos)
-    elif node.isa[RepeatNode]():
-        alias repeat_node = node[RepeatNode]
-        return _match_repeat[nodes, repeat_node](text, start_pos)
-    elif ...&lt;/code&gt;
-    &lt;p&gt;There are two main changes:&lt;/p&gt;
-    &lt;p&gt;That means _match_node is now a generic function, a template.&lt;/p&gt;
-    &lt;p&gt;There's only one nodes value (from the Regex), but there are 28 different node_idxs for this Regex. That means we'll have 28 different instantiations of this _match_node, one for each node_idx.&lt;/p&gt;
-    &lt;p&gt;Previously, we had a very simple call tree, with only one _match_node, that was recursive. The call tree looked like this:&lt;/p&gt;
-    &lt;p&gt;Now, we have 28 versions of _match_node, with a call tree that looks like this:&lt;/p&gt;
-    &lt;p&gt;28 versions, each different only in their node_idx compile-time parameter.&lt;/p&gt;
-    &lt;p&gt;To understand that better, let's look at the _match_node[List(...), 1] function for the first \w+.&lt;/p&gt;
-    &lt;p&gt;When the compiler instantiates it as _match_node[List(...), 1], it would look like below. The @parameter if is evaluated at compile time, so only one of its branches is included. I'll leave them in as comments to illustrate:&lt;/p&gt;
-    &lt;code&gt;fn _match_node[List(...), 1](  # Node 1 is a RepeatNode
-    text: String,
-    start_pos: Int
-) -&amp;gt; MatchResult:
-#   alias node = nodes[node_idx]
-#   @parameter
-#   if node.isa[LiteralNode]():
-#       alias literal_node = node[LiteralNode]
-#       return _match_literal[nodes, literal_node](text, start_pos)
-#   elif node.isa[RepeatNode]():
-#       alias repeat_node = node[RepeatNode]
-        return _match_repeat[List(...), RepeatNode(2, 1, 0)](text, start_pos)
-#   elif ...&lt;/code&gt;
-    &lt;p&gt;The benefit here is that we don't have to do the node.isa[LiteralNode], node.isa[RepeatNode], etc. at run-time. That's pretty nice, it eliminates a bit of overhead.&lt;/p&gt;
-    &lt;p&gt;It also executed the alias statements for us too, so we don't have to do those lookups (and bounds checks) at run-time. Another nice speedup!&lt;/p&gt;
-    &lt;p&gt;We'll see the biggest benefit in the next section though.&lt;/p&gt;
-    &lt;p&gt;Let's look at the call tree again:&lt;/p&gt;
-    &lt;p&gt;Note how these are not actually recursive calls anymore. The compiler doesn't see these as recursive, it sees them as completely different functions, because they are.&lt;/p&gt;
-    &lt;p&gt;As far as the compiler is concerned, this is a normal call tree, not a potentially infinite call tree.&lt;/p&gt;
-    &lt;p&gt;So... maybe we can inline them? Can we put @always_inline on these functions?&lt;/p&gt;
-    &lt;p&gt;Yes we can!&lt;/p&gt;
-    &lt;p&gt;Let's start by inlining the _match_repeat function. We do that by putting @always_inline on fn _match_repeat:&lt;/p&gt;
-    &lt;code&gt;@always_inline
-fn _match_repeat[
-    nodes: List[RegexNode], repeat_node: RepeatNode
-](text: String, start_pos: Int) -&amp;gt; MatchResult:
-    var matches = 0
-    var total_consumed = 0
-    var pos = start_pos
-    while True:
-        if node.maximum_times &amp;gt;= 0 and matches &amp;gt;= node.maximum_times:
-            break
-        var result = _match_node[nodes, node.repeated](text, pos)
-        ...&lt;/code&gt;
-    &lt;p&gt;And now it will be inlined into its caller.&lt;/p&gt;
-    &lt;p&gt;Remember our _match_node[List(...), 1] function?&lt;/p&gt;
-    &lt;code&gt;fn _match_node[List(...), 5](  # Node 5 is a RepeatNode
-    text: String,
-    start_pos: Int
-) -&amp;gt; MatchResult:
-    alias node = nodes[node_idx]
-    alias repeat_node = node[RepeatNode]
-    # Let's inline this _match_repeat call first!
-    return _match_repeat[nodes, repeat_node](text, start_pos)&lt;/code&gt;
-    &lt;p&gt;Now that _match_repeat is inlined, _match_node looks more like this now:&lt;/p&gt;
-    &lt;code&gt;fn _match_node[List(...), 1](  # Node 1 is a RepeatNode
-    text: String,
-    start_pos: Int
-) -&amp;gt; MatchResult:
-    alias node = nodes[node_idx]
-    alias repeat_node = node[RepeatNode]
-    # Inlined _match_repeat call
-    var matches = 0
-    var total_consumed = 0
-    while True:
-        if node.maximum_times &amp;gt;= 0 and matches &amp;gt;= node.maximum_times:
-            break
-        var result = _match_node[nodes, node.repeated](text, pos)
-        ...
-    ...&lt;/code&gt;
-    &lt;p&gt;And the compiler will also execute those alias statements at compile time and inline their results.&lt;/p&gt;
-    &lt;p&gt;This part:&lt;/p&gt;
-    &lt;code&gt;if node.maximum_times &amp;gt;= 0 and matches &amp;gt;= node.maximum_times:
-    break&lt;/code&gt;
-    &lt;p&gt;actually becomes:&lt;/p&gt;
-    &lt;code&gt;if RepeatNode(2, 1, -1)_times &amp;gt;= 0 and matches &amp;gt;= RepeatNode(2, 1, 0).maximum_times:
-    break&lt;/code&gt;
-    &lt;p&gt;which then becomes:&lt;/p&gt;
-    &lt;code&gt;if -1 &amp;gt;= 0 and matches &amp;gt;= -1:
-    break&lt;/code&gt;
-    &lt;p&gt;which then becomes:&lt;/p&gt;
-    &lt;code&gt;if False and matches &amp;gt;= -1:
-    break&lt;/code&gt;
-    &lt;p&gt;which is then completely eliminated, because it's impossible.&lt;/p&gt;
-    &lt;p&gt;So in the end, our _match_node[List(...), 1] function is much simpler, and more specialized to this particular RepeatNode.&lt;/p&gt;
-    &lt;code&gt;fn _match_node[List(...), 1](  # Node 1 is a RepeatNode
-    text: String,
-    start_pos: Int
-) -&amp;gt; MatchResult:
-    # No node lookup!
-    var matches = 0
-    var total_consumed = 0
-    while True:
-        # No useless maximum_times checks here!
-        var result = _match_node[nodes, node.repeated](text, pos)
-        ...
-    ...&lt;/code&gt;
-    &lt;p&gt;We got all that benefit from just one @always_inline on one function!&lt;/p&gt;
-    &lt;p&gt;Let's throw @always_inline on all the functions:&lt;/p&gt;
-    &lt;p&gt;Suddenly, our large call tree above becomes simply this:&lt;/p&gt;
-    &lt;p&gt;And looking at the generated IR, it was all folded down into one function, structured similarly to the hand-written version.&lt;/p&gt;
-    &lt;p&gt;The final results (tested on an M2 Macbook Pro), run 200,000,000 times:&lt;/p&gt;
-    &lt;p&gt;The metaprogrammed version is 10x faster than the normal recursive version, and within ~3% of the hand-written version.&lt;/p&gt;
-    &lt;p&gt;Pretty impressive!&lt;/p&gt;
-    &lt;p&gt;It could!&lt;/p&gt;
-    &lt;p&gt;Regex libraries often do their own custom optimizations on the AST, before matching against the user's strings.&lt;/p&gt;
-    &lt;p&gt;For example, the pattern (catastrophe|catapult|category) shares the prefix 'cat'. At compile-time, we could detect this and generate code that's more like cat(astrophe|apult|egory), saving some comparisons.&lt;/p&gt;
-    &lt;p&gt;Or, for patterns like \b(GET|POST|PUT|DELETE)\b, it could figure out (at compile-time) a perfect hash table or trie, replacing 4 string comparisons with one hash lookup / string compare.&lt;/p&gt;
-    &lt;p&gt;These are techniques you rarely see in hand-written versions, but are common in normal regex engines.&lt;/p&gt;
-    &lt;p&gt;If we combine those with this technique, we could get those optimizations on top of hand-written performance.&lt;/p&gt;
-    &lt;p&gt;Let's talk about the main downside: compile times!&lt;/p&gt;
-    &lt;p&gt;This takes much more time to compile, because the compiler is generating much more code. In this example, we made 28 _match_node[...] functions, each about a fifth of the size of the original run-time recursive _match_node. So this technique generated about 5x as much _match_node code.&lt;/p&gt;
-    &lt;p&gt;And if you do custom optimizations like I mentioned in the last section, that also gets more performance at the cost of more compile time.&lt;/p&gt;
-    &lt;p&gt;One should use this technique wisely, only on code that needs to run fast.&lt;/p&gt;
-    &lt;p&gt;I should mention, I suspect drawback can be mitigated or avoided entirely. I think a user could theoretically use MaybeComptime and a few accompanying tools to have a dev/test mode where these calculations happen at run-time instead. Not proven, but my spidey sense says it's possible.&lt;/p&gt;
-    &lt;p&gt;This is metaprogramming. It's not just templates and constexpr. It's moving entire aspects of your entire program into compile-time, doing custom optimizations so that it can work even better than hand-written code.&lt;/p&gt;
-    &lt;p&gt;Metaprogramming is a term I've heard for many, many years, but I admit, I didn't truly understand its power and implications until seeing what it could do here.&lt;/p&gt;
-    &lt;p&gt;This regex example is just something most of us can relate to, but I think this technique can be used for much, much more.&lt;/p&gt;
-    &lt;p&gt;This is just wild speculation, but I think you could use this for:&lt;/p&gt;
-    &lt;p&gt;If I was to generalize:&lt;/p&gt;
-    &lt;p&gt;There's a few other directions I want to explore here:&lt;/p&gt;
-    &lt;p&gt;If you have any thoughts on where this technique can go, let me know!&lt;/p&gt;
-    &lt;p&gt;It turns out, the impossible optimization is totally possible!&lt;/p&gt;
-    &lt;p&gt;All it took was a little metaprogramming sorcery.&lt;/p&gt;
-    &lt;p&gt;If you want to see the code, you can find it here.&lt;/p&gt;
-    &lt;p&gt;If you want to read more on this technique, search for first Futamura projection or "staged programming" which is a similar concept.&lt;/p&gt;
-    &lt;p&gt;I hope you enjoyed this! Stay tuned for more articles by subscribing to the RSS feed, twitter, and come hang out in the Mojo discord or find me on the Vale discord.&lt;/p&gt;
-    &lt;p&gt;Cheers!&lt;/p&gt;
-    &lt;p&gt;- Evan&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45731256</guid><pubDate>Tue, 28 Oct 2025 10:53:21 +0000</pubDate></item><item><title>Show HN: Pipelex – Declarative language for repeatable AI workflows</title><link>https://github.com/Pipelex/pipelex</link><description>&lt;doc fingerprint="1416981b30b7fe88"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Pipelex is developing the open standard for repeatable AI workflows.&lt;lb/&gt; Write business logic, not API calls.&lt;/p&gt;
-    &lt;code&gt;pip install pipelex
-pipelex init&lt;/code&gt;
-    &lt;p&gt;To use AI models, you need an API key:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Free Pipelex API Key: Join our Discord community and request your free API key (no credit card required) in the 🔑・free-api-key channel.&lt;/item&gt;
-      &lt;item&gt;Bring your own API keys: OpenAI, Anthropic, Google, Mistral)&lt;/item&gt;
-      &lt;item&gt;Local AI: Ollama, vLLM, LM Studio, llama.cpp... any endpoint based on the OpenAI API or not, as you can plug-in your own non-standard APIs.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;See Configure AI Providers for details.&lt;/p&gt;
-    &lt;p&gt;Create a complete AI workflow with a single command:&lt;/p&gt;
-    &lt;code&gt;pipelex build pipe "Take a CV and Job offer in PDF, analyze if they match and generate 5 questions for the interview" --output results/cv_match.plx&lt;/code&gt;
-    &lt;p&gt;This command generates a production-ready &lt;code&gt;.plx&lt;/code&gt; file with domain definitions, concepts, and multiple processing steps that analyzes CV-job fit and prepares interview questions.&lt;/p&gt;
-    &lt;p&gt;cv_match.plx&lt;/p&gt;
-    &lt;code&gt;domain = "cv_match"
-description = "Matching CVs with job offers and generating interview questions"
-main_pipe = "analyze_cv_job_match_and_generate_questions"
-
-[concept.MatchAnalysis]
-description = """
-Analysis of alignment between a candidate and a position, including strengths, gaps, and areas requiring further exploration.
-"""
-
-[concept.MatchAnalysis.structure]
-strengths = { type = "text", description = "Areas where the candidate's profile aligns well with the requirements", required = true }
-gaps = { type = "text", description = "Areas where the candidate's profile does not meet the requirements or lacks evidence", required = true }
-areas_to_probe = { type = "text", description = "Topics or competencies that need clarification or deeper assessment during the interview", required = true }
-
-[concept.Question]
-description = "A single interview question designed to assess a candidate."
-refines = "Text"
-
-[pipe.analyze_cv_job_match_and_generate_questions]
-type = "PipeSequence"
-description = """
-Main pipeline that orchestrates the complete CV-job matching and interview question generation workflow. Takes a candidate's CV and a job offer as PDF documents, extracts their content, performs a comprehensive match analysis identifying strengths, gaps, and areas to probe, and generates exactly 5 targeted interview questions based on the analysis results.
-"""
-inputs = { cv_pdf = "PDF", job_offer_pdf = "PDF" }
-output = "Question[5]"
-steps = [
-    { pipe = "extract_documents_parallel", result = "extracted_documents" },
-    { pipe = "analyze_match", result = "match_analysis" },
-    { pipe = "generate_interview_questions", result = "interview_questions" },
-]&lt;/code&gt;
-    &lt;head&gt;📄 Click to view the supporting pipes implementation&lt;/head&gt;
-    &lt;code&gt;[pipe.extract_documents_parallel]
-type = "PipeParallel"
-description = """
-Executes parallel extraction of text content from both the CV PDF and job offer PDF simultaneously to optimize processing time.
-"""
-inputs = { cv_pdf = "PDF", job_offer_pdf = "PDF" }
-output = "Dynamic"
-parallels = [
-    { pipe = "extract_cv_text", result = "cv_pages" },
-    { pipe = "extract_job_offer_text", result = "job_offer_pages" },
-]
-add_each_output = true
-
-[pipe.extract_cv_text]
-type = "PipeExtract"
-description = """
-Extracts text content from the candidate's CV PDF document using OCR technology, converting all pages into machine-readable text format for subsequent analysis.
-"""
-inputs = { cv_pdf = "PDF" }
-output = "Page[]"
-model = "extract_text_from_pdf"
-
-[pipe.extract_job_offer_text]
-type = "PipeExtract"
-description = """
-Extracts text content from the job offer PDF document using OCR technology, converting all pages into machine-readable text format for subsequent analysis.
-"""
-inputs = { job_offer_pdf = "PDF" }
-output = "Page[]"
-model = "extract_text_from_pdf"
-
-[pipe.analyze_match]
-type = "PipeLLM"
-description = """
-Performs comprehensive analysis comparing the candidate's CV against the job offer requirements. Identifies and structures: (1) strengths where the candidate's profile aligns well with requirements, (2) gaps where the profile lacks evidence or doesn't meet requirements, and (3) specific areas requiring deeper exploration or clarification during the interview process.
-"""
-inputs = { cv_pages = "Page[]", job_offer_pages = "Page[]" }
-output = "MatchAnalysis"
-model = "llm_to_answer_hard_questions"
-system_prompt = """
-You are an expert HR analyst and recruiter specializing in candidate-job fit assessment. Your task is to generate a structured MatchAnalysis comparing a candidate's CV against job requirements.
-"""
-prompt = """
-Analyze the match between the candidate's CV and the job offer requirements.
-
-Candidate CV:
-@cv_pages
-
-Job Offer:
-@job_offer_pages
-
-Perform a comprehensive comparison and provide a structured analysis.
-"""
-
-[pipe.generate_interview_questions]
-type = "PipeLLM"
-description = """
-Generates exactly 5 targeted, relevant interview questions based on the match analysis results. Questions are designed to probe identified gaps, clarify areas of uncertainty, validate strengths, and assess competencies that require deeper evaluation to determine candidate-position fit.
-"""
-inputs = { match_analysis = "MatchAnalysis" }
-output = "Question[5]"
-model = "llm_to_write_questions"
-system_prompt = """
-You are an expert HR interviewer and talent assessment specialist. Your task is to generate structured interview questions based on candidate-position match analysis.
-"""
-prompt = """
-Based on the following match analysis between a candidate and a position, generate exactly 5 targeted interview questions.
-
-@match_analysis
-
-The questions should:
-- Probe the identified gaps to assess if they are deal-breakers or can be mitigated
-- Clarify areas that require deeper exploration
-- Validate the candidate's strengths with concrete examples
-- Be open-ended and behavioral when appropriate
-- Help determine overall candidate-position fit
-
-Generate exactly 5 interview questions.
-"""&lt;/code&gt;
-    &lt;p&gt;View the pipeline flowchart:&lt;/p&gt;
-    &lt;code&gt;flowchart TD
- subgraph PAR["extract_documents_parallel (PipeParallel)"]
-    direction LR
-        EXTRACT_CV["extract_cv_text (PipeExtract)"]
-        EXTRACT_JOB["extract_job_offer_text (PipeExtract)"]
-  end
- subgraph MAIN["analyze_cv_job_match_and_generate_questions (PipeSequence)"]
-    direction TB
-        PAR
-        CV_PAGES[["cv_pages: Page"]]
-        JOB_PAGES[["job_offer_pages: Page"]]
-        ANALYZE["analyze_match (PipeLLM)"]
-        MATCH[["MatchAnalysis"]]
-        GENERATE["generate_interview_questions (PipeLLM)"]
-        OUT[["Question"]]
-  end
-    CV_IN[["cv_pdf: PDF"]] --&amp;gt; EXTRACT_CV
-    JOB_IN[["job_offer_pdf: PDF"]] --&amp;gt; EXTRACT_JOB
-    EXTRACT_CV --&amp;gt; CV_PAGES
-    EXTRACT_JOB --&amp;gt; JOB_PAGES
-    CV_PAGES --&amp;gt; ANALYZE
-    JOB_PAGES --&amp;gt; ANALYZE
-    ANALYZE --&amp;gt; MATCH
-    MATCH --&amp;gt; GENERATE
-    GENERATE --&amp;gt; OUT
-    classDef default stroke:#1976D2,stroke-width:2px,fill:#E3F2FD,color:#0D47A1
-    style EXTRACT_CV stroke:#1565C0,fill:#BBDEFB,color:#0D47A1
-    style EXTRACT_JOB stroke:#1565C0,fill:#BBDEFB,color:#0D47A1
-    style PAR fill:#FFF9C4,stroke:#F57C00,stroke-width:2px
-    style CV_PAGES stroke:#2E7D32,fill:#C8E6C9,color:#1B5E20
-    style JOB_PAGES stroke:#2E7D32,fill:#C8E6C9,color:#1B5E20
-    style ANALYZE stroke:#1565C0,fill:#BBDEFB,color:#0D47A1
-    style MATCH stroke:#2E7D32,fill:#C8E6C9,color:#1B5E20
-    style GENERATE stroke:#1565C0,fill:#BBDEFB,color:#0D47A1
-    style OUT stroke:#2E7D32,fill:#C8E6C9,color:#1B5E20
-    style CV_IN stroke:#2E7D32,fill:#C8E6C9,color:#1B5E20
-    style JOB_IN stroke:#2E7D32,fill:#C8E6C9,color:#1B5E20
-    style MAIN fill:#F3E5F5,stroke:#7B1FA2,stroke-width:2px
-&lt;/code&gt;
-    &lt;p&gt;Via CLI:&lt;/p&gt;
-    &lt;code&gt;# Run with input file
-pipelex run results/cv_match.plx --inputs inputs.json&lt;/code&gt;
-    &lt;p&gt;Create an &lt;code&gt;inputs.json&lt;/code&gt; file with your PDF URLs:&lt;/p&gt;
-    &lt;code&gt;{
-  "cv_pdf": {
-    "concept": "PDF",
-    "content": {
-      "url": "https://pipelex-web.s3.amazonaws.com/demo/John-Doe-CV.pdf"
-    }
-  },
-  "job_offer_pdf": {
-    "concept": "PDF",
-    "content": {
-      "url": "https://pipelex-web.s3.amazonaws.com/demo/Job-Offer.pdf"
-    }
-  }
-}&lt;/code&gt;
-    &lt;p&gt;Via Python:&lt;/p&gt;
-    &lt;code&gt;import asyncio
-import json
-from pipelex.pipeline.execute import execute_pipeline
-from pipelex.pipelex import Pipelex
-
-async def run_pipeline():
-    with open("inputs.json", encoding="utf-8") as f:
-        inputs = json.load(f)
-
-    pipe_output = await execute_pipeline(
-        pipe_code="cv_match",
-        inputs=inputs
-    )
-    print(pipe_output.main_stuff_as_str)
-
-Pipelex.make()
-asyncio.run(run_pipeline())&lt;/code&gt;
-    &lt;p&gt;Install AI assistant rules to easily modify your pipelines:&lt;/p&gt;
-    &lt;code&gt;pipelex kit rules&lt;/code&gt;
-    &lt;p&gt;This installs rules for Cursor, Claude, OpenAI Codex, GitHub Copilot, Windsurf, and Blackbox AI. Now you can refine pipelines with natural language:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;"Include confidence scores between 0 and 100 in the match analysis"&lt;/item&gt;
-      &lt;item&gt;"Write a recap email at the end"&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Pipelex is an open-source language that enables you to build and run repeatable AI workflows. Instead of cramming everything into one complex prompt, you break tasks into focused steps, each pipe handling one clear transformation.&lt;/p&gt;
-    &lt;p&gt;Each pipe processes information using Concepts (typing with meaning) to ensure your pipelines make sense. The Pipelex language (&lt;code&gt;.plx&lt;/code&gt; files) is simple and human-readable, even for non-technical users. Each step can be structured and validated, giving you the reliability of software with the intelligence of AI.&lt;/p&gt;
-    &lt;p&gt;Learn More:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Writing Workflows Tutorial - Complete guide with examples&lt;/item&gt;
-      &lt;item&gt;Build Reliable AI Workflows - Deep dive into Pipelex&lt;/item&gt;
-      &lt;item&gt;Configuration Guide - Set up AI providers and models&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;We highly recommend installing our extension for &lt;code&gt;.plx&lt;/code&gt; files into your IDE. You can find it in the Open VSX Registry. It's coming soon to VS Code marketplace too. If you're using Cursor, Windsurf or another VS Code fork, you can search for it directly in your extensions tab.&lt;/p&gt;
-    &lt;p&gt;Explore real-world examples in our Cookbook repository:&lt;/p&gt;
-    &lt;p&gt;Clone it, fork it, and experiment with production-ready pipelines for various use cases.&lt;/p&gt;
-    &lt;p&gt;The package supports the following additional features:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;anthropic&lt;/code&gt;: Anthropic/Claude support for text generation&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;google&lt;/code&gt;: Google models (Vertex) support for text generation&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;mistralai&lt;/code&gt;: Mistral AI support for text generation and OCR&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;bedrock&lt;/code&gt;: Amazon Bedrock support for text generation&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;fal&lt;/code&gt;: Image generation with Black Forest Labs "FAL" service&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Install all extras:&lt;/p&gt;
-    &lt;p&gt;Using &lt;code&gt;pip&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;pip install "pipelex[anthropic,google,google-genai,mistralai,bedrock,fal]"&lt;/code&gt;
-    &lt;p&gt;Pipelex collects optional, anonymous usage data to help improve the product. On first run, you'll be prompted to choose your telemetry preference:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Off: No telemetry data collected&lt;/item&gt;
-      &lt;item&gt;Anonymous: Anonymous usage data only (command usage, performance metrics, feature usage)&lt;/item&gt;
-      &lt;item&gt;Identified: Usage data with user identification (helps us provide better support)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Your prompts, LLM responses, file paths, and URLs are automatically redacted and never transmitted. You can change your preference at any time or disable telemetry completely by setting the &lt;code&gt;DO_NOT_TRACK&lt;/code&gt; environment variable.&lt;/p&gt;
-    &lt;p&gt;For more details, see the Telemetry Documentation or read our Privacy Policy.&lt;/p&gt;
-    &lt;p&gt;We welcome contributions! Please see our Contributing Guidelines for details on how to get started, including development setup and testing information.&lt;/p&gt;
-    &lt;p&gt;Join our vibrant Discord community to connect with other developers, share your experiences, and get help with your Pipelex projects!&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;GitHub Issues: For bug reports and feature requests&lt;/item&gt;
-      &lt;item&gt;Discussions: For questions and community discussions&lt;/item&gt;
-      &lt;item&gt;Documentation&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;If you find Pipelex helpful, please consider giving us a star! It helps us reach more developers and continue improving the tool.&lt;/p&gt;
-    &lt;p&gt;This project is licensed under the MIT license. Runtime dependencies are distributed under their own licenses via PyPI.&lt;/p&gt;
-    &lt;p&gt;"Pipelex" is a trademark of Evotis S.A.S.&lt;/p&gt;
-    &lt;p&gt;© 2025 Evotis S.A.S.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45734865</guid><pubDate>Tue, 28 Oct 2025 16:19:26 +0000</pubDate></item><item><title>Hacking India's largest automaker: Tata Motors</title><link>https://eaton-works.com/2025/10/28/tata-motors-hack/</link><description>&lt;doc fingerprint="3f6092114f4737db"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Hacking India’s largest automaker: Tata Motors&lt;/head&gt;
-    &lt;head rend="h2"&gt;Key Points / Summary&lt;/head&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;2 exposed AWS keys on public-facing websites revealed 70+ TB of sensitive information and infrastructure across hundreds of buckets.&lt;/item&gt;
-      &lt;item&gt;Pointless AWS key encryption easily defeated.&lt;/item&gt;
-      &lt;item&gt;Tableau backdoor made it possible to log in as anyone without a password, including the server admin. This exposed countless internal projects, financial reports, and dealer dashboards.&lt;/item&gt;
-      &lt;item&gt;Exposed Azuga API key compromised test drive fleet management system.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;If you are in the US and ask your friends and family if they have heard of “Tata Motors”, they would likely say no. However, if you go overseas, Tata Motors and the Tata Group in general are a massive, well-known conglomerate. Back in 2023, I took my hacking adventures overseas and found many vulnerabilities with Tata Motors. This post covers 4 of the most impactful findings I discovered that I am finally ready to share today. Let’s dive in!&lt;/p&gt;
-    &lt;p&gt;Note that all secrets/credentials shown have been rotated, meaning they are no longer valid and cannot be used anymore. Additionally, no substantial amounts of data were downloaded as part of any testing, nor was there any obvious evidence of malicious access.&lt;/p&gt;
-    &lt;head rend="h2"&gt;AWS Keys in E-Dukaan Marketplace&lt;/head&gt;
-    &lt;p&gt;E-Dukaan is a Tata Motors site where their customers can buy spare parts for their vehicles. It’s a typical E-Commerce site, but it had a dark secret!&lt;/p&gt;
-    &lt;p&gt;Can you see it? Right there, in plaintext, are AWS keys. For those unfamiliar, you NEVER EVER want to expose these because people can use them to download all your files stored on Amazon, upload malicious content, rack up massive bills, etc.&lt;/p&gt;
-    &lt;p&gt;Intrigued, I put them into S3 Browser to see what it unlocked access to. The answer was.. basically everything. A long list of buckets packed with sensitive information. Here’s a few examples:&lt;/p&gt;
-    &lt;p&gt;A customer database backup? Check ✅&lt;/p&gt;
-    &lt;p&gt;Customer lists and market intelligence? Yup ✅&lt;/p&gt;
-    &lt;p&gt;Hundreds of thousands of invoices for E-Dukaan containing customer information, like PAN? Of course ✅&lt;/p&gt;
-    &lt;p&gt;Admin order reports? Absolutely ✅ (about 40 GB worth of reports in here)&lt;/p&gt;
-    &lt;p&gt;You may be wondering, where was this AWS keyset actually used? What made it worth the risk of exposing so much? Answer: to download a 4 KB file containing tax codes:&lt;/p&gt;
-    &lt;head rend="h2"&gt;Decryptable AWS Keys in FleetEdge&lt;/head&gt;
-    &lt;p&gt;Finding the AWS keys in E-Dukaan was so easy that it felt like cheating. This next one was more challenging (but not by much).&lt;/p&gt;
-    &lt;p&gt;FleetEdge is Tata Motors’ fleet management/tracking solution. More info is here. Looking at the API calls that are executed on site load as a guest user, one immediately stuck out:&lt;/p&gt;
-    &lt;p&gt;Right there in the response is another set of AWS keys, but this time they were not plaintext – they appeared to be encrypted. A quick search of a decrypt method turned up the exact code, and setting a breakpoint there was enough to reveal the contents:&lt;/p&gt;
-    &lt;p&gt;As recently seen with Intel, there seems to be a trend where developers will do this pointless client-side decryption. When the client has the key, it’s strange that anyone would think that would be secure. Maybe these devs knew what the E-Dukaan team was doing and wanted to (try) doing things a little better?&lt;/p&gt;
-    &lt;p&gt;This set of AWS keys has a similarly serious impact. There was another long list of new buckets you could access. At one point, S3 Browser had estimated 70 TB in one bucket before it crashed. Here’s a few examples:&lt;/p&gt;
-    &lt;p&gt;Fleet insights – this is where 70 TB+ of data was found. There was some datalake with files going back to 1996!&lt;/p&gt;
-    &lt;p&gt;You also had write access to some websites. You could easily slip in some malware on the frontpage and wreak some havoc.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Backdoor admin access to Tableau&lt;/head&gt;
-    &lt;p&gt;Note: This flaw is not believed to be linked to Tableau itself and instead was introduced by Tata Motors.&lt;/p&gt;
-    &lt;p&gt;Let’s go back to E-Dukaan now. Turns out, it’s the gift that keeps on giving. Poking around the source code of the website, I came across some interesting code:&lt;/p&gt;
-    &lt;p&gt;The first obvious issue was the username and password in the comments. If you look closer, you can see an HTTP call to get a “trusted token”. Crucially, it only needs username and site name (no password). Thanks to the code comment, we had a username to try. Performing the HTTP POST manually yielded a token!&lt;/p&gt;
-    &lt;p&gt;When you plug that into the infoviz URL like the code does, you will be redirected to Tableau!&lt;/p&gt;
-    &lt;p&gt;But there is more fun to be had. This user didn’t have access to much. Since we essentially had a backdoor into Tableau needing only username, we could in theory log in as anyone. One of the cards had the server admin as the owner, and it was possible to get the username that way:&lt;/p&gt;
-    &lt;p&gt;With that in hand, I went through the same process of getting a token, and then I had total control over Tableau with access to everything. I didn’t dig too deep after this since it was a lot of sensitive corporate stuff, and I had proven the vulnerability at this point.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Azuga API Key Leak&lt;/head&gt;
-    &lt;p&gt;Azuga is a fleet management platform. Tata Motors used it for their test drive website, presumably to keep tabs on where their cars are. Right there in the JS code was the Azuga token that should never have left the server. A quick API test was enough to confirm it was valid, and that is where I wrapped things up.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Timeline&lt;/head&gt;
-    &lt;p&gt;Special thanks to India’s Computer Emergency Response Team (CERT-IN) for working with me on these disclosures.&lt;/p&gt;
-    &lt;p&gt;All 4 issues were reported to Tata Motors through CERT-IN. Tata Motors was a bit slow in rotating the AWS keys. Given what was exposed, I had hoped they would have done it faster.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;August 8, 2023: Reported. A response is received shortly after confirming they will take action with the concerned authority.&lt;/item&gt;
-      &lt;item&gt;August 30, 2023: I request an update.&lt;/item&gt;
-      &lt;item&gt;September 1, 2023: Tata Motors shared with CERT-IN (who then shared with me) that the issues are remediated.&lt;/item&gt;
-      &lt;item&gt;September 3, 2023: I confirm only 2/4 issues were remediated and the AWS keys were still present on the websites, and active.&lt;/item&gt;
-      &lt;item&gt;October 22, 2023: After no updates and finding the AWS issues still not remediated, I send over some more specific steps on what must be done.&lt;/item&gt;
-      &lt;item&gt;October 23, 2023: They confirm receipt and are working on taking action. After this date and up until January 2, 2024, there were various back and forth emails trying to get Tata Motors to revoke the AWS keys. I am not sure if something was lost in translation, but it took a lot of pestering and specific instructions to get it done.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h2"&gt;India’s largest automaker should be more secure&lt;/head&gt;
-    &lt;p&gt;Compared to some of my other recent hacks, these weren’t anything super sophisticated. You just had to know where to look. Secrets leak all the time, but the impact is often tempered by the secret having limited access. In this case, having 2 sets of AWS keys leak with access to so much is incredibly concerning. When buying a car, you should be able to trust the automaker will take reasonable actions to keep your data secure. I hope Tata Motors does better in the future – someone else would have absolutely discovered these vulnerabilities at some point, and that would have been a much darker story.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45741569</guid><pubDate>Wed, 29 Oct 2025 01:31:56 +0000</pubDate></item><item><title>Introducing architecture variants</title><link>https://discourse.ubuntu.com/t/introducing-architecture-variants-amd64v3-now-available-in-ubuntu-25-10/71312</link><description>&lt;doc fingerprint="7175513321d03c02"&gt;
-  &lt;main&gt;
-    &lt;div&gt;
-      &lt;p&gt;Is there any way I can check if ubuntu-drivers isn’t working because amd64v3 or not?&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;liviu@bobdenaut:~$ sudo ubuntu-drivers devices
-[sudo: authenticate] Password: 
-liviu@bobdenaut:~$ sudo ubuntu-drivers list
-liviu@bobdenaut:~$ sudo ubuntu-drivers debug
-=== log messages from detection ===
-DEBUG:root:package_get_nv_allowing_driver(): unable to read /etc/custom_supported_gpus.json
-DEBUG:root:package_get_nv_allowing_driver(): unable to read /etc/custom_supported_gpus.json
-DEBUG:root:Loading custom detection plugin /usr/share/ubuntu-drivers-common/detect/arm-gles.py
-DEBUG:root:plugin /usr/share/ubuntu-drivers-common/detect/arm-gles.py return value: None
-DEBUG:root:Loading custom detection plugin /usr/share/ubuntu-drivers-common/detect/sl-modem.py
-DEBUG:root:plugin /usr/share/ubuntu-drivers-common/detect/sl-modem.py return value: None
-=== modaliases in the system ===
-platform:acpi-cpufreq
-acpi:INT33A1:PNP0D80:
-platform:intel_rapl_msr
-acpi:INTC1085:
-acpi:USBC000:PNP0CA0:
-acpi:PNP0C14:
-wmi:05901221-D566-11D1-B2F0-00A0C9062910
-wmi:0B3CBB35-E3C2-45ED-91C2-4C5A6D195D1C
-wmi:97845ED0-4E6D-11DE-8A39-0800200C9A66
-acpi:PNP0C0C:
-acpi:ACPI000C:
-platform:rtc-efi
-acpi:ASUS2018:
-wmi:A6FEA33E-DABF-46F5-BFC8-460D961BEC9F
-wmi:2BC49DEF-7B15-4F05-8BB7-EE37B9547C0B
-acpi:ASUS9001:
-platform:coretemp
-acpi:INTC1041:
-acpi:PNP0C0E:
-acpi:MSFT0101:
-acpi:ACPI000E:
-platform:efivars
-wmi:88765ADC-4FFE-4824-A48C-C68BBD71821B
-wmi:FEF38251-8214-4D1F-A98A-71A010EBFF7B
-serio:ty01pr00id00ex00
-input:b0011v0001p0002eAB41-e0,1,4,11,14,k71,72,73,74,75,76,77,79,7A,7B,7C,7D,7E,7F,80,8C,8E,8F,9B,9C,9D,9E,9F,A3,A4,A5,A6,AC,AD,B7,B8,B9,BA,BB,BC,BD,BE,BF,C0,C1,C2,D9,E2,ram4,l0,1,2,sfw
-platform:asus-nb-wmi
-input:b0019v0000p0000e0000-e0,1,4,14,k71,72,73,8C,94,95,96,98,A3,A4,A5,A6,A9,B7,B8,B9,CA,CB,D4,D7,E0,E1,E2,E3,E5,E6,ED,EE,F0,F7,F8,1D6,1E2,212,213,230,27A,ram4,lsfw
-acpi:NVDA0820:
-wmi:1F13AB7F-6220-4210-8F8E-8BB5E71EE969
-platform:pcspkr
-pci:v00008086d00007A3Dsv00000000sd00000000bc06sc04i00
-pci:v000010ECd00008168sv00001043sd0000205Fbc02sc00i00
-wmi:603E9613-EF25-4338-A3D0-C46177516DB7
-pci:v00008086d0000A74Fsv00000000sd00000000bc08sc80i00
-pci:v00008086d00007A0Csv00001043sd000014D3bc06sc01i00
-acpi:PNP0C0A:
-acpi:PNP0C0D:
-acpi:PNP0103:
-acpi:INTC1046:
-pci:v00008086d0000A70Dsv00001043sd000014D3bc06sc04i00
-pci:v000010DEd00002860sv00001043sd000014D3bc03sc00i00
-pci:v000010DEd000022BDsv00001043sd000014D3bc04sc03i00
-hdaudio:v10DE00A6r00100100a01
-input:b0000v0000p0000e0000-e0,5,kramlsfw6,8,
-pci:v00008086d00007A79sv00000000sd00000000bc0Csc80i00
-acpi:CSC3551:
-platform:pxa2xx-spi
-spi:cs35l41-hda
-platform:idma64
-pci:v00008086d0000A71Dsv00001043sd000014D3bc11sc80i00
-pci:v00008086d00007A70sv00008086sd00000094bc02sc80i00
-pci:v00008086d00007A68sv00001043sd000014D3bc07sc80i00
-mei::6861ec7b-d07a-4673-856c-7f22b4d55769:02:
-mei::3c4852d6-d47b-4f46-b05e-b5edc1aa440e:01:
-mei::dba4d603-d7ed-4931-8823-17ad585705d5:01:
-mei::dd17041c-09ea-4b17-a271-5b989867ec65:02:
-mei::082ee5a7-7c25-470a-9643-0c06f0466ea1:00:
-mei::42b3ce2f-bd9f-485a-96ae-26406230b1ff:01:
-mei::309dcde8-ccb1-4062-8f78-600115a34327:01:
-mei::55213584-9a29-4916-badf-0fb7ed682aeb:02:
-mei::8e6a6715-9abc-4043-88ef-9e39c6f63e0f:02:
-mei::8c2f4425-77d6-4755-aca3-891fdbc66a58:01:
-mei::fbf6fcf1-96cf-4e2e-a6a6-1bab8cbe36b1:01:
-mei::b638ab7e-94e2-4ea2-a552-d1c54b627f04:01:
-mei::5565a099-7fe2-45c1-a22b-d7e9dfea9a2e:01:
-pci:v00008086d00007A44sv00000000sd00000000bc06sc04i00
-pci:v00002646d00005017sv00002646sd00005017bc01sc08i02
-pci:v00008086d00007A24sv00001043sd000014D3bc0Csc80i00
-spi:spi-nor
-pci:v00008086d00007A50sv00001043sd00001C9Fbc04sc03i80
-hdaudio:v80862818r00100000a01
-hdaudio:v10EC0294r00100004a01
-input:b0000v0000p0000e0000-e0,5,kramlsfw4,
-input:b0000v0000p0000e0000-e0,5,kramlsfw2,
-pci:v00008086d0000A702sv00001043sd000014D3bc06sc00i00
-pci:v00008086d00007A34sv00000000sd00000000bc06sc04i00
-pci:v00001344d00005413sv00001344sd00002100bc01sc08i02
-pci:v00008086d00007A4Csv00001043sd000014D3bc0Csc80i00
-acpi:ASUF1205:PNP0C50:
-hid:b0018g0004v00002808p00000106
-input:b0018v2808p0106e0100-e0,1,2,4,k110,111,r0,1,8,B,am4,lsfw
-input:b0018v2808p0106e0100-e0,1,3,4,k110,145,148,14A,14D,14E,14F,ra0,1,2F,35,36,37,39,m5,lsfw
-pci:v00008086d00007A48sv00000000sd00000000bc06sc04i00
-pci:v00008086d00001133sv00001043sd00001F02bc06sc04i00
-pci:v00008086d00001134sv00001043sd00001F02bc0Csc03i40
-pci:v00008086d00001135sv00000000sd00000000bc0Csc03i30
-usb:v1D6Bp0002d0617dc09dsc00dp01ic09isc00ip00in00
-usb:v1D6Bp0003d0617dc09dsc00dp03ic09isc00ip00in00
-pci:v00008086d00007A30sv00000000sd00000000bc06sc04i00
-pci:v00008086d00007A27sv00000000sd00000000bc05sc00i00
-pci:v00008086d0000A788sv00001043sd000014D3bc03sc80i00
-pci:v00008086d00007A60sv00001043sd0000201Fbc0Csc03i30
-usb:v8087p0033d0000dcE0dsc01dp01icE0isc01ip01in00
-usb:v8087p0033d0000dcE0dsc01dp01icE0isc01ip01in01
-usb:v0B05p19B6d0316dc00dsc00dp00ic03isc01ip01in00
-hid:b0003g0001v00000B05p000019B6
-input:b0003v0B05p19B6e0110-e0,1,2,3,4,11,14,k71,72,73,74,75,77,79,7A,7B,7C,7D,7E,7F,80,81,82,83,84,85,86,87,88,89,8A,8B,8C,8E,8F,90,94,95,96,98,9B,9C,9E,9F,A1,A3,A4,A5,A6,A7,A8,A9,AB,AC,AD,AE,B0,B1,B2,B3,B4,B5,B7,B8,B9,BA,BB,BC,BD,BE,BF,C0,C1,C2,CA,CB,CE,CF,D0,D1,D2,D4,D8,D9,DB,E0,E1,E4,E5,E6,EA,EB,F0,F1,F4,F5,F7,F8,100,110,111,112,113,114,161,162,166,16A,16E,172,174,176,177,178,179,17A,17B,17C,17D,17F,180,182,183,185,188,189,18C,18D,18E,18F,190,191,192,193,195,197,198,199,19A,19C,1A0,1A1,1A2,1A3,1A4,1A5,1A6,1A7,1A8,1A9,1AA,1AB,1AC,1AD,1AE,1AF,1B0,1B1,1B7,1BA,1D1,240,241,242,243,244,245,246,247,249,24A,24B,24C,24D,250,251,r0,1,6,8,B,C,a20,28,m4,l0,1,2,3,4,sfw
-usb:v322Ep2122d1118dcEFdsc02dp01ic0Eisc02ip00in01
-usb:v322Ep2122d1118dcEFdsc02dp01ic0Eisc01ip00in00
-usb:v17EFp60D1d0100dc00dsc00dp00ic03isc01ip02in00
-hid:b0003g0001v000017EFp000060D1
-input:b0003v17EFp60D1e0110-e0,1,2,4,k110,111,112,113,114,r0,1,6,8,B,C,am4,lsfw
-input:b0003v17EFp60D1e0110-e0,1,4,k74,8E,8F,ram4,lsfw
-input:b0003v17EFp60D1e0110-e0,14,kramlsfw
-input:b0003v17EFp60D1e0110-e0,1,2,3,4,k71,72,73,74,77,80,82,83,85,86,87,88,89,8A,8B,8C,8E,90,96,98,9B,9C,9E,9F,A1,A3,A4,A5,A6,A7,A8,A9,AB,AC,AD,AE,B1,B2,B5,CE,CF,D0,D1,D2,D4,D8,D9,DB,E0,E1,E4,E5,E6,EA,EB,F0,F1,F4,100,161,162,166,16A,16E,172,174,176,177,178,179,17A,17B,17C,17D,17F,180,182,183,185,188,189,18C,18D,18E,18F,190,191,192,193,195,197,198,199,19A,19C,1A0,1A1,1A2,1A3,1A4,1A5,1A6,1A7,1A8,1A9,1AA,1AB,1AC,1AD,1AE,1AF,1B0,1B1,1B7,1BA,240,241,242,243,244,245,246,247,249,24A,24B,24C,24D,250,251,r6,C,a20,m4,lsfw
-pci:v00008086d00007A23sv00001043sd000014D3bc0Csc05i00
-platform:iTCO_wdt
-cpu:type:x86,ven0000fam0006mod00B7:feature:,0000,0001,0002,0003,0004,0005,0006,0007,0008,0009,000B,000C,000D,000E,000F,0010,0011,0013,0015,0016,0017,0018,0019,001A,001B,001C,001D,001F,002B,0034,003A,003B,003D,0068,006A,006B,006C,006D,006F,0070,0072,0074,0075,0076,0078,0079,007C,007F,0080,0081,0082,0083,0084,0085,0087,0088,0089,008B,008C,008D,008E,008F,0091,0093,0094,0095,0096,0097,0098,0099,009A,009B,009C,009D,009E,00C0,00C5,00C8,00E1,00E3,00EA,00F0,00F1,00F9,00FA,00FB,00FE,00FF,0100,0101,0102,0103,0111,0120,0121,0123,0125,0126,0127,0128,0129,012A,012D,0132,0133,0134,0137,0138,0139,013D,0140,0141,0142,0143,0164,0165,0166,016B,0171,0177,017B,0184,018B,0196,01C0,01C1,01C2,01C4,01C5,01C6,01C7,01C8,01C9,01CA,01CB,01CE,01CF,01D0,01D1,01D2,01D3,01D4,01D6,01D7,01F9,0202,0203,0204,0205,0207,0208,0209,020A,0216,0217,021B,021C,021F,0244,024A,024E,024F,0253,0254,025A,025B,025C,025D,025E,025F,0282,02A2,02A3,02AE
-dmi:bvnAmericanMegatrendsInternational,LLC.:bvrG614JI.331:bd11/11/2024:br5.27:efr0.81:svnASUSTeKCOMPUTERINC.:pnROGStrixG614JI_G614JI:pvr1.0:rvnASUSTeKCOMPUTERINC.:rnG614JI:rvr1.0:cvnASUSTeKCOMPUTERINC.:ct10:cvr1.0:sku:
-acpi:LNXSYSTM:
-acpi:LNXSYBUS:
-acpi:ACPI0007:
-acpi:PNP0C0F:
-acpi:PNP0C02:
-input:b0019v0000p0001e0000-e0,1,k74,8F,ramlsfw
-acpi:INT340E:PNP0C02:
-input:b0019v0000p0003e0000-e0,1,k8E,ramlsfw
-acpi:PNP0A08:PNP0A03:
-acpi:LNXPOWER:
-acpi:LNXVIDEO:
-input:b0019v0000p0006e0000-e0,1,kE0,E1,E3,F1,F2,F3,F4,F5,ramlsfw
-acpi:ACPI0003:
-acpi:ATK3001:PNP030B:
-input:b0019v0000p0005e0000-e0,5,kramlsfw0,
-acpi:INTC109C:PNP0C02:
-acpi:PNP0100:
-acpi:PNP0000:
-acpi:PRP00001:PNP0A05:
-acpi:PNP0C0B:
-=== matching driver packages ===
-
-&lt;/code&gt;
-      &lt;/quote&gt;
-    &lt;/div&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45758392</guid><pubDate>Thu, 30 Oct 2025 10:35:00 +0000</pubDate></item><item><title>How We Found 7 TiB of Memory Just Sitting Around</title><link>https://render.com/blog/how-we-found-7-tib-of-memory-just-sitting-around</link><description>&lt;doc fingerprint="aec895875436e7e0"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 01 Nov 2025 14:08:28 +0000</lastBuildDate><item><title>How We Found 7 TiB of Memory Just Sitting Around</title><link>https://render.com/blog/how-we-found-7-tib-of-memory-just-sitting-around</link><description>&lt;doc fingerprint="aec895875436e7e0"&gt;
   &lt;main&gt;
     &lt;head rend="h2"&gt;Inside the hypercube of bad vibes: the namespace dimension&lt;/head&gt;
     &lt;p&gt;Credits: Hyperkube from gregegan.net, diagram (modified) from Kubernetes community repo&lt;/p&gt;
@@ -1519,7 +733,13 @@ eventually get attracted to the same states but have different trajectories.&lt;
     &lt;p&gt;I didn't set out to build a profitable startup. But once I got there, I realized I wouldn't want to build a company any other way.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45778984</guid><pubDate>Sat, 01 Nov 2025 03:18:04 +0000</pubDate></item><item><title>You Can't Refuse to Be Scanned by ICE's Facial Recognition App, DHS Document Say</title><link>https://www.404media.co/you-cant-refuse-to-be-scanned-by-ices-facial-recognition-app-dhs-document-says/</link><description>&lt;doc fingerprint="d4998b5510e20338"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45778984</guid><pubDate>Sat, 01 Nov 2025 03:18:04 +0000</pubDate></item><item><title>Hard Rust requirements from May onward for all Debian ports</title><link>https://lists.debian.org/debian-devel/2025/10/msg00285.html</link><description>&lt;doc fingerprint="87995b15cc375c90"&gt;
+  &lt;main&gt;
+    &lt;quote&gt;Hi all, I plan to introduce hard Rust dependencies and Rust code into APT, no earlier than May 2026. This extends at first to the Rust compiler and standard library, and the Sequoia ecosystem. In particular, our code to parse .deb, .ar, .tar, and the HTTP signature verification code would strongly benefit from memory safe languages and a stronger approach to unit testing. If you maintain a port without a working Rust toolchain, please ensure it has one within the next 6 months, or sunset the port. It's important for the project as whole to be able to move forward and rely on modern tools and technologies and not be held back by trying to shoehorn modern software on retro computing devices. Thank you for your understanding. -- debian developer - deb.li/jak | jak-linux.org - free software dev ubuntu core developer i speak de, en&lt;/quote&gt;
+    &lt;p&gt;Attachment: signature.asc&lt;lb/&gt; Description: PGP signature&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45779860</guid><pubDate>Sat, 01 Nov 2025 07:31:40 +0000</pubDate></item><item><title>You Can't Refuse to Be Scanned by ICE's Facial Recognition App, DHS Document Say</title><link>https://www.404media.co/you-cant-refuse-to-be-scanned-by-ices-facial-recognition-app-dhs-document-says/</link><description>&lt;doc fingerprint="d4998b5510e20338"&gt;
   &lt;main&gt;
     &lt;p&gt;Immigration and Customs Enforcement (ICE) does not let people decline to be scanned by its new facial recognition app, which the agency uses to verify a person’s identity and their immigration status, according to an internal Department of Homeland Security (DHS) document obtained by 404 Media. The document also says any face photos taken by the app, called Mobile Fortify, will be stored for 15 years, including those of U.S. citizens.&lt;/p&gt;
     &lt;p&gt;The document provides new details about the technology behind Mobile Fortify, how the data it collects is processed and stored, and DHS’s rationale for using it. On Wednesday 404 Media reported that both ICE and Customs and Border Protection (CBP) are scanning peoples’ faces in the streets to verify citizenship.&lt;/p&gt;
@@ -1597,7 +817,49 @@ Figure 6 - The command invocation. Click once to select all.
 
 Figure 7 - Those may look fake, but it's completely real:&lt;p&gt;XSS payload, and a timing shell injection payload&lt;/p&gt;&lt;p&gt;I went through the first 3 pages of duckduckgo and google results for "online reverse DNS lookup". In the sea of SEO garbage, I found roughly 10 webpages offering actual lookups; Four of them have turned out vulnerable, but only to the XSS payload. Thankfully, no page actually executed the shell injection (nor variants of it).&lt;/p&gt;&lt;p&gt;Interestingly, almost all of those pages can be divided into two categories:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;displays the record verbatim, is vulnerable to this attack or a variant&lt;/item&gt;&lt;item&gt;refuses to display a record if it isn't a valid domain, isn't vulnerable&lt;/item&gt;&lt;/list&gt;&lt;p&gt;The odd-one-out was the googleapps dig page, which mangled the record, removing the &amp;lt;script&amp;gt; tag - from both sides, even. Turns out that they're doing sanitizations client-side, using a slightly inapropriate library for the job. It even lets through some basic tags like &amp;lt;b&amp;gt; and &amp;lt;br&amp;gt;. It is unknown to me why they didn't just use innerText instead of innerHTML. TXT record lookups worked just the same, so I doubt I'm the first to look at this. Anyhoo, beyond visual oddities, NOTABUG.&lt;/p&gt;&lt;p&gt;All the actual vulnerabilities that I discovered have been reported, and this post has been delayed to give them time to patch. To my best knowledge, all of the pages are patched by now. Also, no hate to any parties involved: vulnerable code happens, and it's hard to write something that's secure against all kinds of attacks. Everyone who I wrote to was really responsive, with the quickest ACKs getting to me within 15 minutes. A pleasant surprise!&lt;/p&gt;&lt;head rend="h3"&gt;Addendum #2: Other ARPA subdomains&lt;/head&gt;&lt;p&gt;There are several other subdomains outside in-addr and ip6; Wikipedia even has a nice list. Of those, perhaps the most interesting one is e164.arpa., which relates to the E.164 public numbering plan for the public telephone network. In very short terms, the dream was to have a subdomain with a reversed phone number (same reason as revDNS), pointing to an IP address on which one could receive a telephone call. This telephone-to-IP mapping could be used in various scenarios, such as roaming between physical locations.&lt;/p&gt;&lt;p&gt;Unfortunately, e164 never caught on, and multiple regional registrars have already deprecated the supporting infra. Still, if after reading this article you're in a dire need of an ARPA subdomain, &lt;del&gt;this may be your easiest way of getting ahold one.&lt;/del&gt; See below for an easier method!&lt;/p&gt;&lt;head rend="h3"&gt;Addendum #3: Do It Yourself (no please don't)&lt;/head&gt;&lt;p&gt;Through the adventures of yet another entity hosting an ARPA fedi instance I found out that Hurricane Electric's tunnelbroker.net, besides giving out free IPv6 ranges, also gives out free ip6.arpa zones! HE 💚&lt;/p&gt;&lt;p&gt;Greetz to paige, and thanks for sharing your method! Also greetz to caramel for their writeup (linked earlier)!&lt;/p&gt;&lt;p&gt;Should you welcome this into your own home, I published all the source under a BSD license - feel free to steal any part. also click here for a free ipv6 shirt.&lt;/p&gt;&lt;p&gt;Notes:&lt;/p&gt;&lt;p&gt;1. Technically, you're supposed to put a domain in there. Practically, the protocol is very malleable: with a custom DNS server, you could likely put anything in a PTR record and see how clients reject your response, or burn in undefined behavior. However! For simplicity, I wanted to keep with PowerDNS, so for the purpose of this article I'm considering limits of pdns as limits of the protocol.&lt;/p&gt;&lt;p&gt;2. Yes, yes, I know, SOCK_RAW is a thing, and you can handle ICMP with it. Bash doesn't have a single way to open RAW sockets tho, so this was out of the question - and even if it wasn't, I find it not much less painful than what I ended up doing.&lt;/p&gt;&lt;p&gt;3. The "superseded" part is a bit vague. In reality, links joining ARPANET and the internet existed for some time before the final closure. For a lack of a better word, this shall do.&lt;/p&gt;&lt;p&gt;Big thanks to kleines Filmröllchen, Lili, famfo and Linus for proofreading this post!&lt;/p&gt;&lt;head rend="h3"&gt;Comments:&lt;/head&gt;&lt;p&gt;what.&lt;/p&gt;🐢 at 30.03.2025, 08:02:59&lt;p&gt;🐢 That's crazy🐢 That's actually crazy🐢That's messed up🐢&lt;/p&gt;liuzhen932 at 30.03.2025, 23:32:47&lt;p&gt;Displaying images or even animations in a traceroute is a really crazy idea!&lt;/p&gt;paige at 04.04.2025, 05:26:12&lt;p&gt;greetz! bad apple in traceroute is crazy&lt;/p&gt;tufo at 08.04.2025, 21:05:45&lt;p&gt;very cool, i love reading longer blogposts such as this.&lt;/p&gt;Ymity at 19.04.2025, 11:22:14&lt;p&gt;Thanks for the great read! &amp;lt;3&lt;/p&gt;bud at 27.04.2025, 09:01:15&lt;p&gt;finally!!!, we got the blogpost!!! :DDDD&lt;/p&gt;utahorange at 15.06.2025, 06:09:46&lt;p&gt;so awesome!!!!!!&lt;/p&gt;vvv at 09.10.2025, 03:46:18&lt;p&gt;Incredible stuff!&lt;/p&gt;By commenting, you agree for the session cookie to be stored on your device ;p&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45780490</guid><pubDate>Sat, 01 Nov 2025 10:01:46 +0000</pubDate></item><item><title>Abandonware of the web: do you know that there is an HTML tables API?</title><link>https://christianheilmann.com/2025/10/08/abandonware-of-the-web-do-you-know-that-there-is-an-html-tables-api/</link><description>&lt;doc fingerprint="3220185a99e5836b"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45780490</guid><pubDate>Sat, 01 Nov 2025 10:01:46 +0000</pubDate></item><item><title>Pitching the Death Star to Investors</title><link>https://supremefounder.com/pitching-investors.html</link><description>&lt;doc fingerprint="e9f6d8d569a02f6a"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Day 31, Pitching Investors&lt;/head&gt;
+    &lt;head rend="h3"&gt;Meeting with Sith VCs: 'Unlimited Power Capital'&lt;/head&gt;
+    &lt;p&gt;Today, we navigated the treacherous waters of venture capital, presenting our vision to the esteemed partners at Unlimited Power Capital. We discussed the audacious future of galactic security, and the unparalleled opportunity our platform presents.&lt;/p&gt;
+    &lt;p&gt;Our pitch deck was meticulously crafted, each slide a testament to inevitable success. We focused on the undeniable value proposition and the sheer scale of our "security solution."&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Market Opportunity: Billions of potential users, ripe for "onboarding."&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Proprietary Technology: A superlaser, unparalleled in its capacity for enforcement.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Team Expertise: Decades of experience in galactic governance and strategic coercion.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Exit Strategy: A complete restructuring of existing power dynamics, yielding infinite returns.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h4"&gt;Addressing Investor Concerns&lt;/head&gt;
+    &lt;p&gt;Naturally, there were questions. Concerns about "ethical implications" and "collateral damage" were raised, which I artfully reframed as "necessary market adjustments" for long-term stability. Their initial skepticism quickly dissolved.&lt;/p&gt;
+    &lt;p&gt;I emphasized our commitment to a unified galaxy, secured by our platform. The investment isn't just in a product; it's in a new paradigm of order.&lt;/p&gt;
+    &lt;head rend="h4"&gt;Negotiating Terms: A Forceful Approach&lt;/head&gt;
+    &lt;p&gt;Negotiating the term sheet required a firm hand. We discussed equity, valuation, and the critical need for absolute operational autonomy. Their initial hesitation was understandable, given the scope of our ambition.&lt;/p&gt;
+    &lt;p&gt;However, the sheer inevitability of our success, coupled with a subtle demonstration of our capabilities, helped streamline the process considerably. We secured a substantial seed round.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Valuation: A pre-money valuation reflecting our disruptive potential.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Board Seats: Strategic advisors, not meddlers, to guide our rapid expansion.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Milestones: Clear, aggressive targets for galactic integration and compliance.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h4"&gt;The Future of Galactic Domination&lt;/head&gt;
+    &lt;p&gt;This funding round is merely the first step towards a truly unified galaxy. Unlimited Power Capital recognized the opportunity to invest in a future where chaos is eradicated and order reigns supreme. They understood that sometimes, to build, one must first dismantle.&lt;/p&gt;
+    &lt;p&gt;Our burn rate will be astronomical, but the returns will be immeasurable. This is not just a startup; it's an empire in the making.&lt;lb/&gt;â DS, Founder &amp;amp; CEO, Death Star&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45781280</guid><pubDate>Sat, 01 Nov 2025 12:56:44 +0000</pubDate></item><item><title>Abandonware of the web: do you know that there is an HTML tables API?</title><link>https://christianheilmann.com/2025/10/08/abandonware-of-the-web-do-you-know-that-there-is-an-html-tables-api/</link><description>&lt;doc fingerprint="3220185a99e5836b"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;Abandonware of the web: do you know that there is an HTML tables API?&lt;/head&gt;Wednesday, October 8th, 2025 at 3:08 pm&lt;p&gt;When people turn data into HTML tables using JavaScript, they either use the DOM methods (createElement() and the likes), but most of the time just append a huge string and use innerHTML, which always is a security concern. However, did you know that HTML tables also have an old, forgotten API ? Using this one, you can loop over tables, create bodies, rows, cells, heads, footers, captions an summaries (yes, HTML tables have all of those) and access the table cells. Without having to re-render the whole table on each change. Check out the Codepen to see how you can create a table from a nested array:&lt;/p&gt;&lt;table&gt;&lt;row&gt;&lt;cell&gt;&lt;quote&gt;let table = [ ['one','two','three'], ['four','five','six'] ]; let b = document.body; let t = document.createElement('table'); b.appendChild(t); table.forEach((row,ri) =&amp;gt; { let r = t.insertRow(ri); row.forEach((l,i) =&amp;gt; { let c = r.insertCell(i); c.innerText = l; }) });&lt;/quote&gt;&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;You can then access each table cell with an index (with t being a reference to the table):&lt;/p&gt;&lt;table&gt;&lt;row&gt;&lt;cell&gt;&lt;quote&gt;console.log(t.rows[1].cells[1]); // =&amp;gt; &amp;lt;td&amp;gt;five&amp;lt;/td&amp;gt;&lt;/quote&gt;&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;You can also delete and create cells and rows, if you want to add a row to the end of the table with a cell, all you need to do is:&lt;/p&gt;&lt;table&gt;&lt;row&gt;&lt;cell&gt;&lt;quote&gt;t.insertRow(-1); t.rows[2].insertCell(0); t.rows[2].cells[0].innerText = 'foo';&lt;/quote&gt;&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;There are a few things here that are odd – adding a -1 to add a row at the end for example – and there seems to be no way to create a TH element instead of a TD. All table cells are just cells.&lt;/p&gt;&lt;p&gt;However, seeing how much of a pain it is to create tables, it would be fun to re-visit this API and add more functionality to it. We did add a lot of things to HTML forms, like formData and the change event, so why not add events and other features to tables. That way they’d finally get the status as data structures and not a hack to layout content on the web.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
 &lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45781293</guid><pubDate>Sat, 01 Nov 2025 12:58:21 +0000</pubDate></item><item><title>SQLite concurrency and why you should care about it</title><link>https://jellyfin.org/posts/SQLite-locking/</link><description>&lt;doc fingerprint="7b4e765eeca27f9a"&gt;
@@ -1644,4 +906,32 @@ Figure 7 - Those may look fake, but it's completely real:&lt;p&gt;XSS payload, a
     &lt;p&gt;- JPVenson&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45781298</guid><pubDate>Sat, 01 Nov 2025 12:59:03 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45781298</guid><pubDate>Sat, 01 Nov 2025 12:59:03 +0000</pubDate></item><item><title>CharlotteOS – An Experimental Modern Operating System</title><link>https://github.com/charlotte-os/Catten</link><description>&lt;doc fingerprint="25a44afe193d139f"&gt;
+  &lt;main&gt;
+    &lt;p&gt;&lt;code&gt;catten&lt;/code&gt; is an operating system kernel developed as a key component of the CharlotteOS project but it is designed to be flexible enough that we hope it can also find use in many other places. It seeks to be a monolithic kernel with low-level system call interfaces that borrows ideas from exokernels and other novel systems like Plan 9 and Fuchsia. Its design allows for almost any higher level interface to be layered on top and also includes a typesafe system namespace (akin to the namespaces found in Fuschsia and Plan 9 but more flexible and typesafe) with URIs as paths which has the added benefit of allowing access to the namespace of another host over a network without having to mount anything locally all while being secured by granular capabilities and a persistent mandatory access control policy.&lt;/p&gt;
+    &lt;p&gt;catten is still in early development, and core subsystems are actively being built. We welcome contributions—feel free to grab an issue from the tracker, suggest features, or participate in discussions on our repository, Discord server or Matrix instance.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;&lt;code&gt;catten&lt;/code&gt;is written in Rust and ISA specific assembly languages&lt;/item&gt;
+      &lt;item&gt;x86_64 assembly should use Intel syntax as implemented by &lt;code&gt;rustc&lt;/code&gt;and&lt;code&gt;llvm-mc&lt;/code&gt;exclusively&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;C language dependencies are allowed if vetted by maintainers.&lt;/item&gt;
+      &lt;item&gt;Any dependencies in languages other than Rust, C, and assembly are strictly forbidden.&lt;/item&gt;
+      &lt;item&gt;Always prefer a high-quality Rust equivalent over an external C library unless there is good reason to do otherwise&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Processor: &lt;list rend="ul"&gt;&lt;item&gt;x86_64 (Primary ISA) &lt;list rend="ul"&gt;&lt;item&gt;x2APIC LAPIC operating mode&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
+      &lt;item&gt;x86_64 (Primary ISA) &lt;/item&gt;
+      &lt;item&gt;Firmware: &lt;list rend="ul"&gt;&lt;item&gt;Unified Extensible Firmware Interface (UEFI)&lt;/item&gt;&lt;item&gt;Advanced Configuration and Power Interface (ACPI)&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
+      &lt;item&gt;Memory: &lt;list rend="ul"&gt;&lt;item&gt;Recommended: &amp;gt;= 1 GiB&lt;/item&gt;&lt;item&gt;Required: 128 MiB&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
+      &lt;item&gt;Storage: &lt;list rend="ul"&gt;&lt;item&gt;Recommended: &amp;gt;= 64 GiB&lt;/item&gt;&lt;item&gt;Required: 4 GiB&lt;/item&gt;&lt;item&gt;Device Types: &lt;list rend="ul"&gt;&lt;item&gt;Non-Volatile Memory Express (NVMe)&lt;/item&gt;&lt;item&gt;USB Mass Storage Device Class&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
+      &lt;item&gt;Output: &lt;list rend="ul"&gt;&lt;item&gt;Display Adapter: Any adapter capable of providing framebuffers via the UEFI Graphics Output Protocol&lt;/item&gt;&lt;item&gt;Serial: &lt;list rend="ul"&gt;&lt;item&gt;NS16550 compatible UART&lt;/item&gt;&lt;item&gt;USB CDC ACM (Virtual UART)&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
+      &lt;item&gt;Input: &lt;list rend="ul"&gt;&lt;item&gt;Keyboard &lt;list rend="ul"&gt;&lt;item&gt;PS/2&lt;/item&gt;&lt;item&gt;USB HID&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;&lt;item&gt;Serial &lt;list rend="ul"&gt;&lt;item&gt;NS16550 compatible UART&lt;/item&gt;&lt;item&gt;USB CDC ACM (Virtual UART)&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
+      &lt;item&gt;Keyboard &lt;/item&gt;
+      &lt;item&gt;Networking: &lt;list rend="ul"&gt;&lt;item&gt;USB CDC Network Control Model&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Please reach out to us on Matrix or Discord if you are interested in contributing.&lt;/p&gt;
+    &lt;p&gt;This kernel is licensed under the GNU General Public License version 3.0 (or at your option, any later version). By contributing to this project you agree to license your contributions under those same terms exclusively.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45781397</guid><pubDate>Sat, 01 Nov 2025 13:12:47 +0000</pubDate></item><item><title>Gilded Rage – Why Silicon Valley went from libertarian to authoritarian</title><link>https://paulkrugman.substack.com/p/gilded-rage-talking-with-jacob-silverman</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45781503</guid><pubDate>Sat, 01 Nov 2025 13:30:41 +0000</pubDate></item></channel></rss>
