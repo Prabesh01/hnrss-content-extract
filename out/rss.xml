@@ -1,74 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sun, 02 Nov 2025 06:14:40 +0000</lastBuildDate><item><title>SQLite concurrency and why you should care about it</title><link>https://jellyfin.org/posts/SQLite-locking/</link><description>&lt;doc fingerprint="7b4e765eeca27f9a"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;SQLite concurrency and why you should care about it&lt;/head&gt;
-    &lt;p&gt;SQLite is a powerful database engine, but due to its design, it has limitations that should not be overlooked.&lt;/p&gt;
-    &lt;p&gt;Jellyfin has used a SQLite-based database for storing most of its data for years, but it has also encountered issues on many systems. In this blog post, I will explain how we address these limitations and how developers using SQLite can apply the same solutions.&lt;/p&gt;
-    &lt;p&gt;This will be a technical blog post intended for developers and everyone wanting to learn about concurrency.&lt;/p&gt;
-    &lt;p&gt;Also Jellyfin's implementation of locking for SQLite should be fairly easy to be implemented into another EF Core application if you are facing the same issue.&lt;/p&gt;
-    &lt;p&gt;- JPVenson&lt;/p&gt;
-    &lt;head rend="h2"&gt;The Premise&lt;/head&gt;
-    &lt;p&gt;SQLite is a file-based database engine running within your application and allows you to store data in a relational structure. Overall it gives your application the means of storing structured data as a single file and without having to depend on another application to do so. Naturally this also comes at a price. If your application fully manages this file, the assumption must be made that your application is the sole owner of this file, and nobody else will tinker with it while you are writing data to it.&lt;/p&gt;
-    &lt;p&gt;So an application that wants to use SQLite as its database needs to be the only one accessing it. Having established this fact, an important thought arises: if only a single write operation should be performed on a single file at a time, this rule must also apply to operations within the same application.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The W-A-L mode&lt;/head&gt;
-    &lt;p&gt;SQLite has a feature that tries to get around this limitation: the Write-Ahead-Log (WAL). The WAL is a separate file that acts as a journal of operations that should be applied to an SQLite file. This allows multiple parallel writes to take place and get enqueued into the WAL. When another part of the application wants to read data, it reads from the actual database, then scans the WAL for modifications and applies them on the fly. This is not a foolproof solution; there are still scenarios where WAL does not prevent locking conflicts.&lt;/p&gt;
-    &lt;head rend="h2"&gt;SQLite transactions&lt;/head&gt;
-    &lt;p&gt;A transaction is supposed to ensure two things. Modifications made within a transaction can be reverted, either when something goes wrong or when the application decides it should and optionally a transaction may also block other readers from reading data that is modified within a transaction. This is where it gets spicy and we come to the real reason why I am writing this blog post. For some reason on some systems that run Jellyfin when a transaction takes place the SQLite engine reports the database is locked and instead of waiting for the transaction to be resolved the engine refuses to wait and just crashes. This seems to be a not uncommon issue and there are many reports to be found on the issue.&lt;/p&gt;
-    &lt;p&gt;The factor that makes this issue so bad is that it does not happen reliably. So far we only have one team member where this can be (somewhat) reliably be reproduced which makes this an even worse a bug. From the reports this issue happens across all operating systems, drive speeds and with or without virtualization. So we do not have any deciding factor identified that even contributes to the likelihood of the issue happening.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The Jellyfin factor&lt;/head&gt;
-    &lt;p&gt;Having established the general theory on how SQLite behaves, we also have to look at the specifics of Jellyfins usage of SQLite. During normal operations on a recommended setup (Non-Networked Storage and preferably SSD) its unusual for any problems to arise, however the way Jellyfin utilises the SQLite db up to 10.11 is very suboptimal. In versions prior to 10.11 Jellyfin had a bug in its parallel task limit which resulted in exponential overscheduling of library scan operations which hammered the database engine with thousands of parallel write requests that an SQLite engine is simply not able to handle. While most SQLite engine implementations have retry behavior, they also have timeouts and checks in place to prevent limitless waiting so if we stress the engine enough, it just fails with an error. That and very long running and frankly unoptimized transactions could lead to the database just being overloaded with requests and flaking out.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The solution&lt;/head&gt;
-    &lt;p&gt;Since we moved the codebase over to EF Core proper, we have the tools to actually do something about this as EF Core gives us a structured abstraction level. EF Core supports a way of hooking into every command execution or transaction by creating Interceptors. With an interceptor we can finally do the straight forward idea of just "not" writing to the database in parallel in a transparent way to the caller. The overall idea is to have multiple strategies of locking. Because all levels of synchronization will inevitably come at the cost of performance, we only want to do it when it is really necessary. So, I decided on three locking strategies:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;No-Lock&lt;/item&gt;
-      &lt;item&gt;Optimistic locking&lt;/item&gt;
-      &lt;item&gt;Pessimistic locking&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;As a default, the no-lock behavior does exactly what the name implies. Nothing. This is the default because my research shows that for 99% all of this is not an issue and every interaction at this level will slow down the whole application.&lt;/p&gt;
-    &lt;p&gt;Both the optimistic and pessimistic behaviors use two interceptors—one for transactions and one for commands—and override &lt;code&gt;SaveChanges&lt;/code&gt; in &lt;code&gt;JellyfinDbContext&lt;/code&gt;.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Optimistic locking behavior&lt;/head&gt;
-    &lt;p&gt;Optimistic locking means to assume the operation in question will succeed and only handle issues afterwards. In essence this can be boiled down to "Try and Retry and Retry ..." for a set number of times until either we succeed with the operation or fail entirely. This still leaves the possibility that we will not actually be able to perform a write, but the introduced overhead is far less than the Pessimistic locking behavior.&lt;/p&gt;
-    &lt;p&gt;The idea behind how this works is simple: every time two operations try to write to the database, one will always win. The other will fail, wait some time, then retry a few times.&lt;/p&gt;
-    &lt;p&gt;Jellyfin uses the &lt;code&gt;Polly&lt;/code&gt; library perform the retry behavior and will only retry operations it will find have been locked due to this exact issue.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Pessimistic locking behavior&lt;/head&gt;
-    &lt;p&gt;Pessimistic locking always locks when a write to SQLite should be performed. Essentially every time an transaction is started or a write operation on the database is done though EF Core, Jellyfin will wait until all other read operations are finished and then block all other operations may they be read or write until the write in question has been performed. This however means, that Jellyfin can only ever perform a single write to the database, even if it would technically does not need to.&lt;/p&gt;
-    &lt;p&gt;In theory, an application should have no issue reading from table "Alice" while writing to table "Bob" however to eliminate all possible sources of concurrency related locking, Jellyfin will only ever allow a single write performed on its database in this mode. While this will absolutely result in the most stable operation, it will undoubtedly also be the slowest.&lt;/p&gt;
-    &lt;p&gt;Jellyfin uses a ReaderWriterLockSlim to lock the operations, that means we allow an unlimited number of reads to happen concurrently while only one write may ever be done on the database.&lt;/p&gt;
-    &lt;head rend="h3"&gt;The future Smart locking behavior&lt;/head&gt;
-    &lt;p&gt;In the future we might also consider combining both modes, to get the best of both worlds.&lt;/p&gt;
-    &lt;head rend="h1"&gt;The result&lt;/head&gt;
-    &lt;p&gt;Initial testing showed that with both modes, we had great success in handling the underlying issue. While we are not yet sure why this happens only on some systems when others work, we at least now have an option for users previously left out of using Jellyfin.&lt;/p&gt;
-    &lt;p&gt;When I was researching this topic, I found many reports all over the internet facing the same error but nobody was able to provide a conclusive explanation whats really happening here. There have been similar proposals made to handle it but there wasn't a "ready to drop in" solution that handles all the different cases or only code that required massive modifications to every EF Core query. Jellyfin's implementation of the locking behaviors should be a copy-paste solution for everyone having the same issues as its using interceptors and the caller has no idea of the actual locking behavior.&lt;/p&gt;
-    &lt;p&gt;Best of luck,&lt;/p&gt;
-    &lt;p&gt;- JPVenson&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45781298</guid><pubDate>Sat, 01 Nov 2025 12:59:03 +0000</pubDate></item><item><title>Updated practice for review articles and position papers in ArXiv CS category</title><link>https://blog.arxiv.org/2025/10/31/attention-authors-updated-practice-for-review-articles-and-position-papers-in-arxiv-cs-category/</link><description>&lt;doc fingerprint="ff55b99b0494c981"&gt;
-  &lt;main&gt;
-    &lt;p&gt;arXiv’s computer science (CS) category has updated its moderation practice with respect to review (or survey) articles and position papers. Before being considered for submission to arXiv’s CS category, review articles and position papers must now be accepted at a journal or a conference and complete successful peer review. When submitting review articles or position papers, authors must include documentation of successful peer review to receive full consideration. Review/survey articles or position papers submitted to arXiv without this documentation will be likely to be rejected and not appear on arXiv.&lt;lb/&gt; This change is being implemented due to the unmanageable influx of review articles and position papers to arXiv CS.&lt;/p&gt;
-    &lt;p&gt;Is this a policy change?&lt;/p&gt;
-    &lt;p&gt;Technically, no! If you take a look at arXiv’s policies for specific content types you’ll notice that review articles and position papers are not (and have never been) listed as part of the accepted content types. Review articles and position papers have, in the past, only been accepted at moderator discretion, because the few we received were of high quality and of interest to arXiv readers and the scientific community at large.&lt;/p&gt;
-    &lt;p&gt;Why is the arXiv CS category making this change?&lt;/p&gt;
-    &lt;p&gt;In the past few years, arXiv has been flooded with papers. Generative AI / large language models have added to this flood by making papers – especially papers not introducing new research results – fast and easy to write. While categories across arXiv have all seen a major increase in submissions, it’s particularly pronounced in arXiv’s CS category.&lt;/p&gt;
-    &lt;p&gt;The goal of this change of practice is to:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Help arXiv readers more easily find valuable review articles and position papers written by subject matter experts&lt;/item&gt;
-      &lt;item&gt;Free up moderators to focus on the content types officially accepted by arXiv, reduce submission hold times, and keep the pace of scientific discovery going!&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Above all, the core purpose of arXiv is to share research papers and facilitate scientific discovery quickly and freely. We are making this change in support of that mission.&lt;/p&gt;
-    &lt;p&gt;In the past, arXiv CS received a relatively small amount of review or survey articles, and those we did receive were of extremely high quality, written by senior researchers at the request of publications like Annual Reviews, Proceedings of the IEEE, and Computing Surveys. Position paper submissions to arXiv were similarly rare, and usually produced by scientific societies or government study groups (for example,the Computing Research Association of the National Academies of Science, Engineering, and Medicine). While, as now, these papers were not content types officially accepted by arXiv, the arXiv moderators accepted them because of their scholarly value to the research community.&lt;/p&gt;
-    &lt;p&gt;Fast forward to present day – submissions to arXiv in general have risen dramatically, and we now receive hundreds of review articles every month. The advent of large language models have made this type of content relatively easy to churn out on demand, and the majority of the review articles we receive are little more than annotated bibliographies, with no substantial discussion of open research issues.&lt;/p&gt;
-    &lt;p&gt;arXiv believes that there are position papers and review articles that are of value to the scientific community, and we would like to be able to share them on arXiv. However, our team of volunteer moderators do not have the time or bandwidth to review the hundreds of these articles we receive without taking time away from our core purpose, which is to share research articles.&lt;/p&gt;
-    &lt;p&gt;Reasonable and trusted outside refereed venues already exist (conferences and journals) which solicit position papers and review articles on subjects of concern or interest to our readers (such as concerns over privacy, ethics, safety, and security of recent CS technologies, particularly applications of artificial intelligence) and as part of that process, they conduct in-depth review to assure quality, evidential support of opinions, and scholarly value. Since arXiv does not have the resources to conduct this quality-control in-house for content types that we do not officially accept, this change of practice is allowing us to rely on these refereed venues to do so for us so that we can still share position papers and review articles of value on arXiv.&lt;/p&gt;
-    &lt;p&gt;How do I submit my review article or position paper to arXiv? Before submission to arXiv, have your review article or position paper accepted to a refereed venue with peer review like a journal or a conference. Review articles or position papers must be accepted to a journal or conference before being submitted to arXiv and you must have documentation of complete and successful peer review.&lt;/p&gt;
-    &lt;p&gt;Please note: the review conducted at conference workshops generally does not meet the same standard of rigor of traditional peer review and is not enough to have your review article or position paper accepted to arXiv.&lt;/p&gt;
-    &lt;p&gt;How do I show my review article or position paper has successfully completed peer review? When you submit to arXiv, please include the peer reviewed journal reference and DOI metadata. If you do not provide this, your review article or position paper will likely be rejected.&lt;/p&gt;
-    &lt;p&gt;Can I resubmit my position paper or review article after being rejected? If your position paper or review article was rejected because it did not complete a successful peer review process, you can submit an appeal request to resubmit if your article has since completed a successful peer review process. Do not resubmit your position paper or review article without an accepted appeal. Here are the instructions for how to appeal.&lt;/p&gt;
-    &lt;p&gt;I have a scientific paper studying the impact of science and technology in society. Can I submit this to arXiv without peer review? Yes, arXiv has always released these types of scientific papers, for example in cs.CY or physics.soc-ph. These are scientific research papers and are not subject to this moderation practice change.&lt;/p&gt;
-    &lt;p&gt;Will other categories on arXiv also change their practice re: review articles and position papers? Each category of arXiv has different moderators, who are subject matter experts with a terminal degree in their particular subject, to best serve the scholarly pursuits, goals, and standards of their category. While all moderators adhere to arXiv policy, the only policy arXiv has in place with regard to review articles and position papers is that they are not a generally accepted content type. The goal of the moderators of each category is to make sure the work being submitted is actually science, and that it is of potential interest to the scientific community. If other categories see a similar rise in LLM-written review articles and position papers, they may choose to change their moderation practices in a similar manner to better serve arXiv authors and readers. We will make these updates public if and when they do occur.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45782136</guid><pubDate>Sat, 01 Nov 2025 14:58:05 +0000</pubDate></item><item><title>GHC now runs in the browser</title><link>https://discourse.haskell.org/t/ghc-now-runs-in-your-browser/13169</link><description>&lt;doc fingerprint="4f3a90df9d363b44"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sun, 02 Nov 2025 06:45:26 +0000</lastBuildDate><item><title>GHC now runs in the browser</title><link>https://discourse.haskell.org/t/ghc-now-runs-in-your-browser/13169</link><description>&lt;doc fingerprint="4f3a90df9d363b44"&gt;
   &lt;main&gt;
     &lt;div&gt;
       &lt;div&gt;
@@ -3479,7 +3410,109 @@ async fn main() {
     &lt;/table&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45787842</guid><pubDate>Sun, 02 Nov 2025 04:27:31 +0000</pubDate></item><item><title>Meta readies $25B bond sale as soaring AI costs trigger stock sell-off</title><link>https://www.ft.com/content/120d2321-8382-4d74-ab48-f9ecb483c2a9</link><description>&lt;doc fingerprint="8e7b1d59dbea13e9"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45787842</guid><pubDate>Sun, 02 Nov 2025 04:27:31 +0000</pubDate></item><item><title>Yes, you should understand backprop (2016)</title><link>https://karpathy.medium.com/yes-you-should-understand-backprop-e2f06eab496b</link><description>&lt;doc fingerprint="f70910553d224cb1"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Yes you should understand backprop&lt;/head&gt;
+    &lt;p&gt;When we offered CS231n (Deep Learning class) at Stanford, we intentionally designed the programming assignments to include explicit calculations involved in backpropagation on the lowest level. The students had to implement the forward and the backward pass of each layer in raw numpy. Inevitably, some students complained on the class message boards:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;“Why do we have to write the backward pass when frameworks in the real world, such as TensorFlow, compute them for you automatically?”&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;This is seemingly a perfectly sensible appeal - if you’re never going to write backward passes once the class is over, why practice writing them? Are we just torturing the students for our own amusement? Some easy answers could make arguments along the lines of “it’s worth knowing what’s under the hood as an intellectual curiosity”, or perhaps “you might want to improve on the core algorithm later”, but there is a much stronger and practical argument, which I wanted to devote a whole post to:&lt;/p&gt;
+    &lt;p&gt;&amp;gt; The problem with Backpropagation is that it is a leaky abstraction.&lt;/p&gt;
+    &lt;p&gt;In other words, it is easy to fall into the trap of abstracting away the learning process — believing that you can simply stack arbitrary layers together and backprop will “magically make them work” on your data. So lets look at a few explicit examples where this is not the case in quite unintuitive ways.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Vanishing gradients on sigmoids&lt;/head&gt;
+    &lt;p&gt;We’re starting off easy here. At one point it was fashionable to use sigmoid (or tanh) non-linearities in the fully connected layers. The tricky part people might not realize until they think about the backward pass is that if you are sloppy with the weight initialization or data preprocessing these non-linearities can “saturate” and entirely stop learning — your training loss will be flat and refuse to go down. For example, a fully connected layer with sigmoid non-linearity computes (using raw numpy):&lt;/p&gt;
+    &lt;code&gt;z = 1/(1 + np.exp(-np.dot(W, x))) # forward pass&lt;lb/&gt;dx = np.dot(W.T, z*(1-z)) # backward pass: local gradient for x&lt;lb/&gt;dW = np.outer(z*(1-z), x) # backward pass: local gradient for W&lt;/code&gt;
+    &lt;p&gt;If your weight matrix W is initialized too large, the output of the matrix multiply could have a very large range (e.g. numbers between -400 and 400), which will make all outputs in the vector z almost binary: either 1 or 0. But if that is the case, z*(1-z), which is local gradient of the sigmoid non-linearity, will in both cases become zero (“vanish”), making the gradient for both x and W be zero. The rest of the backward pass will come out all zero from this point on due to multiplication in the chain rule.&lt;/p&gt;
+    &lt;p&gt;Another non-obvious fun fact about sigmoid is that its local gradient (z*(1-z)) achieves a maximum at 0.25, when z = 0.5. That means that every time the gradient signal flows through a sigmoid gate, its magnitude always diminishes by one quarter (or more). If you’re using basic SGD, this would make the lower layers of a network train much slower than the higher ones.&lt;/p&gt;
+    &lt;p&gt;TLDR: if you’re using sigmoids or tanh non-linearities in your network and you understand backpropagation you should always be nervous about making sure that the initialization doesn’t cause them to be fully saturated. See a longer explanation in this CS231n lecture video.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Dying ReLUs&lt;/head&gt;
+    &lt;p&gt;Another fun non-linearity is the ReLU, which thresholds neurons at zero from below. The forward and backward pass for a fully connected layer that uses ReLU would at the core include:&lt;/p&gt;
+    &lt;code&gt;z = np.maximum(0, np.dot(W, x)) # forward pass&lt;lb/&gt;dW = np.outer(z &amp;gt; 0, x) # backward pass: local gradient for W&lt;/code&gt;
+    &lt;p&gt;If you stare at this for a while you’ll see that if a neuron gets clamped to zero in the forward pass (i.e. z=0, it doesn’t “fire”), then its weights will get zero gradient. This can lead to what is called the “dead ReLU” problem, where if a ReLU neuron is unfortunately initialized such that it never fires, or if a neuron’s weights ever get knocked off with a large update during training into this regime, then this neuron will remain permanently dead. It’s like permanent, irrecoverable brain damage. Sometimes you can forward the entire training set through a trained network and find that a large fraction (e.g. 40%) of your neurons were zero the entire time.&lt;/p&gt;
+    &lt;p&gt;TLDR: If you understand backpropagation and your network has ReLUs, you’re always nervous about dead ReLUs. These are neurons that never turn on for any example in your entire training set, and will remain permanently dead. Neurons can also die during training, usually as a symptom of aggressive learning rates. See a longer explanation in CS231n lecture video.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Exploding gradients in RNNs&lt;/head&gt;
+    &lt;p&gt;Vanilla RNNs feature another good example of unintuitive effects of backpropagation. I’ll copy paste a slide from CS231n that has a simplified RNN that does not take any input x, and only computes the recurrence on the hidden state (equivalently, the input x could always be zero):&lt;/p&gt;
+    &lt;p&gt;This RNN is unrolled for T time steps. When you stare at what the backward pass is doing, you’ll see that the gradient signal going backwards in time through all the hidden states is always being multiplied by the same matrix (the recurrence matrix Whh), interspersed with non-linearity backprop.&lt;/p&gt;
+    &lt;p&gt;What happens when you take one number a and start multiplying it by some other number b (i.e. a*b*b*b*b*b*b…)? This sequence either goes to zero if |b| &amp;lt; 1, or explodes to infinity when |b|&amp;gt;1. The same thing happens in the backward pass of an RNN, except b is a matrix and not just a number, so we have to reason about its largest eigenvalue instead.&lt;/p&gt;
+    &lt;p&gt;TLDR: If you understand backpropagation and you’re using RNNs you are nervous about having to do gradient clipping, or you prefer to use an LSTM. See a longer explanation in this CS231n lecture video.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Spotted in the Wild: DQN Clipping&lt;/head&gt;
+    &lt;p&gt;Lets look at one more — the one that actually inspired this post. Yesterday I was browsing for a Deep Q Learning implementation in TensorFlow (to see how others deal with computing the numpy equivalent of Q[:, a], where a is an integer vector — turns out this trivial operation is not supported in TF). Anyway, I searched “dqn tensorflow”, clicked the first link, and found the core code. Here is an excerpt:&lt;/p&gt;
+    &lt;p&gt;If you’re familiar with DQN, you can see that there is the target_q_t, which is just [reward * \gamma \argmax_a Q(s’,a)], and then there is q_acted, which is Q(s,a) of the action that was taken. The authors here subtract the two into variable delta, which they then want to minimize on line 295 with the L2 loss with tf.reduce_mean(tf.square()). So far so good.&lt;/p&gt;
+    &lt;p&gt;The problem is on line 291. The authors are trying to be robust to outliers, so if the delta is too large, they clip it with tf.clip_by_value. This is well-intentioned and looks sensible from the perspective of the forward pass, but it introduces a major bug if you think about the backward pass.&lt;/p&gt;
+    &lt;p&gt;The clip_by_value function has a local gradient of zero outside of the range min_delta to max_delta, so whenever the delta is above min/max_delta, the gradient becomes exactly zero during backprop. The authors are clipping the raw Q delta, when they are likely trying to clip the gradient for added robustness. In that case the correct thing to do is to use the Huber loss in place of tf.square:&lt;/p&gt;
+    &lt;code&gt;def clipped_error(x): &lt;lb/&gt;  return tf.select(tf.abs(x) &amp;lt; 1.0, &lt;lb/&gt;                   0.5 * tf.square(x), &lt;lb/&gt;                   tf.abs(x) - 0.5) # condition, true, false&lt;/code&gt;
+    &lt;p&gt;It’s a bit gross in TensorFlow because all we want to do is clip the gradient if it is above a threshold, but since we can’t meddle with the gradients directly we have to do it in this round-about way of defining the Huber loss. In Torch this would be much more simple.&lt;/p&gt;
+    &lt;p&gt;I submitted an issue on the DQN repo and this was promptly fixed.&lt;/p&gt;
+    &lt;head rend="h3"&gt;In conclusion&lt;/head&gt;
+    &lt;p&gt;Backpropagation is a leaky abstraction; it is a credit assignment scheme with non-trivial consequences. If you try to ignore how it works under the hood because “TensorFlow automagically makes my networks learn”, you will not be ready to wrestle with the dangers it presents, and you will be much less effective at building and debugging neural networks.&lt;/p&gt;
+    &lt;p&gt;The good news is that backpropagation is not that difficult to understand, if presented properly. I have relatively strong feelings on this topic because it seems to me that 95% of backpropagation materials out there present it all wrong, filling pages with mechanical math. Instead, I would recommend the CS231n lecture on backprop which emphasizes intuition (yay for shameless self-advertising). And if you can spare the time, as a bonus, work through the CS231n assignments, which get you to write backprop manually and help you solidify your understanding.&lt;/p&gt;
+    &lt;p&gt;That’s it for now! I hope you’ll be much more suspicious of backpropagation going forward and think carefully through what the backward pass is doing. Also, I’m aware that this post has (unintentionally!) turned into several CS231n ads. Apologies for that :)&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45787993</guid><pubDate>Sun, 02 Nov 2025 05:20:12 +0000</pubDate></item><item><title>Meta readies $25B bond sale as soaring AI costs trigger stock sell-off</title><link>https://www.ft.com/content/120d2321-8382-4d74-ab48-f9ecb483c2a9</link><description>&lt;doc fingerprint="8e7b1d59dbea13e9"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;&lt;quote&gt;Meta readies $25bn bond sale as soaring AI costs trigger stock sell-off&lt;/quote&gt;&lt;/head&gt;&lt;p&gt;Subscribe to unlock this article&lt;/p&gt;&lt;head rend="h2"&gt;Try unlimited access&lt;/head&gt;Only $1 for 4 weeks&lt;p&gt;Then $75 per month. Complete digital access to quality FT journalism on any device. Cancel anytime during your trial.&lt;/p&gt;&lt;head rend="h2"&gt;Explore more offers.&lt;/head&gt;&lt;head rend="h3"&gt;Standard Digital&lt;/head&gt;&lt;p&gt;$45 per month&lt;/p&gt;&lt;p&gt;Essential digital access to quality FT journalism on any device. Pay a year upfront and save 20%.&lt;/p&gt;&lt;head rend="h3"&gt;Premium Digital&lt;/head&gt;&lt;p&gt;$75 per month&lt;/p&gt;&lt;p&gt;Complete digital access to quality FT journalism with expert analysis from industry leaders. Pay a year upfront and save 20%.&lt;/p&gt;&lt;head rend="h3"&gt;Premium &amp;amp; FT Weekend Print&lt;/head&gt;&lt;p&gt;$79 per month&lt;/p&gt;&lt;p&gt;FT Weekend newspaper delivered Saturday plus complete digital access.&lt;/p&gt;&lt;p&gt;Check whether you already have access via your university or organisation.&lt;/p&gt;&lt;p&gt;Terms &amp;amp; Conditions apply&lt;/p&gt;&lt;head rend="h2"&gt;Explore our full range of subscriptions.&lt;/head&gt;&lt;head rend="h3"&gt;For individuals&lt;/head&gt;&lt;p&gt;Discover all the plans currently available in your country&lt;/p&gt;&lt;head rend="h3"&gt;For multiple readers&lt;/head&gt;&lt;p&gt;Digital access for organisations. Includes exclusive features and content.&lt;/p&gt;&lt;head rend="h2"&gt;Why the FT?&lt;/head&gt;&lt;p&gt;See why over a million readers pay to read the Financial Times.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45788042</guid><pubDate>Sun, 02 Nov 2025 05:33:00 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45788042</guid><pubDate>Sun, 02 Nov 2025 05:33:00 +0000</pubDate></item><item><title>CLI to manage your SQL database schemas and migrations</title><link>https://github.com/gh-PonyM/shed</link><description>&lt;doc fingerprint="6f872a5a1ff192b8"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Are you doing some ETL project, you don't want to manage your database schema with raw SQL, and maybe validate data from external tools using those schemas e.g. when using LLM output? Then this tool might help you.&lt;/p&gt;
+    &lt;p&gt;&lt;code&gt;shed&lt;/code&gt; is a cli tool that acts like an application for your database schemas management using &lt;code&gt;SQLModel&lt;/code&gt; orm and manages
+them for you using &lt;code&gt;alembic&lt;/code&gt;. You get free json-schema export for all your &lt;code&gt;pydantic.BaselModel&lt;/code&gt; (v2).&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;You can create your database models git repo that only manages db models, using &lt;code&gt;shed&lt;/code&gt;to manage db and schemas&lt;/item&gt;
+      &lt;item&gt;You can add &lt;code&gt;shed&lt;/code&gt;as tool into an existing python project and add migration files to it, following the folder structure proposed below.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Using uv:&lt;/p&gt;
+    &lt;code&gt;uv tool install https://github.com/gh-PonyM/shed.git
+&lt;/code&gt;
+    &lt;p&gt;Using pipx:&lt;/p&gt;
+    &lt;code&gt;pipx install git+https://github.com/gh-PonyM/shed.git#main
+&lt;/code&gt;
+    &lt;p&gt;Create a new project inside the projects folder:&lt;/p&gt;
+    &lt;code&gt;shed init news_agg -o projects -c postgres://user:pw@localhost:5432/db_name --env lab
+&lt;/code&gt;
+    &lt;p&gt;This will create the following folder structure:&lt;/p&gt;
+    &lt;code&gt;projects
+└── news_agg
+    ├── migrations
+    │   └── versions
+    └── models.py&lt;/code&gt;
+    &lt;p&gt;This will create a config file for local and prod databases using sqlite for local and postgres for prod.&lt;/p&gt;
+    &lt;code&gt;development:
+  db:
+    news_agg:
+      connection:
+        db_path: news_agg.sqlite
+      type: sqlite
+projects:
+  news_agg:
+    db:
+      lab:
+        connection:
+          database: db_name
+          host: localhost
+          password: pw
+          port: 5432
+          username: user
+        type: postgres
+    module: ./projects/news_agg/models.py&lt;/code&gt;
+    &lt;p&gt;Then just define your &lt;code&gt;SQLModel&lt;/code&gt; files as in models.py.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Clone databases from prod to dev&lt;/item&gt;
+      &lt;item&gt;Running short-commands for alembic like &lt;code&gt;revision&lt;/code&gt;or&lt;code&gt;migrate&lt;/code&gt;&lt;/item&gt;
+      &lt;item&gt;Alembic command wrapper that takes your project and passes the db information to alembic&lt;/item&gt;
+      &lt;item&gt;Exporting jsonschemas for your models (see schemas)&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Alembic uses different config files and folders. The first entrypoint is the &lt;code&gt;alembic.ini&lt;/code&gt; file and the top of the config
+template we use is this:&lt;/p&gt;
+    &lt;code&gt;[alembic]
+script_location = {script_dir}
+prepend_sys_path = .
+version_path_separator = os
+sqlalchemy.url = sqlite:///:memory:
+version_locations = {versions_dir}&lt;/code&gt;
+    &lt;p&gt;As you can see, the folder containing the version python files can be specified as well as the script location where &lt;code&gt;env.py&lt;/code&gt; and &lt;code&gt;script.py.mako&lt;/code&gt; is expected to be found. Using a generated &lt;code&gt;alembic.ini&lt;/code&gt;, &lt;code&gt;env.py&lt;/code&gt; and &lt;code&gt;script.py.mako&lt;/code&gt;,
+we have hassle creating those files for every project we need to manage data as developer / data engineer.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45788202</guid><pubDate>Sun, 02 Nov 2025 06:23:24 +0000</pubDate></item></channel></rss>
