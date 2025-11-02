@@ -1,5 +1,49 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sun, 02 Nov 2025 07:32:36 +0000</lastBuildDate><item><title>Updated practice for review articles and position papers in ArXiv CS category</title><link>https://blog.arxiv.org/2025/10/31/attention-authors-updated-practice-for-review-articles-and-position-papers-in-arxiv-cs-category/</link><description>&lt;doc fingerprint="ff55b99b0494c981"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sun, 02 Nov 2025 08:11:52 +0000</lastBuildDate><item><title>SQLite concurrency and why you should care about it</title><link>https://jellyfin.org/posts/SQLite-locking/</link><description>&lt;doc fingerprint="7b4e765eeca27f9a"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;SQLite concurrency and why you should care about it&lt;/head&gt;
+    &lt;p&gt;SQLite is a powerful database engine, but due to its design, it has limitations that should not be overlooked.&lt;/p&gt;
+    &lt;p&gt;Jellyfin has used a SQLite-based database for storing most of its data for years, but it has also encountered issues on many systems. In this blog post, I will explain how we address these limitations and how developers using SQLite can apply the same solutions.&lt;/p&gt;
+    &lt;p&gt;This will be a technical blog post intended for developers and everyone wanting to learn about concurrency.&lt;/p&gt;
+    &lt;p&gt;Also Jellyfin's implementation of locking for SQLite should be fairly easy to be implemented into another EF Core application if you are facing the same issue.&lt;/p&gt;
+    &lt;p&gt;- JPVenson&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Premise&lt;/head&gt;
+    &lt;p&gt;SQLite is a file-based database engine running within your application and allows you to store data in a relational structure. Overall it gives your application the means of storing structured data as a single file and without having to depend on another application to do so. Naturally this also comes at a price. If your application fully manages this file, the assumption must be made that your application is the sole owner of this file, and nobody else will tinker with it while you are writing data to it.&lt;/p&gt;
+    &lt;p&gt;So an application that wants to use SQLite as its database needs to be the only one accessing it. Having established this fact, an important thought arises: if only a single write operation should be performed on a single file at a time, this rule must also apply to operations within the same application.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The W-A-L mode&lt;/head&gt;
+    &lt;p&gt;SQLite has a feature that tries to get around this limitation: the Write-Ahead-Log (WAL). The WAL is a separate file that acts as a journal of operations that should be applied to an SQLite file. This allows multiple parallel writes to take place and get enqueued into the WAL. When another part of the application wants to read data, it reads from the actual database, then scans the WAL for modifications and applies them on the fly. This is not a foolproof solution; there are still scenarios where WAL does not prevent locking conflicts.&lt;/p&gt;
+    &lt;head rend="h2"&gt;SQLite transactions&lt;/head&gt;
+    &lt;p&gt;A transaction is supposed to ensure two things. Modifications made within a transaction can be reverted, either when something goes wrong or when the application decides it should and optionally a transaction may also block other readers from reading data that is modified within a transaction. This is where it gets spicy and we come to the real reason why I am writing this blog post. For some reason on some systems that run Jellyfin when a transaction takes place the SQLite engine reports the database is locked and instead of waiting for the transaction to be resolved the engine refuses to wait and just crashes. This seems to be a not uncommon issue and there are many reports to be found on the issue.&lt;/p&gt;
+    &lt;p&gt;The factor that makes this issue so bad is that it does not happen reliably. So far we only have one team member where this can be (somewhat) reliably be reproduced which makes this an even worse a bug. From the reports this issue happens across all operating systems, drive speeds and with or without virtualization. So we do not have any deciding factor identified that even contributes to the likelihood of the issue happening.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Jellyfin factor&lt;/head&gt;
+    &lt;p&gt;Having established the general theory on how SQLite behaves, we also have to look at the specifics of Jellyfins usage of SQLite. During normal operations on a recommended setup (Non-Networked Storage and preferably SSD) its unusual for any problems to arise, however the way Jellyfin utilises the SQLite db up to 10.11 is very suboptimal. In versions prior to 10.11 Jellyfin had a bug in its parallel task limit which resulted in exponential overscheduling of library scan operations which hammered the database engine with thousands of parallel write requests that an SQLite engine is simply not able to handle. While most SQLite engine implementations have retry behavior, they also have timeouts and checks in place to prevent limitless waiting so if we stress the engine enough, it just fails with an error. That and very long running and frankly unoptimized transactions could lead to the database just being overloaded with requests and flaking out.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The solution&lt;/head&gt;
+    &lt;p&gt;Since we moved the codebase over to EF Core proper, we have the tools to actually do something about this as EF Core gives us a structured abstraction level. EF Core supports a way of hooking into every command execution or transaction by creating Interceptors. With an interceptor we can finally do the straight forward idea of just "not" writing to the database in parallel in a transparent way to the caller. The overall idea is to have multiple strategies of locking. Because all levels of synchronization will inevitably come at the cost of performance, we only want to do it when it is really necessary. So, I decided on three locking strategies:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;No-Lock&lt;/item&gt;
+      &lt;item&gt;Optimistic locking&lt;/item&gt;
+      &lt;item&gt;Pessimistic locking&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;As a default, the no-lock behavior does exactly what the name implies. Nothing. This is the default because my research shows that for 99% all of this is not an issue and every interaction at this level will slow down the whole application.&lt;/p&gt;
+    &lt;p&gt;Both the optimistic and pessimistic behaviors use two interceptors—one for transactions and one for commands—and override &lt;code&gt;SaveChanges&lt;/code&gt; in &lt;code&gt;JellyfinDbContext&lt;/code&gt;.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Optimistic locking behavior&lt;/head&gt;
+    &lt;p&gt;Optimistic locking means to assume the operation in question will succeed and only handle issues afterwards. In essence this can be boiled down to "Try and Retry and Retry ..." for a set number of times until either we succeed with the operation or fail entirely. This still leaves the possibility that we will not actually be able to perform a write, but the introduced overhead is far less than the Pessimistic locking behavior.&lt;/p&gt;
+    &lt;p&gt;The idea behind how this works is simple: every time two operations try to write to the database, one will always win. The other will fail, wait some time, then retry a few times.&lt;/p&gt;
+    &lt;p&gt;Jellyfin uses the &lt;code&gt;Polly&lt;/code&gt; library perform the retry behavior and will only retry operations it will find have been locked due to this exact issue.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Pessimistic locking behavior&lt;/head&gt;
+    &lt;p&gt;Pessimistic locking always locks when a write to SQLite should be performed. Essentially every time an transaction is started or a write operation on the database is done though EF Core, Jellyfin will wait until all other read operations are finished and then block all other operations may they be read or write until the write in question has been performed. This however means, that Jellyfin can only ever perform a single write to the database, even if it would technically does not need to.&lt;/p&gt;
+    &lt;p&gt;In theory, an application should have no issue reading from table "Alice" while writing to table "Bob" however to eliminate all possible sources of concurrency related locking, Jellyfin will only ever allow a single write performed on its database in this mode. While this will absolutely result in the most stable operation, it will undoubtedly also be the slowest.&lt;/p&gt;
+    &lt;p&gt;Jellyfin uses a ReaderWriterLockSlim to lock the operations, that means we allow an unlimited number of reads to happen concurrently while only one write may ever be done on the database.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The future Smart locking behavior&lt;/head&gt;
+    &lt;p&gt;In the future we might also consider combining both modes, to get the best of both worlds.&lt;/p&gt;
+    &lt;head rend="h1"&gt;The result&lt;/head&gt;
+    &lt;p&gt;Initial testing showed that with both modes, we had great success in handling the underlying issue. While we are not yet sure why this happens only on some systems when others work, we at least now have an option for users previously left out of using Jellyfin.&lt;/p&gt;
+    &lt;p&gt;When I was researching this topic, I found many reports all over the internet facing the same error but nobody was able to provide a conclusive explanation whats really happening here. There have been similar proposals made to handle it but there wasn't a "ready to drop in" solution that handles all the different cases or only code that required massive modifications to every EF Core query. Jellyfin's implementation of the locking behaviors should be a copy-paste solution for everyone having the same issues as its using interceptors and the caller has no idea of the actual locking behavior.&lt;/p&gt;
+    &lt;p&gt;Best of luck,&lt;/p&gt;
+    &lt;p&gt;- JPVenson&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45781298</guid><pubDate>Sat, 01 Nov 2025 12:59:03 +0000</pubDate></item><item><title>Updated practice for review articles and position papers in ArXiv CS category</title><link>https://blog.arxiv.org/2025/10/31/attention-authors-updated-practice-for-review-articles-and-position-papers-in-arxiv-cs-category/</link><description>&lt;doc fingerprint="ff55b99b0494c981"&gt;
   &lt;main&gt;
     &lt;p&gt;arXiv’s computer science (CS) category has updated its moderation practice with respect to review (or survey) articles and position papers. Before being considered for submission to arXiv’s CS category, review articles and position papers must now be accepted at a journal or a conference and complete successful peer review. When submitting review articles or position papers, authors must include documentation of successful peer review to receive full consideration. Review/survey articles or position papers submitted to arXiv without this documentation will be likely to be rejected and not appear on arXiv.&lt;lb/&gt; This change is being implemented due to the unmanageable influx of review articles and position papers to arXiv CS.&lt;/p&gt;
     &lt;p&gt;Is this a policy change?&lt;/p&gt;
@@ -268,373 +312,7 @@ FAIL
     &lt;p&gt;Ava Labs — We at Ava Labs, maintainer of AvalancheGo (the most widely used client for interacting with the Avalanche Network), believe the sustainable maintenance and development of open source cryptographic protocols is critical to the broad adoption of blockchain technology. We are proud to support this necessary and impactful work through our ongoing sponsorship of Filippo and his team.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45784179</guid><pubDate>Sat, 01 Nov 2025 18:41:56 +0000</pubDate></item><item><title>Word2vec-style vector arithmetic on docs embeddings</title><link>https://technicalwriting.dev/embeddings/arithmetic/index.html</link><description>&lt;doc fingerprint="31113c6d4e027e9c"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;word2vec-style vector arithmetic on docs embeddings§&lt;/head&gt;
-    &lt;p&gt;2025 October 29&lt;/p&gt;
-    &lt;p&gt;word2vec popularized the idea of representing words as vectors where semantically similar words are positioned close to each other in the vector space. Nowadays these vectors are usually called embeddings.&lt;/p&gt;
-    &lt;p&gt;A neat consequence of the word2vec approach is that adding and subtracting vectors produces semantically logical results. From Efficient Estimations of Word Representations in Vector Space (the word2vec paper):&lt;/p&gt;
-    &lt;quote&gt;&lt;p&gt;Using a word offset technique where simple algebraic operations are performed on the word vectors, it was shown for example that&lt;/p&gt;&lt;code&gt;vector("King")&lt;/code&gt;-&lt;code&gt;vector("Man")&lt;/code&gt;+&lt;code&gt;vector("Woman")&lt;/code&gt;results in a vector that is closest to the vector representation of the word&lt;code&gt;Queen&lt;/code&gt;.&lt;/quote&gt;
-    &lt;p&gt;Does word2vec-style vector arithmetic work in technical writing contexts?&lt;/p&gt;
-    &lt;head rend="h2"&gt;Experiments§&lt;/head&gt;
-    &lt;p&gt;word2vec was published in 2013. Embedding models have come a long way since then. word2vec models could only operate on single words. A vector always represented a single word. Modern embedding models can operate on arbitrary text. A vector can now represent a word, paragraph, section, document, set of documents, etc.&lt;/p&gt;
-    &lt;p&gt;My experiments follow the same basic pattern of &lt;code&gt;vector("King")&lt;/code&gt; -
-&lt;code&gt;vector("Man")&lt;/code&gt; + &lt;code&gt;vector("Woman")&lt;/code&gt;, with one difference. The experiments
-start out with a vector representing the full text of a document, not a
-single-word vector.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Same topic, different domain§&lt;/head&gt;
-    &lt;p&gt;This is the first experiment. Starting with the vector for the full text of Testing Your Database from the Supabase docs, subtract the vector for the word &lt;code&gt;supabase&lt;/code&gt;, and then add the vector for the word &lt;code&gt;angular&lt;/code&gt;. The
-resultant vector should be semantically close to the concept of “testing in
-Angular”.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Different topic, same domain§&lt;/head&gt;
-    &lt;p&gt;This is the second experiment. Starting with the vector for the full text of Testing Your Database from the Supabase docs, subtract the vector for the word &lt;code&gt;testing&lt;/code&gt;, and then add the vector for the word &lt;code&gt;vectors&lt;/code&gt;. The
-resultant vector should be semantically close to the concept of “vectors in
-Supabase”.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Task types§&lt;/head&gt;
-    &lt;p&gt;From previous research I’ve learned that task types noticeably affect Gemini Embedding’s outputs. EmbeddingGemma (the model I’ll be using in the experiments) also supports tasks types. I’ll run both experiments twice: once with default task types, and again with customized task types.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Verification§&lt;/head&gt;
-    &lt;p&gt;There’s no way to directly verify that the resultant vectors are semantically close to the expected concepts. What I can do instead is generate vectors from the full texts of various docs, and then compare the resultant vectors from the experiments against the vectors of these various docs using cosine similarity.&lt;/p&gt;
-    &lt;p&gt;Here’s the full list of docs that I use in the experiments:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;
-        &lt;p&gt;Background Processing Using Web Workers (Angular)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Refer To Locales By ID (Angular)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Testing (Angular)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Testing Services (Angular)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;LINESTRING (CockroachDB)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Test Your Application Locally (CockroachDB)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;analysis_test (Skylib)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;bzl_library (Skylib)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;diff_test (Skylib)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Actionability (Playwright)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;JUnit (Playwright)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Writing Tests (Playwright)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Branching (Supabase)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Testing Your Database (Supabase)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Testing Your Edge Functions (Supabase)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Vector Columns (Supabase)&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;For the Same topic, different domain experiment (Testing Your Database - &lt;code&gt;supabase&lt;/code&gt; + &lt;code&gt;angular&lt;/code&gt;) I expect the resultant vector to be most similar to
-Testing or Testing Services from the Angular docs. And for the
-Different topic, same domain experiment (Testing Your Database - &lt;code&gt;testing&lt;/code&gt; +
-&lt;code&gt;vectors&lt;/code&gt;) I expect the resultant vector to be most similar to Vector
-Columns from the Supabase docs.&lt;/p&gt;
-    &lt;p&gt;Note that I picked short docs because EmbeddingGemma only supports 2048 tokens of input and I didn’t feel like dealing with chunking. Most of the docs revolve around testing.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Results§&lt;/head&gt;
-    &lt;p&gt;In the Same topic, different domain experiment (Testing Your Database - &lt;code&gt;supabase&lt;/code&gt; + &lt;code&gt;angular&lt;/code&gt;) the resultant vector is most similar to Testing
-and Testing Services from the Angular docs, as expected, when custom task
-types are enabled:&lt;/p&gt;
-    &lt;code&gt;[INFO] Running "same topic, different domain" experiment with customized task types
-[INFO] Results:
-[INFO] "Testing" (Angular) =&amp;gt; 0.751456081867218
-[INFO] "Testing Services" (Angular) =&amp;gt; 0.6292878985404968
-[INFO] "Background Processing Using Web Workers" (Angular) =&amp;gt; 0.5090276598930359
-[INFO] "Testing Your Database" (Supabase) =&amp;gt; 0.5084458589553833
-[INFO] "Refer To Locales By ID" (Angular) =&amp;gt; 0.46428176760673523
-[INFO] "Test Your Application Locally" (CockroachDB) =&amp;gt; 0.4586600363254547
-[INFO] "Writing Tests" (Playwright) =&amp;gt; 0.4434031546115875
-[INFO] "JUnit" (Playwright) =&amp;gt; 0.4156876802444458
-[INFO] "Actionability" (Playwright) =&amp;gt; 0.396766722202301
-[INFO] "analysis_test" (Skylib) =&amp;gt; 0.3869394063949585
-[INFO] "Testing Your Edge Functions" (Supabase) =&amp;gt; 0.368389755487442
-[INFO] "diff_test" (Skylib) =&amp;gt; 0.3524951934814453
-[INFO] "bzl_library" (Skylib) =&amp;gt; 0.29295891523361206
-[INFO] "LINESTRING" (CockroachDB) =&amp;gt; 0.2778087854385376
-[INFO] "Branching" (Supabase) =&amp;gt; 0.26931506395339966
-[INFO] "Vector Columns" (Supabase) =&amp;gt; 0.23397961258888245
-&lt;/code&gt;
-    &lt;p&gt;When using the default task types, the resultant vector is most similar to Testing Your Database i.e. the doc that the experiment started with:&lt;/p&gt;
-    &lt;code&gt;[INFO] Running "same topic, different domain" experiment with default task types
-[INFO] Results:
-[INFO] "Testing Your Database" (Supabase) =&amp;gt; 0.6590374708175659
-[INFO] "Testing" (Angular) =&amp;gt; 0.571465790271759
-[INFO] "Testing Services" (Angular) =&amp;gt; 0.46747612953186035
-[INFO] "Test Your Application Locally" (CockroachDB) =&amp;gt; 0.43749818205833435
-[INFO] "Testing Your Edge Functions" (Supabase) =&amp;gt; 0.4073418378829956
-[INFO] "Writing Tests" (Playwright) =&amp;gt; 0.3561333119869232
-[INFO] "Background Processing Using Web Workers" (Angular) =&amp;gt; 0.3353777527809143
-[INFO] "Vector Columns" (Supabase) =&amp;gt; 0.3085843324661255
-[INFO] "LINESTRING" (CockroachDB) =&amp;gt; 0.30450767278671265
-[INFO] "Branching" (Supabase) =&amp;gt; 0.29775649309158325
-[INFO] "analysis_test" (Skylib) =&amp;gt; 0.2946781814098358
-[INFO] "Actionability" (Playwright) =&amp;gt; 0.2879413962364197
-[INFO] "JUnit" (Playwright) =&amp;gt; 0.2845016121864319
-[INFO] "Refer To Locales By ID" (Angular) =&amp;gt; 0.2824022173881531
-[INFO] "diff_test" (Skylib) =&amp;gt; 0.26220911741256714
-[INFO] "bzl_library" (Skylib) =&amp;gt; 0.2447129189968109
-&lt;/code&gt;
-    &lt;p&gt;In the Different topic, same domain experiment (Testing Your Database - &lt;code&gt;testing&lt;/code&gt; + &lt;code&gt;vectors&lt;/code&gt;) the resultant vector is most similar to
-Vector Columns, regardless of whether default or custom task types were used.&lt;/p&gt;
-    &lt;p&gt;Custom task types:&lt;/p&gt;
-    &lt;code&gt;[INFO] Running "different topic, same domain" experiment with customized task types
-[INFO] Results:
-[INFO] "Vector Columns" (Supabase) =&amp;gt; 0.6380605697631836
-[INFO] "Testing Your Database" (Supabase) =&amp;gt; 0.44831225275993347
-[INFO] "LINESTRING" (CockroachDB) =&amp;gt; 0.32693782448768616
-[INFO] "Background Processing Using Web Workers" (Angular) =&amp;gt; 0.2737721800804138
-[INFO] "Testing Your Edge Functions" (Supabase) =&amp;gt; 0.25883781909942627
-[INFO] "Branching" (Supabase) =&amp;gt; 0.2509428560733795
-[INFO] "Refer To Locales By ID" (Angular) =&amp;gt; 0.2328835278749466
-[INFO] "bzl_library" (Skylib) =&amp;gt; 0.2133977860212326
-[INFO] "Test Your Application Locally" (CockroachDB) =&amp;gt; 0.20613139867782593
-[INFO] "Testing" (Angular) =&amp;gt; 0.16262517869472504
-[INFO] "Actionability" (Playwright) =&amp;gt; 0.14792931079864502
-[INFO] "Writing Tests" (Playwright) =&amp;gt; 0.14344163239002228
-[INFO] "Testing Services" (Angular) =&amp;gt; 0.13723336160182953
-[INFO] "diff_test" (Skylib) =&amp;gt; 0.12111848592758179
-[INFO] "JUnit" (Playwright) =&amp;gt; 0.11599748581647873
-[INFO] "analysis_test" (Skylib) =&amp;gt; 0.0979730486869812
-&lt;/code&gt;
-    &lt;p&gt;Default task types:&lt;/p&gt;
-    &lt;code&gt;[INFO] Running "different topic, same domain" experiment with default task types
-[INFO] Results:
-[INFO] "Vector Columns" (Supabase) =&amp;gt; 0.6698287129402161
-[INFO] "Testing Your Database" (Supabase) =&amp;gt; 0.6086233854293823
-[INFO] "Testing Your Edge Functions" (Supabase) =&amp;gt; 0.36533844470977783
-[INFO] "LINESTRING" (CockroachDB) =&amp;gt; 0.34430524706840515
-[INFO] "Branching" (Supabase) =&amp;gt; 0.3141021430492401
-[INFO] "Test Your Application Locally" (CockroachDB) =&amp;gt; 0.29872700572013855
-[INFO] "Background Processing Using Web Workers" (Angular) =&amp;gt; 0.28414368629455566
-[INFO] "bzl_library" (Skylib) =&amp;gt; 0.26424312591552734
-[INFO] "Refer To Locales By ID" (Angular) =&amp;gt; 0.2537899315357208
-[INFO] "Testing" (Angular) =&amp;gt; 0.23542608320713043
-[INFO] "Writing Tests" (Playwright) =&amp;gt; 0.22030793130397797
-[INFO] "Testing Services" (Angular) =&amp;gt; 0.20675960183143616
-[INFO] "Actionability" (Playwright) =&amp;gt; 0.1959698647260666
-[INFO] "diff_test" (Skylib) =&amp;gt; 0.19095730781555176
-[INFO] "JUnit" (Playwright) =&amp;gt; 0.1832783967256546
-[INFO] "analysis_test" (Skylib) =&amp;gt; 0.15578024089336395
-&lt;/code&gt;
-    &lt;p&gt;So, yes, it seems like word2vec-style vector arithmetic can work in technical writing contexts. Make sure to set your task types correctly.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Discussion§&lt;/head&gt;
-    &lt;p&gt;I still don’t really understand how it’s possible to semantically represent an entire document as a single vector, let alone how adding and subtracting single-word vectors from full-document vectors works.&lt;/p&gt;
-    &lt;p&gt;How do we actually use this in technical writing workflows or documentation experiences? I’m not sure. I was just curious to learn whether or not it would work.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Appendix§&lt;/head&gt;
-    &lt;head rend="h3"&gt;Source code§&lt;/head&gt;
-    &lt;p&gt;&lt;code&gt;experiments.py&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;from json import load
-from os import environ
-from sys import exit
-
-from requests import get
-from sentence_transformers import SentenceTransformer
-
-
-class Doc:
-
-    def __init__(self, topic, domain, url, length, embedding):
-        self.topic = topic
-        self.domain = domain
-        self.url = url
-        self.length = length
-        self.embedding = embedding
-        self.similarity = None
-
-
-def init_docs(model, task_types):
-    with open("data.json", "r") as f:
-        data = load(f)
-    tokenizer = model.tokenizer
-    docs = []
-    max_length = tokenizer.model_max_length
-    for item in data:
-        url = item["url"]
-        response = get(url)
-        text = response.text
-        length = len(tokenizer.encode(text))
-        topic = item["topic"]
-        domain = item["domain"]
-        if length &amp;gt; max_length:
-            exit(f"[ERROR] Document is too large: {topic}, {domain}")
-        prompt = "title: {topic} | text: "
-        embedding = model.encode(text, prompt=prompt) if task_types else model.encode(text)
-        doc = Doc(topic, domain, url, length, embedding)
-        docs.append(doc)
-    return docs
-
-
-def create_domain_query(model, task_types):
-    url = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/apps/docs/content/guides/database/testing.mdx"
-    response = get(url)
-    text = response.text
-    if task_types:
-        doc = model.encode(text, prompt_name="Retrieval-query")
-        supabase = model.encode("supabase", prompt_name="Retrieval-query")
-        angular = model.encode("angular", prompt_name="Retrieval-query")
-    else:
-        doc = model.encode(text)
-        supabase = model.encode("supabase")
-        angular = model.encode("angular")
-    return doc - supabase + angular
-
-
-def create_topic_query(model, task_types):
-    url = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/apps/docs/content/guides/database/testing.mdx"
-    response = get(url)
-    text = response.text
-    if task_types:
-        doc = model.encode(text, prompt_name="Retrieval-query")
-        testing = model.encode("testing", prompt_name="Retrieval-query")
-        vectors = model.encode("vectors", prompt_name="Retrieval-query")
-    else:
-        doc = model.encode(text)
-        testing = model.encode("testing")
-        vectors = model.encode("vectors")
-    return doc - testing + vectors
-
-
-def run_experiments():
-    environ["TOKENIZERS_PARALLELISM"] = "false"
-    model = SentenceTransformer("google/embeddinggemma-300m")
-    for task_types in [True, False]:
-        print(f'[INFO] Running "same topic, different domain" experiment with {"customized" if task_types else "default"} task types')
-        docs = init_docs(model, task_types)
-        query = create_domain_query(model, task_types)
-        for doc in docs:
-            similarity = model.similarity(query, doc.embedding).item()
-            doc.similarity = similarity
-        docs.sort(key=lambda doc: doc.similarity, reverse=True)
-        print(f'[INFO] Results:')
-        for doc in docs:
-            print(f'[INFO] "{doc.topic}" ({doc.domain}) =&amp;gt; {doc.similarity}')
-        print()
-        print(f'[INFO] Running "different topic, same domain" experiment with {"customized" if task_types else "default"} task types')
-        docs = init_docs(model, task_types)
-        query = create_topic_query(model, task_types)
-        for doc in docs:
-            similarity = model.similarity(query, doc.embedding).item()
-            doc.similarity = similarity
-        docs.sort(key=lambda doc: doc.similarity, reverse=True)
-        print(f'[INFO] Results:')
-        for doc in docs:
-            print(f'[INFO] "{doc.topic}" ({doc.domain}) =&amp;gt; {doc.similarity}')
-        print()
-
-
-if __name__ == "__main__":
-    run_experiments()
-&lt;/code&gt;
-    &lt;p&gt;&lt;code&gt;data.json&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;[
-  {
-    "domain": "Angular",
-    "topic": "Background Processing Using Web Workers",
-    "url": "https://raw.githubusercontent.com/angular/angular/refs/heads/main/adev/src/content/ecosystem/web-workers.md" 
-  },
-  {
-    "domain": "Angular",
-    "topic": "Refer To Locales By ID",
-    "url": "https://raw.githubusercontent.com/angular/angular/refs/heads/main/adev/src/content/guide/i18n/locale-id.md" 
-  },
-  {
-    "domain": "Angular",
-    "topic": "Testing",
-    "url": "https://raw.githubusercontent.com/angular/angular/refs/heads/main/adev/src/content/guide/testing/overview.md" 
-  },
-  {
-    "domain": "Angular",
-    "topic": "Testing Services",
-    "url": "https://raw.githubusercontent.com/angular/angular/refs/heads/main/adev/src/content/guide/testing/services.md" 
-  },
-  {
-    "domain": "CockroachDB",
-    "topic": "LINESTRING",
-    "url": "https://raw.githubusercontent.com/cockroachdb/docs/refs/heads/main/src/current/v25.4/linestring.md" 
-  },
-  {
-    "domain": "CockroachDB",
-    "topic": "Test Your Application Locally",
-    "url": "https://raw.githubusercontent.com/cockroachdb/docs/refs/heads/main/src/current/v25.4/local-testing.md" 
-  },
-  {
-    "domain": "Skylib",
-    "topic": "analysis_test",
-    "url": "https://raw.githubusercontent.com/bazelbuild/bazel-skylib/refs/heads/main/docs/analysis_test_doc.md"
-  },
-  {
-    "domain": "Skylib",
-    "topic": "bzl_library",
-    "url": "https://raw.githubusercontent.com/bazelbuild/bazel-skylib/refs/heads/main/docs/bzl_library.md"
-  },
-  {
-    "domain": "Skylib",
-    "topic": "diff_test",
-    "url": "https://raw.githubusercontent.com/bazelbuild/bazel-skylib/refs/heads/main/docs/diff_test_doc.md"
-  },
-  {
-    "domain": "Playwright",
-    "topic": "Actionability",
-    "url": "https://raw.githubusercontent.com/microsoft/playwright/refs/heads/main/docs/src/actionability.md"
-  },
-  {
-    "domain": "Playwright",
-    "topic": "JUnit",
-    "url": "https://raw.githubusercontent.com/microsoft/playwright/refs/heads/main/docs/src/junit-java.md"
-  },
-  {
-    "domain": "Playwright",
-    "topic": "Writing Tests",
-    "url": "https://raw.githubusercontent.com/microsoft/playwright/refs/heads/main/docs/src/writing-tests-java.md"
-  },
-  {
-    "domain": "Supabase",
-    "topic": "Branching",
-    "url": "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/apps/docs/content/guides/deployment/branching.mdx"
-  },
-  {
-    "domain": "Supabase",
-    "topic": "Testing Your Database",
-    "url": "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/apps/docs/content/guides/database/testing.mdx"
-  },
-  {
-    "domain": "Supabase",
-    "topic": "Testing Your Edge Functions",
-    "url": "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/apps/docs/content/guides/functions/unit-test.mdx"
-  },
-  {
-    "domain": "Supabase",
-    "topic": "Vector Columns",
-    "url": "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/apps/docs/content/guides/ai/vector-columns.mdx"
-  }
-]
-&lt;/code&gt;
-    &lt;p&gt;Note that I forgot to pin the URLs to specific commits. I.e. I used the &lt;code&gt;HEAD&lt;/code&gt; version of each URL. If you run the experiments a year or two from now
-(October 2025), your cosine similarity scores will probably be different,
-because the underlying text of the documents will probably have changed.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45784455</guid><pubDate>Sat, 01 Nov 2025 19:14:58 +0000</pubDate></item><item><title>Beginner-friendly, unofficial documentation for Helix text editor</title><link>https://helix-editor.vercel.app/start-here/basics/</link><description>&lt;doc fingerprint="2e1d8a1e0335f69e"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45784179</guid><pubDate>Sat, 01 Nov 2025 18:41:56 +0000</pubDate></item><item><title>Beginner-friendly, unofficial documentation for Helix text editor</title><link>https://helix-editor.vercel.app/start-here/basics/</link><description>&lt;doc fingerprint="2e1d8a1e0335f69e"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Basics&lt;/head&gt;
     &lt;p&gt;To get started check out the installation instructions in order to follow along with the tutorial.&lt;/p&gt;
@@ -3208,7 +2886,7 @@ async fn main() {
     &lt;/table&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45787842</guid><pubDate>Sun, 02 Nov 2025 04:27:31 +0000</pubDate></item><item><title>Yes, you should understand backprop (2016)</title><link>https://karpathy.medium.com/yes-you-should-understand-backprop-e2f06eab496b</link><description>&lt;doc fingerprint="f70910553d224cb1"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45787842</guid><pubDate>Sun, 02 Nov 2025 04:27:31 +0000</pubDate></item><item><title>Backpropagation is a leaky abstraction</title><link>https://karpathy.medium.com/yes-you-should-understand-backprop-e2f06eab496b</link><description>&lt;doc fingerprint="f70910553d224cb1"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Yes you should understand backprop&lt;/head&gt;
     &lt;p&gt;When we offered CS231n (Deep Learning class) at Stanford, we intentionally designed the programming assignments to include explicit calculations involved in backpropagation on the lowest level. The students had to implement the forward and the backward pass of each layer in raw numpy. Inevitably, some students complained on the class message boards:&lt;/p&gt;

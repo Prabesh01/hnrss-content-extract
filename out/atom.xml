@@ -1,5 +1,49 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-11-02T07:32:36.141692+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=45782136</id><title>Updated practice for review articles and position papers in ArXiv CS category</title><updated>2025-11-02T07:32:44.833297+00:00</updated><content>&lt;doc fingerprint="ff55b99b0494c981"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-11-02T08:11:52.889647+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=45781298</id><title>SQLite concurrency and why you should care about it</title><updated>2025-11-02T08:12:00.087194+00:00</updated><content>&lt;doc fingerprint="7b4e765eeca27f9a"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;SQLite concurrency and why you should care about it&lt;/head&gt;
+    &lt;p&gt;SQLite is a powerful database engine, but due to its design, it has limitations that should not be overlooked.&lt;/p&gt;
+    &lt;p&gt;Jellyfin has used a SQLite-based database for storing most of its data for years, but it has also encountered issues on many systems. In this blog post, I will explain how we address these limitations and how developers using SQLite can apply the same solutions.&lt;/p&gt;
+    &lt;p&gt;This will be a technical blog post intended for developers and everyone wanting to learn about concurrency.&lt;/p&gt;
+    &lt;p&gt;Also Jellyfin's implementation of locking for SQLite should be fairly easy to be implemented into another EF Core application if you are facing the same issue.&lt;/p&gt;
+    &lt;p&gt;- JPVenson&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Premise&lt;/head&gt;
+    &lt;p&gt;SQLite is a file-based database engine running within your application and allows you to store data in a relational structure. Overall it gives your application the means of storing structured data as a single file and without having to depend on another application to do so. Naturally this also comes at a price. If your application fully manages this file, the assumption must be made that your application is the sole owner of this file, and nobody else will tinker with it while you are writing data to it.&lt;/p&gt;
+    &lt;p&gt;So an application that wants to use SQLite as its database needs to be the only one accessing it. Having established this fact, an important thought arises: if only a single write operation should be performed on a single file at a time, this rule must also apply to operations within the same application.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The W-A-L mode&lt;/head&gt;
+    &lt;p&gt;SQLite has a feature that tries to get around this limitation: the Write-Ahead-Log (WAL). The WAL is a separate file that acts as a journal of operations that should be applied to an SQLite file. This allows multiple parallel writes to take place and get enqueued into the WAL. When another part of the application wants to read data, it reads from the actual database, then scans the WAL for modifications and applies them on the fly. This is not a foolproof solution; there are still scenarios where WAL does not prevent locking conflicts.&lt;/p&gt;
+    &lt;head rend="h2"&gt;SQLite transactions&lt;/head&gt;
+    &lt;p&gt;A transaction is supposed to ensure two things. Modifications made within a transaction can be reverted, either when something goes wrong or when the application decides it should and optionally a transaction may also block other readers from reading data that is modified within a transaction. This is where it gets spicy and we come to the real reason why I am writing this blog post. For some reason on some systems that run Jellyfin when a transaction takes place the SQLite engine reports the database is locked and instead of waiting for the transaction to be resolved the engine refuses to wait and just crashes. This seems to be a not uncommon issue and there are many reports to be found on the issue.&lt;/p&gt;
+    &lt;p&gt;The factor that makes this issue so bad is that it does not happen reliably. So far we only have one team member where this can be (somewhat) reliably be reproduced which makes this an even worse a bug. From the reports this issue happens across all operating systems, drive speeds and with or without virtualization. So we do not have any deciding factor identified that even contributes to the likelihood of the issue happening.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Jellyfin factor&lt;/head&gt;
+    &lt;p&gt;Having established the general theory on how SQLite behaves, we also have to look at the specifics of Jellyfins usage of SQLite. During normal operations on a recommended setup (Non-Networked Storage and preferably SSD) its unusual for any problems to arise, however the way Jellyfin utilises the SQLite db up to 10.11 is very suboptimal. In versions prior to 10.11 Jellyfin had a bug in its parallel task limit which resulted in exponential overscheduling of library scan operations which hammered the database engine with thousands of parallel write requests that an SQLite engine is simply not able to handle. While most SQLite engine implementations have retry behavior, they also have timeouts and checks in place to prevent limitless waiting so if we stress the engine enough, it just fails with an error. That and very long running and frankly unoptimized transactions could lead to the database just being overloaded with requests and flaking out.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The solution&lt;/head&gt;
+    &lt;p&gt;Since we moved the codebase over to EF Core proper, we have the tools to actually do something about this as EF Core gives us a structured abstraction level. EF Core supports a way of hooking into every command execution or transaction by creating Interceptors. With an interceptor we can finally do the straight forward idea of just "not" writing to the database in parallel in a transparent way to the caller. The overall idea is to have multiple strategies of locking. Because all levels of synchronization will inevitably come at the cost of performance, we only want to do it when it is really necessary. So, I decided on three locking strategies:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;No-Lock&lt;/item&gt;
+      &lt;item&gt;Optimistic locking&lt;/item&gt;
+      &lt;item&gt;Pessimistic locking&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;As a default, the no-lock behavior does exactly what the name implies. Nothing. This is the default because my research shows that for 99% all of this is not an issue and every interaction at this level will slow down the whole application.&lt;/p&gt;
+    &lt;p&gt;Both the optimistic and pessimistic behaviors use two interceptors—one for transactions and one for commands—and override &lt;code&gt;SaveChanges&lt;/code&gt; in &lt;code&gt;JellyfinDbContext&lt;/code&gt;.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Optimistic locking behavior&lt;/head&gt;
+    &lt;p&gt;Optimistic locking means to assume the operation in question will succeed and only handle issues afterwards. In essence this can be boiled down to "Try and Retry and Retry ..." for a set number of times until either we succeed with the operation or fail entirely. This still leaves the possibility that we will not actually be able to perform a write, but the introduced overhead is far less than the Pessimistic locking behavior.&lt;/p&gt;
+    &lt;p&gt;The idea behind how this works is simple: every time two operations try to write to the database, one will always win. The other will fail, wait some time, then retry a few times.&lt;/p&gt;
+    &lt;p&gt;Jellyfin uses the &lt;code&gt;Polly&lt;/code&gt; library perform the retry behavior and will only retry operations it will find have been locked due to this exact issue.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Pessimistic locking behavior&lt;/head&gt;
+    &lt;p&gt;Pessimistic locking always locks when a write to SQLite should be performed. Essentially every time an transaction is started or a write operation on the database is done though EF Core, Jellyfin will wait until all other read operations are finished and then block all other operations may they be read or write until the write in question has been performed. This however means, that Jellyfin can only ever perform a single write to the database, even if it would technically does not need to.&lt;/p&gt;
+    &lt;p&gt;In theory, an application should have no issue reading from table "Alice" while writing to table "Bob" however to eliminate all possible sources of concurrency related locking, Jellyfin will only ever allow a single write performed on its database in this mode. While this will absolutely result in the most stable operation, it will undoubtedly also be the slowest.&lt;/p&gt;
+    &lt;p&gt;Jellyfin uses a ReaderWriterLockSlim to lock the operations, that means we allow an unlimited number of reads to happen concurrently while only one write may ever be done on the database.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The future Smart locking behavior&lt;/head&gt;
+    &lt;p&gt;In the future we might also consider combining both modes, to get the best of both worlds.&lt;/p&gt;
+    &lt;head rend="h1"&gt;The result&lt;/head&gt;
+    &lt;p&gt;Initial testing showed that with both modes, we had great success in handling the underlying issue. While we are not yet sure why this happens only on some systems when others work, we at least now have an option for users previously left out of using Jellyfin.&lt;/p&gt;
+    &lt;p&gt;When I was researching this topic, I found many reports all over the internet facing the same error but nobody was able to provide a conclusive explanation whats really happening here. There have been similar proposals made to handle it but there wasn't a "ready to drop in" solution that handles all the different cases or only code that required massive modifications to every EF Core query. Jellyfin's implementation of the locking behaviors should be a copy-paste solution for everyone having the same issues as its using interceptors and the caller has no idea of the actual locking behavior.&lt;/p&gt;
+    &lt;p&gt;Best of luck,&lt;/p&gt;
+    &lt;p&gt;- JPVenson&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://jellyfin.org/posts/SQLite-locking/"/><published>2025-11-01T12:59:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45782136</id><title>Updated practice for review articles and position papers in ArXiv CS category</title><updated>2025-11-02T08:11:59.732837+00:00</updated><content>&lt;doc fingerprint="ff55b99b0494c981"&gt;
   &lt;main&gt;
     &lt;p&gt;arXiv’s computer science (CS) category has updated its moderation practice with respect to review (or survey) articles and position papers. Before being considered for submission to arXiv’s CS category, review articles and position papers must now be accepted at a journal or a conference and complete successful peer review. When submitting review articles or position papers, authors must include documentation of successful peer review to receive full consideration. Review/survey articles or position papers submitted to arXiv without this documentation will be likely to be rejected and not appear on arXiv.&lt;lb/&gt; This change is being implemented due to the unmanageable influx of review articles and position papers to arXiv CS.&lt;/p&gt;
     &lt;p&gt;Is this a policy change?&lt;/p&gt;
@@ -24,7 +68,7 @@
     &lt;p&gt;Will other categories on arXiv also change their practice re: review articles and position papers? Each category of arXiv has different moderators, who are subject matter experts with a terminal degree in their particular subject, to best serve the scholarly pursuits, goals, and standards of their category. While all moderators adhere to arXiv policy, the only policy arXiv has in place with regard to review articles and position papers is that they are not a generally accepted content type. The goal of the moderators of each category is to make sure the work being submitted is actually science, and that it is of potential interest to the scientific community. If other categories see a similar rise in LLM-written review articles and position papers, they may choose to change their moderation practices in a similar manner to better serve arXiv authors and readers. We will make these updates public if and when they do occur.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://blog.arxiv.org/2025/10/31/attention-authors-updated-practice-for-review-articles-and-position-papers-in-arxiv-cs-category/"/><published>2025-11-01T14:58:05+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45782981</id><title>GHC now runs in the browser</title><updated>2025-11-02T07:32:44.431186+00:00</updated><content>&lt;doc fingerprint="4f3a90df9d363b44"&gt;
+&lt;/doc&gt;</content><link href="https://blog.arxiv.org/2025/10/31/attention-authors-updated-practice-for-review-articles-and-position-papers-in-arxiv-cs-category/"/><published>2025-11-01T14:58:05+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45782981</id><title>GHC now runs in the browser</title><updated>2025-11-02T08:11:59.188535+00:00</updated><content>&lt;doc fingerprint="4f3a90df9d363b44"&gt;
   &lt;main&gt;
     &lt;div&gt;
       &lt;div&gt;
@@ -132,7 +176,7 @@
     &lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://discourse.haskell.org/t/ghc-now-runs-in-your-browser/13169"/><published>2025-11-01T16:29:23+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45783640</id><title>Show HN: Why write code if the LLM can just do the thing? (web app experiment)</title><updated>2025-11-02T07:32:43.911384+00:00</updated><content>&lt;doc fingerprint="a15b850a73e66ead"&gt;
+&lt;/doc&gt;</content><link href="https://discourse.haskell.org/t/ghc-now-runs-in-your-browser/13169"/><published>2025-11-01T16:29:23+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45783640</id><title>Show HN: Why write code if the LLM can just do the thing? (web app experiment)</title><updated>2025-11-02T08:11:58.532752+00:00</updated><content>&lt;doc fingerprint="a15b850a73e66ead"&gt;
   &lt;main&gt;
     &lt;p&gt;A web server with no application logic. Just an LLM with three tools.&lt;/p&gt;
     &lt;p&gt;One day we won't need code. LLMs will output video at 120fps, sample inputs in realtime, and just... be our computers. No apps, no code, just intent and execution.&lt;/p&gt;
@@ -203,7 +247,7 @@ ANTHROPIC_MODEL=claude-3-haiku-20240307&lt;/code&gt;
     &lt;p&gt;MIT License&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/samrolken/nokode"/><published>2025-11-01T17:45:18+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45784179</id><title>Claude Code can debug low-level cryptography</title><updated>2025-11-02T07:32:43.557456+00:00</updated><content>&lt;doc fingerprint="c6650996270f1fd4"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/samrolken/nokode"/><published>2025-11-01T17:45:18+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45784179</id><title>Claude Code can debug low-level cryptography</title><updated>2025-11-02T08:11:58.356062+00:00</updated><content>&lt;doc fingerprint="c6650996270f1fd4"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Claude Code Can Debug Low-level Cryptography&lt;/head&gt;
     &lt;p&gt;Over the past few days I wrote a new Go implementation of ML-DSA, a post-quantum signature algorithm specified by NIST last summer. I livecoded it all over four days, finishing it on Thursday evening. Except… Verify was always rejecting valid signatures.&lt;/p&gt;
@@ -268,373 +312,7 @@ FAIL
     &lt;p&gt;Ava Labs — We at Ava Labs, maintainer of AvalancheGo (the most widely used client for interacting with the Avalanche Network), believe the sustainable maintenance and development of open source cryptographic protocols is critical to the broad adoption of blockchain technology. We are proud to support this necessary and impactful work through our ongoing sponsorship of Filippo and his team.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://words.filippo.io/claude-debugging/"/><published>2025-11-01T18:41:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45784455</id><title>Word2vec-style vector arithmetic on docs embeddings</title><updated>2025-11-02T07:32:43.306728+00:00</updated><content>&lt;doc fingerprint="31113c6d4e027e9c"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;word2vec-style vector arithmetic on docs embeddings§&lt;/head&gt;
-    &lt;p&gt;2025 October 29&lt;/p&gt;
-    &lt;p&gt;word2vec popularized the idea of representing words as vectors where semantically similar words are positioned close to each other in the vector space. Nowadays these vectors are usually called embeddings.&lt;/p&gt;
-    &lt;p&gt;A neat consequence of the word2vec approach is that adding and subtracting vectors produces semantically logical results. From Efficient Estimations of Word Representations in Vector Space (the word2vec paper):&lt;/p&gt;
-    &lt;quote&gt;&lt;p&gt;Using a word offset technique where simple algebraic operations are performed on the word vectors, it was shown for example that&lt;/p&gt;&lt;code&gt;vector("King")&lt;/code&gt;-&lt;code&gt;vector("Man")&lt;/code&gt;+&lt;code&gt;vector("Woman")&lt;/code&gt;results in a vector that is closest to the vector representation of the word&lt;code&gt;Queen&lt;/code&gt;.&lt;/quote&gt;
-    &lt;p&gt;Does word2vec-style vector arithmetic work in technical writing contexts?&lt;/p&gt;
-    &lt;head rend="h2"&gt;Experiments§&lt;/head&gt;
-    &lt;p&gt;word2vec was published in 2013. Embedding models have come a long way since then. word2vec models could only operate on single words. A vector always represented a single word. Modern embedding models can operate on arbitrary text. A vector can now represent a word, paragraph, section, document, set of documents, etc.&lt;/p&gt;
-    &lt;p&gt;My experiments follow the same basic pattern of &lt;code&gt;vector("King")&lt;/code&gt; -
-&lt;code&gt;vector("Man")&lt;/code&gt; + &lt;code&gt;vector("Woman")&lt;/code&gt;, with one difference. The experiments
-start out with a vector representing the full text of a document, not a
-single-word vector.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Same topic, different domain§&lt;/head&gt;
-    &lt;p&gt;This is the first experiment. Starting with the vector for the full text of Testing Your Database from the Supabase docs, subtract the vector for the word &lt;code&gt;supabase&lt;/code&gt;, and then add the vector for the word &lt;code&gt;angular&lt;/code&gt;. The
-resultant vector should be semantically close to the concept of “testing in
-Angular”.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Different topic, same domain§&lt;/head&gt;
-    &lt;p&gt;This is the second experiment. Starting with the vector for the full text of Testing Your Database from the Supabase docs, subtract the vector for the word &lt;code&gt;testing&lt;/code&gt;, and then add the vector for the word &lt;code&gt;vectors&lt;/code&gt;. The
-resultant vector should be semantically close to the concept of “vectors in
-Supabase”.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Task types§&lt;/head&gt;
-    &lt;p&gt;From previous research I’ve learned that task types noticeably affect Gemini Embedding’s outputs. EmbeddingGemma (the model I’ll be using in the experiments) also supports tasks types. I’ll run both experiments twice: once with default task types, and again with customized task types.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Verification§&lt;/head&gt;
-    &lt;p&gt;There’s no way to directly verify that the resultant vectors are semantically close to the expected concepts. What I can do instead is generate vectors from the full texts of various docs, and then compare the resultant vectors from the experiments against the vectors of these various docs using cosine similarity.&lt;/p&gt;
-    &lt;p&gt;Here’s the full list of docs that I use in the experiments:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;
-        &lt;p&gt;Background Processing Using Web Workers (Angular)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Refer To Locales By ID (Angular)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Testing (Angular)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Testing Services (Angular)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;LINESTRING (CockroachDB)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Test Your Application Locally (CockroachDB)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;analysis_test (Skylib)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;bzl_library (Skylib)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;diff_test (Skylib)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Actionability (Playwright)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;JUnit (Playwright)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Writing Tests (Playwright)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Branching (Supabase)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Testing Your Database (Supabase)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Testing Your Edge Functions (Supabase)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Vector Columns (Supabase)&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;For the Same topic, different domain experiment (Testing Your Database - &lt;code&gt;supabase&lt;/code&gt; + &lt;code&gt;angular&lt;/code&gt;) I expect the resultant vector to be most similar to
-Testing or Testing Services from the Angular docs. And for the
-Different topic, same domain experiment (Testing Your Database - &lt;code&gt;testing&lt;/code&gt; +
-&lt;code&gt;vectors&lt;/code&gt;) I expect the resultant vector to be most similar to Vector
-Columns from the Supabase docs.&lt;/p&gt;
-    &lt;p&gt;Note that I picked short docs because EmbeddingGemma only supports 2048 tokens of input and I didn’t feel like dealing with chunking. Most of the docs revolve around testing.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Results§&lt;/head&gt;
-    &lt;p&gt;In the Same topic, different domain experiment (Testing Your Database - &lt;code&gt;supabase&lt;/code&gt; + &lt;code&gt;angular&lt;/code&gt;) the resultant vector is most similar to Testing
-and Testing Services from the Angular docs, as expected, when custom task
-types are enabled:&lt;/p&gt;
-    &lt;code&gt;[INFO] Running "same topic, different domain" experiment with customized task types
-[INFO] Results:
-[INFO] "Testing" (Angular) =&amp;gt; 0.751456081867218
-[INFO] "Testing Services" (Angular) =&amp;gt; 0.6292878985404968
-[INFO] "Background Processing Using Web Workers" (Angular) =&amp;gt; 0.5090276598930359
-[INFO] "Testing Your Database" (Supabase) =&amp;gt; 0.5084458589553833
-[INFO] "Refer To Locales By ID" (Angular) =&amp;gt; 0.46428176760673523
-[INFO] "Test Your Application Locally" (CockroachDB) =&amp;gt; 0.4586600363254547
-[INFO] "Writing Tests" (Playwright) =&amp;gt; 0.4434031546115875
-[INFO] "JUnit" (Playwright) =&amp;gt; 0.4156876802444458
-[INFO] "Actionability" (Playwright) =&amp;gt; 0.396766722202301
-[INFO] "analysis_test" (Skylib) =&amp;gt; 0.3869394063949585
-[INFO] "Testing Your Edge Functions" (Supabase) =&amp;gt; 0.368389755487442
-[INFO] "diff_test" (Skylib) =&amp;gt; 0.3524951934814453
-[INFO] "bzl_library" (Skylib) =&amp;gt; 0.29295891523361206
-[INFO] "LINESTRING" (CockroachDB) =&amp;gt; 0.2778087854385376
-[INFO] "Branching" (Supabase) =&amp;gt; 0.26931506395339966
-[INFO] "Vector Columns" (Supabase) =&amp;gt; 0.23397961258888245
-&lt;/code&gt;
-    &lt;p&gt;When using the default task types, the resultant vector is most similar to Testing Your Database i.e. the doc that the experiment started with:&lt;/p&gt;
-    &lt;code&gt;[INFO] Running "same topic, different domain" experiment with default task types
-[INFO] Results:
-[INFO] "Testing Your Database" (Supabase) =&amp;gt; 0.6590374708175659
-[INFO] "Testing" (Angular) =&amp;gt; 0.571465790271759
-[INFO] "Testing Services" (Angular) =&amp;gt; 0.46747612953186035
-[INFO] "Test Your Application Locally" (CockroachDB) =&amp;gt; 0.43749818205833435
-[INFO] "Testing Your Edge Functions" (Supabase) =&amp;gt; 0.4073418378829956
-[INFO] "Writing Tests" (Playwright) =&amp;gt; 0.3561333119869232
-[INFO] "Background Processing Using Web Workers" (Angular) =&amp;gt; 0.3353777527809143
-[INFO] "Vector Columns" (Supabase) =&amp;gt; 0.3085843324661255
-[INFO] "LINESTRING" (CockroachDB) =&amp;gt; 0.30450767278671265
-[INFO] "Branching" (Supabase) =&amp;gt; 0.29775649309158325
-[INFO] "analysis_test" (Skylib) =&amp;gt; 0.2946781814098358
-[INFO] "Actionability" (Playwright) =&amp;gt; 0.2879413962364197
-[INFO] "JUnit" (Playwright) =&amp;gt; 0.2845016121864319
-[INFO] "Refer To Locales By ID" (Angular) =&amp;gt; 0.2824022173881531
-[INFO] "diff_test" (Skylib) =&amp;gt; 0.26220911741256714
-[INFO] "bzl_library" (Skylib) =&amp;gt; 0.2447129189968109
-&lt;/code&gt;
-    &lt;p&gt;In the Different topic, same domain experiment (Testing Your Database - &lt;code&gt;testing&lt;/code&gt; + &lt;code&gt;vectors&lt;/code&gt;) the resultant vector is most similar to
-Vector Columns, regardless of whether default or custom task types were used.&lt;/p&gt;
-    &lt;p&gt;Custom task types:&lt;/p&gt;
-    &lt;code&gt;[INFO] Running "different topic, same domain" experiment with customized task types
-[INFO] Results:
-[INFO] "Vector Columns" (Supabase) =&amp;gt; 0.6380605697631836
-[INFO] "Testing Your Database" (Supabase) =&amp;gt; 0.44831225275993347
-[INFO] "LINESTRING" (CockroachDB) =&amp;gt; 0.32693782448768616
-[INFO] "Background Processing Using Web Workers" (Angular) =&amp;gt; 0.2737721800804138
-[INFO] "Testing Your Edge Functions" (Supabase) =&amp;gt; 0.25883781909942627
-[INFO] "Branching" (Supabase) =&amp;gt; 0.2509428560733795
-[INFO] "Refer To Locales By ID" (Angular) =&amp;gt; 0.2328835278749466
-[INFO] "bzl_library" (Skylib) =&amp;gt; 0.2133977860212326
-[INFO] "Test Your Application Locally" (CockroachDB) =&amp;gt; 0.20613139867782593
-[INFO] "Testing" (Angular) =&amp;gt; 0.16262517869472504
-[INFO] "Actionability" (Playwright) =&amp;gt; 0.14792931079864502
-[INFO] "Writing Tests" (Playwright) =&amp;gt; 0.14344163239002228
-[INFO] "Testing Services" (Angular) =&amp;gt; 0.13723336160182953
-[INFO] "diff_test" (Skylib) =&amp;gt; 0.12111848592758179
-[INFO] "JUnit" (Playwright) =&amp;gt; 0.11599748581647873
-[INFO] "analysis_test" (Skylib) =&amp;gt; 0.0979730486869812
-&lt;/code&gt;
-    &lt;p&gt;Default task types:&lt;/p&gt;
-    &lt;code&gt;[INFO] Running "different topic, same domain" experiment with default task types
-[INFO] Results:
-[INFO] "Vector Columns" (Supabase) =&amp;gt; 0.6698287129402161
-[INFO] "Testing Your Database" (Supabase) =&amp;gt; 0.6086233854293823
-[INFO] "Testing Your Edge Functions" (Supabase) =&amp;gt; 0.36533844470977783
-[INFO] "LINESTRING" (CockroachDB) =&amp;gt; 0.34430524706840515
-[INFO] "Branching" (Supabase) =&amp;gt; 0.3141021430492401
-[INFO] "Test Your Application Locally" (CockroachDB) =&amp;gt; 0.29872700572013855
-[INFO] "Background Processing Using Web Workers" (Angular) =&amp;gt; 0.28414368629455566
-[INFO] "bzl_library" (Skylib) =&amp;gt; 0.26424312591552734
-[INFO] "Refer To Locales By ID" (Angular) =&amp;gt; 0.2537899315357208
-[INFO] "Testing" (Angular) =&amp;gt; 0.23542608320713043
-[INFO] "Writing Tests" (Playwright) =&amp;gt; 0.22030793130397797
-[INFO] "Testing Services" (Angular) =&amp;gt; 0.20675960183143616
-[INFO] "Actionability" (Playwright) =&amp;gt; 0.1959698647260666
-[INFO] "diff_test" (Skylib) =&amp;gt; 0.19095730781555176
-[INFO] "JUnit" (Playwright) =&amp;gt; 0.1832783967256546
-[INFO] "analysis_test" (Skylib) =&amp;gt; 0.15578024089336395
-&lt;/code&gt;
-    &lt;p&gt;So, yes, it seems like word2vec-style vector arithmetic can work in technical writing contexts. Make sure to set your task types correctly.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Discussion§&lt;/head&gt;
-    &lt;p&gt;I still don’t really understand how it’s possible to semantically represent an entire document as a single vector, let alone how adding and subtracting single-word vectors from full-document vectors works.&lt;/p&gt;
-    &lt;p&gt;How do we actually use this in technical writing workflows or documentation experiences? I’m not sure. I was just curious to learn whether or not it would work.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Appendix§&lt;/head&gt;
-    &lt;head rend="h3"&gt;Source code§&lt;/head&gt;
-    &lt;p&gt;&lt;code&gt;experiments.py&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;from json import load
-from os import environ
-from sys import exit
-
-from requests import get
-from sentence_transformers import SentenceTransformer
-
-
-class Doc:
-
-    def __init__(self, topic, domain, url, length, embedding):
-        self.topic = topic
-        self.domain = domain
-        self.url = url
-        self.length = length
-        self.embedding = embedding
-        self.similarity = None
-
-
-def init_docs(model, task_types):
-    with open("data.json", "r") as f:
-        data = load(f)
-    tokenizer = model.tokenizer
-    docs = []
-    max_length = tokenizer.model_max_length
-    for item in data:
-        url = item["url"]
-        response = get(url)
-        text = response.text
-        length = len(tokenizer.encode(text))
-        topic = item["topic"]
-        domain = item["domain"]
-        if length &amp;gt; max_length:
-            exit(f"[ERROR] Document is too large: {topic}, {domain}")
-        prompt = "title: {topic} | text: "
-        embedding = model.encode(text, prompt=prompt) if task_types else model.encode(text)
-        doc = Doc(topic, domain, url, length, embedding)
-        docs.append(doc)
-    return docs
-
-
-def create_domain_query(model, task_types):
-    url = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/apps/docs/content/guides/database/testing.mdx"
-    response = get(url)
-    text = response.text
-    if task_types:
-        doc = model.encode(text, prompt_name="Retrieval-query")
-        supabase = model.encode("supabase", prompt_name="Retrieval-query")
-        angular = model.encode("angular", prompt_name="Retrieval-query")
-    else:
-        doc = model.encode(text)
-        supabase = model.encode("supabase")
-        angular = model.encode("angular")
-    return doc - supabase + angular
-
-
-def create_topic_query(model, task_types):
-    url = "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/apps/docs/content/guides/database/testing.mdx"
-    response = get(url)
-    text = response.text
-    if task_types:
-        doc = model.encode(text, prompt_name="Retrieval-query")
-        testing = model.encode("testing", prompt_name="Retrieval-query")
-        vectors = model.encode("vectors", prompt_name="Retrieval-query")
-    else:
-        doc = model.encode(text)
-        testing = model.encode("testing")
-        vectors = model.encode("vectors")
-    return doc - testing + vectors
-
-
-def run_experiments():
-    environ["TOKENIZERS_PARALLELISM"] = "false"
-    model = SentenceTransformer("google/embeddinggemma-300m")
-    for task_types in [True, False]:
-        print(f'[INFO] Running "same topic, different domain" experiment with {"customized" if task_types else "default"} task types')
-        docs = init_docs(model, task_types)
-        query = create_domain_query(model, task_types)
-        for doc in docs:
-            similarity = model.similarity(query, doc.embedding).item()
-            doc.similarity = similarity
-        docs.sort(key=lambda doc: doc.similarity, reverse=True)
-        print(f'[INFO] Results:')
-        for doc in docs:
-            print(f'[INFO] "{doc.topic}" ({doc.domain}) =&amp;gt; {doc.similarity}')
-        print()
-        print(f'[INFO] Running "different topic, same domain" experiment with {"customized" if task_types else "default"} task types')
-        docs = init_docs(model, task_types)
-        query = create_topic_query(model, task_types)
-        for doc in docs:
-            similarity = model.similarity(query, doc.embedding).item()
-            doc.similarity = similarity
-        docs.sort(key=lambda doc: doc.similarity, reverse=True)
-        print(f'[INFO] Results:')
-        for doc in docs:
-            print(f'[INFO] "{doc.topic}" ({doc.domain}) =&amp;gt; {doc.similarity}')
-        print()
-
-
-if __name__ == "__main__":
-    run_experiments()
-&lt;/code&gt;
-    &lt;p&gt;&lt;code&gt;data.json&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;[
-  {
-    "domain": "Angular",
-    "topic": "Background Processing Using Web Workers",
-    "url": "https://raw.githubusercontent.com/angular/angular/refs/heads/main/adev/src/content/ecosystem/web-workers.md" 
-  },
-  {
-    "domain": "Angular",
-    "topic": "Refer To Locales By ID",
-    "url": "https://raw.githubusercontent.com/angular/angular/refs/heads/main/adev/src/content/guide/i18n/locale-id.md" 
-  },
-  {
-    "domain": "Angular",
-    "topic": "Testing",
-    "url": "https://raw.githubusercontent.com/angular/angular/refs/heads/main/adev/src/content/guide/testing/overview.md" 
-  },
-  {
-    "domain": "Angular",
-    "topic": "Testing Services",
-    "url": "https://raw.githubusercontent.com/angular/angular/refs/heads/main/adev/src/content/guide/testing/services.md" 
-  },
-  {
-    "domain": "CockroachDB",
-    "topic": "LINESTRING",
-    "url": "https://raw.githubusercontent.com/cockroachdb/docs/refs/heads/main/src/current/v25.4/linestring.md" 
-  },
-  {
-    "domain": "CockroachDB",
-    "topic": "Test Your Application Locally",
-    "url": "https://raw.githubusercontent.com/cockroachdb/docs/refs/heads/main/src/current/v25.4/local-testing.md" 
-  },
-  {
-    "domain": "Skylib",
-    "topic": "analysis_test",
-    "url": "https://raw.githubusercontent.com/bazelbuild/bazel-skylib/refs/heads/main/docs/analysis_test_doc.md"
-  },
-  {
-    "domain": "Skylib",
-    "topic": "bzl_library",
-    "url": "https://raw.githubusercontent.com/bazelbuild/bazel-skylib/refs/heads/main/docs/bzl_library.md"
-  },
-  {
-    "domain": "Skylib",
-    "topic": "diff_test",
-    "url": "https://raw.githubusercontent.com/bazelbuild/bazel-skylib/refs/heads/main/docs/diff_test_doc.md"
-  },
-  {
-    "domain": "Playwright",
-    "topic": "Actionability",
-    "url": "https://raw.githubusercontent.com/microsoft/playwright/refs/heads/main/docs/src/actionability.md"
-  },
-  {
-    "domain": "Playwright",
-    "topic": "JUnit",
-    "url": "https://raw.githubusercontent.com/microsoft/playwright/refs/heads/main/docs/src/junit-java.md"
-  },
-  {
-    "domain": "Playwright",
-    "topic": "Writing Tests",
-    "url": "https://raw.githubusercontent.com/microsoft/playwright/refs/heads/main/docs/src/writing-tests-java.md"
-  },
-  {
-    "domain": "Supabase",
-    "topic": "Branching",
-    "url": "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/apps/docs/content/guides/deployment/branching.mdx"
-  },
-  {
-    "domain": "Supabase",
-    "topic": "Testing Your Database",
-    "url": "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/apps/docs/content/guides/database/testing.mdx"
-  },
-  {
-    "domain": "Supabase",
-    "topic": "Testing Your Edge Functions",
-    "url": "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/apps/docs/content/guides/functions/unit-test.mdx"
-  },
-  {
-    "domain": "Supabase",
-    "topic": "Vector Columns",
-    "url": "https://raw.githubusercontent.com/supabase/supabase/refs/heads/master/apps/docs/content/guides/ai/vector-columns.mdx"
-  }
-]
-&lt;/code&gt;
-    &lt;p&gt;Note that I forgot to pin the URLs to specific commits. I.e. I used the &lt;code&gt;HEAD&lt;/code&gt; version of each URL. If you run the experiments a year or two from now
-(October 2025), your cosine similarity scores will probably be different,
-because the underlying text of the documents will probably have changed.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://technicalwriting.dev/embeddings/arithmetic/index.html"/><published>2025-11-01T19:14:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45784596</id><title>Beginner-friendly, unofficial documentation for Helix text editor</title><updated>2025-11-02T07:32:42.962424+00:00</updated><content>&lt;doc fingerprint="2e1d8a1e0335f69e"&gt;
+&lt;/doc&gt;</content><link href="https://words.filippo.io/claude-debugging/"/><published>2025-11-01T18:41:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45784596</id><title>Beginner-friendly, unofficial documentation for Helix text editor</title><updated>2025-11-02T08:11:58.133910+00:00</updated><content>&lt;doc fingerprint="2e1d8a1e0335f69e"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Basics&lt;/head&gt;
     &lt;p&gt;To get started check out the installation instructions in order to follow along with the tutorial.&lt;/p&gt;
@@ -863,7 +541,7 @@ because the underlying text of the documents will probably have changed.&lt;/p&g
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://helix-editor.vercel.app/start-here/basics/"/><published>2025-11-01T19:33:48+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45784729</id><title>From 400 Mbps to 1.7 Gbps: A WiFi 7 Debugging Journey</title><updated>2025-11-02T07:32:42.779804+00:00</updated><content>&lt;doc fingerprint="f6b23c642b0115b9"&gt;
+&lt;/doc&gt;</content><link href="https://helix-editor.vercel.app/start-here/basics/"/><published>2025-11-01T19:33:48+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45784729</id><title>From 400 Mbps to 1.7 Gbps: A WiFi 7 Debugging Journey</title><updated>2025-11-02T08:11:58.059272+00:00</updated><content>&lt;doc fingerprint="f6b23c642b0115b9"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;From 400 Mbps to 1.7 Gbps: A WiFi 7 Debugging Journey&lt;/head&gt;
     &lt;p&gt;I recently upgraded from a UniFi Dream Machine to a UniFi Dream Router 7 because I’m getting 2.5 Gbps internet in two weeks and figured I’d jump on the WiFi 7 bandwagon while I’m at it. My iPhone 17 Pro Max supports it, so why not? After setting everything up, I was getting nowhere near the speeds I expected. Time for some debugging.&lt;/p&gt;
@@ -951,7 +629,7 @@ Tx/Rx Rate: 1.20 Gbps
     &lt;p&gt;Now I just need my ISP to actually deliver that 2.5 Gbps upgrade&amp;amp;mldr;&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://blog.tymscar.com/posts/wifi7speedhunt/"/><published>2025-11-01T19:50:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45785840</id><title>SailfishOS: A Linux-based European alternative to dominant mobile OSes</title><updated>2025-11-02T07:32:42.169274+00:00</updated><content>&lt;doc fingerprint="f389bb2315a326c8"&gt;
+&lt;/doc&gt;</content><link href="https://blog.tymscar.com/posts/wifi7speedhunt/"/><published>2025-11-01T19:50:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45785840</id><title>SailfishOS: A Linux-based European alternative to dominant mobile OSes</title><updated>2025-11-02T08:11:57.545614+00:00</updated><content>&lt;doc fingerprint="f389bb2315a326c8"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Info&lt;/head&gt;
     &lt;head rend="h1"&gt;Sailfish OS history&lt;/head&gt;
@@ -968,7 +646,7 @@ Tx/Rx Rate: 1.20 Gbps
     &lt;p&gt;If you are interested in Open Source software part, you can download source code from here.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://sailfishos.org/info/"/><published>2025-11-01T22:05:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45785858</id><title>Visopsys: OS maintained by a single developer since 1997</title><updated>2025-11-02T07:32:41.456364+00:00</updated><content>&lt;doc fingerprint="a1fd7da091abb4c3"&gt;
+&lt;/doc&gt;</content><link href="https://sailfishos.org/info/"/><published>2025-11-01T22:05:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45785858</id><title>Visopsys: OS maintained by a single developer since 1997</title><updated>2025-11-02T08:11:57.074825+00:00</updated><content>&lt;doc fingerprint="a1fd7da091abb4c3"&gt;
   &lt;main&gt;
     &lt;head rend="h3"&gt;Welcome!&lt;/head&gt;
     &lt;p&gt;Visopsys is an alternative operating system for PC compatible computers. In development since 1997, this system is small, fast, and open source. It features a simple but functional graphical interface, pre-emptive multitasking, and virtual memory. Though it attempts to be compatible in a number of ways, Visopsys is not a clone of any other operating system. You can demo the distribution from a “live” USB stick, CD/DVD, or floppy disk … (read more).&lt;/p&gt;
@@ -984,7 +662,7 @@ Tx/Rx Rate: 1.20 Gbps
     &lt;p&gt;[21.09.2023] – Version 0.92 is now available from the download page&lt;lb/&gt; [30.07.2021] – Version 0.91 was released&lt;lb/&gt; [16.04.2020] – Version 0.9 was released&lt;lb/&gt; [21.01.2020] – Version 0.85 was released&lt;lb/&gt; [15.05.2019] – Version 0.84 was released&lt;lb/&gt; [09.08.2018] – Version 0.83 was released&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://visopsys.org/"/><published>2025-11-01T22:07:49+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45786324</id><title>Pomelli</title><updated>2025-11-02T07:32:41.086319+00:00</updated><content>&lt;doc fingerprint="71941a302cb5a8f1"&gt;
+&lt;/doc&gt;</content><link href="https://visopsys.org/"/><published>2025-11-01T22:07:49+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45786324</id><title>Pomelli</title><updated>2025-11-02T08:11:56.822651+00:00</updated><content>&lt;doc fingerprint="71941a302cb5a8f1"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Create on-brand marketing content for your business with Pomelli&lt;/head&gt;
     &lt;p&gt;Creating impactful, on-brand content can often require significant investment in time, budget, and design expertise. For small to medium-sized businesses (SMBs), this can be a major obstacle. That’s where Pomelli, our newest experiment from Google Labs in partnership with Google DeepMind, comes in. Pomelli is an AI marketing tool designed to help SMBs more easily generate scalable, on-brand social media campaigns to help grow their businesses.&lt;/p&gt;
@@ -999,7 +677,7 @@ Tx/Rx Rate: 1.20 Gbps
     &lt;p&gt;Pomelli is launching today as a public beta experiment in the United States, Canada, Australia and New Zealand in English. It’s an early experiment and it might take some time to get things right. Our goal is to build the highest quality experiments, so your feedback is appreciated. Give it a try and let us know what you think.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://blog.google/technology/google-labs/pomelli/"/><published>2025-11-01T23:09:25+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45786738</id><title>How I use every Claude Code feature</title><updated>2025-11-02T07:32:40.915763+00:00</updated><content>&lt;doc fingerprint="36cf0efb2d9d82af"&gt;
+&lt;/doc&gt;</content><link href="https://blog.google/technology/google-labs/pomelli/"/><published>2025-11-01T23:09:25+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45786738</id><title>How I use every Claude Code feature</title><updated>2025-11-02T08:11:56.561251+00:00</updated><content>&lt;doc fingerprint="36cf0efb2d9d82af"&gt;
   &lt;main&gt;
     &lt;p&gt;I use Claude Code. A lot.&lt;/p&gt;
     &lt;p&gt;As a hobbyist, I run it in a VM several times a week on side projects, often with &lt;code&gt;--dangerously-skip-permissions&lt;/code&gt; to vibe code whatever idea is on my mind. Professionally, part of my team builds the AI-IDE rules and tooling for our engineering team that consumes several billion tokens per month just for codegen.&lt;/p&gt;
@@ -1163,7 +841,7 @@ For &amp;lt;complex usage&amp;gt; or &amp;lt;error&amp;gt; see path/to/&amp;lt;t
     &lt;p&gt;To me, a fairly interesting philosophical question is how many reviewers should a PR get that was generated directly from a customer request (no internal human prompter)? We’ve settled on 2 human approvals for any AI-initiated PR for now, but it is kind of a weird paradigm shift (for me at least) when it’s no longer a human making something for another human to review.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://blog.sshh.io/p/how-i-use-every-claude-code-feature"/><published>2025-11-02T00:13:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45786914</id><title>Anonymous credentials: rate-limit bots and agents without compromising privacy</title><updated>2025-11-02T07:32:40.494628+00:00</updated><content>&lt;doc fingerprint="a42ac4d20989ea8d"&gt;
+&lt;/doc&gt;</content><link href="https://blog.sshh.io/p/how-i-use-every-claude-code-feature"/><published>2025-11-02T00:13:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45786914</id><title>Anonymous credentials: rate-limit bots and agents without compromising privacy</title><updated>2025-11-02T08:11:55.888842+00:00</updated><content>&lt;doc fingerprint="a42ac4d20989ea8d"&gt;
   &lt;main&gt;
     &lt;div&gt;
       &lt;p&gt;The way we interact with the Internet is changing. Not long ago, ordering a pizza meant visiting a website, clicking through menus, and entering your payment details. Soon, you might just ask your phone to order a pizza that matches your preferences. A program on your device or on a remote server, which we call an AI agent, would visit the website and orchestrate the necessary steps on your behalf.&lt;/p&gt;
@@ -1608,7 +1286,7 @@ export default {
     &lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://blog.cloudflare.com/private-rate-limiting/"/><published>2025-11-02T00:45:13+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45786962</id><title>Linux and Windows: A tale of Kerberos, SSSD, DFS, and black magic</title><updated>2025-11-02T07:32:40.192012+00:00</updated><content>&lt;doc fingerprint="1b43e25236f47ed1"&gt;
+&lt;/doc&gt;</content><link href="https://blog.cloudflare.com/private-rate-limiting/"/><published>2025-11-02T00:45:13+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45786962</id><title>Linux and Windows: A tale of Kerberos, SSSD, DFS, and black magic</title><updated>2025-11-02T08:11:55.687019+00:00</updated><content>&lt;doc fingerprint="1b43e25236f47ed1"&gt;
   &lt;main&gt;
     &lt;p&gt;Interfacing with Active Directory is kind of a pain in the rear. Hereâs what Iâve implemented. This is somewhat lightweight, in that AD is only used for authentication - it is not used (directly) for access control, GPO is not utilized, no print services, etc. I do not go over autofs configuration, because itâs pretty straightforward.&lt;/p&gt;
     &lt;p&gt;You should set your hostname to be your FQDN, uppercased. This doesnât have to look ugly, if you have systemd! This will fix it to uppercase FQDN where it matters, but for display purposes you should see a lowercase short name.&lt;/p&gt;
@@ -1710,7 +1388,7 @@ use_fully_qualified_names = False
     &lt;p&gt;All original content on this website is, unless explicitly stated otherwise, licensed under the MIT license. Full license text is available here. Non-original content that is included on this website in whole or in part, linked, or otherwise made available remains under copyright of the original owners.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="http://www.draeath.net/blog/it/2018/03/13/DFSwithKRB/"/><published>2025-11-02T00:54:13+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45787036</id><title>A Few Words About Async</title><updated>2025-11-02T07:32:39.826766+00:00</updated><content>&lt;doc fingerprint="767298572c2192f8"&gt;
+&lt;/doc&gt;</content><link href="http://www.draeath.net/blog/it/2018/03/13/DFSwithKRB/"/><published>2025-11-02T00:54:13+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45787036</id><title>A Few Words About Async</title><updated>2025-11-02T08:11:55.342647+00:00</updated><content>&lt;doc fingerprint="767298572c2192f8"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;(Quite) A Few Words About Async&lt;/head&gt;
     &lt;p&gt;I’ve had a few conversations about async code recently (and not so recently) and seen some code that seems to make wrong assumptions about async, so I figured out it was time to have a serious chat about async, what it’s for, what it guarantees and what it doesn’t.&lt;/p&gt;
@@ -2699,7 +2377,7 @@ it is good for and what it won’t do for you, as well as a few alternatives.&lt
     &lt;p&gt;Posted on: July 8, 2025&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://yoric.github.io/post/quite-a-few-words-about-async/"/><published>2025-11-02T01:10:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45787571</id><title>Crossfire: High-performance lockless spsc/mpsc/mpmc channels for Rust</title><updated>2025-11-02T07:32:39.239795+00:00</updated><content>&lt;doc fingerprint="6e579a034ced13c0"&gt;
+&lt;/doc&gt;</content><link href="https://yoric.github.io/post/quite-a-few-words-about-async/"/><published>2025-11-02T01:10:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45787571</id><title>Crossfire: High-performance lockless spsc/mpsc/mpmc channels for Rust</title><updated>2025-11-02T08:11:54.943949+00:00</updated><content>&lt;doc fingerprint="6e579a034ced13c0"&gt;
   &lt;main&gt;
     &lt;p&gt;High-performance lockless spsc/mpsc/mpmc channels.&lt;/p&gt;
     &lt;p&gt;It supports async contexts, and communication between async and blocking contexts.&lt;/p&gt;
@@ -2971,7 +2649,7 @@ async fn main() {
 }&lt;/code&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/frostyplanet/crossfire-rs"/><published>2025-11-02T03:07:15+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45787775</id><title>You Don't Need Anubis</title><updated>2025-11-02T07:32:39.057120+00:00</updated><content>&lt;doc fingerprint="712f3f131d007a9c"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/frostyplanet/crossfire-rs"/><published>2025-11-02T03:07:15+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45787775</id><title>You Don't Need Anubis</title><updated>2025-11-02T08:11:54.787864+00:00</updated><content>&lt;doc fingerprint="712f3f131d007a9c"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;you don't need anubis&lt;/head&gt;
     &lt;p&gt;In the past years, scrapers operated by LLM training companies have become more relentless. They no longer respect &lt;code&gt;robots.txt&lt;/code&gt;, spoof their User Agents and IP addresses and even DDoS small sites with aggessive requests.&lt;/p&gt;
@@ -3010,7 +2688,7 @@ async fn main() {
     &lt;p&gt;you don't need anubis by flexagoon is marked with CC0 1.0&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://fxgn.dev/blog/anubis/"/><published>2025-11-02T04:03:53+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45787842</id><title>LM8560, the eternal chip from the 1980 years</title><updated>2025-11-02T07:32:37.866162+00:00</updated><content>&lt;doc fingerprint="c6401d002374c3f4"&gt;
+&lt;/doc&gt;</content><link href="https://fxgn.dev/blog/anubis/"/><published>2025-11-02T04:03:53+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45787842</id><title>LM8560, the eternal chip from the 1980 years</title><updated>2025-11-02T08:11:53.822514+00:00</updated><content>&lt;doc fingerprint="c6401d002374c3f4"&gt;
   &lt;main&gt;
     &lt;p&gt;Quick jumps to:&lt;lb/&gt;– What digital alarm clocks before it were like&lt;lb/&gt;– Why is the LM8560 so costs effective? The trick, how it works&lt;lb/&gt;– Typical issues&lt;lb/&gt;– Its weak point is also its strength&lt;lb/&gt;– Its “hidden” functions&lt;lb/&gt;– Some unwanted behaviors&lt;lb/&gt;– That evil beep beep!&lt;lb/&gt;– Limitations of use&lt;lb/&gt;– Make a quartz clock / DC supply clock with the LM8560&lt;lb/&gt;– Operating modes&lt;lb/&gt;– Its relatives and predecessors&lt;lb/&gt;– The Duplex display. A not versatile but clever solution&lt;lb/&gt;– Not the best chip for electronics hobbyists&lt;lb/&gt;– My alarm clocks&lt;lb/&gt;– My first clock radio in 1986, by Majestic&lt;lb/&gt;– Sony ICF-C102&lt;lb/&gt;– Sony ICF-C290&lt;lb/&gt;– Thomson CR61, my final clock radio&lt;lb/&gt;– The modern clock radios&lt;lb/&gt;– LM8560 manufacturers list and alternative ICs&lt;/p&gt;
     &lt;p&gt;Almost everybody has had one, or even has still one of it at home. Almost everybody who had it, kept it in his/her immediate proximity while sleeping…&lt;/p&gt;
@@ -3208,7 +2886,7 @@ async fn main() {
     &lt;/table&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.tycospages.com/other-themes/lm8560-the-eternal-chip-from-the-1980-years/"/><published>2025-11-02T04:27:31+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45787993</id><title>Yes, you should understand backprop (2016)</title><updated>2025-11-02T07:32:37.651586+00:00</updated><content>&lt;doc fingerprint="f70910553d224cb1"&gt;
+&lt;/doc&gt;</content><link href="https://www.tycospages.com/other-themes/lm8560-the-eternal-chip-from-the-1980-years/"/><published>2025-11-02T04:27:31+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45787993</id><title>Backpropagation is a leaky abstraction</title><updated>2025-11-02T08:11:53.671170+00:00</updated><content>&lt;doc fingerprint="f70910553d224cb1"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Yes you should understand backprop&lt;/head&gt;
     &lt;p&gt;When we offered CS231n (Deep Learning class) at Stanford, we intentionally designed the programming assignments to include explicit calculations involved in backpropagation on the lowest level. The students had to implement the forward and the backward pass of each layer in raw numpy. Inevitably, some students complained on the class message boards:&lt;/p&gt;
@@ -3248,7 +2926,7 @@ async fn main() {
     &lt;p&gt;That’s it for now! I hope you’ll be much more suspicious of backpropagation going forward and think carefully through what the backward pass is doing. Also, I’m aware that this post has (unintentionally!) turned into several CS231n ads. Apologies for that :)&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://karpathy.medium.com/yes-you-should-understand-backprop-e2f06eab496b"/><published>2025-11-02T05:20:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45788040</id><title>Notes by djb on using Fil-C (2025)</title><updated>2025-11-02T07:32:37.229400+00:00</updated><content>&lt;doc fingerprint="afe1387bca053cc2"&gt;
+&lt;/doc&gt;</content><link href="https://karpathy.medium.com/yes-you-should-understand-backprop-e2f06eab496b"/><published>2025-11-02T05:20:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45788040</id><title>Notes by djb on using Fil-C (2025)</title><updated>2025-11-02T08:11:53.440056+00:00</updated><content>&lt;doc fingerprint="afe1387bca053cc2"&gt;
   &lt;main&gt;&lt;p&gt;I'm impressed with the level of compatibility of the new memory-safe C/C++ compiler Fil-C (filcc, fil++). Many libraries and applications that I've tried work under Fil-C without changes, and the exceptions haven't been hard to get working.&lt;/p&gt;&lt;p&gt;I've started accumulating miscellaneous notes on this page regarding usage of Fil-C. My selfish objective here is to protect various machines that I manage by switching them over to code compiled with Fil-C, but maybe you'll find something useful here too.&lt;/p&gt;&lt;p&gt;Timings below are from a mini-PC named phoenix except where otherwise mentioned. This mini-PC has a 6-core (12-thread) AMD Ryzen 5 7640HS (Zen 4) CPU, 12GB RAM, and 36GB swap. The OS is Debian 13. (I normally run LTS software, periodically upgrading from software that's 4â5 years old such as Debian 11 today to software that's 2â3 years old such as Debian 12 today; but some of the packages included in Fil-C expect newer utilities to be available.)&lt;/p&gt;&lt;p&gt;Related:&lt;/p&gt;&lt;p&gt;Another way to run Fil-C is via Filnix from Mikael Brockman. For example, an unprivileged user under Debian 12 with about 10GB of free disk space can download, compile, and install Fil-C, and run a Fil-C-compiled Nethack, as follows:&lt;/p&gt;&lt;code&gt;unshare --user --pid echo YES # just to test
 git clone https://github.com/nix-community/nix-user-chroot
 cd nix-user-chroot
@@ -3468,7 +3146,7 @@ rm ../ncurses-*deb # apt won't let us touch the binaries
 &lt;/code&gt;
 &lt;p&gt;libmd. Seems to work. At first this didn't install since the compiled version (for amd64fil0) was 1.1.0-2 while the installed version (for amd64) was 1.1.0-2+b1. Debian requires the same version number across architectures (see above regarding include-file compatibility), so apt said that 1.1.0-2+b1 breaks 1.1.0-2. I resolved this by compiling and installing 1.1.0-2 for both amd64 and amd64fil0. This is a downgrade since "+b" refers to a "binNMU", a "binary-only non-maintainer upload", a patch beyond the official source; I don't know what the patch is.&lt;/p&gt;&lt;p&gt;readline. Needs ln -s /usr/include/readline /usr/include/x86_64+fil0-linux-gnu/readline after installation. Could have tweaks in debian/rules (which seems to predate *.install), but this is in any case an example of the messiness that I'm planning to get rid of.&lt;/p&gt;&lt;p&gt;lua5.4. Seems to work. Depends on readline.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://cr.yp.to/2025/fil-c.html"/><published>2025-11-02T05:32:02+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45788202</id><title>CLI to manage your SQL database schemas and migrations</title><updated>2025-11-02T07:32:36.711828+00:00</updated><content>&lt;doc fingerprint="6f872a5a1ff192b8"&gt;
+&lt;/doc&gt;</content><link href="https://cr.yp.to/2025/fil-c.html"/><published>2025-11-02T05:32:02+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45788202</id><title>CLI to manage your SQL database schemas and migrations</title><updated>2025-11-02T08:11:53.116844+00:00</updated><content>&lt;doc fingerprint="6f872a5a1ff192b8"&gt;
   &lt;main&gt;
     &lt;p&gt;Are you doing some ETL project, you don't want to manage your database schema with raw SQL, and maybe validate data from external tools using those schemas e.g. when using LLM output? Then this tool might help you.&lt;/p&gt;
     &lt;p&gt;&lt;code&gt;shed&lt;/code&gt; is a cli tool that acts like an application for your database schemas management using &lt;code&gt;SQLModel&lt;/code&gt; orm and manages
