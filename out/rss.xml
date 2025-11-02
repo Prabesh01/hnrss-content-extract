@@ -1,5 +1,49 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sun, 02 Nov 2025 09:32:24 +0000</lastBuildDate><item><title>Updated practice for review articles and position papers in ArXiv CS category</title><link>https://blog.arxiv.org/2025/10/31/attention-authors-updated-practice-for-review-articles-and-position-papers-in-arxiv-cs-category/</link><description>&lt;doc fingerprint="ff55b99b0494c981"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sun, 02 Nov 2025 10:09:19 +0000</lastBuildDate><item><title>SQLite concurrency and why you should care about it</title><link>https://jellyfin.org/posts/SQLite-locking/</link><description>&lt;doc fingerprint="7b4e765eeca27f9a"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;SQLite concurrency and why you should care about it&lt;/head&gt;
+    &lt;p&gt;SQLite is a powerful database engine, but due to its design, it has limitations that should not be overlooked.&lt;/p&gt;
+    &lt;p&gt;Jellyfin has used a SQLite-based database for storing most of its data for years, but it has also encountered issues on many systems. In this blog post, I will explain how we address these limitations and how developers using SQLite can apply the same solutions.&lt;/p&gt;
+    &lt;p&gt;This will be a technical blog post intended for developers and everyone wanting to learn about concurrency.&lt;/p&gt;
+    &lt;p&gt;Also Jellyfin's implementation of locking for SQLite should be fairly easy to be implemented into another EF Core application if you are facing the same issue.&lt;/p&gt;
+    &lt;p&gt;- JPVenson&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Premise&lt;/head&gt;
+    &lt;p&gt;SQLite is a file-based database engine running within your application and allows you to store data in a relational structure. Overall it gives your application the means of storing structured data as a single file and without having to depend on another application to do so. Naturally this also comes at a price. If your application fully manages this file, the assumption must be made that your application is the sole owner of this file, and nobody else will tinker with it while you are writing data to it.&lt;/p&gt;
+    &lt;p&gt;So an application that wants to use SQLite as its database needs to be the only one accessing it. Having established this fact, an important thought arises: if only a single write operation should be performed on a single file at a time, this rule must also apply to operations within the same application.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The W-A-L mode&lt;/head&gt;
+    &lt;p&gt;SQLite has a feature that tries to get around this limitation: the Write-Ahead-Log (WAL). The WAL is a separate file that acts as a journal of operations that should be applied to an SQLite file. This allows multiple parallel writes to take place and get enqueued into the WAL. When another part of the application wants to read data, it reads from the actual database, then scans the WAL for modifications and applies them on the fly. This is not a foolproof solution; there are still scenarios where WAL does not prevent locking conflicts.&lt;/p&gt;
+    &lt;head rend="h2"&gt;SQLite transactions&lt;/head&gt;
+    &lt;p&gt;A transaction is supposed to ensure two things. Modifications made within a transaction can be reverted, either when something goes wrong or when the application decides it should and optionally a transaction may also block other readers from reading data that is modified within a transaction. This is where it gets spicy and we come to the real reason why I am writing this blog post. For some reason on some systems that run Jellyfin when a transaction takes place the SQLite engine reports the database is locked and instead of waiting for the transaction to be resolved the engine refuses to wait and just crashes. This seems to be a not uncommon issue and there are many reports to be found on the issue.&lt;/p&gt;
+    &lt;p&gt;The factor that makes this issue so bad is that it does not happen reliably. So far we only have one team member where this can be (somewhat) reliably be reproduced which makes this an even worse a bug. From the reports this issue happens across all operating systems, drive speeds and with or without virtualization. So we do not have any deciding factor identified that even contributes to the likelihood of the issue happening.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Jellyfin factor&lt;/head&gt;
+    &lt;p&gt;Having established the general theory on how SQLite behaves, we also have to look at the specifics of Jellyfins usage of SQLite. During normal operations on a recommended setup (Non-Networked Storage and preferably SSD) its unusual for any problems to arise, however the way Jellyfin utilises the SQLite db up to 10.11 is very suboptimal. In versions prior to 10.11 Jellyfin had a bug in its parallel task limit which resulted in exponential overscheduling of library scan operations which hammered the database engine with thousands of parallel write requests that an SQLite engine is simply not able to handle. While most SQLite engine implementations have retry behavior, they also have timeouts and checks in place to prevent limitless waiting so if we stress the engine enough, it just fails with an error. That and very long running and frankly unoptimized transactions could lead to the database just being overloaded with requests and flaking out.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The solution&lt;/head&gt;
+    &lt;p&gt;Since we moved the codebase over to EF Core proper, we have the tools to actually do something about this as EF Core gives us a structured abstraction level. EF Core supports a way of hooking into every command execution or transaction by creating Interceptors. With an interceptor we can finally do the straight forward idea of just "not" writing to the database in parallel in a transparent way to the caller. The overall idea is to have multiple strategies of locking. Because all levels of synchronization will inevitably come at the cost of performance, we only want to do it when it is really necessary. So, I decided on three locking strategies:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;No-Lock&lt;/item&gt;
+      &lt;item&gt;Optimistic locking&lt;/item&gt;
+      &lt;item&gt;Pessimistic locking&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;As a default, the no-lock behavior does exactly what the name implies. Nothing. This is the default because my research shows that for 99% all of this is not an issue and every interaction at this level will slow down the whole application.&lt;/p&gt;
+    &lt;p&gt;Both the optimistic and pessimistic behaviors use two interceptors—one for transactions and one for commands—and override &lt;code&gt;SaveChanges&lt;/code&gt; in &lt;code&gt;JellyfinDbContext&lt;/code&gt;.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Optimistic locking behavior&lt;/head&gt;
+    &lt;p&gt;Optimistic locking means to assume the operation in question will succeed and only handle issues afterwards. In essence this can be boiled down to "Try and Retry and Retry ..." for a set number of times until either we succeed with the operation or fail entirely. This still leaves the possibility that we will not actually be able to perform a write, but the introduced overhead is far less than the Pessimistic locking behavior.&lt;/p&gt;
+    &lt;p&gt;The idea behind how this works is simple: every time two operations try to write to the database, one will always win. The other will fail, wait some time, then retry a few times.&lt;/p&gt;
+    &lt;p&gt;Jellyfin uses the &lt;code&gt;Polly&lt;/code&gt; library perform the retry behavior and will only retry operations it will find have been locked due to this exact issue.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Pessimistic locking behavior&lt;/head&gt;
+    &lt;p&gt;Pessimistic locking always locks when a write to SQLite should be performed. Essentially every time an transaction is started or a write operation on the database is done though EF Core, Jellyfin will wait until all other read operations are finished and then block all other operations may they be read or write until the write in question has been performed. This however means, that Jellyfin can only ever perform a single write to the database, even if it would technically does not need to.&lt;/p&gt;
+    &lt;p&gt;In theory, an application should have no issue reading from table "Alice" while writing to table "Bob" however to eliminate all possible sources of concurrency related locking, Jellyfin will only ever allow a single write performed on its database in this mode. While this will absolutely result in the most stable operation, it will undoubtedly also be the slowest.&lt;/p&gt;
+    &lt;p&gt;Jellyfin uses a ReaderWriterLockSlim to lock the operations, that means we allow an unlimited number of reads to happen concurrently while only one write may ever be done on the database.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The future Smart locking behavior&lt;/head&gt;
+    &lt;p&gt;In the future we might also consider combining both modes, to get the best of both worlds.&lt;/p&gt;
+    &lt;head rend="h1"&gt;The result&lt;/head&gt;
+    &lt;p&gt;Initial testing showed that with both modes, we had great success in handling the underlying issue. While we are not yet sure why this happens only on some systems when others work, we at least now have an option for users previously left out of using Jellyfin.&lt;/p&gt;
+    &lt;p&gt;When I was researching this topic, I found many reports all over the internet facing the same error but nobody was able to provide a conclusive explanation whats really happening here. There have been similar proposals made to handle it but there wasn't a "ready to drop in" solution that handles all the different cases or only code that required massive modifications to every EF Core query. Jellyfin's implementation of the locking behaviors should be a copy-paste solution for everyone having the same issues as its using interceptors and the caller has no idea of the actual locking behavior.&lt;/p&gt;
+    &lt;p&gt;Best of luck,&lt;/p&gt;
+    &lt;p&gt;- JPVenson&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45781298</guid><pubDate>Sat, 01 Nov 2025 12:59:03 +0000</pubDate></item><item><title>Updated practice for review articles and position papers in ArXiv CS category</title><link>https://blog.arxiv.org/2025/10/31/attention-authors-updated-practice-for-review-articles-and-position-papers-in-arxiv-cs-category/</link><description>&lt;doc fingerprint="ff55b99b0494c981"&gt;
   &lt;main&gt;
     &lt;p&gt;arXiv’s computer science (CS) category has updated its moderation practice with respect to review (or survey) articles and position papers. Before being considered for submission to arXiv’s CS category, review articles and position papers must now be accepted at a journal or a conference and complete successful peer review. When submitting review articles or position papers, authors must include documentation of successful peer review to receive full consideration. Review/survey articles or position papers submitted to arXiv without this documentation will be likely to be rejected and not appear on arXiv.&lt;lb/&gt; This change is being implemented due to the unmanageable influx of review articles and position papers to arXiv CS.&lt;/p&gt;
     &lt;p&gt;Is this a policy change?&lt;/p&gt;
@@ -1242,109 +1286,7 @@ export default {
     &lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45786914</guid><pubDate>Sun, 02 Nov 2025 00:45:13 +0000</pubDate></item><item><title>Linux and Windows: A tale of Kerberos, SSSD, DFS, and black magic (2018)</title><link>http://www.draeath.net/blog/it/2018/03/13/DFSwithKRB/</link><description>&lt;doc fingerprint="1b43e25236f47ed1"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Interfacing with Active Directory is kind of a pain in the rear. Hereâs what Iâve implemented. This is somewhat lightweight, in that AD is only used for authentication - it is not used (directly) for access control, GPO is not utilized, no print services, etc. I do not go over autofs configuration, because itâs pretty straightforward.&lt;/p&gt;
-    &lt;p&gt;You should set your hostname to be your FQDN, uppercased. This doesnât have to look ugly, if you have systemd! This will fix it to uppercase FQDN where it matters, but for display purposes you should see a lowercase short name.&lt;/p&gt;
-    &lt;p&gt;You donât have to do this, but you may have problems with adcli later on, for example when it attempts to update the machine account in AD.&lt;/p&gt;
-    &lt;code&gt;hostnamectl --static set-hostname "FOO.AD.EXAMPLE.COM"
-hostnamectl --pretty set-hostname "foo"
-hostnamectl --transient set-hostname ""
-&lt;/code&gt;
-    &lt;p&gt;This depends on your distribution, of course. You will need the krb5 userspace, adcli, realmd, sssd, the openldap client, and the PAM modules for krb5 and sssd. For mounting DFS, youâll need the CIFS tools.&lt;/p&gt;
-    &lt;p&gt;This is pretty straightforward. Note that realm names in Kerberos are case-sensitive and should be uppercased - contrary to DNS. Example &lt;code&gt;/etc/krb5.conf&lt;/code&gt; file follows.&lt;/p&gt;
-    &lt;code&gt;[libdefaults]
-default_realm = AD.EXAMPLE.COM
-dns_lookup_realm = true
-dns_lookup_kdc = true
-ticket_lifetime = 24h
-renew_lifetime = 7d
-rdns = false
-forwardable = true
-default_ccache_name = KEYRING:persistent:%{uid}
-
-[domain_realm]
-.ad.example.com = AD.EXAMPLE.COM
-ad.example.com = AD.EXAMPLE.COM
-&lt;/code&gt;
-    &lt;p&gt;This is also pretty straightforward - the complexity comes with automation, if you want to do that. Hereâs an example ansible task, for inspiration. You can also see how to do it manually, if you donât care about automating it. Note that &lt;code&gt;GetDomainAdminPassword&lt;/code&gt; is left as an exercise for your imagination. Something like Hashicorp Vault may be ideal. Either way, you should take care with the credential. Again, the Kerberos realm is case sensitive!&lt;/p&gt;
-    &lt;code&gt;- name: initialize Kerberos ticket
-  shell: |
-    set timeout 300
-    spawn /usr/bin/kinit -V adminuser@AD.EXAMPLE.COM
-    expect -exact "Password for adminuser"
-    send -- "{{ lookup('pipe', '/usr/local/bin/GetDomainAdminPassword') }}\r"
-    expect eof
-    catch wait result
-    exit [lindex $result 3]
-  args:
-    executable: /usr/bin/expect
-  changed_when: false
-  no_log: true
-&lt;/code&gt;
-    &lt;p&gt;This next step, using realmd to join the domain, should not require authentication. If it asks, something is wrong! It should use the previously created Kerberos ticket. Note, that if the user does not have permissions to create the computer account, it will silently fail and realmd will ask for a password on the TTY. You should use an uppercase computer name (FQDN, not hostname!), but the domain argument (the last one) can be lowercase. Also note the âstaticâ hostname you set back in step 1 should match the computer name supplied here.&lt;/p&gt;
-    &lt;p&gt;The following example is a single command, I have broken the arguments out to individual lines for clarity.&lt;/p&gt;
-    &lt;code&gt;/usr/sbin/realm
-  --unattended
-  join
-  --automatic-id-mapping=no
-  --client-software=sssd
-  --computer-name=FOO.AD.EXAMPLE.COM
-  --computer-ou='OU=Linux,OU=Servers,DC=ad,DC=example,DC=com'
-  ad.example.com
-&lt;/code&gt;
-    &lt;p&gt;This part will need some customization on your part. Iâm not going to go into all the details, rather Iâm going to show you a working example. Note that some of the domain name entries are uppercase - in those cases itâs referring to the Kerberos realm (and as such are case sensitive - thanks, MIT!), so keep them uppercase.&lt;/p&gt;
-    &lt;code&gt;[sssd]
-config_file_version = 2
-domains = ad.example.com
-reconnection_retries = 3
-services = nss, pam
-
-[nss]
-entry_cache_nowait_percentage = 75
-filter_groups = root
-filter_users = root
-reconnection_retries = 3
-
-[pam]
-reconnection_retries = 3
-
-[domain/AD.EXAMPLE.COM]
-access_provider = simple
-account_cache_expiration = 7
-ad_domain = ad.example.com
-auth_provider = ad
-cache_credentials = True
-default_shell = /bin/bash
-dns_discovery_domain = AD.EXAMPLE.COM
-dyndns_update = false
-enumerate = true
-fallback_homedir = /home/%u
-id_provider = ad
-krb5_realm = AD.EXAMPLE.COM
-krb5_store_password_if_offline = True
-ldap_id_mapping = False
-ldap_schema = ad
-realmd_tags = manages-system joined-with-samba
-simple_allow_groups = AdminGroup, DevelGroup, OpsGroup
-simple_allow_users = bob, alice, charlie
-use_fully_qualified_names = False
-&lt;/code&gt;
-    &lt;p&gt;The &lt;code&gt;/etc/fstab&lt;/code&gt; config is pretty self-explanatory. Note that &lt;code&gt;sec=krb5&lt;/code&gt; only uses Kerberos for authentication. Traffic is not necessarily private or guaranteed integrity. Check &lt;code&gt;man mount.cifs&lt;/code&gt; for possible settings (ignore the non-Kerberos items)&lt;/p&gt;
-    &lt;code&gt;//domain/root/path /mnt/path cifs noauto,nofail,rw,user,sec=krb5 0 0
-&lt;/code&gt;
-    &lt;p&gt;However, unless your AD/DNS admins have gone out of their way to set up a bunch of normally-useless DNS records, you will not have much luck with DFS without a further tweak. This is because authentication will use the provided target hostname, which is probably not the name of the host actually responding. The secret sauce? &lt;code&gt;cifs.upcall&lt;/code&gt; needs an additional argument, &lt;code&gt;-t&lt;/code&gt;, which tells it to trust DNS and perform a PTR lookup, and authenticate against that hostname. Donât do this if you donât trust your DNS servers (trust as in authentic, not reliable).&lt;/p&gt;
-    &lt;p&gt;Find the &lt;code&gt;create cifs.spnego&lt;/code&gt; line(s) calling &lt;code&gt;cifs.upcall&lt;/code&gt; in &lt;code&gt;/etc/request-key.conf&lt;/code&gt; and/or &lt;code&gt;/etc/request-key.d/*&lt;/code&gt; and add the &lt;code&gt;-t&lt;/code&gt; argument. It should look something like this:&lt;/p&gt;
-    &lt;code&gt;create  cifs.spnego    * * /usr/sbin/cifs.upcall -t %k
-&lt;/code&gt;
-    &lt;p&gt;Bonus: this works for standalone server shares, too, not just DFS!&lt;/p&gt;
-    &lt;p&gt;If there is one thing that stands out as not implemented, itâs using a DFS share for an autofs home mount. Itâs certainly doable - but thereâs two gotchas that come to mind. First, the user would need to have a kerberos ticket. Second, the mount command would need to be executed as the user, not as root. Fortunately, autofs has available a concept of a âprogramâ map type that may be abused for the purpose. This is simply a map file thatâs been set with executable permissions (be sure to include a shebang). The program should accept a single argument (the âkeyâ - the first field in a normal map) and should output via STDOUT the remaining fields of a normal map. Of course, nothing stops you from doing other things in the script/program, and it does run as rootâ¦&lt;/p&gt;
-    &lt;p&gt;The information, views, and opinions published on this website were done so in the author's personal capacity. The information, views, and opinions expressed in this article are the author's own and do not reflect the view of their employer, or any other entity unless explicitly stated otherwise.&lt;/p&gt;
-    &lt;p&gt;All data and information provided on this site is for informational purposes only. This website and it's operators makes no representations as to accuracy, completeness, currentness, suitability, or validity of any information on this site and will not be liable for any errors, omissions, or delays in this information or any losses, injuries, or damages arising from its display or use. All information is provided on an as-is basis.&lt;/p&gt;
-    &lt;p&gt;All original content on this website is, unless explicitly stated otherwise, licensed under the MIT license. Full license text is available here. Non-original content that is included on this website in whole or in part, linked, or otherwise made available remains under copyright of the original owners.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45786962</guid><pubDate>Sun, 02 Nov 2025 00:54:13 +0000</pubDate></item><item><title>A Few Words About Async</title><link>https://yoric.github.io/post/quite-a-few-words-about-async/</link><description>&lt;doc fingerprint="767298572c2192f8"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45786914</guid><pubDate>Sun, 02 Nov 2025 00:45:13 +0000</pubDate></item><item><title>A Few Words About Async</title><link>https://yoric.github.io/post/quite-a-few-words-about-async/</link><description>&lt;doc fingerprint="767298572c2192f8"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;(Quite) A Few Words About Async&lt;/head&gt;
     &lt;p&gt;I’ve had a few conversations about async code recently (and not so recently) and seen some code that seems to make wrong assumptions about async, so I figured out it was time to have a serious chat about async, what it’s for, what it guarantees and what it doesn’t.&lt;/p&gt;
