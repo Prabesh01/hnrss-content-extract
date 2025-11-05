@@ -1,150 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 05 Nov 2025 13:05:05 +0000</lastBuildDate><item><title>Moving tables across PostgreSQL instances</title><link>https://ananthakumaran.in/2025/11/02/moving-tables-across-postgres-instances.html</link><description>&lt;doc fingerprint="a358c972ddb109a2"&gt;
-  &lt;main&gt;&lt;head rend="h1"&gt;Moving tables across PostgreSQL instances&lt;/head&gt;02 Nov 2025&lt;p&gt;At work, we recently had to move a few tables from one PostgreSQL instance to another. In my previous post, I discussed how to use Google’s Database Migration Service (DMS) to migrate data from one instance to another. Unfortunately, that option was not available here, since DMS only allows the migration of an entire database, not specific tables within a database.&lt;/p&gt;&lt;p&gt;We chose the native logical replication option. It’s a much more involved process compared to using DMS, but it provides greater flexibility and allows replication of specific tables only.&lt;/p&gt;&lt;head rend="h3"&gt;Grant access to user accounts&lt;/head&gt;&lt;p&gt;Let’s assume you already have both the source and destination PostgreSQL instances ready. You need to grant replication access to the user accounts on both the source and destination databases. In the case of Cloud SQL, we had to grant the &lt;code&gt;REPLICATION&lt;/code&gt; role to the user account;
-this may vary for other instances.&lt;/p&gt;&lt;code&gt;ALTER USER "sql" with REPLICATION
-
--- run \du to verify
-&lt;/code&gt;&lt;head rend="h3"&gt;Copy over schema&lt;/head&gt;&lt;p&gt;The next step is to copy over the schema. The table schema needs to be identical on both the source and destination. We used &lt;code&gt;pg_dump&lt;/code&gt; to dump
-and restore the schema, as we had to move more than 50 tables.&lt;/p&gt;&lt;p&gt;There are a few nuances related to constraints as well, which we will cover soon. Before that, let’s try to understand a bit more about how logical replication works.&lt;/p&gt;&lt;p&gt;Logical replication runs in two modes:&lt;/p&gt;&lt;p&gt;1) Initial dump: It copies the data from the source to the destination.&lt;/p&gt;&lt;p&gt;2) CDC: Once the initial dump is done, it switches to CDC mode and applies changes to the destination in real time.&lt;/p&gt;&lt;p&gt;The key point here is that during the initial dump, some constraints can’t be enforced. For example, if you have a foreign key relationship between two tables, dumping one of the tables will throw an error if the referenced column hasn’t been dumped yet.&lt;/p&gt;&lt;p&gt;To solve this problem and to speed up the initial dump process, we first create tables without constraints and indexes. Indexes slow down the dump stage, and it’s easier to rebuild them once the initial dump is complete.&lt;/p&gt;&lt;p&gt;&lt;code&gt;pg_dump&lt;/code&gt; provides a useful flag to dump only the table definitions
-without indexes and constraints.&lt;/p&gt;&lt;code&gt;pg_dump URL --no-owner --no-acl --section=pre-data -s \
-   -t users \
-   -t events \
-   &amp;gt; /tmp/pre-data.sql
-&lt;/code&gt;&lt;p&gt;The &lt;code&gt;--section&lt;/code&gt; flag allows us to control what is dumped. &lt;code&gt;pre-data&lt;/code&gt;
-dumps only the table definitions, while &lt;code&gt;post-data&lt;/code&gt; dumps all
-constraints and indexes.&lt;/p&gt;&lt;code&gt;pg_dump URL --no-owner --no-acl --section=post-data -s \
-   -t users \
-   -t events \
-   &amp;gt; /tmp/post-data.sql
-&lt;/code&gt;&lt;head rend="h4"&gt;Restore table definition&lt;/head&gt;&lt;code&gt;psql URL --echo-all --single-transaction -v ON_ERROR_STOP=1 -f /tmp/pre-data.sql
-&lt;/code&gt;&lt;p&gt;There’s one more catch here: logical replication depends on the primary key, so you need to create the primary key constraint in addition to the table definition. However, primary key constraints are in the &lt;code&gt;post-data.sql&lt;/code&gt; file. Open it in an editor and remove everything
-except the primary key constraints.&lt;/p&gt;&lt;head rend="h4"&gt;Restore primary key constrain&lt;/head&gt;&lt;code&gt;psql URL --echo-all --single-transaction -v ON_ERROR_STOP=1 -f /tmp/primary-key-only.sql
-&lt;/code&gt;&lt;head rend="h4"&gt;Functions and others&lt;/head&gt;&lt;p&gt;If you use PostgreSQL functions, enums, or anything that isn’t covered by &lt;code&gt;pg_dump&lt;/code&gt;, you might have to handle those manually. When you
-specify the &lt;code&gt;-t table&lt;/code&gt; option, it only copies objects directly related
-to the tables. Enums and functions don’t fall under that.&lt;/p&gt;&lt;head rend="h3"&gt;Set up publication and subscription&lt;/head&gt;&lt;p&gt;At this point, the table structure should be identical on both instances for the tables that are going to be migrated. The publication should be created on the source instance.&lt;/p&gt;&lt;code&gt;CREATE PUBLICATION migration_publication FOR TABLE users, events
-&lt;/code&gt;&lt;p&gt;A corresponding subscription needs to be created on the destination instance.&lt;/p&gt;&lt;code&gt;CREATE SUBSCRIPTION migration_subscription
-         CONNECTION 'host={IP} port=5432 user={USER} password={SECRET} dbname={DBNAME} sslmode=require'
-        PUBLICATION migration_publication
-&lt;/code&gt;&lt;p&gt;Replace &lt;code&gt;{variable}&lt;/code&gt; with the respective values. If the verify CA
-option is enabled on the source instance, you need to disable it and
-enable only SSL mode.&lt;/p&gt;&lt;p&gt;Once the subscription is created, PostgreSQL starts copying data from the source to the destination instance. It performs an initial data dump for each table and then switches to CDC mode.&lt;/p&gt;&lt;p&gt;You need to wait until the initial dump is complete and it moves to the CDC state with near-zero lag. PostgreSQL exposes this information through several tables such as &lt;code&gt;pg_replication_slots&lt;/code&gt;, &lt;code&gt;pg_stat_replication&lt;/code&gt;, and
-&lt;code&gt;pg_stat_subscription&lt;/code&gt;.&lt;/p&gt;&lt;code&gt;SELECT slot_name,
-       confirmed_flush_lsn,
-       pg_current_wal_lsn(),
-       (pg_current_wal_lsn() - confirmed_flush_lsn) AS lsn_distance
-FROM pg_replication_slots
-&lt;/code&gt;&lt;code&gt;SELECT subscription_name, active,
-       pg_size_pretty(pg_current_wal_lsn() - replay_lsn) AS lag_bytes
-FROM pg_stat_subscription
-&lt;/code&gt;&lt;code&gt;SELECT relid::regclass AS table_name,
-       srel.srsubstate AS replication_state,
-       CASE srel.srsubstate
-           WHEN 'i' THEN 'Initializing'
-           WHEN 'd' THEN 'Initial Dump'
-           WHEN 's' THEN 'Synchronized'
-           WHEN 'r' THEN 'Replicating'
-           ELSE 'Unknown'
-       END AS state_description
-FROM pg_subscription sub
-JOIN pg_subscription_rel srel ON sub.oid = srel.srsubid
-ORDER BY table_name
-&lt;/code&gt;&lt;head rend="h3"&gt;Add indexes and foreign keys&lt;/head&gt;&lt;p&gt;Once the replication moves to the CDC state, you can create indexes and foreign keys. The &lt;code&gt;post-data.sql&lt;/code&gt; file contains all indexes and foreign
-keys. Remove the primary key constraints and keep the rest.&lt;/p&gt;&lt;code&gt;psql URL --echo-all --single-transaction -v ON_ERROR_STOP=1 -f /tmp/indexes.sql
-&lt;/code&gt;&lt;p&gt;This will take quite some time if you have a lot of data.&lt;/p&gt;&lt;head rend="h3"&gt;Analyze&lt;/head&gt;&lt;p&gt;&lt;code&gt;analyze&lt;/code&gt; is one of the most often overlooked steps when moving or upgrading
-PostgreSQL instances. PostgreSQL depends on the statistics generated by this
-command to create an efficient query plan. Without these statistics, it might
-choose an inefficient plan, and a query that used to take 50 ms could turn
-into a 1-second query on your new instance. So make sure to run &lt;code&gt;analyze&lt;/code&gt;
-once the indexes are created. If you have more time, you can also run
-a &lt;code&gt;vacuum&lt;/code&gt; as well.&lt;/p&gt;&lt;code&gt;-- start with analyze (will be done faster compared to vacuum)
-analyze (verbose, BUFFER_USAGE_LIMIT '64MB')
--- vacuum analyze
-vacuum (verbose, analyze)
-&lt;/code&gt;&lt;head rend="h3"&gt;Switchover&lt;/head&gt;&lt;head rend="h4"&gt;Sequence&lt;/head&gt;&lt;p&gt;Your data is now available on both systems, and you are nearly ready to switch your traffic from the source to the destination.&lt;/p&gt;&lt;p&gt;PostgreSQL copies the data and keeps the indexes in sync, but it doesn’t sync the sequences. You have to do that manually.&lt;/p&gt;&lt;code&gt;-- view current value
-SELECT s.schemaname, s.sequencename, s.last_value
-FROM pg_sequences s
-WHERE s.sequencename in ('users_id_seq', 'events_id_seq');
-&lt;/code&gt;&lt;p&gt;You can view the current value on the source instance, and then set it to a higher value on the destination instance.&lt;/p&gt;&lt;code&gt;SELECT
-  'SELECT setval(' ||
-  quote_literal(s.schemaname || '.' || s.sequencename) || ', ' ||
-  CASE
-    WHEN s.sequencename = 'users_id_seq' THEN s.last_value + 100
-    ELSE s.last_value + 10000
-  END || ', true);'
-FROM pg_sequences s
-WHERE s.sequencename IN (
-  'events_id_seq',
-  'users_id_seq'
-);
-&lt;/code&gt;&lt;p&gt;You can run the snippet above on the source instance; the output is a SQL query that you can run on the destination instance. The buffer value is up to you. The key point is that after running the query on the destination instance, you need to perform the switchover before the sequence values on the source instance exceed those on the destination instance.&lt;/p&gt;&lt;head rend="h4"&gt;Disable writes&lt;/head&gt;&lt;p&gt;Once the sequence is updated, stop sending writes to the source PostgreSQL instance. Wait for the replication lag to reach zero, and then switch all writes to the destination PostgreSQL instance. You can monitor the replication lag using &lt;code&gt;pg_replication_slots&lt;/code&gt;.&lt;/p&gt;&lt;head rend="h4"&gt;PgBouncer&lt;/head&gt;&lt;p&gt;The amount of downtime depends on how your app is architected, whether your application can run in read-only mode, and other factors. PgBouncer can help significantly in this regard, and it’s what we used to achieve near-zero downtime.&lt;/p&gt;&lt;p&gt;PgBouncer is a PostgreSQL proxy. The key feature relevant to our situation is that it allows configuration changes without requiring a restart. Assume you have a database named &lt;code&gt;myapp&lt;/code&gt; that’s configured to
-connect to the source instance. You can edit the PgBouncer config file
-to update the connection details to point to the destination instance.
-Then, connect to the PgBouncer
-admin console and
-run the following commands.&lt;/p&gt;&lt;code&gt;pgbouncer&amp;gt; PAUSE myapp;
-pgbouncer&amp;gt; RELOAD;
-pgbouncer&amp;gt; SHOW DATABASES;
-pgbouncer&amp;gt; RESUME myapp;
-&lt;/code&gt;&lt;p&gt;The first command pauses all connections from PgBouncer to the source PostgreSQL instance. The command blocks until all in-flight queries are completed, and new queries are queued. &lt;code&gt;RELOAD&lt;/code&gt; reloads the configuration
-from disk. You can run &lt;code&gt;SHOW DATABASES&lt;/code&gt; to quickly verify that the new
-configuration has been loaded. &lt;code&gt;RESUME&lt;/code&gt; then resumes connectivity, now
-to the new destination PostgreSQL instance.&lt;/p&gt;&lt;p&gt;If you don’t have any long-running queries, this process can result in near-zero downtime, as no queries are dropped. As long as &lt;code&gt;RESUME&lt;/code&gt; is
-executed quickly, users will notice at most a slight increase in latency.&lt;/p&gt;&lt;p&gt;You can use the following query to check for long-running queries and terminate them if needed.&lt;/p&gt;&lt;code&gt;SELECT pid, now() - pg_stat_activity.query_start AS duration, query
-FROM pg_stat_activity
-WHERE (now() - pg_stat_activity.query_start) &amp;gt; interval '2 minutes';
-&lt;/code&gt;&lt;p&gt;In the worst-case scenario, if the &lt;code&gt;PAUSE&lt;/code&gt; command hangs because of a
-long-running query, you can forcefully restart PgBouncer. However, this
-will result in errors for any active connections.&lt;/p&gt;&lt;head rend="h3"&gt;Cleanup&lt;/head&gt;&lt;p&gt;Once you’re confident everything is working correctly, you can clean up the logical replication setup.&lt;/p&gt;&lt;p&gt;Drop the subscription on the destination instance.&lt;/p&gt;&lt;code&gt;DROP SUBSCRIPTION migration_subscription
-&lt;/code&gt;&lt;p&gt;Drop the publication on the source instance.&lt;/p&gt;&lt;code&gt;DROP PUBLICATION migration_publication
-&lt;/code&gt;&lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45788086</guid><pubDate>Sun, 02 Nov 2025 05:47:46 +0000</pubDate></item><item><title>Intervaltree with Rust Back End</title><link>https://github.com/Athe-kunal/intervaltree_rs</link><description>&lt;doc fingerprint="1a5b32fdd0e4e110"&gt;
-  &lt;main&gt;
-    &lt;p&gt;This crate exposes an interval tree implementation written in Rust to Python via PyO3. The Python wrapper provides the ability to build a tree from tuples, insert additional intervals, search for overlaps, and delete intervals by their &lt;code&gt;(left, right)&lt;/code&gt; key.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Rust toolchain (for compiling the extension module)&lt;/item&gt;
-      &lt;item&gt;Python 3.8+&lt;/item&gt;
-      &lt;item&gt;maturin for building/installing the package&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;code&gt;python -m venv .venv
-source .venv/bin/activate
-pip install maturin
-maturin develop&lt;/code&gt;
-    &lt;p&gt;You can install the package with (also with uv)&lt;/p&gt;
-    &lt;code&gt;pip install intervaltree_rs
-&lt;/code&gt;
-    &lt;p&gt;&lt;code&gt;maturin develop&lt;/code&gt; builds the extension module in-place and installs it into the active virtual environment, making it importable as &lt;code&gt;intervaltree_rs&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;Once installed, you can use the interval tree directly from Python:&lt;/p&gt;
-    &lt;code&gt;from intervaltree_rs import IntervalTree
-
-# Build a tree from tuples: (left, right, payload)
-intervals = [
-    (5, 10, "a"),
-    (12, 18, "b"),
-    (1, 4, "c"),
-]
-tree = IntervalTree.from_tuples(intervals)
-
-# Insert another interval
-tree.insert((8, 11, "d"))
-
-# Search for overlaps. Inclusive bounds are enabled by default.
-hits = tree.search(9, 10)
-for left, right, value in hits:
-    print(left, right, value)
-
-# Delete by the interval key
-removed = tree.delete((12, 18))
-print("Removed:", removed)&lt;/code&gt;
-    &lt;p&gt;&lt;code&gt;IntervalTree.search(ql, qr, inclusive=True)&lt;/code&gt; accepts an &lt;code&gt;inclusive&lt;/code&gt; flag. Set it to &lt;code&gt;False&lt;/code&gt; to perform exclusive range queries.&lt;/p&gt;
-    &lt;p&gt;To build a wheel that you can distribute or upload to PyPI, run:&lt;/p&gt;
-    &lt;code&gt;maturin build --release&lt;/code&gt;
-    &lt;p&gt;The built wheels will be placed under &lt;code&gt;target/wheels/&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;The Python bindings are covered by Rust unit tests. Run them with:&lt;/p&gt;
-    &lt;code&gt;cargo test&lt;/code&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45788385</guid><pubDate>Sun, 02 Nov 2025 07:04:59 +0000</pubDate></item><item><title>This week in 1988, Robert Morris unleashed his eponymous worm</title><link>https://www.tomshardware.com/tech-industry/cyber-security/on-this-day-in-1988-the-morris-worm-slithered-out-and-sparked-a-new-era-in-cybersecurity-10-percent-of-the-internet-was-infected-within-24-hours</link><description>&lt;doc fingerprint="ff40223f0be08a6f"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 05 Nov 2025 13:46:51 +0000</lastBuildDate><item><title>This week in 1988, Robert Morris unleashed his eponymous worm</title><link>https://www.tomshardware.com/tech-industry/cyber-security/on-this-day-in-1988-the-morris-worm-slithered-out-and-sparked-a-new-era-in-cybersecurity-10-percent-of-the-internet-was-infected-within-24-hours</link><description>&lt;doc fingerprint="ff40223f0be08a6f"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;37 years ago this week, the Morris worm infected 10% of the Internet within 24 hours — worm slithered out and sparked a new era in cybersecurity&lt;/head&gt;
     &lt;p&gt;The Internet contracted worms a year before the World Wide Web was even a thing.&lt;/p&gt;
@@ -490,40 +345,327 @@ int gs_write_pgm(struct gs_image img, const char *path);&lt;/code&gt;
     &lt;p&gt;- David&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45816879</guid><pubDate>Tue, 04 Nov 2025 22:59:22 +0000</pubDate></item><item><title>UPS plane crashes near Louisville airport</title><link>https://www.cbsnews.com/news/ups-plane-crash-louisville-kentucky/</link><description>&lt;doc fingerprint="77180153807383cf"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;UPS plane crashes near Louisville airport, at least 7 killed, officials say&lt;/head&gt;
-    &lt;p&gt;At least seven people were killed and several others injured after a UPS plane crashed shortly after takeoff near the Louisville International Airport on Tuesday, officials said.&lt;/p&gt;
-    &lt;p&gt;The number of fatalities is expected to increase, Kentucky Gov. Andy Beshear wrote on social media Tuesday night. At least 11 people were injured, officials said earlier.&lt;/p&gt;
-    &lt;p&gt;Beshear said on social media Wednesday morning that 16 families have reported loved ones who are unaccounted for. "A significant search and rescue mission was underway overnight, which is continuing this morning," he said.&lt;/p&gt;
-    &lt;p&gt;Louisville Mayor Craig Greenberg confirmed at a news conference Tuesday night that at least four people had been killed on the ground.&lt;/p&gt;
-    &lt;p&gt;UPS Flight 2976 crashed around 5:15 p.m. local time after it departed from the Louisville airport, according to the Federal Aviation Administration. The aircraft was headed to Daniel K. Inouye International Airport in Honolulu, Hawaii, when it went down three miles south of the airfield, Louisville airport public safety officer Jonathan Biven said at a news conference.&lt;/p&gt;
-    &lt;p&gt;Beshear said there was no hazardous cargo onboard the plane that would create environmental issues around the crash site, but urged residents to follow any shelter-in-place orders.&lt;/p&gt;
-    &lt;p&gt;The Louisville Metro Police Department described the scene as active with "fire and debris," warning residents to stay away from Fern Valley and Grade Lane, an intersection located on the south side of the airport, which serves as the hub of UPS.&lt;/p&gt;
-    &lt;p&gt;More than 100 firefighters responded to the crash and were still battling hot spots as of Tuesday night, Greenberg said. Louisville Fire Chief Brian O'Neill noted the fire was "almost entirely contained."&lt;/p&gt;
-    &lt;p&gt;Greenberg noted on social media Wednesday morning that there were more than 200 first responders of all types at the scene in all.&lt;/p&gt;
-    &lt;p&gt;O'Neill said the fire had been extinguished enough to allow a formal grid search for any possible victims in the area.&lt;/p&gt;
-    &lt;p&gt;Videos of the crash showed the aircraft partially on fire as it sped down the runway before it burst into flames.&lt;/p&gt;
-    &lt;p&gt;A shelter-in-place order was reduced to a one-mile radius of the crash site, authorities said. Then Greenberg said in his post Wednesday morning it was down to a quarter-mile radius.&lt;/p&gt;
-    &lt;p&gt;The police department also urged those in the area to turn off any air intake systems as soon as possible due to the smoke in the area.&lt;/p&gt;
-    &lt;p&gt;"Anybody who has seen the images and the video knows how violent this crash is, and there are a lot of families that are gonna be waiting and wondering for a period of time. We're going to try to get them that information as fast as we can," Beshear said.&lt;/p&gt;
-    &lt;p&gt;UPS said in a statement that it was notified of an incident involving one of its aircraft. Three UPS crewmembers were on board, the company said. It didn't immediately provide more details.&lt;/p&gt;
-    &lt;p&gt;"We do not at the moment have the status of the crew," Beshear said. "Watching that video, I think we're all very, very worried about them."&lt;/p&gt;
-    &lt;p&gt;Businesses in the area were heavily impacted by the crash, including Kentucky Petroleum Recycling and Grade A Auto Parts, the governor said.&lt;/p&gt;
-    &lt;p&gt;All arriving and departing flights at the Louisville airport were temporarily suspended. The airport was closed Tuesday night but one runway as reopened Wednesday morning, Greenberg said.&lt;/p&gt;
-    &lt;p&gt;According to preliminary flight data from FlightRadar24, the plane appeared to hit 175 feet in altitude briefly after takeoff. It would have been full of fuel for the flight to Hawaii, which likely led to the significant fire as seen from CBS affiliate WLKY-TV's chopper.&lt;/p&gt;
-    &lt;p&gt;The three-engine McDonnell Douglas MD-11 was manufactured in 1991, according to FAA data.&lt;/p&gt;
-    &lt;p&gt;It was carrying approximately 38,000 gallons of fuel, which weighs about 233,000 pounds, Louisville Fire Chief Brian O'Neill said. The area affected by the crash is about a city block wide, he said, but it has been difficult to contain the fire due to surrounding hazardous materials.&lt;/p&gt;
-    &lt;p&gt;Greenberg urged any residents who find debris on their property not to touch it, and instead report it through a website that should be live by Wednesday.&lt;/p&gt;
-    &lt;p&gt;The crash is where UPS Worldport, an international air hub for the parcel service, is located. UPS said it was halting package sorting operations at Worldport on Tuesday night.&lt;/p&gt;
-    &lt;p&gt;"This is a UPS town," Louisville Metro Councilwoman Betsy Ruhe, whose district is part of the crash site, said during the news conference Tuesday night. "We all know somebody who works at UPS, and they're all texting their friends, their family, trying to make sure everyone is safe. Sadly, some of those texts are probably going to go unanswered."&lt;/p&gt;
-    &lt;p&gt;The 5.2 million-square-foot facility processes more than 400,000 packages an hour and is home to 20,000 UPS workers and 300 daily flights, according to the company.&lt;/p&gt;
-    &lt;p&gt;"My team and I are closely monitoring the plane crash near Louisville Muhammad Ali International Airport," Kentucky Sen. Rand Paul said. "We continue to pray for the safety of the aircrew, everyone in the area, and for the first-responders on the scene."&lt;/p&gt;
-    &lt;p&gt;The National Transportation Safety Board will lead the investigation into the crash. A team of 28 investigators is expected to arrive Wednesday, Greenberg said.&lt;/p&gt;
-    &lt;p&gt;All public schools in the Jefferson County School District, the largest school district in Kentucky with a little under 100,000 students, will be closed Wednesday, Greenberg added.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45816963</guid><pubDate>Tue, 04 Nov 2025 23:10:53 +0000</pubDate></item><item><title>Bluetui – A TUI for managing Bluetooth on Linux</title><link>https://github.com/pythops/bluetui</link><description>&lt;doc fingerprint="e4d181ddbeaa2ea"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45816879</guid><pubDate>Tue, 04 Nov 2025 22:59:22 +0000</pubDate></item><item><title>UPS plane crashes near Louisville airport</title><link>https://avherald.com/h?article=52f5748f&amp;opt=0</link><description>The Aviation Herald Last Update: Wednesday, Nov 5th 2025 10:24Z
+
+32135 Articles available
+
+Events from Mar 23rd 1994 to Nov 4th 2025 www.avherald.com Incidents and News in Aviation List by: Filter:
+
+Crash: UPS MD11 at Louisville on Nov 4th 2025, burst into flames on takeoff
+
+By Simon Hradecky, created Wednesday, Nov 5th 2025 07:11Z, last updated Wednesday, Nov 5th 2025 10:24Z
+
+
+
+
+
+The aircraft had already been handed off to departure frequency but did not report on departure frequency anymore.
+
+
+
+According to ADS-B data the aircraft achieved 185 knots over ground near the aiming markers runway 35L still on the runway centerline but never became airborne.
+
+
+
+According to pictorial evidence engine #1 (left hand engine, CF6) separated the airframe during rotation for takeoff, the departure of that engine may also have failed the center engine #2.
+
+
+
+The FAA reported: "UPS Flight 2976 crashed around 5:15 p.m. local time on Tuesday, Nov. 4, after departing from Louisville Muhammad Ali International Airport in Kentucky. The McDonnell Douglas MD-11 was headed to Daniel K. Inouye International Airport in Honolulu. The FAA and NTSB will investigate."
+
+
+
+Ground observers reported the aircraft had been delayed for about two hours for work on the left hand engine (engine #1), the engine #1 separated during the takeoff run, the center engine emitted streaks of flames, the aircraft impacted a UPS warehouse and ploughed through other facilities before coming to rest in a large plume of fire and smoke.
+
+
+
+The local governor reported the plane hit two businesses near the airport, the three occupants of the aircraft died, 4 people on the ground are confirmed dead, the death toll could rise. At least 11 people are treated in hospitals for in part serious injuries, that number might rise further, too. The aircraft with 38000 gallons of fuel climbed to about 175 feet AGL before descending again.
+
+
+
+UPS reported they are halting package sorting at Louisville.
+
+
+
+The NTSB reported: "NTSB is launching a go-team to investigate Tuesdays crash of a UPS MD-11 cargo aircraft, Flight 2976 near Louisville, Kentucky. NTSB Board Member Todd Inman will serve as the on-scene spokesperson. The investigative team is scheduled to arrive in Kentucky tomorrow. A media briefing will be held tomorrow, with the time and location to be announced."
+
+
+
+Related NOTAMs:
+
+!SDF 11/010 SDF RWY 17L/35R CLSD 2511031730-2511040300
+
+
+
+!SDF 11/031 SDF RWY 35L ALS U/S 2511041300-2511041800
+
+
+
+!SDF 11/038 SDF AD AP CLSD 2511042230-2511051200
+
+
+
+!SDF 11/077 SDF RWY 17L/35R CLSD 2511050624-2511080300
+
+
+
+Metars:
+
+KSDF 050056Z 15005KT 10SM SCT026 SCT250 13/05 A3020 RMK AO2 SLP227 FU SCT026 T01280050=
+
+KSDF 050028Z 15005KT 10SM SCT026 BKN250 13/05 A3020 RMK AO2 FU SCT026 T01330050=
+
+KSDF 042356Z 14004KT 10SM FEW022 BKN026 BKN250 14/06 A3021 RMK AO2 SLP229 FU BKN026 T01390056 10183 20133 56007=
+
+KSDF 042303Z 16008KT 10SM FEW021 BKN028 BKN032 BKN250 16/05 A3021 RMK AO2 FU BKN028 T01560050=
+
+KSDF 042256Z 17006KT 10SM SCT032 BKN250 16/05 A3021 RMK AO2 SLP230 FU SCT032 T01560050=
+
+KSDF 042156Z 12006KT 10SM SCT200 BKN250 17/05 A3022 RMK AO2 SLP233 T01670050=
+
+KSDF 042056Z 15006KT 10SM FEW200 BKN250 17/04 A3023 RMK AO2 SLP237 T01720044 56028=
+
+KSDF 041956Z 14006KT 10SM FEW200 BKN250 18/04 A3025 RMK AO2 SLP241 T01780044=
+
+KSDF 041856Z 15007KT 10SM FEW200 BKN250 18/02 A3028 RMK AO2 SLP253 T01780022=
+
+KSDF 041756Z 17008KT 10SM FEW200 BKN250 17/02 A3031 RMK AO2 SLP264 T01670022 10167 20033 58028=
+
+
+
+CCTV recording of initial impact:
+
+https://www.youtube.com/watch?v=1hI2RxfCmhE
+
+
+
+Another CCTV recording of final stages of takeoff run and initial impact:
+
+https://www.youtube.com/watch?v=CmePrd7PkYI
+
+
+
+CCTV camera footage of last stages of takeoff run and crash sequence included in News Coverage (Video: WHAS11):
+
+https://www.youtube.com/watch?v=v0cmrFJ6mN8
+
+
+
+Engine #1 at the side of the runway:
+
+
+
+
+
+Aerial overview of crash site:
+
+
+
+
+
+Map (Graphics: AVH/Google Earth):
+
+
+
+
+
+
+
+
+
+A UPS United Parcel Service McDonnell Douglas MD-11, registration N259UP performing flight 5X-2976 from Louisville,KY to Honolulu,HI (USA) with 3 crew, was accelerating for takeoff from Louisville's runway 17R at 17:13L (22:13Z) when the aircraft impacted ground and came to a rest at approximate position N38.146 W85.734 about 0.57nm past the runway end and about 0.09nm to the left of the extended runway centerline bursting into flames. All three on board perished, 4 fatalities on the ground are confirmed and 11 injuries on the ground reported, too.The aircraft had already been handed off to departure frequency but did not report on departure frequency anymore.According to ADS-B data the aircraft achieved 185 knots over ground near the aiming markers runway 35L still on the runway centerline but never became airborne.According to pictorial evidence engine #1 (left hand engine, CF6) separated the airframe during rotation for takeoff, the departure of that engine may also have failed the center engine #2.The FAA reported: "UPS Flight 2976 crashed around 5:15 p.m. local time on Tuesday, Nov. 4, after departing from Louisville Muhammad Ali International Airport in Kentucky. The McDonnell Douglas MD-11 was headed to Daniel K. Inouye International Airport in Honolulu. The FAA and NTSB will investigate."Ground observers reported the aircraft had been delayed for about two hours for work on the left hand engine (engine #1), the engine #1 separated during the takeoff run, the center engine emitted streaks of flames, the aircraft impacted a UPS warehouse and ploughed through other facilities before coming to rest in a large plume of fire and smoke.The local governor reported the plane hit two businesses near the airport, the three occupants of the aircraft died, 4 people on the ground are confirmed dead, the death toll could rise. At least 11 people are treated in hospitals for in part serious injuries, that number might rise further, too. The aircraft with 38000 gallons of fuel climbed to about 175 feet AGL before descending again.UPS reported they are halting package sorting at Louisville.The NTSB reported: "NTSB is launching a go-team to investigate Tuesdays crash of a UPS MD-11 cargo aircraft, Flight 2976 near Louisville, Kentucky. NTSB Board Member Todd Inman will serve as the on-scene spokesperson. The investigative team is scheduled to arrive in Kentucky tomorrow. A media briefing will be held tomorrow, with the time and location to be announced."Related NOTAMs:!SDF 11/010 SDF RWY 17L/35R CLSD 2511031730-2511040300!SDF 11/031 SDF RWY 35L ALS U/S 2511041300-2511041800!SDF 11/038 SDF AD AP CLSD 2511042230-2511051200!SDF 11/077 SDF RWY 17L/35R CLSD 2511050624-2511080300Metars:KSDF 050056Z 15005KT 10SM SCT026 SCT250 13/05 A3020 RMK AO2 SLP227 FU SCT026 T01280050=KSDF 050028Z 15005KT 10SM SCT026 BKN250 13/05 A3020 RMK AO2 FU SCT026 T01330050=KSDF 042356Z 14004KT 10SM FEW022 BKN026 BKN250 14/06 A3021 RMK AO2 SLP229 FU BKN026 T01390056 10183 20133 56007=KSDF 042303Z 16008KT 10SM FEW021 BKN028 BKN032 BKN250 16/05 A3021 RMK AO2 FU BKN028 T01560050=KSDF 042056Z 15006KT 10SM FEW200 BKN250 17/04 A3023 RMK AO2 SLP237 T01720044 56028=KSDF 041956Z 14006KT 10SM FEW200 BKN250 18/04 A3025 RMK AO2 SLP241 T01780044=KSDF 041856Z 15007KT 10SM FEW200 BKN250 18/02 A3028 RMK AO2 SLP253 T01780022=KSDF 041756Z 17008KT 10SM FEW200 BKN250 17/02 A3031 RMK AO2 SLP264 T01670022 10167 20033 58028=CCTV recording of initial impact:Another CCTV recording of final stages of takeoff run and initial impact:CCTV camera footage of last stages of takeoff run and crash sequence included in News Coverage (Video: WHAS11):Engine #1 at the side of the runway:Aerial overview of crash site:Map (Graphics: AVH/Google Earth):
+
+By Thomas on Wednesday, Nov 5th 2025 13:43Z
+
+
+
+
+
+By Sam Coat on Wednesday, Nov 5th 2025 13:15Z
+
+
+
+
+
+By James on Wednesday, Nov 5th 2025 13:12Z
+
+
+
+
+
+By (anonymous) on Wednesday, Nov 5th 2025 13:06Z
+
+
+
+
+
+By Dave on Wednesday, Nov 5th 2025 13:01Z
+
+
+
+
+
+By Captain Crunch on Wednesday, Nov 5th 2025 12:38Z
+
+
+
+
+
+By Delta 3 on Wednesday, Nov 5th 2025 12:34Z
+
+
+
+
+
+By Martin on Wednesday, Nov 5th 2025 12:24Z
+
+
+
+
+
+By xicoff on Wednesday, Nov 5th 2025 12:15Z
+
+
+
+
+
+By Rex on Wednesday, Nov 5th 2025 12:09Z
+
+
+
+
+
+By Luap on Wednesday, Nov 5th 2025 12:06Z
+
+
+
+
+
+By Rex on Wednesday, Nov 5th 2025 11:59Z
+
+
+
+
+
+By Horstroad on Wednesday, Nov 5th 2025 11:56Z
+
+
+
+
+
+By Captain Crunch on Wednesday, Nov 5th 2025 11:17Z
+
+
+
+
+
+By The Legacy on Wednesday, Nov 5th 2025 11:08Z
+
+
+
+
+
+By Plitot Dad on Wednesday, Nov 5th 2025 11:04Z
+
+
+
+
+
+By The Legacy on Wednesday, Nov 5th 2025 11:02Z
+
+
+
+
+
+By YankeeJuliett on Wednesday, Nov 5th 2025 10:35Z
+
+
+
+
+
+By Horstroad on Wednesday, Nov 5th 2025 10:14Z
+
+
+
+
+
+By Has to be ice crystals on Wednesday, Nov 5th 2025 10:03Z
+
+
+
+
+
+By Simon Hradecky on Wednesday, Nov 5th 2025 10:01Z
+
+
+
+
+
+By Armchair on Wednesday, Nov 5th 2025 09:55Z
+
+
+
+
+
+By Captain Crunch on Wednesday, Nov 5th 2025 09:26Z
+
+
+
+
+
+By Kaj Jensen on Wednesday, Nov 5th 2025 09:24Z
+
+
+
+
+
+By B737-pilot on Wednesday, Nov 5th 2025 09:18Z
+
+
+
+
+
+By SEC4 on Wednesday, Nov 5th 2025 09:09Z
+
+
+
+
+
+By Captain Crunch on Wednesday, Nov 5th 2025 09:01Z
+
+
+
+
+
+By Fez on Wednesday, Nov 5th 2025 08:46Z
+
+
+
+
+
+By Rawa Badawee on Wednesday, Nov 5th 2025 08:37Z
+
+
+
+
+
+By Uros Kastelic on Wednesday, Nov 5th 2025 08:13Z
+
+
+
+
+
+Add your comment: (max 1024 characters) Your Name: Your Email: Subject: Your comment: The Aviation Herald Apps
+
+Android and iOS
+
+Support The Aviation Herald
+
+Euro
+
+US$
+
+Interview: The human factor named "Simon Hradecky" and the team of man and machine Get the news right onto your desktop when they happen © 2008-2025 by The Aviation Herald, all rights reserved, reproduction, redistribution and AI learning/use prohibited. We use cookies to ensure you get the best experience on our site, learn more</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45816963</guid><pubDate>Tue, 04 Nov 2025 23:10:53 +0000</pubDate></item><item><title>Bluetui – A TUI for managing Bluetooth on Linux</title><link>https://github.com/pythops/bluetui</link><description>&lt;doc fingerprint="e4d181ddbeaa2ea"&gt;
   &lt;main&gt;
     &lt;p&gt;A Linux based OS with bluez installed.&lt;/p&gt;
     &lt;p&gt;Note&lt;/p&gt;
@@ -840,7 +982,29 @@ You can see this in code here.&lt;/p&gt;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45820872</guid><pubDate>Wed, 05 Nov 2025 08:54:11 +0000</pubDate></item><item><title>Founder in Residence at Woz (San Francisco)</title><link>https://news.ycombinator.com/item?id=45821921</link><description>&lt;doc fingerprint="3ab8fb7857c0d6e6"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45820872</guid><pubDate>Wed, 05 Nov 2025 08:54:11 +0000</pubDate></item><item><title>72% of devs believe Steam has a monopoly on PC games, according to study</title><link>https://www.gamesindustry.biz/72-of-devs-believe-steam-has-a-monopoly-on-pc-games-according-to-study</link><description>&lt;doc fingerprint="f4c401bf831e7342"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;72% of devs believe Steam has a monopoly on PC games, according to study&lt;/head&gt;
+    &lt;p&gt;Majority of studios surveyed say Steam accounts for 75% of overall revenue&lt;/p&gt;
+    &lt;p&gt;More than half of developers feel they rely too heavily on Steam to distribute their games, with 72% believing the platform has a monopoly on the PC games market.&lt;/p&gt;
+    &lt;p&gt;That's according to a new whitepaper from PC distribution platform Rokky titled 'The State of PC Game Distribution.'&lt;/p&gt;
+    &lt;p&gt;The independent study, conducted by Atomik Research, surveyed 306 industry executives across the UK and USA between May 18 and May 22, 2025.&lt;/p&gt;
+    &lt;p&gt;75% of respondents were senior managers of C-suite level, with 77% from studios with more than 50 employees.&lt;/p&gt;
+    &lt;p&gt;The study found that for the majority of studios, Steam accounts for over 75% of revenue.&lt;/p&gt;
+    &lt;p&gt;However, it also noted that developers have started utilising other platforms including the Epic Game Store and the Xbox PC Games store.&lt;/p&gt;
+    &lt;p&gt;Almost half of those surveyed (48%) have distributed a title to both stores, while 10% have used GOG and 8% have used Itch.io.&lt;/p&gt;
+    &lt;p&gt;Rokky does note that as its survey is "dominated by larger companies with diverse portfolios", a larger proportion use storefronts like the Epic Games Store rather than Itch.io, which aims to serve independent developers.&lt;/p&gt;
+    &lt;p&gt;Elsewhere, the study found that 32% of developers release some of their games on physical media (disc, cartridges, and 'keys-in-boxes').&lt;/p&gt;
+    &lt;p&gt;Marketplaces like G2A and Kinguin are also an option for distribution, as are E-stores such as Fanatical and Humble Bundle.&lt;/p&gt;
+    &lt;p&gt;Developers highlighted benefits for both including ease of use, pricing control, promotional support, and international reach.&lt;/p&gt;
+    &lt;p&gt;Data also showed that 80% of those surveyed expect to use alternative channels alongside Steam within five years.&lt;/p&gt;
+    &lt;p&gt;75% predict they will see "at least a 10% uplift in revenue" from using marketplaces and E-stores in particular.&lt;/p&gt;
+    &lt;p&gt;However, respondents voiced concerns regarding the gray market when using these platforms, as well as potential loss of control.&lt;/p&gt;
+    &lt;p&gt;"With a growing prominence of E-stores and marketplaces, PC game distribution is more varied, vast, and complex than it has ever been," Rokky co-founder and CEO Vadim Andreev.&lt;/p&gt;
+    &lt;p&gt;"New opportunities are everywhere – as are pitfalls and challenges. And most of the old guard remain relevant. Understanding the nuances has never been more important, and so we created this report to highlight the trends that matter."&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45821423</guid><pubDate>Wed, 05 Nov 2025 10:28:50 +0000</pubDate></item><item><title>Founder in Residence at Woz (San Francisco)</title><link>https://news.ycombinator.com/item?id=45821921</link><description>&lt;doc fingerprint="3ab8fb7857c0d6e6"&gt;
   &lt;main&gt;
     &lt;div&gt;
       &lt;p&gt;Founder in Residence at Woz (San Francisco)&lt;/p&gt;
@@ -852,62 +1016,114 @@ You can see this in code here.&lt;/p&gt;
     &lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45821921</guid><pubDate>Wed, 05 Nov 2025 12:00:17 +0000</pubDate></item><item><title>YouTube Erased More Than 700 Videos Documenting Israeli Human Rights Violations</title><link>https://theintercept.com/2025/11/04/youtube-google-israel-palestine-human-rights-censorship/</link><description>&lt;doc fingerprint="fd80828532655cd2"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45821921</guid><pubDate>Wed, 05 Nov 2025 12:00:17 +0000</pubDate></item><item><title>The grim truth behind the Pied Piper</title><link>https://www.bbc.com/travel/article/20200902-the-grim-truth-behind-the-pied-piper</link><description>&lt;doc fingerprint="bf3fc84dbbe71458"&gt;
   &lt;main&gt;
-    &lt;p&gt;A documentary featuring mothers surviving Israel’s genocide in Gaza. A video investigation uncovering Israel’s role in the killing of a Palestinian American journalist. Another video revealing Israel’s destruction of Palestinian homes in the occupied West Bank.&lt;/p&gt;
-    &lt;p&gt;YouTube surreptitiously deleted all these videos in early October by wiping the accounts that posted them from its website, along with their channels’ archives. The accounts belonged to three prominent Palestinian human rights groups: Al-Haq, Al Mezan Center for Human Rights, and the Palestinian Centre for Human Rights.&lt;/p&gt;
-    &lt;p&gt;The move came in response to a U.S. government campaign to stifle accountability for alleged Israeli war crimes against Palestinians in Gaza and the West Bank.&lt;/p&gt;
-    &lt;p&gt;The Palestinian groups’ YouTube channels hosted hours of footage documenting and highlighting alleged Israeli government violations of international law in both Gaza and the West Bank, including the killing of Palestinian civilians.&lt;/p&gt;
-    &lt;p&gt;“I’m pretty shocked that YouTube is showing such a little backbone,” said Sarah Leah Whitson, executive director of Democracy for the Arab World Now. “It’s really hard to imagine any serious argument that sharing information from these Palestinian human rights organizations would somehow violate sanctions. Succumbing to this arbitrary designation of these Palestinian organizations, to now censor them, is disappointing and pretty surprising.”&lt;/p&gt;
-    &lt;p&gt;After the International Criminal Court issued arrest warrants and charged Israeli Prime Minister Benjamin Netanyahu and former Israeli Defense Secretary Yoav Gallant with war crimes in Gaza, the Trump administration escalated its defense of Israel’s actions by sanctioning ICC officials and targeting people and organizations that work with the court.&lt;/p&gt;
-    &lt;quote&gt;“YouTube is furthering the Trump administration’s agenda to remove evidence of human rights violations and war crimes.”&lt;/quote&gt;
-    &lt;p&gt;“It is outrageous that YouTube is furthering the Trump administration’s agenda to remove evidence of human rights violations and war crimes from public view,” said Katherine Gallagher, a senior staff attorney at the Center for Constitutional Rights. “Congress did not intend to allow the president to cut off the flow of information to the American public and the world — instead, information, including documents and videos, are specifically exempted under the statute that the president cited as his authority for issuing the ICC sanctions.”&lt;/p&gt;
-    &lt;head rend="h2"&gt;“Alarming Setback”&lt;/head&gt;
-    &lt;p&gt;YouTube, which is owned by Google, confirmed to The Intercept that it deleted the groups’ accounts as a direct result of State Department sanctions against the group after a review. The Trump administration leveled the sanctions against the organizations in September over their work with the International Criminal Court in cases charging Israeli officials of war crimes.&lt;/p&gt;
-    &lt;p&gt;“Google is committed to compliance with applicable sanctions and trade compliance laws,” YouTube spokesperson Boot Bullwinkle said in a statement.&lt;/p&gt;
-    &lt;p&gt;According to Google’s Sanctions Compliance publisher policy, “Google publisher products are not eligible for any entities or individuals that are restricted under applicable trade sanctions and export compliance laws.”&lt;/p&gt;
-    &lt;p&gt;Al Mezan, a human rights organization in Gaza, told The Intercept that its YouTube channel was abruptly terminated this year on October 7 without prior notification.&lt;/p&gt;
-    &lt;p&gt;“Terminating the channel deprives us from reaching what we aspire to convey our message to, and fulfill our mission,” a spokesperson for the group said, “and prevents us from achieving our goals and limits our ability to reach the audience we aspire to share our message with.”&lt;/p&gt;
-    &lt;p&gt;The West Bank-based Al-Haq’s channel was deleted on October 3, a spokesperson for the group said, with a message from YouTube that its “content violates our guidelines.”&lt;/p&gt;
-    &lt;p&gt;“YouTube’s removal of a human rights organisation’s platform, carried out without prior warning, represents a serious failure of principle and an alarming setback for human rights and freedom of expression,” the Al-Haq spokesperson said in a statement. “The U.S. Sanctions are being used to cripple accountability work on Palestine and silence Palestinian voices and victims, and this has a ripple effect on such platforms also acting under such measures to further silence Palestinian voices.”&lt;/p&gt;
-    &lt;p&gt;The Palestinian Center for Human Rights, which the U.N. describes as the oldest human rights organization in Gaza, said in a statement that YouTube’s move “protects perpetrators from accountability.”&lt;/p&gt;
-    &lt;p&gt;“YouTube’s decision to close PCHR’s account is basically one of many consequences that we as an organisation have faced since the decision of the US government to sanction our organisations for our legitimate work,” said Basel al-Sourani, an international advocacy officer and legal advisor for the group. “YouTube said that we were not following their policy on Community Guidelines, when all our work was basically presenting factual and evidence-based reporting on the crimes committed against the Palestinian people especially since the start of the ongoing genocide on 7 October.”&lt;/p&gt;
-    &lt;p&gt;“By doing this, YouTube is being complicit in silencing the voices of Palestinian victims,” al-Sourani added.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Looking Outside the U.S.&lt;/head&gt;
-    &lt;p&gt;The three human rights groups’ account terminations cumulatively amount to the erasure of more than 700 videos, according to an Intercept tally.&lt;/p&gt;
-    &lt;p&gt;The deleted videos range in scope from investigations, such as an analysis of the Israeli killing of American journalist Shireen Abu Akleh, to testimonies of Palestinians tortured by Israeli forces and documentaries like “The Beach,” about children playing on a beach who were killed by an Israeli strike.&lt;/p&gt;
-    &lt;p&gt;Some videos are still available through copies saved on the Internet Archive’s Wayback Machine or on alternate platforms, such as Facebook and Vimeo. The wiping only affected the group’s official channels; videos which were produced by the nonprofits but hosted on alternate YouTube channels remain active. No cumulative index of videos deleted by YouTube is available, however, and many appear to not be available elsewhere online.&lt;/p&gt;
-    &lt;p&gt;Videos posted elsewhere online, the groups fear, could soon be targeted for deletion because many of the platforms hosting them are also U.S.-based services. The ICC itself began exploring using service providers outside the U.S.&lt;/p&gt;
-    &lt;p&gt;Al-Haq said it would also be looking for alternatives outside of U.S. companies to host their work.&lt;/p&gt;
-    &lt;p&gt;YouTube isn’t the only U.S. tech company blocking Palestinian rights groups from using its services. The Al-Haq spokesperson said Mailchimp, the mailing list service, also deleted the group’s account in September. (Mailchimp and its parent company, Intuit, did not immediately respond to a request for comment.)&lt;/p&gt;
-    &lt;head rend="h2"&gt;Caving to Trump’s Demand&lt;/head&gt;
-    &lt;p&gt;Both the U.S. and Israeli governments have long shielded themselves from the ICC and accountability for their alleged war crimes. Neither country is party to the Rome Statute, the international treaty that established the court.&lt;/p&gt;
-    &lt;p&gt;In November 2024, the ICC prosecutors issued arrest warrants for Netanyahu and Gallant, charging the leaders with intentionally starving civilians by blocking aid from entering into Gaza. Both the Biden and Trump administrations rejected the legitimacy of the warrants.&lt;/p&gt;
-    &lt;p&gt;Since his reelection, Trump has taken a more aggressive posture against accountability for Israel. In the early days of his second term, Trump renewed sanctions against the ICC and issued new, more severe measures against court officials and anyone accused of aiding their efforts. In September, in a new order, he specifically sanctioned the three Palestinian groups.&lt;/p&gt;
-    &lt;p&gt;The U.S. moves followed Israel’s own designation of Al-Haq as a “terrorist organization” in 2021 and an online smear campaign by pro-Israeli activists attempting to link Palestinian Centre for Human Rights with militant groups.&lt;/p&gt;
-    &lt;p&gt;The sanctions freeze the organizations’ assets in the U.S. and bar sanctioned individuals from traveling to the country. Federal judges have already issued preliminary injunctions in two cases in favor of plaintiffs who argued the sanctions had violated their First Amendment rights.&lt;/p&gt;
-    &lt;p&gt;“The Trump administration is focused on contributing to the censorship of information about Israeli atrocities in Palestine and the sanctions against these organizations is very deliberately designed to make association with these organizations frightening to Americans who will be concerned about material support laws,” said Whitson, of DAWN, which joined a coalition of groups in September to demand the Trump administration drop its sanctions.&lt;/p&gt;
-    &lt;p&gt;Like many tech firms, YouTube has shown a ready willingness to comply with demands from both the Trump administration and Israel. YouTube coordinated with a campaign organized by Israeli tech workers to remove social media content deemed critical of Israel. At home, Google, YouTube’s parent company, secretly handed over personal Gmail account information to U.S. Immigration and Customs Enforcement in an effort to detain a pro-Palestinian student organizer.&lt;/p&gt;
-    &lt;p&gt;Even before Israel’s genocidal campaign in Gaza, YouTube had been accused of unevenly applying its community guidelines to censor Palestinian voices while withholding similar scrutiny from pro-Israeli content. Such trends continued during the war, according to a Wired report.&lt;/p&gt;
-    &lt;p&gt;Earlier this year, YouTube shut down the official account of the Addameer Prisoner Support and Human Rights Association. The move came after pressure from UK Lawyers for Israel, which wrote to YouTube to point out that the organization had been sanctioned by the State Department.&lt;/p&gt;
-    &lt;p&gt;Whitson warned that YouTube’s capitulation could set a precedent, pushing other tech companies to bend to censorship.&lt;/p&gt;
-    &lt;p&gt;“They are basically allowing the Trump administration to dictate what information they share with the global audience,” she said. “It’s not going to end with Palestine.”&lt;/p&gt;
-    &lt;p&gt;IT’S EVEN WORSE THAN WE THOUGHT.&lt;/p&gt;
-    &lt;p&gt;What we’re seeing right now from Donald Trump is a full-on authoritarian takeover of the U.S. government.&lt;/p&gt;
-    &lt;p&gt;This is not hyperbole.&lt;/p&gt;
-    &lt;p&gt;Court orders are being ignored. MAGA loyalists have been put in charge of the military and federal law enforcement agencies. The Department of Government Efficiency has stripped Congress of its power of the purse. News outlets that challenge Trump have been banished or put under investigation.&lt;/p&gt;
-    &lt;p&gt;Yet far too many are still covering Trump’s assault on democracy like politics as usual, with flattering headlines describing Trump as “unconventional,” “testing the boundaries,” and “aggressively flexing power.”&lt;/p&gt;
-    &lt;p&gt;The Intercept has long covered authoritarian governments, billionaire oligarchs, and backsliding democracies around the world. We understand the challenge we face in Trump and the vital importance of press freedom in defending democracy.&lt;/p&gt;
-    &lt;head rend="h2"&gt;We’re independent of corporate interests. Will you help us?&lt;/head&gt;
-    &lt;head rend="h2"&gt;Latest Stories&lt;/head&gt;
-    &lt;p&gt;Collateral Damage&lt;/p&gt;
-    &lt;head rend="h3"&gt;Episode Five: What Fourth Amendment?&lt;/head&gt;
-    &lt;p&gt;How the killing of Trevon Cole by Las Vegas police almost made prime-time TV.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Zohran Mamdani Avoided Campaigning Against the Police. Will They Work With Him?&lt;/head&gt;
-    &lt;p&gt;To implement his sweeping agenda, Mamdani will have to navigate the New York City Police Department and its influential union.&lt;/p&gt;
-    &lt;p&gt;Voices&lt;/p&gt;
-    &lt;head rend="h3"&gt;They Tried to Smear Zohran Mamdani as an Antisemite. Voters Saw Right Through It.&lt;/head&gt;
-    &lt;p&gt;Mamdani’s victory means so much — including the repudiation of Islamophobic attacks and weaponization of antisemitism.&lt;/p&gt;
+    &lt;head rend="h1"&gt;The grim truth behind the Pied Piper&lt;/head&gt;
+    &lt;p&gt;Writers like the Grimm Brothers and Robert Browning may have shaped the Pied Piper legend into art, but it turns out the story is likely based on an actual historical incident.&lt;/p&gt;
+    &lt;p&gt;(This year, we published many inspiring and amazing stories that made us fall in love with the world – and this is one our favourites. Click here for the full list).&lt;/p&gt;
+    &lt;p&gt;Every working morning for the last 26 years, Michael Boyer has slipped into a pair of neon-bright, multi-coloured tights, tied on his lipstick-red cape, grabbed his flute and marched out into the medieval streets of Hamelin, a town of 60,000 residents in Lower Saxony, Germany.&lt;/p&gt;
+    &lt;p&gt;“People sometimes mistake me for a superhero, court jester or Robin Hood,” he laughed. He’s also increasingly become an Instagram prop for tourists and, maybe in some woke eyes, a gender-fluid statement.&lt;/p&gt;
+    &lt;p&gt;But most people recognise him for what he is, the Pied Piper incarnate, appointed by Hamelin to impersonate its simultaneously favourite (at least commercially) and least favourite adopted son. Responsible for meeting and greeting visiting groups and dignitaries, he leads tours of the city and embodies the enduring hold of the legend that draws most travellers here.&lt;/p&gt;
+    &lt;p&gt;The tale in fact has survived for a very long time. Originating as medieval folklore, the story inspired a Goethe verse, Der Rattenfänger; a Grimm Brothers’ legend, The Children of Hamelin; and one of Robert Browning’s best-known poems, The Pied Piper of Hamelin. And although each writer tinkered with the story, the basics remained the same: the Piper was hired by Hamelin to rid the town of its plague of rats. Trailing after the hypnotic notes of the rat-catcher’s magical flute, the rodents politely filed through the city gates to their presumed doom.&lt;/p&gt;
+    &lt;p&gt;They weren’t the only ones lured by his music, though. When the town refused to pay the Piper for his service, the saviour turned into a more satanic seducer and came for Hamelin’s children. Entranced by the notes of his flute, the transfixed boys and girls followed the Piper out of town and simply vanished.&lt;/p&gt;
+    &lt;p&gt;While the tale has endured, so has Hamelin itself, which still looks as though it belongs in a fairy tale. Boyer’s tour leads visitors past rows of half-timbered houses. There are 16th Century burgher manors encrusted with Gothic gables and scrollwork, and flamboyant wedding cake buildings offering prime examples of the local Weser-Renaissance architecture, all leering gargoyles and brightly coloured polychrome wood carvings.&lt;/p&gt;
+    &lt;p&gt;However, all this is merely background for the town’s real cottage industry, which cashes in on all things Piper. The local restaurants plate a “rat tail” signature dish made from thinly sliced pork, and the bakeries do a brisk business in rodent-shaped breads and cakes. The Hameln Museum offers a sound and light Pied Piper re-enactment; local actors put on an open-air Pied Piper play during summer; and the souvenir shops hawk their own rat-inspired memorabilia. You can go home, if you wish, loaded down with Pied Piper T-shirts, fridge magnets, mugs and flutes.&lt;/p&gt;
+    &lt;p&gt;What could pass for mere comic relief, though, masks something deeper, and suggests why the legend lives on not only in Hamelin but in enduring folklore. On some level, the tale stokes a primal fear, with the Piper a version of a universal bogey man that continues to haunt us. Parents everywhere still fear the loss of their babies. Children, popping up on the nightly news, still go missing every day. And then we all ultimately vanish in something like an instant. The Piper, in the end, is one very grim reaper.&lt;/p&gt;
+    &lt;p&gt;But if the tale evokes a universal fear, it still resonates most strongly in Hamelin – and the Piper’s tour suggests why. In fact, the real surprise of his tour isn’t so much the beautifully preserved townscape but the suggestion that the Pied Piper is much more than just a fairy tale. The Grimm Brothers and Browning may have shaped the legend into art, but the story, it turns out, is likely based on an actual historical incident.&lt;/p&gt;
+    &lt;p&gt;You may also be interested in:&lt;/p&gt;
+    &lt;p&gt;• The elusive hidden people of Iceland&lt;/p&gt;
+    &lt;p&gt;The proof is etched on Hamelin’s face itself. An inscribed plaque on the stone facade of the so-called Pied Piper house, a half-timbered private residence dating to 1602 – similar to an even earlier one etched on the building’s window – bears explicit witness to the mystery. The inscription reads:&lt;/p&gt;
+    &lt;p&gt;“A.D. 1284 – on the 26th of June – the day of St John and St Paul – 130 children – born in Hamelin – were led out of the town by a piper wearing multicoloured clothes. After passing the Calvary near the Koppenberg they disappeared forever.”&lt;/p&gt;
+    &lt;p&gt;The inscription isn’t the only clue. An entry in Hamelin’s town records, dating to 1384, laments that, “It is 100 years since our children left.” The stained-glass window in the town’s St Nicolai church, destroyed in the 17th Century but described in earlier accounts, reportedly illustrated the figure of the Pied Piper leading several ghostly white children. And the 15th Century Luneburg manuscript, an early German account of the event, along with five historical memory verses, some in Latin and others in Middle Low German, all refer to a similar story of 130 children or young people vanishing on the 26 June 1284, following a pied piper to a place called Calvary or Koppen.&lt;/p&gt;
+    &lt;p&gt;The Pied Piper then, more than a fairy tale, becomes the emblem of a profound historical mystery. What happened to the missing children of Hamelin? Still the master seducer, the mesmerising rat-catcher is now leading a whole new trail of entranced followers – this time a conga line of historians each taking their own deep dive into the question of what exactly transpired in Hamelin on 26 June 1284.&lt;/p&gt;
+    &lt;p&gt;The theories are legion, according to Wibke Reimer, project coordinator at the Hameln Museum who has been organising a special exhibit that focuses on the global reach of the Pied Piper legend. One of the leading current theories suggests the town’s youth were part of a migration of Germans to Eastern Europe fuelled by an economic depression.&lt;/p&gt;
+    &lt;p&gt;“In this scenario,” Reimer said, “the Pied Piper played the role of a so-called locator or recruiter. They were responsible for organising migrations to the east and were said to have worn colourful garments and played an instrument to attract the attention of possible settlers.”&lt;/p&gt;
+    &lt;p&gt;While some historians believe that the youth emigrated to Transylvania, the German linguist Jürgen Udolph’s theory is most accepted. “He suggests the regions around Berlin as the most probable location, in an area that’s now [eastern Germany],” Reimer said, “and he backs up his theory by place name evidence.” In fact, Udolph found that the family names common in Hamelin at the time show up with surprising frequency in the areas of Uckermark and Prignitz, near Berlin, that he locates as the centre of the migration. The theory is also reinforced by evidence that the region, newly liberated from the Danes, was ripe for German colonisation.&lt;/p&gt;
+    &lt;p&gt;More fanciful theories abound, too. Some historians suggest the legend reflects a 13th Century children’s crusade, part of the wave of medieval crusades aimed at winning back the Holy Land. And some argue the youth were lost to the Black Plague, though the dates don’t match up.&lt;/p&gt;
+    &lt;p&gt;More intriguing is a theory that points to the medieval phenomenon of “dancing mania”, driven by a succession of pandemics and natural disasters. Known as St Vitus’ Dance, the dancing plague is documented surfacing in continental Europe as early as the 11th Century. A form of mass hysteria, the dance could spread from individuals to large groups, all driven by an unshakeable compulsion to dance feverishly, sometimes for weeks, often leaping and singing and sometimes hallucinating to the point of exhaustion and occasionally death, like a top that can’t stop spinning.&lt;/p&gt;
+    &lt;p&gt;And, in fact, one 13th Century outbreak – a literal form of dance fever – occurred south of Hamelin, in the town of Erfurt, where a group of youths were documented as wildly gyrating as they travelled out of town, ending up 20km away in a neighbouring town. Some of the children, one chronicle suggests, expired shortly thereafter, having flat-out danced themselves to death, and those who survived were left with chronic tremors. Perhaps, some theorise, Hamelin witnessed a similar plague, dancing to the figurative tune of the Piper.&lt;/p&gt;
+    &lt;p&gt;But all these theories neglect one specific key to the Hamelin mystery. “They don’t explain the very particular date cited for the loss of the children, and the local sense of trauma,” Reimer noted. “Did something happen that officials had been covering up? Something so traumatic that it was transmitted orally for so long in the town’s collective memory, over decades and even centuries?”&lt;/p&gt;
+    &lt;p&gt;In fact, the date chronicled in all the local documentation pinpoint 26 June as the day the children disappeared. This day is also the date of pagan midsummer celebrations. The fact the documentation also emphasises that the youth followed the Piper to the Koppen, commonly translated as “hills”, suggest another link. “There were regions in Germany where midsummer was celebrated by lighting fires on the hills,” said Reimer. All that leads to one particularly macabre reading of the Pied Piper legend. Perhaps the Piper, emblematic of a pagan shaman, playing his flute, was leading the youth of Hamelin to their midsummer festivities when the local Christian faction, hoping to cement conversion of the region, waylaid and massacred the group. A less bloody theory: maybe the children were spirited away to local monasteries.&lt;/p&gt;
+    &lt;p&gt;If the tale suggests a possible historical tragedy, though, it also offers an artistic redemption as well.&lt;/p&gt;
+    &lt;p&gt;“The Pied Piper story,” said Reimer, preparing for the debut of her exhibit on 26 June, “is to our knowledge known in at least 42 countries and 30 languages, maybe more. And it appears in international art, literature and music. The Pied Piper is a shared heritage of many people, and that cultural heritage connects people.”&lt;/p&gt;
+    &lt;p&gt;Ultimately, then, the Piper didn’t just fracture a community. He also, in the end, brought a larger one together.&lt;/p&gt;
+    &lt;p&gt;Join more than three million BBC Travel fans by liking us on Facebook, or follow us on Twitter and Instagram.&lt;/p&gt;
+    &lt;p&gt;If you liked this story, sign up for the weekly bbc.com features newsletter called "The Essential List". A handpicked selection of stories from BBC Future, Culture, Worklife and Travel, delivered to your inbox every Friday.&lt;/p&gt;
+    &lt;p&gt;{"image":{"pid":""}}&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45822018</guid><pubDate>Wed, 05 Nov 2025 12:13:08 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45822071</guid><pubDate>Wed, 05 Nov 2025 12:21:39 +0000</pubDate></item><item><title>iOS 26.2 to allow third-party app stores in Japan ahead of regulatory deadline</title><link>https://www.macrumors.com/2025/11/05/ios-26-2-third-party-app-stores-japan/</link><description>&lt;doc fingerprint="adccf96d132611dc"&gt;
+  &lt;main&gt;
+    &lt;div&gt;
+      &lt;head rend="h1"&gt;iOS 26.2 to Allow Third-Party App Stores in Japan Ahead of Regulatory Deadline&lt;/head&gt;
+      &lt;div&gt;
+        &lt;div&gt;
+          &lt;p&gt;Apple on Tuesday released the first beta of iOS 26.2 to developers, and it appears that the software will allow users in Japan to install alternative app marketplaces on their devices when it is released to the public in December.&lt;/p&gt;
+          &lt;p&gt;&lt;lb/&gt;According to a post shared on X by @Tzzlala, iPhones running the beta in Japan are able to install alternative app stores like AltStore PAL and Epic Games, and download apps from them, though Fortnite in-app purchases are currently region-blocked by Epic. &lt;/p&gt;
+          &lt;p&gt;Apple only lets iPhone and iPad users based in the EU to install apps using alternative app marketplaces in addition to the App Store. The ability was introduced in iOS 17.4 and iPadOS 18 in order to comply with the Digital Markets Act, and Apple does not currently allow it in any regions outside the 27-member bloc. However, that's set to change. &lt;/p&gt;
+          &lt;p&gt;In June 2024, the Japanese parliament approved and enacted legislation that requires Apple to allow third-party app stores and payment providers on the iPhone. The law seeks to curb the dominance of major tech firms like Apple in the smartphone market.&lt;/p&gt;
+          &lt;p&gt;More recently, in August 2025, the Japan Fair Trade Commission established the Mobile Software Competition Act Guidelines. Under the new guidelines, platform operators like Apple and Google are banned from blocking or restricting the availability of alternative app stores and payment systems on their mobile operating systems. &lt;/p&gt;
+          &lt;p&gt;The guidelines are set to come into effect by December 18, 2025, while Apple is expected to release iOS 26.2 in December, sometime between December 9 and December 16. Epic Games has already announced plans to bring Fortnite and its game store platform to iOS in Japan by late 2025. &lt;/p&gt;
+        &lt;/div&gt;
+      &lt;/div&gt;
+      &lt;head rend="h2"&gt;Popular Stories&lt;/head&gt;
+      &lt;div&gt;
+        &lt;div&gt;
+          &lt;div&gt;
+            &lt;p&gt;Apple is planning to launch at least 15 new products in 2026, according to Bloomberg's Mark Gurman. Gurman outlined what to expect from Apple in 2026 in the latest edition of his "Power On" newsletter. He said the company is heading "into one of its most pivotal years in recent memory," with the rollout of major new Apple Intelligence features, intense regulatory pressure on the App Store,...&lt;/p&gt;
+          &lt;/div&gt;
+        &lt;/div&gt;
+      &lt;/div&gt;
+      &lt;div&gt;
+        &lt;div&gt;
+          &lt;div&gt;
+            &lt;p&gt;In his "Power On" newsletter, Bloomberg's Mark Gurman today provided an update on the status of Apple Intelligence and the plans for it in 2026. Apple is still planning to roll out its revamped version of Siri around March of next year. The release should be accompanied by the release of a new smart home display product with speaker-base and wall-mount options. A new Apple TV and HomePod...&lt;/p&gt;
+          &lt;/div&gt;
+        &lt;/div&gt;
+      &lt;/div&gt;
+      &lt;div&gt;
+        &lt;div&gt;
+          &lt;div&gt;
+            &lt;p&gt;A new Apple TV and HomePod mini could launch as soon as this month, Bloomberg's Mark Gurman today suggested. In today's "Power On" newsletter, Gurman said that Apple retail stores are planning an overnight refresh on the evening of November 11, where changes will be made after closing, such as refreshing displays and placing new products for the following day. The timing of the overnight...&lt;/p&gt;
+          &lt;/div&gt;
+        &lt;/div&gt;
+      &lt;/div&gt;
+      &lt;div&gt;
+        &lt;div&gt;
+          &lt;div&gt;
+            &lt;p&gt;Apple today released iOS 26.1, the first major update to the iOS 26 operating system that came out in September, iOS 26.1 comes over a month after iOS 26 launched. iOS 26.1 is compatible with the iPhone 11 series and later, as well as the second-generation iPhone SE. The new software can be downloaded on eligible iPhones over-the-air by going to Settings &amp;gt; General &amp;gt;...&lt;/p&gt;
+          &lt;/div&gt;
+        &lt;/div&gt;
+      &lt;/div&gt;
+      &lt;div&gt;
+        &lt;div&gt;
+          &lt;div&gt;
+            &lt;p&gt;We're officially in the month of Black Friday, which will take place on Friday, November 28 in 2025. As always, this will be the best time of the year to shop for great deals, including popular Apple products like AirPods, iPad, Apple Watch, and more. In this article, the majority of the discounts will be found on Amazon. Note: MacRumors is an affiliate partner with some of these vendors. When ...&lt;/p&gt;
+          &lt;/div&gt;
+        &lt;/div&gt;
+      &lt;/div&gt;
+      &lt;div&gt;
+        &lt;div&gt;
+          &lt;div&gt;
+            &lt;p&gt;Update: Apple has released iOS 26.1. Following more than a month of beta testing, Apple is expected to release iOS 26.1 this Monday, November 3. The update includes a handful of new features and changes, including the ability to adjust the look of Liquid Glass and more. Below, we outline key details about iOS 26.1. Liquid Glass Toggle iOS 26.1 lets you choose your preferred look for ...&lt;/p&gt;
+          &lt;/div&gt;
+        &lt;/div&gt;
+      &lt;/div&gt;
+      &lt;div&gt;
+        &lt;div&gt;
+          &lt;div&gt;
+            &lt;p&gt;Apple is expected to launch a new foldable iPhone next year, based on multiple rumors and credible sources. The long-awaited device has been rumored for years now, but signs increasingly suggest that 2026 could indeed be the year that Apple releases its first foldable device. Below, we've collated an updated set of key details that have been leaked about Apple's foldable iPhone so far. Ove...&lt;/p&gt;
+          &lt;/div&gt;
+        &lt;/div&gt;
+      &lt;/div&gt;
+      &lt;div&gt;
+        &lt;div&gt;
+          &lt;div&gt;
+            &lt;p&gt;Apple updated the logo and name for its Apple TV streaming service today, and it looks like Apple One might be next. On the revamped Apple TV website, there's a new, more colorful Apple One logo available. The logo features an Apple icon that's split into six slices, and each slice includes the color that Apple uses for one of the services included in Apple One Premium. Apple One is...&lt;/p&gt;
+          &lt;/div&gt;
+        &lt;/div&gt;
+      &lt;/div&gt;
+    &lt;/div&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45822302</guid><pubDate>Wed, 05 Nov 2025 12:51:44 +0000</pubDate></item></channel></rss>
