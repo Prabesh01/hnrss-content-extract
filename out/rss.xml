@@ -1,5 +1,457 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 05 Nov 2025 09:12:28 +0000</lastBuildDate><item><title>Building blobd: single-machine object store with sub-ms reads and 15 GB/s upload</title><link>https://blog.wilsonl.in/blobd/</link><description>&lt;doc fingerprint="a6da511d29868b81"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 05 Nov 2025 09:40:54 +0000</lastBuildDate><item><title>By the Power of Grayscale</title><link>https://zserge.com/posts/grayskull/</link><description>&lt;doc fingerprint="362f87793ff11b93"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;By the power of grayscale!&lt;/head&gt;
+    &lt;p&gt;When people talk about computer vision, they usually think of OpenCV or deep neural networks like YOLO. But in most cases, doing computer vision implies understanding of the core algorithms, so you can use or adapt them for your own needs.&lt;/p&gt;
+    &lt;p&gt;I wanted to see how far I could go by stripping computer vision down to the bare minimum: only grayscale 8-bit images, no fancy data structures, plain old C, some byte arrays and a single header file. After all, an image is just a rectangle of numbers, right?&lt;/p&gt;
+    &lt;p&gt;This post is a guided tour through the algorithms behind Grayskull – a minimal computer vision library designed for resource-constrained devices.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Pixels&lt;/head&gt;
+    &lt;p&gt;A grayscale pixel is normally represented as a single byte, where &lt;code&gt;0&lt;/code&gt; means black, &lt;code&gt;255&lt;/code&gt; means white, and values in between represent various shades of gray.&lt;/p&gt;
+    &lt;p&gt;A grayscale image is essentially a 2D array of these pixels, defined by its width and height, but for a simpler memory layout languages such as C often represent it as a 1D array of size &lt;code&gt;width * height&lt;/code&gt;:&lt;/p&gt;
+    &lt;code&gt;// An image of WxH pixels, stored as a flat array of bytes
+struct gs_image { unsigned w, h; uint8_t *data; };
+
+// Helpers to get/set pixel values respecting the bounds
+uint8_t gs_get(struct gs_image img, unsigned x, unsigned y) {
+  return (x &amp;lt; img.w &amp;amp;&amp;amp; y &amp;lt; img.h) ? img.data[y * img.w + x] : 0;
+}
+void gs_set(struct gs_image img, unsigned x, unsigned y, uint8_t value) {
+  if (x &amp;lt; img.w &amp;amp;&amp;amp; y &amp;lt; img.h) img.data[y * img.w + x] = value;
+}
+
+// A somewhat convenient macro to iterate over all pixels
+#define gs_for(img, x, y)                \
+  for (unsigned y = 0; y &amp;lt; (img).h; y++) \
+    for (unsigned x = 0; x &amp;lt; (img).w; x++)
+&lt;/code&gt;
+    &lt;p&gt;This humble start already allows us to do some tricks like inverting or mirroring images:&lt;/p&gt;
+    &lt;code&gt;// invert image (negative): px[x,y] = 255 - px[x,y]
+gs_for(img, x, y) gs_set(img, x, y, 255 - gs_get(img, x, y));
+
+// mirror the image: swap px[x,y] with px[w-x-1,y]
+gs_for(img, x, y) {
+for (unsigned y = 0; y &amp;lt; img.h; y++) {
+  for (unsigned x = 0; x &amp;lt; img.w/2; x++) { // iterate only through the first half
+    uint8_t tmp = gs_get(img, x, y);
+    gs_set(img, x, y, gs_get(img, img.w - x - 1, y));
+    gs_set(img, img.w - x - 1, y, tmp);
+  }
+}
+&lt;/code&gt;
+    &lt;p&gt;We can just as well copy images, crop images, resize or rotate them. It’s not computer vision yet, but still some basic image processing:&lt;/p&gt;
+    &lt;code&gt;struct gs_rect { unsigned x, y, w, h; }; // for regions of interest (ROI)
+
+// crop image src into dst using region of interest (roi)
+gs_for(roi, x, y) gs_set(dst, x, y, gs_get(src, roi.x + x, roi.y + y));
+
+// downscale 2x: set pixel to average from 4 neighbouring pixels (2x2)
+gs_for(dst, x, y) {
+    unsigned sum = 0;
+    for (unsigned j = 0; j &amp;lt; 2; j++)
+      for (unsigned i = 0; i &amp;lt; 2; i++)
+        sum += gs_get(src, x * 2 + i, y * 2 + j);
+    gs_set(dst, x, y, sum / 4);
+}
+&lt;/code&gt;
+    &lt;p&gt;One can do naïve nearest-neighbour resizing, which is fast but looks blocky, or do bilinear interpolation, which is slower and requires floating point operations, but often looks better:&lt;/p&gt;
+    &lt;code&gt;// Nearest-neighbour resize
+void gs_resize_nn(struct gs_image dst, struct gs_image src) {
+    gs_for(dst, x, y) {
+        unsigned sx = x * src.w / dst.w, sy = y * src.h / dst.h;
+        gs_set(dst, x, y, gs_get(src, sx, sy));
+    }
+}
+
+// Bilinear resize
+GS_API void gs_resize(struct gs_image dst, struct gs_image src) {
+  gs_for(dst, x, y) {
+    float sx = ((float)x + 0.5f) * src.w / dst.w, sy = ((float)y + 0.5f) * src.h / dst.h;
+    sx = GS_MAX(0.0f, GS_MIN(sx, src.w - 1.0f)), sy = GS_MAX(0.0f, GS_MIN(sy, src.h - 1.0f));
+    unsigned sx_int = (unsigned)sx, sy_int = (unsigned)sy;
+    unsigned sx1 = GS_MIN(sx_int + 1, src.w - 1), sy1 = GS_MIN(sy_int + 1, src.h - 1);
+    float dx = sx - sx_int, dy = sy - sy_int;
+    uint8_t c00 = gs_get(src, sx_int, sy_int), c01 = gs_get(src, sx1, sy_int),
+            c10 = gs_get(src, sx_int, sy1), c11 = gs_get(src, sx1, sy1);
+    uint8_t p = (c00 * (1 - dx) * (1 - dy)) + (c01 * dx * (1 - dy)) + (c10 * (1 - dx) * dy) + (c11 * dx * dy);
+    gs_set(dst, x, y, p);
+  }
+}
+&lt;/code&gt;
+    &lt;p&gt;Here’s how the original image (left) looks after bilinear resizing (middle) compared to nearest-neighbour resizing (right).&lt;/p&gt;
+    &lt;head rend="h2"&gt;Image processing&lt;/head&gt;
+    &lt;p&gt;Now that we can manipulate individual pixels, we can start doing more serious image processing.&lt;/p&gt;
+    &lt;p&gt;One useful tool is convolutional filters. A filter is a small 2D array (kernel) that is applied to each pixel in the image. The new pixel value is computed as a weighted sum of the neighbouring pixels, where weights are defined by the kernel.&lt;/p&gt;
+    &lt;code&gt;void gs_filter(struct gs_image dst, struct gs_image src, struct gs_image kernel, unsigned norm) {
+    gs_for(dst, x, y) {
+        int sum = 0;
+        gs_for(kernel, i, j) {
+            sum += gs_get(src, x + i - kernel.w / 2, y + j - kernel.h / 2) * (int8_t)gs_get(kernel, i, j);
+        }
+        gs_set(dst, x, y, sum / norm);
+    }
+}
+&lt;/code&gt;
+    &lt;p&gt;This technique can be used for blurring, sharpening, edge detection and many other effects. Here are some common kernels. Note that they are defined as signed 8-bit integers:&lt;/p&gt;
+    &lt;code&gt;// box blur 3x3, all pixels have equal weight
+struct gs_image gs_blur_box = {3, 3, (uint8_t *)(int8_t[]){1, 1, 1, 1, 1, 1, 1, 1, 1}};
+// gaussian blur 3x3, central pixels have more weight
+struct gs_image gs_blur_gaussian = {3, 3, (uint8_t *)(int8_t[]){1, 2, 1, 2, 4, 2, 1, 2, 1}};
+// sharpen, enhance edges
+struct gs_image gs_sharpen = {3, 3, (uint8_t *)(int8_t[]){0, -1, 0, -1, 5, -1, 0, -1, 0}};
+// emboss, make image look "3D"
+struct gs_image gs_emboss = {3, 3, (uint8_t *)(int8_t[]){-2, -1, 0, -1, 1, 1, 0, 1, 2}};
+&lt;/code&gt;
+    &lt;p&gt;Similarly, we can apply Sobel filters, that are useful if we want to detect edges in the image:&lt;/p&gt;
+    &lt;code&gt;struct gs_image gs_sobel_x = {3, 3, (uint8_t *)(int8_t[]){-1, 0, 1, -2, 0, 2, -1, 0, 1}};
+struct gs_image gs_sobel_y = {3, 3, (uint8_t *)(int8_t[]){1, 2, 1, 0, 0, 0, -1, -2, -1}};
+
+void gs_sobel(struct gs_image dst, struct gs_image src) {
+    struct gs_image gx = {src.w, src.h, malloc(src.w * src.h)};
+    struct gs_image gy = {src.w, src.h, malloc(src.w * src.h)};
+    gs_filter(gx, src, gs_sobel_x, 1);
+    gs_filter(gy, src, gs_sobel_y, 1);
+    gs_for(dst, x, y) {
+        int mag = sqrt(gs_get(gx, x, y) * gs_get(gx, x, y) + gs_get(gy, x, y) * gs_get(gy, x, y));
+        gs_set(dst, x, y, GS_MIN(mag, 255));
+    }
+    free(gx.data);
+    free(gy.data);
+}
+&lt;/code&gt;
+    &lt;p&gt;Here are some examples of these filters, notice how some of them remove the noise or enhance the edges:&lt;/p&gt;
+    &lt;p&gt;The first image is the original, followed by box filter and Gaussian blur filter. Next is the sharpen filter, then emboss filter and finally Sobel filter that highlights edges.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Thresholding&lt;/head&gt;
+    &lt;p&gt;To actually “see” objects in an image, we need to segment it into foreground and background, and then operate on the foreground segments, trying to locate objects of interest.&lt;/p&gt;
+    &lt;p&gt;This is much easier done when an image is binary, so that each pixel is either fully black or fully white. This conversion from grayscale to black-and-white is called thresholding.&lt;/p&gt;
+    &lt;p&gt;In the simplest case we may consider any pixel above 127 white, and below – black. This is fixed-level thresholding. Of course, in darker environments this thresholding value could be too high and many meaningful details would be lost. So how to pick a threshold value more accurately?&lt;/p&gt;
+    &lt;code&gt;// apply fixed threshold value and binarise the image
+GS_API void gs_threshold(struct gs_image img, uint8_t thresh) {
+  for (unsigned i = 0; i &amp;lt; img.w * img.h; i++) img.data[i] = (img.data[i] &amp;gt; thresh) ? 255 : 0;
+}
+&lt;/code&gt;
+    &lt;p&gt;One approach would be to calculate the brightness distribution as a histogram. We know that there are 255 unique values of pixels in a grayscale image, so we iterate through all pixels and count how many of them have this or that value. Analysing the resulting histogram could give us some clue about which pixel value would work best as a threshold for the particular image.&lt;/p&gt;
+    &lt;p&gt;A clever way to do this is with Otsu’s method. It automatically determines the optimal threshold by testing every possible value (from 0 to 255). For each value, it splits the image’s pixels into two classes—background and foreground—and calculates their “inter-class variance.” The threshold that maximizes this variance is the one that creates the best separation between the two classes, making it the ideal choice. It works fiarly well on images with good contrast:&lt;/p&gt;
+    &lt;code&gt;// try to find the best threshold to separate "foreground" from "background"
+uint8_t gs_otsu_threshold(struct gs_image img) {
+  unsigned hist[256] = {0}, wb = 0, wf = 0, threshold = 0;
+  // calculate how many pixels of each brightness value we have
+  for (unsigned i = 0; i &amp;lt; img.w * img.h; i++) hist[img.data[i]]++;
+  float sum = 0, sumB = 0, varMax = -1.0;
+  for (unsigned i = 0; i &amp;lt; 256; i++) sum += (float)i * hist[i];
+  // try to find the threshold that maximises inter-class variance
+  for (unsigned t = 0; t &amp;lt; 256; t++) {
+    wb += hist[t];
+    if (wb == 0) continue;
+    wf = (img.w * img.h) - wb;
+    if (wf == 0) break;
+    sumB += (float)t * hist[t];
+    float mB = (float)sumB / wb;
+    float mF = (float)(sum - sumB) / wf;
+    float varBetween = (float)wb * (float)wf * (mB - mF) * (mB - mF);
+    if (varBetween &amp;gt; varMax) varMax = varBetween, threshold = t;
+  }
+  return threshold;
+}
+&lt;/code&gt;
+    &lt;p&gt;In real life, however, the lighting conditions are often uneven. In such cases a single global threshold may not work well, and neither of the possible 255 threshold values would give a good result.&lt;/p&gt;
+    &lt;p&gt;To address this, we can use adaptive thresholding. Instead of using a single threshold for the entire image, we compute a local threshold for each pixel based on the average brightness of its neighbouring pixels. This way, we can better handle varying lighting conditions across the image:&lt;/p&gt;
+    &lt;code&gt;gs_for(src, x, y) {
+  unsigned sum = 0, count = 0;
+  for (int dy = -radius; dy &amp;lt;= (int)radius; dy++) {
+    for (int dx = -radius; dx &amp;lt;= (int)radius; dx++) {
+      int sy = (int)y + dy, sx = (int)x + dx;
+      if (sy &amp;gt;= 0 &amp;amp;&amp;amp; sy &amp;lt; (int)src.h &amp;amp;&amp;amp; sx &amp;gt;= 0 &amp;amp;&amp;amp; sx &amp;lt; (int)src.w) {
+        sum += gs_get(src, sx, sy);
+        count++;
+      }
+    }
+  }
+  int threshold = sum / count - c;
+  gs_set(dst, x, y, (gs_get(src, x, y) &amp;gt; threshold) ? 255 : 0);
+}
+&lt;/code&gt;
+    &lt;p&gt;Compare how various thresholding approaches work on the same image:&lt;/p&gt;
+    &lt;p&gt;The first image is the original, followed by fixed-level thresholding (80), then Otsu’s method and adaptive thresholding. Notice how adaptive thresholding preserves more details in both bright and dark areas of the image, while Otsu’s method struggles with uneven lighting.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Morphological operations&lt;/head&gt;
+    &lt;p&gt;Due to the way how image sensors work in cameras, images often contain noise.&lt;/p&gt;
+    &lt;p&gt;This means that after thresholding there would be random individual pixels that do not belong to any object, or small holes in objects, or small gaps between object parts. All of this will confuse the object detection algorithms, but morphological operations can help to clean up the binary image.&lt;/p&gt;
+    &lt;p&gt;Two most common operations are erosion and dilation. Erosion removes pixels on object boundaries (shrinking the objects), while dilation adds pixels to their boundaries (expanding the objects).&lt;/p&gt;
+    &lt;p&gt;There is also opening (erosion followed by dilation) and closing (dilation followed by erosion). Opening is useful for removing small objects or noise, while closing is useful for filling small holes in objects.&lt;/p&gt;
+    &lt;code&gt;void gs_erode(struct gs_image dst, struct gs_image src, unsigned radius) {
+  gs_for(dst, x, y) {
+    uint8_t min_val = 255;
+    for (int dy = -radius; dy &amp;lt;= (int)radius; dy++) {
+      for (int dx = -radius; dx &amp;lt;= (int)radius; dx++) {
+        int sy = (int)y + dy, sx = (int)x + dx;
+        if (sy &amp;gt;= 0 &amp;amp;&amp;amp; sy &amp;lt; (int)src.h &amp;amp;&amp;amp; sx &amp;gt;= 0 &amp;amp;&amp;amp; sx &amp;lt; (int)src.w) {
+          uint8_t val = gs_get(src, sx, sy);
+          if (val &amp;lt; min_val) min_val = val;
+        }
+      }
+    }
+    gs_set(dst, x, y, min_val);
+  }
+}
+void gs_dilate(struct gs_image dst, struct gs_image src, unsigned radius) {
+  gs_for(dst, x, y) {
+    uint8_t max_val = 0;
+    for (int dy = -radius; dy &amp;lt;= (int)radius; dy++) {
+      for (int dx = -radius; dx &amp;lt;= (int)radius; dx++) {
+        int sy = (int)y + dy, sx = (int)x + dx;
+        if (sy &amp;gt;= 0 &amp;amp;&amp;amp; sy &amp;lt; (int)src.h &amp;amp;&amp;amp; sx &amp;gt;= 0 &amp;amp;&amp;amp; sx &amp;lt; (int)src.w) {
+          uint8_t val = gs_get(src, sx, sy);
+          if (val &amp;gt; max_val) max_val = val;
+        }
+      }
+    }
+    gs_set(dst, x, y, max_val);
+  }
+}
+&lt;/code&gt;
+    &lt;p&gt;Here’s how morphological operations can clean up a rather confusing image with ArUco markers:&lt;/p&gt;
+    &lt;p&gt;The first image is the original, followed by thresholded image (Otsu). Next we do erosion followed by dilation. Since the markers are black it might sound odd, but since morpological operations work on white pixels we essentially perform closing, but for black pixels. We could also invert the image first, then do opening and invert back.&lt;/p&gt;
+    &lt;p&gt;At the end all markers are shrinked to their original dimensions and all of them are easily detectable by shape and size.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Blobs and contours&lt;/head&gt;
+    &lt;p&gt;Once we have a clean binary image, we can start detecting objects in it. A classic way to do this is by finding connected components (blobs).&lt;/p&gt;
+    &lt;p&gt;A “blob” is a group of connected white pixels (255) that form an object. The simplest way to find blobs is by using a flood-fill algorithm or depth-first search (DFS) to label connected pixels:&lt;/p&gt;
+    &lt;code&gt;void gs_flood_fill(struct gs_image img, unsigned x, unsigned y, uint8_t target, uint8_t replacement) {
+  if (x &amp;gt;= img.w || y &amp;gt;= img.h) return;
+  if (gs_get(img, x, y) != target || gs_get(img, x, y) == replacement) return;
+  gs_set(img, x, y, replacement);
+  gs_flood_fill(img, x + 1, y, target, replacement);
+  gs_flood_fill(img, x - 1, y, target, replacement);
+  gs_flood_fill(img, x, y + 1, target, replacement);
+  gs_flood_fill(img, x, y - 1, target, replacement);
+}
+&lt;/code&gt;
+    &lt;p&gt;Of course this would immediately blow up your stack on most real-life images. So an iterative approach using a queue or stack is preferred.&lt;/p&gt;
+    &lt;p&gt;However, it’s still a fairly suboptimal way to find blobs. A more efficient approach is a two-pass algorithm, which scans the image twice: first to assign “provisional” labels and record equivalences between them, followed by the second scan to resolve these equivalences and assign final unique labels to every blob.&lt;/p&gt;
+    &lt;p&gt;It would be nice if we could use the same &lt;code&gt;gs_image&lt;/code&gt; type for labels, but in most cases it would require more than 256 labels (especially for temporary provisional labels). So we need a separate array of larger integers to store labels:&lt;/p&gt;
+    &lt;code&gt;typedef uint16_t gs_label; // 64K should be enough, right?
+
+struct gs_blob {
+  gs_label label; // what label the blob has?
+  unsigned area; // how many white pixels are in a blob?
+  struct gs_rect box; // bounding box
+  struct gs_point centroid; // center of "mass"
+};
+unsigned gs_blobs(struct gs_image img, gs_label *labels, struct gs_blob *blobs, unsigned nblobs) { ... }
+&lt;/code&gt;
+    &lt;p&gt;Before we go futher, let’s talk about connectivity. There are two common types of pixel connectivity: 4-connectivity and 8-connectivity. In 4-connectivity, a pixel is connected to its four direct neighbours (up, down, left, right). In 8-connectivity, a pixel is connected to all eight surrounding pixels (including diagonals). So, in case of 8-connectivity this would be one blob and in case of 4-connectivity - two separate blobs:&lt;/p&gt;
+    &lt;code&gt;......
+.#..#.
+.##.#.
+.###..
+......
+&lt;/code&gt;
+    &lt;p&gt;We will be using 4-connectivity in our implementation, for simplicity. Let’s consider the following image:&lt;/p&gt;
+    &lt;code&gt;.........
+.###..#..
+.###.##..
+.#####..#
+.......##
+&lt;/code&gt;
+    &lt;p&gt;We start scanning it row after row, if a white pixel is found, we check its left and top neighbours:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;If both are black (0), we assign a new label to the pixel, assuming that it could be a new blob.&lt;/item&gt;
+      &lt;item&gt;If one of them is white, we assign its label to the current pixel, as it is a continuation of the existing known blob.&lt;/item&gt;
+      &lt;item&gt;If both are white but have different labels, we assign the smallest of the labels to the current pixel and record the equivalence between the two labels in a special data structure (like a union-find).&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;After this first pass the labels array would look like this:&lt;/p&gt;
+    &lt;code&gt;.........
+.111..2..
+.111.32..
+.11111..4
+.......55
+&lt;/code&gt;
+    &lt;p&gt;Our equivalence table would look like this: &lt;code&gt;1 &amp;lt;-&amp;gt; 3, 3 &amp;lt;-&amp;gt; 2, 4 &amp;lt;-&amp;gt; 5&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;During the second pass we resolve the equivalences and assign final labels to each pixel. The final labels array would look like this:&lt;/p&gt;
+    &lt;code&gt;.........
+.111..1..
+.111.11..
+.11111..4
+.......44
+&lt;/code&gt;
+    &lt;p&gt;During the second pass we can also calculate blob properties, such as area, bounding box and centroid. Largest blob’s area is 14 pixels, bounding box is from (1,1) to (6,3). Centroid is calculated as the average of all pixel coordinates in the blob, in our case for X it would be &lt;code&gt;(3*1+3*2+3*3+4+2*5+2*6)/14&lt;/code&gt;, or rounded to 4. Y coordinate would be &lt;code&gt;(4*1+5*2+5*3)/14&lt;/code&gt;, or rounded to 2. So the centroid is (4,2), which is not part of the blob “body”, but still is the center of mass.&lt;/p&gt;
+    &lt;p&gt;Such geometric properties already give us plenty of information about blobs. For example, we can filter blobs by area to remove small noise blobs. We can also calculate aspect ratio (width/height) of the bounding box to filter out very tall or very wide blobs. Ratio between blob actual area and bounding box area helps to filter out blobs that are not compact enough. Rectangles tend to have a ratio of &lt;code&gt;1.0&lt;/code&gt;, circles are &lt;code&gt;pi/4 = 0.785&lt;/code&gt;, while lines approach to zero.&lt;/p&gt;
+    &lt;p&gt;Another clues could be centroid position, orientation using moments or contour shape. There is a fairly simple method to trace a contour of a blob using the Moore-Neighbor tracing algorithm. It starts from a known border pixel and follows the contour clockwise by checking neighbouring pixels, until it returns to the starting pixel:&lt;/p&gt;
+    &lt;code&gt;struct gs_contour { struct gs_rect box; struct gs_point start; unsigned length; };
+void gs_trace_contour(struct gs_image img, struct gs_image visited, struct gs_contour *c) {
+  static const int dx[] = {1, 1, 0, -1, -1, -1, 0, 1};
+  static const int dy[] = {0, 1, 1, 1, 0, -1, -1, -1};
+  c-&amp;gt;length = 0;
+  c-&amp;gt;box = (struct gs_rect){c-&amp;gt;start.x, c-&amp;gt;start.y, 1, 1};
+  struct gs_point p = c-&amp;gt;start;
+  unsigned dir = 7, seenstart = 0;
+  for (;;) {
+    if (!visited.data[p.y * visited.w + p.x]) c-&amp;gt;length++;
+    visited.data[p.y * visited.w + p.x] = 255;
+    int ndir = (dir + 1) % 8, found = 0;
+    for (int i = 0; i &amp;lt; 8; i++) {
+      int d = (ndir + i) % 8, nx = p.x + dx[d], ny = p.y + dy[d];
+      if (nx &amp;gt;= 0 &amp;amp;&amp;amp; nx &amp;lt; (int)img.w &amp;amp;&amp;amp; ny &amp;gt;= 0 &amp;amp;&amp;amp; ny &amp;lt; (int)img.h &amp;amp;&amp;amp;
+          img.data[ny * img.w + nx] &amp;gt; 128) {
+        p = (struct gs_point){nx, ny};
+        dir = (d + 6) % 8;
+        found = 1;
+        break;
+      }
+    }
+    if (!found) break;  // open contour
+    c-&amp;gt;box.x = GS_MIN(c-&amp;gt;box.x, p.x);
+    c-&amp;gt;box.y = GS_MIN(c-&amp;gt;box.y, p.y);
+    c-&amp;gt;box.w = GS_MAX(c-&amp;gt;box.w, p.x - c-&amp;gt;box.x + 1);
+    c-&amp;gt;box.h = GS_MAX(c-&amp;gt;box.h, p.y - c-&amp;gt;box.y + 1);
+    if (p.x == c-&amp;gt;start.x &amp;amp;&amp;amp; p.y == c-&amp;gt;start.y) {
+      if (seenstart) break;
+      seenstart = 1;
+    }
+  }
+}
+&lt;/code&gt;
+    &lt;p&gt;This way we can extract contours for each blob and analyse their shapes or compare contour length (perimeter) to the blob area. It is also possible to approximate contours with straight lines using Douglas-Peucker algirithm, which replaces a curve with a series of straight line segments, while preserving the overall shape.&lt;/p&gt;
+    &lt;p&gt;All of this is good if we want to detect simple objects in a static image. But what if we want to detect or track more complex objects, like faces, cars or pedestrians?&lt;/p&gt;
+    &lt;head rend="h2"&gt;Keypoints and descriptors&lt;/head&gt;
+    &lt;p&gt;A keypoint is a specific location in an image that is distinctive and can be reliably detected no matter what scale, rotation or lighting of the object are.&lt;/p&gt;
+    &lt;p&gt;In practice, keypoints are often corners (also known as “features”). One of the most intuitive algorithms to detect features is FAST (Features from Accelerated Segment Test). It works by examining a circle of 16 pixels around a candidate pixel (4 pixels away from it). If at least 9 of contiguous pixels in this &lt;code&gt;r=4px&lt;/code&gt; circle around pixel &lt;code&gt;P&lt;/code&gt; are all brighter or all darker - then the candidate pixel is considered a corner:&lt;/p&gt;
+    &lt;code&gt;..............
+......012.....
+.....F...3....
+....E.....4...
+....D..P..5...
+....C.....6...
+.....B...7....
+......A98.....
+..............
+&lt;/code&gt;
+    &lt;p&gt;As simple as it gets, this approach finds too many features in real-life images. A solution is to keep “score” of each feature and only keep the points with the highest score. The score can be calculated as the sum of absolute differences between the candidate pixel and the contiguous pixels in the circle, or by the minimum difference between central pixel and the pixels on the circle.&lt;/p&gt;
+    &lt;code&gt;  gs_assert(gs_valid(img) &amp;amp;&amp;amp; kps &amp;amp;&amp;amp; nkps &amp;gt; 0);
+  static const int dx[16] = {0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1};
+  static const int dy[16] = {-3, -3, -2, -1, 0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3};
+  unsigned n = 0;
+  // first pass: compute score map
+  for (unsigned y = 3; y &amp;lt; img.h - 3; y++) {
+    for (unsigned x = 3; x &amp;lt; img.w - 3; x++) {
+      uint8_t p = img.data[y * img.w + x];
+      int run = 0, score = 0;
+      for (int i = 0; i &amp;lt; 16 + 9; i++) {
+        int idx = (i % 16);
+        uint8_t v = img.data[(y + dy[idx]) * img.w + (x + dx[idx])];
+        if (v &amp;gt; p + threshold) {
+          run = (run &amp;gt; 0) ? run + 1 : 1;
+        } else if (v &amp;lt; p - threshold) {
+          run = (run &amp;lt; 0) ? run - 1 : -1;
+        } else {
+          run = 0;
+        }
+        if (run &amp;gt;= 9 || run &amp;lt;= -9) {
+          score = 255;
+          for (int j = 0; j &amp;lt; 16; j++) {
+            int d = gs_get(img, x + dx[j], y + dy[j]) - p;
+            if (d &amp;lt; 0) d = -d;
+            if (d &amp;lt; score) score = d;
+          }
+          break;
+        }
+      }
+      scoremap.data[y * img.w + x] = score;
+    }
+  }
+  // second pass: non-maximum suppression
+  for (unsigned y = 3; y &amp;lt; img.h - 3; y++) {
+    for (unsigned x = 3; x &amp;lt; img.w - 3; x++) {
+      int s = scoremap.data[y * img.w + x], is_max = 1;
+      if (s == 0) continue;
+      for (int yy = -1; yy &amp;lt;= 1 &amp;amp;&amp;amp; is_max; yy++) {
+        for (int xx = -1; xx &amp;lt;= 1; xx++) {
+          if (xx == 0 &amp;amp;&amp;amp; yy == 0) continue;
+          if (scoremap.data[(y + yy) * img.w + (x + xx)] &amp;gt; s) {
+            is_max = 0;
+            break;
+          }
+        }
+      }
+      if (is_max &amp;amp;&amp;amp; n &amp;lt; nkps) kps[n++] = (struct gs_keypoint){{x, y}, (unsigned)s, 0, {0}};
+    }
+  }
+  return n;
+}
+&lt;/code&gt;
+    &lt;p&gt;Notice how keypoints are detected on corners and distinctive features of the cat image, such as eyes, nose, whiskers and other “meaningful” corners. But how to use keypoints to detect objects?&lt;/p&gt;
+    &lt;p&gt;This is where ORB enters the stage. ORB builds on top of the same FAST corner detector, it tries to find sharp intensity changes, but also adds two more components: orientation and descriptor.&lt;/p&gt;
+    &lt;p&gt;Once the corners are found, ORB estimates their orientation by calculating image moments in a small patch around each keypoint. This way, each keypoint gets an angle, basically saying which way is “up” for this keypoint.&lt;/p&gt;
+    &lt;p&gt;Then comes the descriptor. A descriptor is a compact representation of the local image patch around the keypoint, designed to be invariant to scale and rotation. ORB uses a modified version of BRIEF (Binary Robust Independent Elementary Features) descriptor, which is a clever way to encode image patch as a small bit string.&lt;/p&gt;
+    &lt;p&gt;It simply compares bit intensities, if one pixel is lighter than another, it sets the corresponding bit to &lt;code&gt;1&lt;/code&gt;, otherwise to &lt;code&gt;0&lt;/code&gt;. By performing multiple such comparisons, we can create a binary string that represents the local image patch.&lt;/p&gt;
+    &lt;p&gt;The descriptor is 256 bit long, and for each of the 256 “samples” we pick two sampling points within the patch area using some pseudo-random lookup table and encode the following bit as 0 or 1 depending on the pixel relative values.&lt;/p&gt;
+    &lt;p&gt;Comparing keypoints becomes trivial, we simply XOR two bitstrings and count the bits.&lt;/p&gt;
+    &lt;p&gt;Since keypoints are agnostic to rotation and lighting conditions, we can use them to detect objects in various scenarios.&lt;/p&gt;
+    &lt;p&gt;One last addition to this algorithm is to resize/scale the image multiple times and detect keypoints at different scales. This way we can detect objects that are closer or further away from the camera, rotated at any angle, or partially occluded.&lt;/p&gt;
+    &lt;head rend="h2"&gt;LBP Cascades&lt;/head&gt;
+    &lt;p&gt;While keypoints and descriptors are great for detecting arbitrary objects, sometimes we need a more specialised approach for specific object types, like faces, vehicles, or hand gestures. This is where cascade classifiers, famously used in the Viola-Jones object detection framework, come into play.&lt;/p&gt;
+    &lt;p&gt;Instead of complex Haar-like features used by Viola and Jones, we can use something simpler: Local Binary Patterns (LBP). LBP is a powerful texture descriptor. For each pixel, it looks at its 8 neighbours. If a neighbour is brighter than the central pixel, we write a ‘1’, otherwise a ‘0’. This gives us an 8-bit number that describes the local texture.&lt;/p&gt;
+    &lt;p&gt;The “cascade” is a series of simple classifiers, or “stages”. Each stage looks at a sub-window of the image and uses a few LBP features to decide if that window could possibly contain the object of interest (e.g., a face).&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;If the sub-window fails the test at any stage, it’s immediately rejected. This is very fast.&lt;/item&gt;
+      &lt;item&gt;Only if a sub-window passes all stages is it classified as a positive detection.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;This structure allows the classifier to quickly discard the vast majority of the image, focusing computational power only on promising regions. By sliding this detection window across the entire image (and across multiple scales), we can find objects of a specific, pre-trained class. Grayskull provides a pre-trained frontal face detector that uses this exact technique.&lt;/p&gt;
+    &lt;p&gt;Here you can see the LBP cascade classifier in action, successfully detecting Sir Gary Oldman in all variety of his faces. The picture on the left uses minimum number of neighbours set to 4, while the right one uses 14. This means the left image detects more faces, but also has more false positives, while the right one is more conservative and only detect camera-facing images with no visual obstructions.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Conclusion&lt;/head&gt;
+    &lt;p&gt;We’ve taken a journey from the humble pixel to sophisticated object detection, all using simple C structures and fundamental algorithms. We tried to manipulate pixels, apply filters to enhance images, segment objects using thresholding, and clean them up. We then learned to find and analyze blobs, detect robust keypoints with FAST and ORB, and finally, use LBP cascades for specialized object detection.&lt;/p&gt;
+    &lt;p&gt;This is the core philosophy of Grayskull: to demystify computer vision by providing a minimal, dependency-free, and understandable toolkit. It proves that you don’t always need massive libraries or deep learning frameworks to achieve decent results, especially on resource-constrained systems.&lt;/p&gt;
+    &lt;p&gt;An image is indeed just a rectangle of numbers, and with a bit of algorithmic knowledge, you have the power to make it see. As always, I encourage you to check out the repository, experiment with the code, and maybe even try building your own simple CV project!&lt;/p&gt;
+    &lt;p&gt;I hope you’ve enjoyed this article. You can follow – and contribute to – on Github, Mastodon, Twitter or subscribe via rss.&lt;/p&gt;
+    &lt;p&gt;Oct 26, 2025&lt;/p&gt;
+    &lt;p&gt;See also: Étude in C minor and more.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45771151</guid><pubDate>Fri, 31 Oct 2025 12:11:03 +0000</pubDate></item><item><title>Intervaltree with Rust Back End</title><link>https://github.com/Athe-kunal/intervaltree_rs</link><description>&lt;doc fingerprint="1a5b32fdd0e4e110"&gt;
+  &lt;main&gt;
+    &lt;p&gt;This crate exposes an interval tree implementation written in Rust to Python via PyO3. The Python wrapper provides the ability to build a tree from tuples, insert additional intervals, search for overlaps, and delete intervals by their &lt;code&gt;(left, right)&lt;/code&gt; key.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Rust toolchain (for compiling the extension module)&lt;/item&gt;
+      &lt;item&gt;Python 3.8+&lt;/item&gt;
+      &lt;item&gt;maturin for building/installing the package&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;code&gt;python -m venv .venv
+source .venv/bin/activate
+pip install maturin
+maturin develop&lt;/code&gt;
+    &lt;p&gt;You can install the package with (also with uv)&lt;/p&gt;
+    &lt;code&gt;pip install intervaltree_rs
+&lt;/code&gt;
+    &lt;p&gt;&lt;code&gt;maturin develop&lt;/code&gt; builds the extension module in-place and installs it into the active virtual environment, making it importable as &lt;code&gt;intervaltree_rs&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;Once installed, you can use the interval tree directly from Python:&lt;/p&gt;
+    &lt;code&gt;from intervaltree_rs import IntervalTree
+
+# Build a tree from tuples: (left, right, payload)
+intervals = [
+    (5, 10, "a"),
+    (12, 18, "b"),
+    (1, 4, "c"),
+]
+tree = IntervalTree.from_tuples(intervals)
+
+# Insert another interval
+tree.insert((8, 11, "d"))
+
+# Search for overlaps. Inclusive bounds are enabled by default.
+hits = tree.search(9, 10)
+for left, right, value in hits:
+    print(left, right, value)
+
+# Delete by the interval key
+removed = tree.delete((12, 18))
+print("Removed:", removed)&lt;/code&gt;
+    &lt;p&gt;&lt;code&gt;IntervalTree.search(ql, qr, inclusive=True)&lt;/code&gt; accepts an &lt;code&gt;inclusive&lt;/code&gt; flag. Set it to &lt;code&gt;False&lt;/code&gt; to perform exclusive range queries.&lt;/p&gt;
+    &lt;p&gt;To build a wheel that you can distribute or upload to PyPI, run:&lt;/p&gt;
+    &lt;code&gt;maturin build --release&lt;/code&gt;
+    &lt;p&gt;The built wheels will be placed under &lt;code&gt;target/wheels/&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;The Python bindings are covered by Rust unit tests. Run them with:&lt;/p&gt;
+    &lt;code&gt;cargo test&lt;/code&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45788385</guid><pubDate>Sun, 02 Nov 2025 07:04:59 +0000</pubDate></item><item><title>Building blobd: single-machine object store with sub-ms reads and 15 GB/s upload</title><link>https://blog.wilsonl.in/blobd/</link><description>&lt;doc fingerprint="a6da511d29868b81"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Building blobd: single-machine object store with sub-millisecond reads and 15 GB/s uploads&lt;/head&gt;
     &lt;p&gt;For a past content platform, I used S3 for serving user content videos and documents, where there were lots of small range requests for streaming and seeking. Despite serving from same-region datacenters 2 ms from the user, S3 would take 30-200 ms to respond to each request. Even slight delays when jumping around quickly felt grating, and in UX every millisecond counts.&lt;/p&gt;
@@ -726,12 +1178,7 @@ sysctl -w net.ipv4.ip_local_port_range="10000 65535"
     &lt;p&gt;You can check out the open source code and usage instructions on the GitHub repo. Feel free to raise issues, ask questions and start discussions about blobd there! I'm especially interested in ideas or considerations to use blobd in projects, how the performance can benefit, and any limitations around using it.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45809644</guid><pubDate>Tue, 04 Nov 2025 11:09:24 +0000</pubDate></item><item><title>Show HN: A CSS-Only Terrain Generator</title><link>https://terra.layoutit.com</link><description>&lt;doc fingerprint="109996e321a537ae"&gt;
-  &lt;main&gt;
-    &lt;p&gt;CSS Terrain Generator Regenerate Restart Undo Redo Import Export Heightmap CSS VOX TXT PNG Copy Embed Open Codepen Download Code move raise lower about world size ✕ ✕ landmass coverage small medium large terrain type pampas hilly alpinist biome temperate arctic desert camera settings rotate x 45° tilt y 60° zoom 50% pan x 0px lift y 0px animate reset to defaults minimap heightmap matrix v0.0.1 Regenerate&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45811093</guid><pubDate>Tue, 04 Nov 2025 13:58:35 +0000</pubDate></item><item><title>This week in 1988, Robert Morris unleashed his eponymous worm</title><link>https://www.tomshardware.com/tech-industry/cyber-security/on-this-day-in-1988-the-morris-worm-slithered-out-and-sparked-a-new-era-in-cybersecurity-10-percent-of-the-internet-was-infected-within-24-hours</link><description>&lt;doc fingerprint="ff40223f0be08a6f"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45809644</guid><pubDate>Tue, 04 Nov 2025 11:09:24 +0000</pubDate></item><item><title>This week in 1988, Robert Morris unleashed his eponymous worm</title><link>https://www.tomshardware.com/tech-industry/cyber-security/on-this-day-in-1988-the-morris-worm-slithered-out-and-sparked-a-new-era-in-cybersecurity-10-percent-of-the-internet-was-infected-within-24-hours</link><description>&lt;doc fingerprint="ff40223f0be08a6f"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;37 years ago this week, the Morris worm infected 10% of the Internet within 24 hours — worm slithered out and sparked a new era in cybersecurity&lt;/head&gt;
     &lt;p&gt;The Internet contracted worms a year before the World Wide Web was even a thing.&lt;/p&gt;
@@ -1195,91 +1642,7 @@ select count(*) from parquet_table;
     &lt;p&gt;One-hot encoding for categorical variables proj_a, proj_b, funder and quarter.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45813310</guid><pubDate>Tue, 04 Nov 2025 17:07:47 +0000</pubDate></item><item><title>NoLongerEvil-Thermostat – Nest Generation 1 and 2 Firmware</title><link>https://github.com/codykociemba/NoLongerEvil-Thermostat</link><description>&lt;doc fingerprint="1eabf0080969b3e8"&gt;
-  &lt;main&gt;
-    &lt;quote&gt;&lt;g-emoji&gt;⚠️&lt;/g-emoji&gt;WARNING: EXPERIMENTAL SOFTWARE&lt;p&gt;This project is currently in the experimental/testing phase. Do NOT use this firmware on any thermostat that is critical for your heating or cooling needs. Flashing this firmware may brick your device or cause unexpected behavior. Only proceed if you have a backup thermostat or can afford to have your device non-functional during testing.&lt;/p&gt;&lt;/quote&gt;
-    &lt;p&gt;This directory contains the tools and firmware needed to flash custom firmware to Nest Thermostat devices using the OMAP DFU (Device Firmware Update) interface.&lt;/p&gt;
-    &lt;p&gt;This firmware loader uses the OMAP bootloader interface to flash custom bootloader and kernel images to Nest Thermostat devices. The device must be put into DFU mode to accept new firmware.&lt;/p&gt;
-    &lt;p&gt;Important: After flashing this firmware, your device will no longer contact Nest/Google servers. It will operate independently and connect to the NoLongerEvil platform instead, giving you complete control over your thermostat.&lt;/p&gt;
-    &lt;p&gt;The custom firmware flashes the device with modified bootloader and kernel components that redirect all network traffic from the original Nest/Google servers to a server we specify. This server hosts a reverse-engineered replica of their API, allowing the thermostat to function independently while giving you complete control over your device data and settings.&lt;/p&gt;
-    &lt;p&gt;By intercepting the communication layer, the thermostat believes it's communicating with the official Nest infrastructure, but instead connects to the NoLongerEvil platform. This approach ensures full compatibility with the device's existing software while breaking free from Google's cloud dependency.&lt;/p&gt;
-    &lt;code&gt;git clone --recurse-submodules https://github.com/codykociemba/NoLongerEvil-Thermostat.git
-cd NoLongerEvil-Thermostat&lt;/code&gt;
-    &lt;p&gt;Before building, you'll need to install some required packages:&lt;/p&gt;
-    &lt;code&gt;sudo apt-get update
-sudo apt-get install build-essential libusb-1.0-0-dev gcc pkg-config&lt;/code&gt;
-    &lt;p&gt;First, install Xcode Command Line Tools:&lt;/p&gt;
-    &lt;code&gt;xcode-select --install&lt;/code&gt;
-    &lt;p&gt;Then install libusb using Homebrew (the build script will attempt to install this automatically if missing):&lt;/p&gt;
-    &lt;code&gt;# Install Homebrew if you don't have it
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-# Install libusb
-brew install libusb&lt;/code&gt;
-    &lt;code&gt;chmod +x build.sh
-./build.sh&lt;/code&gt;
-    &lt;p&gt;The build script will automatically detect your operating system (Linux, macOS, or Windows) and build the appropriate binary.&lt;/p&gt;
-    &lt;p&gt;IMPORTANT: You must start the installer script BEFORE rebooting the device.&lt;/p&gt;
-    &lt;code&gt;chmod +x install.sh
-./install.sh&lt;/code&gt;
-    &lt;code&gt;chmod +x install.sh
-./install.sh&lt;/code&gt;
-    &lt;p&gt;Note for macOS: You may need to grant USB permissions. If you encounter permission issues, check System Preferences → Security &amp;amp; Privacy.&lt;/p&gt;
-    &lt;p&gt;The script will wait for the device to enter DFU mode.&lt;/p&gt;
-    &lt;p&gt;Follow these steps carefully:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Charge the device - Ensure your Nest Thermostat is properly charged (at least 50% battery recommended)&lt;/item&gt;
-      &lt;item&gt;Remove from wall - Remove the Nest from its back plate/wall mount&lt;/item&gt;
-      &lt;item&gt;Connect via USB - Plug the Nest into your computer using a micro USB cable&lt;/item&gt;
-      &lt;item&gt;Wait for the installer - Make sure the &lt;code&gt;install.sh&lt;/code&gt;script is running and waiting&lt;/item&gt;
-      &lt;item&gt;Reboot the device - Press and hold down on the display for 10-15 seconds until the device reboots&lt;/item&gt;
-      &lt;item&gt;DFU mode active - Once it reboots, the device will enter DFU mode and the installer script will recognize it and begin flashing&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;The firmware installer will automatically detect the device and flash the custom bootloader (x-load, u-boot) and kernel (uImage).&lt;/p&gt;
-    &lt;p&gt;After the firmware is flashed successfully, you should see our logo on the device screen:&lt;/p&gt;
-    &lt;p&gt;Important:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Keep the device plugged in via USB&lt;/item&gt;
-      &lt;item&gt;Wait for the device to complete its boot sequence (this may take 3-4 minutes)&lt;/item&gt;
-      &lt;item&gt;Do not disconnect or power off the device during this time&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Once the device has fully rebooted:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Visit https://nolongerevil.com in your web browser&lt;/item&gt;
-      &lt;item&gt;Register an account (or sign in if you already have one)&lt;/item&gt;
-      &lt;item&gt;Navigate to your Dashboard&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;You will see a "No devices" screen that prompts you for an entry code.&lt;/p&gt;
-    &lt;p&gt;To link your Nest device to your NoLongerEvil account:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;On your Nest device, navigate to: Settings → Nest App → Get Entry Code&lt;/item&gt;
-      &lt;item&gt;The device will display a unique entry code&lt;/item&gt;
-      &lt;item&gt;Enter this code on the NoLongerEvil dashboard&lt;/item&gt;
-      &lt;item&gt;Your device is now linked and ready to use!&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;The firmware installation process installs three components:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;x-load.bin - First-stage bootloader (X-Loader for OMAP)&lt;/item&gt;
-      &lt;item&gt;u-boot.bin - Second-stage bootloader (Das U-Boot) loaded at address 0x80100000&lt;/item&gt;
-      &lt;item&gt;uImage - Linux kernel image loaded at address 0x80A00000&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;After flashing, the device jumps to execution at 0x80100000 (u-boot).&lt;/p&gt;
-    &lt;p&gt;This tool provides low-level access to the device's boot process. Use responsibly:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Only use on devices you own&lt;/item&gt;
-      &lt;item&gt;Improper firmware can brick your device (Don't sue me bro)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;This project builds upon the excellent work of several security researchers and developers:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;grant-h / ajb142 - omap_loader, the USB bootloader tool used to flash OMAP devices&lt;/item&gt;
-      &lt;item&gt;exploiteers (GTVHacker) - Original research and development of the Nest DFU attack, which demonstrated the ability to flash custom firmware to Nest devices gen 1 &amp;amp; gen 2&lt;/item&gt;
-      &lt;item&gt;FULU and all bounty backers - For funding the Nest Learning Thermostat Gen 1/2 bounty and supporting the right-to-repair movement&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Without their groundbreaking research, open-source contributions, and advocacy for device ownership rights, this work would not be possible. Thank you!&lt;/p&gt;
-    &lt;p&gt;We are committed to transparency and the right-to-repair movement. The firmware images and backend API server code will be open sourced soon, allowing the community to audit, improve, and self-host their own infrastructure.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45813343</guid><pubDate>Tue, 04 Nov 2025 17:10:35 +0000</pubDate></item><item><title>Codemaps: Understand Code, Before You Vibe It</title><link>https://cognition.ai/blog/codemaps</link><description>&lt;doc fingerprint="3fc296052cb3ae5f"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45813310</guid><pubDate>Tue, 04 Nov 2025 17:07:47 +0000</pubDate></item><item><title>Codemaps: Understand Code, Before You Vibe It</title><link>https://cognition.ai/blog/codemaps</link><description>&lt;doc fingerprint="3fc296052cb3ae5f"&gt;
   &lt;main&gt;
     &lt;quote&gt;“Your code is your understanding of the problem you’re exploring. So it’s only when you have your code in your head that you really understand the problem.” — Paul Graham&lt;/quote&gt;
     &lt;p&gt;Software development only becomes engineering with understanding. Your ability to reason through your most challenging coding tasks is constrained by your mental model of how things work — in other words, how quickly and how well you onboard to any codebase for solving any problem. However most AI vibe coding tools are aimed at relieving you of that burden by reading → thinking → writing the code for you, increasing the separation from you and your code. This is fine for low value, commodity tasks, but absolutely unacceptable for the hard, sensitive, and high value work that defines real engineering.&lt;/p&gt;
@@ -1389,7 +1752,7 @@ int gs_write_pgm(struct gs_image img, const char *path);&lt;/code&gt;
     &lt;p&gt;This project is licensed under the MIT License. Feel free to use in research, products, and your next embedded vision project!&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45816673</guid><pubDate>Tue, 04 Nov 2025 22:35:58 +0000</pubDate></item><item><title>Mr Tiff</title><link>https://inventingthefuture.ghost.io/mr-tiff/</link><description>&lt;doc fingerprint="6498b18bb326a2bd"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45816673</guid><pubDate>Tue, 04 Nov 2025 22:35:58 +0000</pubDate></item><item><title>Mr TIFF</title><link>https://inventingthefuture.ghost.io/mr-tiff/</link><description>&lt;doc fingerprint="6498b18bb326a2bd"&gt;
   &lt;main&gt;
     &lt;p&gt;For as long as I have published my books, one of my overarching goals was to give credit to those who actually invented the hardware and software that we use.&lt;/p&gt;
     &lt;p&gt;I have spent 10,000+ hours to create an accurate record of their work but I'm not complaining. The 'as-close-to-possible' truth of invention by individuals or teams meant identifying the work, educating myself, writing questions, and sending emails. And after that process, I set up a chat because it all gets down to talking to someone on the other side of the world, about something that happened 30 or 40 years ago.&lt;/p&gt;
@@ -1516,19 +1879,24 @@ int gs_write_pgm(struct gs_image img, const char *path);&lt;/code&gt;
     &lt;p&gt;You might need to install nerdfonts for the icons to be displayed correctly.&lt;/p&gt;
     &lt;p&gt;You can download the pre-built binaries from the release page release page&lt;/p&gt;
     &lt;p&gt;You can install &lt;code&gt;bluetui&lt;/code&gt; from crates.io&lt;/p&gt;
-    &lt;code&gt;cargo install bluetui&lt;/code&gt;
+    &lt;code&gt;cargo install bluetui
+&lt;/code&gt;
     &lt;p&gt;You can install &lt;code&gt;bluetui&lt;/code&gt; from the extra repository:&lt;/p&gt;
-    &lt;code&gt;pacman -S bluetui&lt;/code&gt;
+    &lt;code&gt;pacman -S bluetui
+&lt;/code&gt;
     &lt;p&gt;You can install &lt;code&gt;bluetui&lt;/code&gt; from the lamdness Gentoo Overlay:&lt;/p&gt;
     &lt;code&gt;sudo eselect repository enable lamdness
 sudo emaint -r lamdness sync
-sudo emerge -av net-wireless/bluetui&lt;/code&gt;
+sudo emerge -av net-wireless/bluetui
+&lt;/code&gt;
     &lt;p&gt;If you are a user of x-cmd, you can run:&lt;/p&gt;
-    &lt;code&gt;x install bluetui&lt;/code&gt;
+    &lt;code&gt;x install bluetui
+&lt;/code&gt;
     &lt;p&gt;Run the following command:&lt;/p&gt;
     &lt;code&gt;git clone https://github.com/pythops/bluetui
 cd bluetui
-cargo build --release&lt;/code&gt;
+cargo build --release
+&lt;/code&gt;
     &lt;p&gt;This will produce an executable file at &lt;code&gt;target/release/bluetui&lt;/code&gt; that you can copy to a directory in your &lt;code&gt;$PATH&lt;/code&gt;.&lt;/p&gt;
     &lt;p&gt;&lt;code&gt;Tab&lt;/code&gt;: Switch between different sections.&lt;/p&gt;
     &lt;p&gt;&lt;code&gt;j&lt;/code&gt; or &lt;code&gt;Down&lt;/code&gt; : Scroll down.&lt;/p&gt;
@@ -1563,7 +1931,8 @@ toggle_discovery = "d"
 [paired_device]
 unpair = "u"
 toggle_trust = "t"
-rename = "e"&lt;/code&gt;
+rename = "e"
+&lt;/code&gt;
     &lt;p&gt;GPLv3&lt;/p&gt;
     &lt;p&gt;Bluetui logo: Marco Bulgarelli&lt;/p&gt;
   &lt;/main&gt;
@@ -1596,27 +1965,7 @@ rename = "e"&lt;/code&gt;
     &lt;p&gt;DHS is taking comments on the proposal until January 2; so far the submissions are nearly entirely negative, with posters decrying the plan as government overreach, comparing the proposal to communist China, and calling it a violation of Constitutional guarantees against unreasonable search and seizure. ®&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45817167</guid><pubDate>Tue, 04 Nov 2025 23:35:27 +0000</pubDate></item><item><title>Munich's surfers left stunned after famed river wave vanishes</title><link>https://www.theguardian.com/world/2025/nov/04/munichs-surfers-left-stunned-after-famed-river-wave-vanishes</link><description>&lt;doc fingerprint="fe1b0d4e24b3d61d"&gt;
-  &lt;main&gt;
-    &lt;p&gt;The “mother of all river waves” in a German canal that is often credited as the birthplace of freshwater surfing has mysteriously disappeared after decades of flowing smoothly, leaving enthusiasts dumbfounded.&lt;/p&gt;
-    &lt;p&gt;The famous stationary wave in the southern city of Munich is known as the Eisbach, or “ice brook”, for its frigid temperatures, and has become a pilgrimage site for surfers worldwide.&lt;/p&gt;
-    &lt;p&gt;Unlike ocean surfing, its freshwater cousin takes place on a “standing wave”, which is often human-made, with currents often flowing over a concrete slab that manipulates the water into a permanent wave.&lt;/p&gt;
-    &lt;p&gt;The sport’s origin is often cited as dating back to the early 1970s, when rule-breaking daredevils rode the naturally forming wave in Munich for the first time.&lt;/p&gt;
-    &lt;p&gt;Today, river surfing has a global following, including in the River Severn in the United Kingdom, where surfers ride tidal bores, a phenomenon in which incoming tides form waves that move up a river.&lt;/p&gt;
-    &lt;p&gt;In Hawaii, surfers also make river waves by digging a trench between a river and the ocean, with water flowing violently over the sand.&lt;/p&gt;
-    &lt;p&gt;The Eisbach wave was originally believed to be formed by gravel, but the Munich surfing community later installed wooden planks that helped artificially stabilise the wave. Over the decades, it has become a major tourist draw for Bavaria’s state capital.&lt;/p&gt;
-    &lt;p&gt;Largest during the winter months – when ice melt can push the wave up to one metre high – the river is now officially managed, including being drained once a year to clean away debris and inspect the streambed.&lt;/p&gt;
-    &lt;p&gt;But after torrents were released back into the canal following its cleanup on Friday, the Eisbach wave did not form as usual, instead leaving unstable white water rapids.&lt;/p&gt;
-    &lt;p&gt;“We’re at a loss,” surfer Klaus Rudolf told Stern magazine. “I was standing at the edge with my board on Friday evening and couldn’t believe it.”&lt;/p&gt;
-    &lt;p&gt;Authorities were looking into the cause of the wave’s disappearance, including whether it could be due to the cleaning or a lack of water.&lt;/p&gt;
-    &lt;p&gt;“No structural changes were made to the Eisbach wave or its banks during the cleanup,” the city said. An inspection of the site on Monday also did not reveal any damage.&lt;/p&gt;
-    &lt;p&gt;On Tuesday, Mayor Dieter Reiter said in a statement that the city administration was “working with the Water Management Office and surfers to find a quick solution so that the famous surf wave will soon be available again as usual”.&lt;/p&gt;
-    &lt;p&gt;Officials now plan to divert more water into the canal in hopes of a reappearance of the Eisbach, which SurferToday.com describes as “the mother of all river waves”. Standing waves require delicately balanced water levels and speeds.&lt;/p&gt;
-    &lt;p&gt;The Eisbach wave closed earlier this year for several months after the death of a 33-year-old Munich woman who became trapped under the surface at night. Since it reopened, new rules have banned night-time surfing.&lt;/p&gt;
-    &lt;p&gt;Agence France-Presse contributed to this report&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45818123</guid><pubDate>Wed, 05 Nov 2025 01:51:27 +0000</pubDate></item><item><title>Direct File won't happen in 2026, IRS tells states</title><link>https://www.nextgov.com/digital-government/2025/11/direct-file-wont-happen-2026-irs-tells-states/409309/</link><description>&lt;doc fingerprint="b8a1c09cd9635069"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45817167</guid><pubDate>Tue, 04 Nov 2025 23:35:27 +0000</pubDate></item><item><title>Direct File won't happen in 2026, IRS tells states</title><link>https://www.nextgov.com/digital-government/2025/11/direct-file-wont-happen-2026-irs-tells-states/409309/</link><description>&lt;doc fingerprint="b8a1c09cd9635069"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Direct File won’t happen in 2026, IRS tells states&lt;/head&gt;
     &lt;head rend="h2"&gt;The free service that allowed taxpayers to file online directly with the IRS was used by hundreds of thousands of taxpayers in 2024 and 2025, who gave it high marks — although tax prep companies and Republicans have sought its end.&lt;/head&gt;
@@ -1817,4 +2166,13 @@ You can see this in code here.&lt;/p&gt;
     &lt;p&gt;Technical API reference.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45818562</guid><pubDate>Wed, 05 Nov 2025 03:15:37 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45818562</guid><pubDate>Wed, 05 Nov 2025 03:15:37 +0000</pubDate></item><item><title>The Hackers Manifesto (The Conscience of a Hacker) (1986)</title><link>https://phrack.org/issues/7/3</link><description>&lt;doc fingerprint="646e8917c32493a6"&gt;
+  &lt;main&gt;
+    &lt;div&gt;
+      &lt;p&gt;Title : Hacker's Manifesto&lt;/p&gt;
+      &lt;p&gt; Author : The Mentor&lt;/p&gt;
+      &lt;quote&gt; ==Phrack Inc.== Volume One, Issue 7, Phile 3 of 10 =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-= The following was written shortly after my arrest... \/\The Conscience of a Hacker/\/ by +++The Mentor+++ Written on January 8, 1986 =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-= Another one got caught today, it's all over the papers. "Teenager Arrested in Computer Crime Scandal", "Hacker Arrested after Bank Tampering"... Damn kids. They're all alike. But did you, in your three-piece psychology and 1950's technobrain, ever take a look behind the eyes of the hacker? Did you ever wonder what made him tick, what forces shaped him, what may have molded him? I am a hacker, enter my world... Mine is a world that begins with school... I'm smarter than most of the other kids, this crap they teach us bores me... Damn underachiever. They're all alike. I'm in junior high or high school. I've listened to teachers explain for the fifteenth time how to reduce a fraction. I understand it. "No, Ms. Smith, I didn't show my work. I did it in my head..." Damn kid. Probably copied it. They're all alike. I made a discovery today. I found a computer. Wait a second, this is cool. It does what I want it to. If it makes a mistake, it's because I screwed it up. Not because it doesn't like me... Or feels threatened by me... Or thinks I'm a smart ass... Or doesn't like teaching and shouldn't be here... Damn kid. All he does is play games. They're all alike. And then it happened... a door opened to a world... rushing through the phone line like heroin through an addict's veins, an electronic pulse is sent out, a refuge from the day-to-day incompetencies is sought... a board is found. "This is it... this is where I belong..." I know everyone here... even if I've never met them, never talked to them, may never hear from them again... I know you all... Damn kid. Tying up the phone line again. They're all alike... You bet your ass we're all alike... we've been spoon-fed baby food at school when we hungered for steak... the bits of meat that you did let slip through were pre-chewed and tasteless. We've been dominated by sadists, or ignored by the apathetic. The few that had something to teach found us will- ing pupils, but those few are like drops of water in the desert. This is our world now... the world of the electron and the switch, the beauty of the baud. We make use of a service already existing without paying for what could be dirt-cheap if it wasn't run by profiteering gluttons, and you call us criminals. We explore... and you call us criminals. We seek after knowledge... and you call us criminals. We exist without skin color, without nationality, without religious bias... and you call us criminals. You build atomic bombs, you wage wars, you murder, cheat, and lie to us and try to make us believe it's for our own good, yet we're the criminals. Yes, I am a criminal. My crime is that of curiosity. My crime is that of judging people by what they say and think, not what they look like. My crime is that of outsmarting you, something that you will never forgive me for. I am a hacker, and this is my manifesto. You may stop this individual, but you can't stop us all... after all, we're all alike. +++The Mentor+++ _______________________________________________________________________________ &lt;/quote&gt;
+    &lt;/div&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45820715</guid><pubDate>Wed, 05 Nov 2025 08:28:04 +0000</pubDate></item></channel></rss>
