@@ -1,411 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-11-05T08:45:56.450447+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=45771151</id><title>By the Power of Grayscale</title><updated>2025-11-05T08:46:02.668432+00:00</updated><content>&lt;doc fingerprint="362f87793ff11b93"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;By the power of grayscale!&lt;/head&gt;
-    &lt;p&gt;When people talk about computer vision, they usually think of OpenCV or deep neural networks like YOLO. But in most cases, doing computer vision implies understanding of the core algorithms, so you can use or adapt them for your own needs.&lt;/p&gt;
-    &lt;p&gt;I wanted to see how far I could go by stripping computer vision down to the bare minimum: only grayscale 8-bit images, no fancy data structures, plain old C, some byte arrays and a single header file. After all, an image is just a rectangle of numbers, right?&lt;/p&gt;
-    &lt;p&gt;This post is a guided tour through the algorithms behind Grayskull – a minimal computer vision library designed for resource-constrained devices.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Pixels&lt;/head&gt;
-    &lt;p&gt;A grayscale pixel is normally represented as a single byte, where &lt;code&gt;0&lt;/code&gt; means black, &lt;code&gt;255&lt;/code&gt; means white, and values in between represent various shades of gray.&lt;/p&gt;
-    &lt;p&gt;A grayscale image is essentially a 2D array of these pixels, defined by its width and height, but for a simpler memory layout languages such as C often represent it as a 1D array of size &lt;code&gt;width * height&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;// An image of WxH pixels, stored as a flat array of bytes
-struct gs_image { unsigned w, h; uint8_t *data; };
-
-// Helpers to get/set pixel values respecting the bounds
-uint8_t gs_get(struct gs_image img, unsigned x, unsigned y) {
-  return (x &amp;lt; img.w &amp;amp;&amp;amp; y &amp;lt; img.h) ? img.data[y * img.w + x] : 0;
-}
-void gs_set(struct gs_image img, unsigned x, unsigned y, uint8_t value) {
-  if (x &amp;lt; img.w &amp;amp;&amp;amp; y &amp;lt; img.h) img.data[y * img.w + x] = value;
-}
-
-// A somewhat convenient macro to iterate over all pixels
-#define gs_for(img, x, y)                \
-  for (unsigned y = 0; y &amp;lt; (img).h; y++) \
-    for (unsigned x = 0; x &amp;lt; (img).w; x++)
-&lt;/code&gt;
-    &lt;p&gt;This humble start already allows us to do some tricks like inverting or mirroring images:&lt;/p&gt;
-    &lt;code&gt;// invert image (negative): px[x,y] = 255 - px[x,y]
-gs_for(img, x, y) gs_set(img, x, y, 255 - gs_get(img, x, y));
-
-// mirror the image: swap px[x,y] with px[w-x-1,y]
-gs_for(img, x, y) {
-for (unsigned y = 0; y &amp;lt; img.h; y++) {
-  for (unsigned x = 0; x &amp;lt; img.w/2; x++) { // iterate only through the first half
-    uint8_t tmp = gs_get(img, x, y);
-    gs_set(img, x, y, gs_get(img, img.w - x - 1, y));
-    gs_set(img, img.w - x - 1, y, tmp);
-  }
-}
-&lt;/code&gt;
-    &lt;p&gt;We can just as well copy images, crop images, resize or rotate them. It’s not computer vision yet, but still some basic image processing:&lt;/p&gt;
-    &lt;code&gt;struct gs_rect { unsigned x, y, w, h; }; // for regions of interest (ROI)
-
-// crop image src into dst using region of interest (roi)
-gs_for(roi, x, y) gs_set(dst, x, y, gs_get(src, roi.x + x, roi.y + y));
-
-// downscale 2x: set pixel to average from 4 neighbouring pixels (2x2)
-gs_for(dst, x, y) {
-    unsigned sum = 0;
-    for (unsigned j = 0; j &amp;lt; 2; j++)
-      for (unsigned i = 0; i &amp;lt; 2; i++)
-        sum += gs_get(src, x * 2 + i, y * 2 + j);
-    gs_set(dst, x, y, sum / 4);
-}
-&lt;/code&gt;
-    &lt;p&gt;One can do naïve nearest-neighbour resizing, which is fast but looks blocky, or do bilinear interpolation, which is slower and requires floating point operations, but often looks better:&lt;/p&gt;
-    &lt;code&gt;// Nearest-neighbour resize
-void gs_resize_nn(struct gs_image dst, struct gs_image src) {
-    gs_for(dst, x, y) {
-        unsigned sx = x * src.w / dst.w, sy = y * src.h / dst.h;
-        gs_set(dst, x, y, gs_get(src, sx, sy));
-    }
-}
-
-// Bilinear resize
-GS_API void gs_resize(struct gs_image dst, struct gs_image src) {
-  gs_for(dst, x, y) {
-    float sx = ((float)x + 0.5f) * src.w / dst.w, sy = ((float)y + 0.5f) * src.h / dst.h;
-    sx = GS_MAX(0.0f, GS_MIN(sx, src.w - 1.0f)), sy = GS_MAX(0.0f, GS_MIN(sy, src.h - 1.0f));
-    unsigned sx_int = (unsigned)sx, sy_int = (unsigned)sy;
-    unsigned sx1 = GS_MIN(sx_int + 1, src.w - 1), sy1 = GS_MIN(sy_int + 1, src.h - 1);
-    float dx = sx - sx_int, dy = sy - sy_int;
-    uint8_t c00 = gs_get(src, sx_int, sy_int), c01 = gs_get(src, sx1, sy_int),
-            c10 = gs_get(src, sx_int, sy1), c11 = gs_get(src, sx1, sy1);
-    uint8_t p = (c00 * (1 - dx) * (1 - dy)) + (c01 * dx * (1 - dy)) + (c10 * (1 - dx) * dy) + (c11 * dx * dy);
-    gs_set(dst, x, y, p);
-  }
-}
-&lt;/code&gt;
-    &lt;p&gt;Here’s how the original image (left) looks after bilinear resizing (middle) compared to nearest-neighbour resizing (right).&lt;/p&gt;
-    &lt;head rend="h2"&gt;Image processing&lt;/head&gt;
-    &lt;p&gt;Now that we can manipulate individual pixels, we can start doing more serious image processing.&lt;/p&gt;
-    &lt;p&gt;One useful tool is convolutional filters. A filter is a small 2D array (kernel) that is applied to each pixel in the image. The new pixel value is computed as a weighted sum of the neighbouring pixels, where weights are defined by the kernel.&lt;/p&gt;
-    &lt;code&gt;void gs_filter(struct gs_image dst, struct gs_image src, struct gs_image kernel, unsigned norm) {
-    gs_for(dst, x, y) {
-        int sum = 0;
-        gs_for(kernel, i, j) {
-            sum += gs_get(src, x + i - kernel.w / 2, y + j - kernel.h / 2) * (int8_t)gs_get(kernel, i, j);
-        }
-        gs_set(dst, x, y, sum / norm);
-    }
-}
-&lt;/code&gt;
-    &lt;p&gt;This technique can be used for blurring, sharpening, edge detection and many other effects. Here are some common kernels. Note that they are defined as signed 8-bit integers:&lt;/p&gt;
-    &lt;code&gt;// box blur 3x3, all pixels have equal weight
-struct gs_image gs_blur_box = {3, 3, (uint8_t *)(int8_t[]){1, 1, 1, 1, 1, 1, 1, 1, 1}};
-// gaussian blur 3x3, central pixels have more weight
-struct gs_image gs_blur_gaussian = {3, 3, (uint8_t *)(int8_t[]){1, 2, 1, 2, 4, 2, 1, 2, 1}};
-// sharpen, enhance edges
-struct gs_image gs_sharpen = {3, 3, (uint8_t *)(int8_t[]){0, -1, 0, -1, 5, -1, 0, -1, 0}};
-// emboss, make image look "3D"
-struct gs_image gs_emboss = {3, 3, (uint8_t *)(int8_t[]){-2, -1, 0, -1, 1, 1, 0, 1, 2}};
-&lt;/code&gt;
-    &lt;p&gt;Similarly, we can apply Sobel filters, that are useful if we want to detect edges in the image:&lt;/p&gt;
-    &lt;code&gt;struct gs_image gs_sobel_x = {3, 3, (uint8_t *)(int8_t[]){-1, 0, 1, -2, 0, 2, -1, 0, 1}};
-struct gs_image gs_sobel_y = {3, 3, (uint8_t *)(int8_t[]){1, 2, 1, 0, 0, 0, -1, -2, -1}};
-
-void gs_sobel(struct gs_image dst, struct gs_image src) {
-    struct gs_image gx = {src.w, src.h, malloc(src.w * src.h)};
-    struct gs_image gy = {src.w, src.h, malloc(src.w * src.h)};
-    gs_filter(gx, src, gs_sobel_x, 1);
-    gs_filter(gy, src, gs_sobel_y, 1);
-    gs_for(dst, x, y) {
-        int mag = sqrt(gs_get(gx, x, y) * gs_get(gx, x, y) + gs_get(gy, x, y) * gs_get(gy, x, y));
-        gs_set(dst, x, y, GS_MIN(mag, 255));
-    }
-    free(gx.data);
-    free(gy.data);
-}
-&lt;/code&gt;
-    &lt;p&gt;Here are some examples of these filters, notice how some of them remove the noise or enhance the edges:&lt;/p&gt;
-    &lt;p&gt;The first image is the original, followed by box filter and Gaussian blur filter. Next is the sharpen filter, then emboss filter and finally Sobel filter that highlights edges.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Thresholding&lt;/head&gt;
-    &lt;p&gt;To actually “see” objects in an image, we need to segment it into foreground and background, and then operate on the foreground segments, trying to locate objects of interest.&lt;/p&gt;
-    &lt;p&gt;This is much easier done when an image is binary, so that each pixel is either fully black or fully white. This conversion from grayscale to black-and-white is called thresholding.&lt;/p&gt;
-    &lt;p&gt;In the simplest case we may consider any pixel above 127 white, and below – black. This is fixed-level thresholding. Of course, in darker environments this thresholding value could be too high and many meaningful details would be lost. So how to pick a threshold value more accurately?&lt;/p&gt;
-    &lt;code&gt;// apply fixed threshold value and binarise the image
-GS_API void gs_threshold(struct gs_image img, uint8_t thresh) {
-  for (unsigned i = 0; i &amp;lt; img.w * img.h; i++) img.data[i] = (img.data[i] &amp;gt; thresh) ? 255 : 0;
-}
-&lt;/code&gt;
-    &lt;p&gt;One approach would be to calculate the brightness distribution as a histogram. We know that there are 255 unique values of pixels in a grayscale image, so we iterate through all pixels and count how many of them have this or that value. Analysing the resulting histogram could give us some clue about which pixel value would work best as a threshold for the particular image.&lt;/p&gt;
-    &lt;p&gt;A clever way to do this is with Otsu’s method. It automatically determines the optimal threshold by testing every possible value (from 0 to 255). For each value, it splits the image’s pixels into two classes—background and foreground—and calculates their “inter-class variance.” The threshold that maximizes this variance is the one that creates the best separation between the two classes, making it the ideal choice. It works fiarly well on images with good contrast:&lt;/p&gt;
-    &lt;code&gt;// try to find the best threshold to separate "foreground" from "background"
-uint8_t gs_otsu_threshold(struct gs_image img) {
-  unsigned hist[256] = {0}, wb = 0, wf = 0, threshold = 0;
-  // calculate how many pixels of each brightness value we have
-  for (unsigned i = 0; i &amp;lt; img.w * img.h; i++) hist[img.data[i]]++;
-  float sum = 0, sumB = 0, varMax = -1.0;
-  for (unsigned i = 0; i &amp;lt; 256; i++) sum += (float)i * hist[i];
-  // try to find the threshold that maximises inter-class variance
-  for (unsigned t = 0; t &amp;lt; 256; t++) {
-    wb += hist[t];
-    if (wb == 0) continue;
-    wf = (img.w * img.h) - wb;
-    if (wf == 0) break;
-    sumB += (float)t * hist[t];
-    float mB = (float)sumB / wb;
-    float mF = (float)(sum - sumB) / wf;
-    float varBetween = (float)wb * (float)wf * (mB - mF) * (mB - mF);
-    if (varBetween &amp;gt; varMax) varMax = varBetween, threshold = t;
-  }
-  return threshold;
-}
-&lt;/code&gt;
-    &lt;p&gt;In real life, however, the lighting conditions are often uneven. In such cases a single global threshold may not work well, and neither of the possible 255 threshold values would give a good result.&lt;/p&gt;
-    &lt;p&gt;To address this, we can use adaptive thresholding. Instead of using a single threshold for the entire image, we compute a local threshold for each pixel based on the average brightness of its neighbouring pixels. This way, we can better handle varying lighting conditions across the image:&lt;/p&gt;
-    &lt;code&gt;gs_for(src, x, y) {
-  unsigned sum = 0, count = 0;
-  for (int dy = -radius; dy &amp;lt;= (int)radius; dy++) {
-    for (int dx = -radius; dx &amp;lt;= (int)radius; dx++) {
-      int sy = (int)y + dy, sx = (int)x + dx;
-      if (sy &amp;gt;= 0 &amp;amp;&amp;amp; sy &amp;lt; (int)src.h &amp;amp;&amp;amp; sx &amp;gt;= 0 &amp;amp;&amp;amp; sx &amp;lt; (int)src.w) {
-        sum += gs_get(src, sx, sy);
-        count++;
-      }
-    }
-  }
-  int threshold = sum / count - c;
-  gs_set(dst, x, y, (gs_get(src, x, y) &amp;gt; threshold) ? 255 : 0);
-}
-&lt;/code&gt;
-    &lt;p&gt;Compare how various thresholding approaches work on the same image:&lt;/p&gt;
-    &lt;p&gt;The first image is the original, followed by fixed-level thresholding (80), then Otsu’s method and adaptive thresholding. Notice how adaptive thresholding preserves more details in both bright and dark areas of the image, while Otsu’s method struggles with uneven lighting.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Morphological operations&lt;/head&gt;
-    &lt;p&gt;Due to the way how image sensors work in cameras, images often contain noise.&lt;/p&gt;
-    &lt;p&gt;This means that after thresholding there would be random individual pixels that do not belong to any object, or small holes in objects, or small gaps between object parts. All of this will confuse the object detection algorithms, but morphological operations can help to clean up the binary image.&lt;/p&gt;
-    &lt;p&gt;Two most common operations are erosion and dilation. Erosion removes pixels on object boundaries (shrinking the objects), while dilation adds pixels to their boundaries (expanding the objects).&lt;/p&gt;
-    &lt;p&gt;There is also opening (erosion followed by dilation) and closing (dilation followed by erosion). Opening is useful for removing small objects or noise, while closing is useful for filling small holes in objects.&lt;/p&gt;
-    &lt;code&gt;void gs_erode(struct gs_image dst, struct gs_image src, unsigned radius) {
-  gs_for(dst, x, y) {
-    uint8_t min_val = 255;
-    for (int dy = -radius; dy &amp;lt;= (int)radius; dy++) {
-      for (int dx = -radius; dx &amp;lt;= (int)radius; dx++) {
-        int sy = (int)y + dy, sx = (int)x + dx;
-        if (sy &amp;gt;= 0 &amp;amp;&amp;amp; sy &amp;lt; (int)src.h &amp;amp;&amp;amp; sx &amp;gt;= 0 &amp;amp;&amp;amp; sx &amp;lt; (int)src.w) {
-          uint8_t val = gs_get(src, sx, sy);
-          if (val &amp;lt; min_val) min_val = val;
-        }
-      }
-    }
-    gs_set(dst, x, y, min_val);
-  }
-}
-void gs_dilate(struct gs_image dst, struct gs_image src, unsigned radius) {
-  gs_for(dst, x, y) {
-    uint8_t max_val = 0;
-    for (int dy = -radius; dy &amp;lt;= (int)radius; dy++) {
-      for (int dx = -radius; dx &amp;lt;= (int)radius; dx++) {
-        int sy = (int)y + dy, sx = (int)x + dx;
-        if (sy &amp;gt;= 0 &amp;amp;&amp;amp; sy &amp;lt; (int)src.h &amp;amp;&amp;amp; sx &amp;gt;= 0 &amp;amp;&amp;amp; sx &amp;lt; (int)src.w) {
-          uint8_t val = gs_get(src, sx, sy);
-          if (val &amp;gt; max_val) max_val = val;
-        }
-      }
-    }
-    gs_set(dst, x, y, max_val);
-  }
-}
-&lt;/code&gt;
-    &lt;p&gt;Here’s how morphological operations can clean up a rather confusing image with ArUco markers:&lt;/p&gt;
-    &lt;p&gt;The first image is the original, followed by thresholded image (Otsu). Next we do erosion followed by dilation. Since the markers are black it might sound odd, but since morpological operations work on white pixels we essentially perform closing, but for black pixels. We could also invert the image first, then do opening and invert back.&lt;/p&gt;
-    &lt;p&gt;At the end all markers are shrinked to their original dimensions and all of them are easily detectable by shape and size.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Blobs and contours&lt;/head&gt;
-    &lt;p&gt;Once we have a clean binary image, we can start detecting objects in it. A classic way to do this is by finding connected components (blobs).&lt;/p&gt;
-    &lt;p&gt;A “blob” is a group of connected white pixels (255) that form an object. The simplest way to find blobs is by using a flood-fill algorithm or depth-first search (DFS) to label connected pixels:&lt;/p&gt;
-    &lt;code&gt;void gs_flood_fill(struct gs_image img, unsigned x, unsigned y, uint8_t target, uint8_t replacement) {
-  if (x &amp;gt;= img.w || y &amp;gt;= img.h) return;
-  if (gs_get(img, x, y) != target || gs_get(img, x, y) == replacement) return;
-  gs_set(img, x, y, replacement);
-  gs_flood_fill(img, x + 1, y, target, replacement);
-  gs_flood_fill(img, x - 1, y, target, replacement);
-  gs_flood_fill(img, x, y + 1, target, replacement);
-  gs_flood_fill(img, x, y - 1, target, replacement);
-}
-&lt;/code&gt;
-    &lt;p&gt;Of course this would immediately blow up your stack on most real-life images. So an iterative approach using a queue or stack is preferred.&lt;/p&gt;
-    &lt;p&gt;However, it’s still a fairly suboptimal way to find blobs. A more efficient approach is a two-pass algorithm, which scans the image twice: first to assign “provisional” labels and record equivalences between them, followed by the second scan to resolve these equivalences and assign final unique labels to every blob.&lt;/p&gt;
-    &lt;p&gt;It would be nice if we could use the same &lt;code&gt;gs_image&lt;/code&gt; type for labels, but in most cases it would require more than 256 labels (especially for temporary provisional labels). So we need a separate array of larger integers to store labels:&lt;/p&gt;
-    &lt;code&gt;typedef uint16_t gs_label; // 64K should be enough, right?
-
-struct gs_blob {
-  gs_label label; // what label the blob has?
-  unsigned area; // how many white pixels are in a blob?
-  struct gs_rect box; // bounding box
-  struct gs_point centroid; // center of "mass"
-};
-unsigned gs_blobs(struct gs_image img, gs_label *labels, struct gs_blob *blobs, unsigned nblobs) { ... }
-&lt;/code&gt;
-    &lt;p&gt;Before we go futher, let’s talk about connectivity. There are two common types of pixel connectivity: 4-connectivity and 8-connectivity. In 4-connectivity, a pixel is connected to its four direct neighbours (up, down, left, right). In 8-connectivity, a pixel is connected to all eight surrounding pixels (including diagonals). So, in case of 8-connectivity this would be one blob and in case of 4-connectivity - two separate blobs:&lt;/p&gt;
-    &lt;code&gt;......
-.#..#.
-.##.#.
-.###..
-......
-&lt;/code&gt;
-    &lt;p&gt;We will be using 4-connectivity in our implementation, for simplicity. Let’s consider the following image:&lt;/p&gt;
-    &lt;code&gt;.........
-.###..#..
-.###.##..
-.#####..#
-.......##
-&lt;/code&gt;
-    &lt;p&gt;We start scanning it row after row, if a white pixel is found, we check its left and top neighbours:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;If both are black (0), we assign a new label to the pixel, assuming that it could be a new blob.&lt;/item&gt;
-      &lt;item&gt;If one of them is white, we assign its label to the current pixel, as it is a continuation of the existing known blob.&lt;/item&gt;
-      &lt;item&gt;If both are white but have different labels, we assign the smallest of the labels to the current pixel and record the equivalence between the two labels in a special data structure (like a union-find).&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;After this first pass the labels array would look like this:&lt;/p&gt;
-    &lt;code&gt;.........
-.111..2..
-.111.32..
-.11111..4
-.......55
-&lt;/code&gt;
-    &lt;p&gt;Our equivalence table would look like this: &lt;code&gt;1 &amp;lt;-&amp;gt; 3, 3 &amp;lt;-&amp;gt; 2, 4 &amp;lt;-&amp;gt; 5&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;During the second pass we resolve the equivalences and assign final labels to each pixel. The final labels array would look like this:&lt;/p&gt;
-    &lt;code&gt;.........
-.111..1..
-.111.11..
-.11111..4
-.......44
-&lt;/code&gt;
-    &lt;p&gt;During the second pass we can also calculate blob properties, such as area, bounding box and centroid. Largest blob’s area is 14 pixels, bounding box is from (1,1) to (6,3). Centroid is calculated as the average of all pixel coordinates in the blob, in our case for X it would be &lt;code&gt;(3*1+3*2+3*3+4+2*5+2*6)/14&lt;/code&gt;, or rounded to 4. Y coordinate would be &lt;code&gt;(4*1+5*2+5*3)/14&lt;/code&gt;, or rounded to 2. So the centroid is (4,2), which is not part of the blob “body”, but still is the center of mass.&lt;/p&gt;
-    &lt;p&gt;Such geometric properties already give us plenty of information about blobs. For example, we can filter blobs by area to remove small noise blobs. We can also calculate aspect ratio (width/height) of the bounding box to filter out very tall or very wide blobs. Ratio between blob actual area and bounding box area helps to filter out blobs that are not compact enough. Rectangles tend to have a ratio of &lt;code&gt;1.0&lt;/code&gt;, circles are &lt;code&gt;pi/4 = 0.785&lt;/code&gt;, while lines approach to zero.&lt;/p&gt;
-    &lt;p&gt;Another clues could be centroid position, orientation using moments or contour shape. There is a fairly simple method to trace a contour of a blob using the Moore-Neighbor tracing algorithm. It starts from a known border pixel and follows the contour clockwise by checking neighbouring pixels, until it returns to the starting pixel:&lt;/p&gt;
-    &lt;code&gt;struct gs_contour { struct gs_rect box; struct gs_point start; unsigned length; };
-void gs_trace_contour(struct gs_image img, struct gs_image visited, struct gs_contour *c) {
-  static const int dx[] = {1, 1, 0, -1, -1, -1, 0, 1};
-  static const int dy[] = {0, 1, 1, 1, 0, -1, -1, -1};
-  c-&amp;gt;length = 0;
-  c-&amp;gt;box = (struct gs_rect){c-&amp;gt;start.x, c-&amp;gt;start.y, 1, 1};
-  struct gs_point p = c-&amp;gt;start;
-  unsigned dir = 7, seenstart = 0;
-  for (;;) {
-    if (!visited.data[p.y * visited.w + p.x]) c-&amp;gt;length++;
-    visited.data[p.y * visited.w + p.x] = 255;
-    int ndir = (dir + 1) % 8, found = 0;
-    for (int i = 0; i &amp;lt; 8; i++) {
-      int d = (ndir + i) % 8, nx = p.x + dx[d], ny = p.y + dy[d];
-      if (nx &amp;gt;= 0 &amp;amp;&amp;amp; nx &amp;lt; (int)img.w &amp;amp;&amp;amp; ny &amp;gt;= 0 &amp;amp;&amp;amp; ny &amp;lt; (int)img.h &amp;amp;&amp;amp;
-          img.data[ny * img.w + nx] &amp;gt; 128) {
-        p = (struct gs_point){nx, ny};
-        dir = (d + 6) % 8;
-        found = 1;
-        break;
-      }
-    }
-    if (!found) break;  // open contour
-    c-&amp;gt;box.x = GS_MIN(c-&amp;gt;box.x, p.x);
-    c-&amp;gt;box.y = GS_MIN(c-&amp;gt;box.y, p.y);
-    c-&amp;gt;box.w = GS_MAX(c-&amp;gt;box.w, p.x - c-&amp;gt;box.x + 1);
-    c-&amp;gt;box.h = GS_MAX(c-&amp;gt;box.h, p.y - c-&amp;gt;box.y + 1);
-    if (p.x == c-&amp;gt;start.x &amp;amp;&amp;amp; p.y == c-&amp;gt;start.y) {
-      if (seenstart) break;
-      seenstart = 1;
-    }
-  }
-}
-&lt;/code&gt;
-    &lt;p&gt;This way we can extract contours for each blob and analyse their shapes or compare contour length (perimeter) to the blob area. It is also possible to approximate contours with straight lines using Douglas-Peucker algirithm, which replaces a curve with a series of straight line segments, while preserving the overall shape.&lt;/p&gt;
-    &lt;p&gt;All of this is good if we want to detect simple objects in a static image. But what if we want to detect or track more complex objects, like faces, cars or pedestrians?&lt;/p&gt;
-    &lt;head rend="h2"&gt;Keypoints and descriptors&lt;/head&gt;
-    &lt;p&gt;A keypoint is a specific location in an image that is distinctive and can be reliably detected no matter what scale, rotation or lighting of the object are.&lt;/p&gt;
-    &lt;p&gt;In practice, keypoints are often corners (also known as “features”). One of the most intuitive algorithms to detect features is FAST (Features from Accelerated Segment Test). It works by examining a circle of 16 pixels around a candidate pixel (4 pixels away from it). If at least 9 of contiguous pixels in this &lt;code&gt;r=4px&lt;/code&gt; circle around pixel &lt;code&gt;P&lt;/code&gt; are all brighter or all darker - then the candidate pixel is considered a corner:&lt;/p&gt;
-    &lt;code&gt;..............
-......012.....
-.....F...3....
-....E.....4...
-....D..P..5...
-....C.....6...
-.....B...7....
-......A98.....
-..............
-&lt;/code&gt;
-    &lt;p&gt;As simple as it gets, this approach finds too many features in real-life images. A solution is to keep “score” of each feature and only keep the points with the highest score. The score can be calculated as the sum of absolute differences between the candidate pixel and the contiguous pixels in the circle, or by the minimum difference between central pixel and the pixels on the circle.&lt;/p&gt;
-    &lt;code&gt;  gs_assert(gs_valid(img) &amp;amp;&amp;amp; kps &amp;amp;&amp;amp; nkps &amp;gt; 0);
-  static const int dx[16] = {0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3, -3, -3, -2, -1};
-  static const int dy[16] = {-3, -3, -2, -1, 0, 1, 2, 3, 3, 3, 2, 1, 0, -1, -2, -3};
-  unsigned n = 0;
-  // first pass: compute score map
-  for (unsigned y = 3; y &amp;lt; img.h - 3; y++) {
-    for (unsigned x = 3; x &amp;lt; img.w - 3; x++) {
-      uint8_t p = img.data[y * img.w + x];
-      int run = 0, score = 0;
-      for (int i = 0; i &amp;lt; 16 + 9; i++) {
-        int idx = (i % 16);
-        uint8_t v = img.data[(y + dy[idx]) * img.w + (x + dx[idx])];
-        if (v &amp;gt; p + threshold) {
-          run = (run &amp;gt; 0) ? run + 1 : 1;
-        } else if (v &amp;lt; p - threshold) {
-          run = (run &amp;lt; 0) ? run - 1 : -1;
-        } else {
-          run = 0;
-        }
-        if (run &amp;gt;= 9 || run &amp;lt;= -9) {
-          score = 255;
-          for (int j = 0; j &amp;lt; 16; j++) {
-            int d = gs_get(img, x + dx[j], y + dy[j]) - p;
-            if (d &amp;lt; 0) d = -d;
-            if (d &amp;lt; score) score = d;
-          }
-          break;
-        }
-      }
-      scoremap.data[y * img.w + x] = score;
-    }
-  }
-  // second pass: non-maximum suppression
-  for (unsigned y = 3; y &amp;lt; img.h - 3; y++) {
-    for (unsigned x = 3; x &amp;lt; img.w - 3; x++) {
-      int s = scoremap.data[y * img.w + x], is_max = 1;
-      if (s == 0) continue;
-      for (int yy = -1; yy &amp;lt;= 1 &amp;amp;&amp;amp; is_max; yy++) {
-        for (int xx = -1; xx &amp;lt;= 1; xx++) {
-          if (xx == 0 &amp;amp;&amp;amp; yy == 0) continue;
-          if (scoremap.data[(y + yy) * img.w + (x + xx)] &amp;gt; s) {
-            is_max = 0;
-            break;
-          }
-        }
-      }
-      if (is_max &amp;amp;&amp;amp; n &amp;lt; nkps) kps[n++] = (struct gs_keypoint){{x, y}, (unsigned)s, 0, {0}};
-    }
-  }
-  return n;
-}
-&lt;/code&gt;
-    &lt;p&gt;Notice how keypoints are detected on corners and distinctive features of the cat image, such as eyes, nose, whiskers and other “meaningful” corners. But how to use keypoints to detect objects?&lt;/p&gt;
-    &lt;p&gt;This is where ORB enters the stage. ORB builds on top of the same FAST corner detector, it tries to find sharp intensity changes, but also adds two more components: orientation and descriptor.&lt;/p&gt;
-    &lt;p&gt;Once the corners are found, ORB estimates their orientation by calculating image moments in a small patch around each keypoint. This way, each keypoint gets an angle, basically saying which way is “up” for this keypoint.&lt;/p&gt;
-    &lt;p&gt;Then comes the descriptor. A descriptor is a compact representation of the local image patch around the keypoint, designed to be invariant to scale and rotation. ORB uses a modified version of BRIEF (Binary Robust Independent Elementary Features) descriptor, which is a clever way to encode image patch as a small bit string.&lt;/p&gt;
-    &lt;p&gt;It simply compares bit intensities, if one pixel is lighter than another, it sets the corresponding bit to &lt;code&gt;1&lt;/code&gt;, otherwise to &lt;code&gt;0&lt;/code&gt;. By performing multiple such comparisons, we can create a binary string that represents the local image patch.&lt;/p&gt;
-    &lt;p&gt;The descriptor is 256 bit long, and for each of the 256 “samples” we pick two sampling points within the patch area using some pseudo-random lookup table and encode the following bit as 0 or 1 depending on the pixel relative values.&lt;/p&gt;
-    &lt;p&gt;Comparing keypoints becomes trivial, we simply XOR two bitstrings and count the bits.&lt;/p&gt;
-    &lt;p&gt;Since keypoints are agnostic to rotation and lighting conditions, we can use them to detect objects in various scenarios.&lt;/p&gt;
-    &lt;p&gt;One last addition to this algorithm is to resize/scale the image multiple times and detect keypoints at different scales. This way we can detect objects that are closer or further away from the camera, rotated at any angle, or partially occluded.&lt;/p&gt;
-    &lt;head rend="h2"&gt;LBP Cascades&lt;/head&gt;
-    &lt;p&gt;While keypoints and descriptors are great for detecting arbitrary objects, sometimes we need a more specialised approach for specific object types, like faces, vehicles, or hand gestures. This is where cascade classifiers, famously used in the Viola-Jones object detection framework, come into play.&lt;/p&gt;
-    &lt;p&gt;Instead of complex Haar-like features used by Viola and Jones, we can use something simpler: Local Binary Patterns (LBP). LBP is a powerful texture descriptor. For each pixel, it looks at its 8 neighbours. If a neighbour is brighter than the central pixel, we write a ‘1’, otherwise a ‘0’. This gives us an 8-bit number that describes the local texture.&lt;/p&gt;
-    &lt;p&gt;The “cascade” is a series of simple classifiers, or “stages”. Each stage looks at a sub-window of the image and uses a few LBP features to decide if that window could possibly contain the object of interest (e.g., a face).&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;If the sub-window fails the test at any stage, it’s immediately rejected. This is very fast.&lt;/item&gt;
-      &lt;item&gt;Only if a sub-window passes all stages is it classified as a positive detection.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;This structure allows the classifier to quickly discard the vast majority of the image, focusing computational power only on promising regions. By sliding this detection window across the entire image (and across multiple scales), we can find objects of a specific, pre-trained class. Grayskull provides a pre-trained frontal face detector that uses this exact technique.&lt;/p&gt;
-    &lt;p&gt;Here you can see the LBP cascade classifier in action, successfully detecting Sir Gary Oldman in all variety of his faces. The picture on the left uses minimum number of neighbours set to 4, while the right one uses 14. This means the left image detects more faces, but also has more false positives, while the right one is more conservative and only detect camera-facing images with no visual obstructions.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Conclusion&lt;/head&gt;
-    &lt;p&gt;We’ve taken a journey from the humble pixel to sophisticated object detection, all using simple C structures and fundamental algorithms. We tried to manipulate pixels, apply filters to enhance images, segment objects using thresholding, and clean them up. We then learned to find and analyze blobs, detect robust keypoints with FAST and ORB, and finally, use LBP cascades for specialized object detection.&lt;/p&gt;
-    &lt;p&gt;This is the core philosophy of Grayskull: to demystify computer vision by providing a minimal, dependency-free, and understandable toolkit. It proves that you don’t always need massive libraries or deep learning frameworks to achieve decent results, especially on resource-constrained systems.&lt;/p&gt;
-    &lt;p&gt;An image is indeed just a rectangle of numbers, and with a bit of algorithmic knowledge, you have the power to make it see. As always, I encourage you to check out the repository, experiment with the code, and maybe even try building your own simple CV project!&lt;/p&gt;
-    &lt;p&gt;I hope you’ve enjoyed this article. You can follow – and contribute to – on Github, Mastodon, Twitter or subscribe via rss.&lt;/p&gt;
-    &lt;p&gt;Oct 26, 2025&lt;/p&gt;
-    &lt;p&gt;See also: Étude in C minor and more.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://zserge.com/posts/grayskull/"/><published>2025-10-31T12:11:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45809644</id><title>Building blobd: single-machine object store with sub-ms reads and 15 GB/s upload</title><updated>2025-11-05T08:46:01.866144+00:00</updated><content>&lt;doc fingerprint="a6da511d29868b81"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-11-05T09:12:28.563025+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=45809644</id><title>Building blobd: single-machine object store with sub-ms reads and 15 GB/s upload</title><updated>2025-11-05T09:12:37.690292+00:00</updated><content>&lt;doc fingerprint="a6da511d29868b81"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Building blobd: single-machine object store with sub-millisecond reads and 15 GB/s uploads&lt;/head&gt;
     &lt;p&gt;For a past content platform, I used S3 for serving user content videos and documents, where there were lots of small range requests for streaming and seeking. Despite serving from same-region datacenters 2 ms from the user, S3 would take 30-200 ms to respond to each request. Even slight delays when jumping around quickly felt grating, and in UX every millisecond counts.&lt;/p&gt;
@@ -1132,12 +726,12 @@ sysctl -w net.ipv4.ip_local_port_range="10000 65535"
     &lt;p&gt;You can check out the open source code and usage instructions on the GitHub repo. Feel free to raise issues, ask questions and start discussions about blobd there! I'm especially interested in ideas or considerations to use blobd in projects, how the performance can benefit, and any limitations around using it.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://blog.wilsonl.in/blobd/"/><published>2025-11-04T11:09:24+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45811093</id><title>Show HN: A CSS-Only Terrain Generator</title><updated>2025-11-05T08:46:01.742837+00:00</updated><content>&lt;doc fingerprint="109996e321a537ae"&gt;
+&lt;/doc&gt;</content><link href="https://blog.wilsonl.in/blobd/"/><published>2025-11-04T11:09:24+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45811093</id><title>Show HN: A CSS-Only Terrain Generator</title><updated>2025-11-05T09:12:37.323004+00:00</updated><content>&lt;doc fingerprint="109996e321a537ae"&gt;
   &lt;main&gt;
     &lt;p&gt;CSS Terrain Generator Regenerate Restart Undo Redo Import Export Heightmap CSS VOX TXT PNG Copy Embed Open Codepen Download Code move raise lower about world size ✕ ✕ landmass coverage small medium large terrain type pampas hilly alpinist biome temperate arctic desert camera settings rotate x 45° tilt y 60° zoom 50% pan x 0px lift y 0px animate reset to defaults minimap heightmap matrix v0.0.1 Regenerate&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://terra.layoutit.com"/><published>2025-11-04T13:58:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45812024</id><title>This week in 1988, Robert Morris unleashed his eponymous worm upon the Internet</title><updated>2025-11-05T08:46:01.549070+00:00</updated><content>&lt;doc fingerprint="ff40223f0be08a6f"&gt;
+&lt;/doc&gt;</content><link href="https://terra.layoutit.com"/><published>2025-11-04T13:58:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45812024</id><title>This week in 1988, Robert Morris unleashed his eponymous worm</title><updated>2025-11-05T09:12:37.001336+00:00</updated><content>&lt;doc fingerprint="ff40223f0be08a6f"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;37 years ago this week, the Morris worm infected 10% of the Internet within 24 hours — worm slithered out and sparked a new era in cybersecurity&lt;/head&gt;
     &lt;p&gt;The Internet contracted worms a year before the World Wide Web was even a thing.&lt;/p&gt;
@@ -1167,7 +761,7 @@ sysctl -w net.ipv4.ip_local_port_range="10000 65535"
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.tomshardware.com/tech-industry/cyber-security/on-this-day-in-1988-the-morris-worm-slithered-out-and-sparked-a-new-era-in-cybersecurity-10-percent-of-the-internet-was-infected-within-24-hours"/><published>2025-11-04T15:23:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45812606</id><title>Pg_lake: Postgres with Iceberg and data lake access</title><updated>2025-11-05T08:46:01.049480+00:00</updated><content>&lt;doc fingerprint="fb9ba072642955e8"&gt;
+&lt;/doc&gt;</content><link href="https://www.tomshardware.com/tech-industry/cyber-security/on-this-day-in-1988-the-morris-worm-slithered-out-and-sparked-a-new-era-in-cybersecurity-10-percent-of-the-internet-was-infected-within-24-hours"/><published>2025-11-04T15:23:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45812606</id><title>Pg_lake: Postgres with Iceberg and data lake access</title><updated>2025-11-05T09:12:36.272836+00:00</updated><content>&lt;doc fingerprint="fb9ba072642955e8"&gt;
   &lt;main&gt;
     &lt;p&gt;&lt;code&gt;pg_lake&lt;/code&gt; integrates Iceberg and data lake files into Postgres. With the &lt;code&gt;pg_lake&lt;/code&gt; extensions, you can use Postgres as a stand-alone lakehouse system that supports transactions and fast queries on Iceberg tables, and can directly work with raw data files in object stores like S3.&lt;/p&gt;
     &lt;p&gt;At a high level, &lt;code&gt;pg_lake&lt;/code&gt; lets you:&lt;/p&gt;
@@ -1301,7 +895,7 @@ select count(*) from parquet_table;
     &lt;p&gt;&lt;code&gt;pg_lake&lt;/code&gt; is dependent on third-party projects Apache Avro and DuckDB. During build, &lt;code&gt;pg_lake&lt;/code&gt; applies patches to Avro and certain DuckDB extensions in order to provide the &lt;code&gt;pg_lake&lt;/code&gt; functionality. The source code associated with the Avro and DuckDB extensions is downloaded from the applicable upstream repos and the source code associated with those projects remains under the original licenses. If you are packaging or redistributing packages that include &lt;code&gt;pg_lake&lt;/code&gt;, please note that you should review those upstream license terms.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/Snowflake-Labs/pg_lake"/><published>2025-11-04T16:12:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45813310</id><title>Launch HN: Plexe (YC X25) – Build production-grade ML models from prompts</title><updated>2025-11-05T08:46:00.550854+00:00</updated><content>&lt;doc fingerprint="d1d50ecbdfaae78"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/Snowflake-Labs/pg_lake"/><published>2025-11-04T16:12:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45813310</id><title>Launch HN: Plexe (YC X25) – Build production-grade ML models from prompts</title><updated>2025-11-05T09:12:35.579673+00:00</updated><content>&lt;doc fingerprint="d1d50ecbdfaae78"&gt;
   &lt;main&gt;
     &lt;p&gt;AI Data Scientist&lt;/p&gt;
     &lt;p&gt;AI Data Scientist&lt;/p&gt;
@@ -1601,7 +1195,7 @@ select count(*) from parquet_table;
     &lt;p&gt;One-hot encoding for categorical variables proj_a, proj_b, funder and quarter.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.plexe.ai/"/><published>2025-11-04T17:07:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45813343</id><title>NoLongerEvil-Thermostat – Nest Generation 1 and 2 Firmware</title><updated>2025-11-05T08:46:00.164688+00:00</updated><content>&lt;doc fingerprint="1eabf0080969b3e8"&gt;
+&lt;/doc&gt;</content><link href="https://www.plexe.ai/"/><published>2025-11-04T17:07:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45813343</id><title>NoLongerEvil-Thermostat – Nest Generation 1 and 2 Firmware</title><updated>2025-11-05T09:12:34.892080+00:00</updated><content>&lt;doc fingerprint="1eabf0080969b3e8"&gt;
   &lt;main&gt;
     &lt;quote&gt;&lt;g-emoji&gt;⚠️&lt;/g-emoji&gt;WARNING: EXPERIMENTAL SOFTWARE&lt;p&gt;This project is currently in the experimental/testing phase. Do NOT use this firmware on any thermostat that is critical for your heating or cooling needs. Flashing this firmware may brick your device or cause unexpected behavior. Only proceed if you have a backup thermostat or can afford to have your device non-functional during testing.&lt;/p&gt;&lt;/quote&gt;
     &lt;p&gt;This directory contains the tools and firmware needed to flash custom firmware to Nest Thermostat devices using the OMAP DFU (Device Firmware Update) interface.&lt;/p&gt;
@@ -1685,7 +1279,7 @@ brew install libusb&lt;/code&gt;
     &lt;p&gt;We are committed to transparency and the right-to-repair movement. The firmware images and backend API server code will be open sourced soon, allowing the community to audit, improve, and self-host their own infrastructure.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/codykociemba/NoLongerEvil-Thermostat"/><published>2025-11-04T17:10:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45813767</id><title>Codemaps: Understand Code, Before You Vibe It</title><updated>2025-11-05T08:45:59.909969+00:00</updated><content>&lt;doc fingerprint="3fc296052cb3ae5f"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/codykociemba/NoLongerEvil-Thermostat"/><published>2025-11-04T17:10:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45813767</id><title>Codemaps: Understand Code, Before You Vibe It</title><updated>2025-11-05T09:12:34.637186+00:00</updated><content>&lt;doc fingerprint="3fc296052cb3ae5f"&gt;
   &lt;main&gt;
     &lt;quote&gt;“Your code is your understanding of the problem you’re exploring. So it’s only when you have your code in your head that you really understand the problem.” — Paul Graham&lt;/quote&gt;
     &lt;p&gt;Software development only becomes engineering with understanding. Your ability to reason through your most challenging coding tasks is constrained by your mental model of how things work — in other words, how quickly and how well you onboard to any codebase for solving any problem. However most AI vibe coding tools are aimed at relieving you of that burden by reading → thinking → writing the code for you, increasing the separation from you and your code. This is fine for low value, commodity tasks, but absolutely unacceptable for the hard, sensitive, and high value work that defines real engineering.&lt;/p&gt;
@@ -1711,7 +1305,7 @@ brew install libusb&lt;/code&gt;
     &lt;p&gt;You can try Codemaps on the latest versions of Windsurf, or DeepWiki!&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://cognition.ai/blog/codemaps"/><published>2025-11-04T17:47:09+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45816041</id><title>I took all my projects off the cloud, saving thousands of dollars</title><updated>2025-11-05T08:45:59.829670+00:00</updated><content/><link href="https://rameerez.com/send-this-article-to-your-friend-who-still-thinks-the-cloud-is-a-good-idea/"/><published>2025-11-04T21:22:15+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45816673</id><title>Grayskull: A tiny computer vision library in C for embedded systems, etc.</title><updated>2025-11-05T08:45:59.424146+00:00</updated><content>&lt;doc fingerprint="6e340ed9bad71609"&gt;
+&lt;/doc&gt;</content><link href="https://cognition.ai/blog/codemaps"/><published>2025-11-04T17:47:09+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45816041</id><title>I took all my projects off the cloud, saving thousands of dollars</title><updated>2025-11-05T09:12:34.416390+00:00</updated><content/><link href="https://rameerez.com/send-this-article-to-your-friend-who-still-thinks-the-cloud-is-a-good-idea/"/><published>2025-11-04T21:22:15+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45816673</id><title>Grayskull: A tiny computer vision library in C for embedded systems, etc.</title><updated>2025-11-05T09:12:33.748055+00:00</updated><content>&lt;doc fingerprint="6e340ed9bad71609"&gt;
   &lt;main&gt;
     &lt;p&gt;Grayskull is a minimalist, dependency-free computer vision library designed for microcontrollers and other resource-constrained devices. It focuses on grayscale images and provides modern, practical algorithms that fit in a few kilobytes of code. Single-header design, integer-based operations, pure C99.&lt;/p&gt;
     &lt;list rend="ul"&gt;
@@ -1795,7 +1389,7 @@ int gs_write_pgm(struct gs_image img, const char *path);&lt;/code&gt;
     &lt;p&gt;This project is licensed under the MIT License. Feel free to use in research, products, and your next embedded vision project!&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/zserge/grayskull"/><published>2025-11-04T22:35:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45816853</id><title>Mr Tiff</title><updated>2025-11-05T08:45:59.320872+00:00</updated><content>&lt;doc fingerprint="6498b18bb326a2bd"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/zserge/grayskull"/><published>2025-11-04T22:35:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45816853</id><title>Mr Tiff</title><updated>2025-11-05T09:12:33.501292+00:00</updated><content>&lt;doc fingerprint="6498b18bb326a2bd"&gt;
   &lt;main&gt;
     &lt;p&gt;For as long as I have published my books, one of my overarching goals was to give credit to those who actually invented the hardware and software that we use.&lt;/p&gt;
     &lt;p&gt;I have spent 10,000+ hours to create an accurate record of their work but I'm not complaining. The 'as-close-to-possible' truth of invention by individuals or teams meant identifying the work, educating myself, writing questions, and sending emails. And after that process, I set up a chat because it all gets down to talking to someone on the other side of the world, about something that happened 30 or 40 years ago.&lt;/p&gt;
@@ -1843,7 +1437,7 @@ int gs_write_pgm(struct gs_image img, const char *path);&lt;/code&gt;
     &lt;p&gt;My book "Inventing the Future: Bit by Bit" is here -&amp;gt;&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://inventingthefuture.ghost.io/mr-tiff/"/><published>2025-11-04T22:57:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45816879</id><title>Patching 68K Software – SimpleText</title><updated>2025-11-05T08:45:59.167252+00:00</updated><content>&lt;doc fingerprint="b2497ef403174708"&gt;
+&lt;/doc&gt;</content><link href="https://inventingthefuture.ghost.io/mr-tiff/"/><published>2025-11-04T22:57:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45816879</id><title>Patching 68K Software – SimpleText</title><updated>2025-11-05T09:12:33.181395+00:00</updated><content>&lt;doc fingerprint="b2497ef403174708"&gt;
   &lt;main&gt;
     &lt;p&gt;Someone asked to have SimpleText open a smaller text window at startup. Initially, I assumed this would be a fairly easy fix by just overwriting a few constant values in SimpleText code. It turned out to be a pain -- but I learned a lot along the way.&lt;lb/&gt;You need to have the code editor (from one of the Apple developer CDs) in your ResEdit preference file in order to disassemble code resources within ResEdit. Then, open each 'CODE' resource of SimpleText and search for _SizeWindow (A91D). Or, just skim the code until you see system calls that look like they have something to do with windows. Here is a nice chunk in routine Anon48. A new window is created, then it looks at the main device, looks at the size of the menu bar (MBarHeight), sets the port, and moves and sizes the window.&lt;lb/&gt;But, uh oh, earlier in the code it checks what type of window it is opening. A patch is going to need to avoid resizing code for pictures, video, and the about box.&lt;lb/&gt;I could not locate any obvious constants to adjust. Instead, I would need to inject a more complicated routine that detects whether it was a text window and substitute a new rectangle for the size. But, you cannot simply insert code, as it would move all subsequent code down, and the jumps (subroutine calls) that cross over that location would now jump to the wrong spots. So, I need to jump out of their code to my own (appended at the end of the code resource) and return.&lt;lb/&gt;For example, SimpleText's code to get the size of MBarHeight can easily be performed elsewhere. My routine need only return the MBarHeight in register D0 before returning. That gives me 8 bytes to overwrite with my jump.&lt;lb/&gt;Here is my replacement code. It still is only 8 bytes. But, I now jump to my subroutine, check the result, and jump over their resizing code if my routine says it is changing the window size.&lt;lb/&gt;In my subroutine, I make sure all the needed information is in registers (which I checked that SimpleText was not using), I call my various functions and then perform any work that was lost from overwriting or jumping over the original code. Specifically, I get the MBarHeight into D0 and set the current port to the window.&lt;lb/&gt;Easy! But, later in the code, SimpleText reads the content of whatever document is being opened and once again resizes the window. So, I needed to patch later code as well. How could I determine at that point that a replacement window size was being used? I simply store the result of the first subroutine (see SetRecentResult above) and then check it on later calls.&lt;lb/&gt;Where could I store this information? it is not possible to add global variables and the registers are all reused by SimpleText between the first and second routines. Well, you can store a variable (or an entire structure with many variables) within the code itself. Here is my little workaround for CodeWarrior.&lt;lb/&gt;A couple of other tricks.&lt;lb/&gt;1. The system routine GetHandleSize has some glue code (they intercept the call in a local library before calling the system). I needed this call, but didn't want to add the weight of CodeWarrior's libary. So, I defined the direct call to GetHandleSize (I didn't need the glue fix).&lt;lb/&gt;2. You can pass any of the scratch registers (D0-D2, A0-A1, FP0-FP3) to a C function. The way of defining that in CodeWarrior is noted below. You cannot use any other registers. To make debugging easier, I wrote the original subroutine as a true C function, and the register-&amp;gt;C function as a wrapper.&lt;lb/&gt;3. CodeWarrior does not support BSR for some reason. Use JSR instead. Also, a called routine must be placed before the caller routine in order to generate a short relative JSR rather than absolute address. See my 'RecentResult' example above, where the routines that call RecentResult are placed after it in code.&lt;lb/&gt;4. SimpleText stores literals (strings, constants) at the end of the 'CODE' resource. After that is where I placed my code. Unfortunately, this breaks disassembly in ResEdit. Below, do you see 'A9FF'? That's the '_Debugger' trap call. It is follow by the rest of the code, and the MacsBug symbols for "SimpleTextWindowChoicePrep'&lt;lb/&gt;I then needed to hand compute the JSR patched in the original SimpleText code to this location at the end of the code resource.&lt;lb/&gt;5. To make it easy to redefine window sizes in the future, I added a resource.&lt;lb/&gt;The ResEdit definition of this resource is the TMPL. By the way, I have experienced corruption twice with ResEdit 2.1.3. Perhaps it has a bug with templates?&lt;lb/&gt;I doubt this information will be useful to most people. However, it may help avoid some frustrating issues for those few people that attempt patching old software.&lt;lb/&gt;Attached is the hacked version of SimpleText.&lt;lb/&gt;- David&lt;/p&gt;
     &lt;p&gt;You need to have the code editor (from one of the Apple developer CDs) in your ResEdit preference file in order to disassemble code resources within ResEdit. Then, open each 'CODE' resource of SimpleText and search for _SizeWindow (A91D). Or, just skim the code until you see system calls that look like they have something to do with windows. Here is a nice chunk in routine Anon48. A new window is created, then it looks at the main device, looks at the size of the menu bar (MBarHeight), sets the port, and moves and sizes the window.&lt;/p&gt;
@@ -1867,7 +1461,36 @@ int gs_write_pgm(struct gs_image img, const char *path);&lt;/code&gt;
     &lt;p&gt;- David&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://tinkerdifferent.com/threads/patching-68k-software-simpletext.4793/"/><published>2025-11-04T22:59:22+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45816968</id><title>Google Removed 749M Anna's Archive URLs from Its Search Results</title><updated>2025-11-05T08:45:58.962867+00:00</updated><content>&lt;doc fingerprint="3b2013d053b71323"&gt;
+&lt;/doc&gt;</content><link href="https://tinkerdifferent.com/threads/patching-68k-software-simpletext.4793/"/><published>2025-11-04T22:59:22+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45816963</id><title>UPS plane crashes near Louisville airport</title><updated>2025-11-05T09:12:32.886053+00:00</updated><content>&lt;doc fingerprint="771c0157a07387ef"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;UPS plane crashes near Louisville airport, at least 7 killed, officials say&lt;/head&gt;
+    &lt;p&gt;At least seven people were killed and several others injured after a UPS plane crashed shortly after takeoff near the Louisville International Airport on Tuesday, officials said.&lt;/p&gt;
+    &lt;p&gt;The number of fatalities is expected to increase, Kentucky Gov. Andy Beshear wrote on social media Tuesday night. At least 11 people were injured, officials said earlier.&lt;/p&gt;
+    &lt;p&gt;Louisville Mayor Craig Greenberg confirmed at a news conference Tuesday night that at least four people had been killed on the ground.&lt;/p&gt;
+    &lt;p&gt;UPS Flight 2976 crashed around 5:15 p.m. local time after it departed from the Louisville airport, according to the Federal Aviation Administration. The aircraft was headed to Daniel K. Inouye International Airport in Honolulu, Hawaii, when it went down three miles south of the airfield, Louisville airport public safety officer Jonathan Biven said at a news conference.&lt;/p&gt;
+    &lt;p&gt;Beshear said there was no hazardous cargo onboard the plane that would create environmental issues around the crash site, but urged residents to follow any shelter-in-place orders.&lt;/p&gt;
+    &lt;p&gt;The Louisville Metro Police Department described the scene as active with "fire and debris," warning residents to stay away from Fern Valley and Grade Lane, an intersection located on the south side of the airport, which serves as the hub of UPS. More than 100 firefighters responded to the crash and were still battling hot spots as of Tuesday night, Greenberg said. Louisville Fire Chief Brian O'Neill noted the fire was "almost entirely contained."&lt;/p&gt;
+    &lt;p&gt;O'Neill said the fire had been extinguished enough to allow a formal grid search for any possible victims in the area.&lt;/p&gt;
+    &lt;p&gt;Videos of the crash showed the aircraft partially on fire as it sped down the runway before it burst into flames.&lt;/p&gt;
+    &lt;p&gt;A shelter-in-place order has been reduced to a one-mile radius of the crash site, authorities said. The police department also urged those in the area to turn off any air intake systems as soon as possible due to the smoke in the area.&lt;/p&gt;
+    &lt;p&gt;"Anybody who has seen the images and the video knows how violent this crash is, and there are a lot of families that are gonna be waiting and wondering for a period of time. We're going to try to get them that information as fast as we can," Beshear said.&lt;/p&gt;
+    &lt;p&gt;UPS said in a statement that it was notified of an incident involving one of its aircraft. Three UPS crewmembers were on board, the company said. It didn't immediately provide more details.&lt;/p&gt;
+    &lt;p&gt;"We do not at the moment have the status of the crew," Beshear said. "Watching that video, I think we're all very, very worried about them."&lt;/p&gt;
+    &lt;p&gt;Businesses in the area were heavily impacted by the crash, including Kentucky Petroleum Recycling and Grade A Auto Parts, the governor said.&lt;/p&gt;
+    &lt;p&gt;All arriving and departing flights at the Louisville airport were temporarily suspended. The airport will remain closed Tuesday night, but is expected to reopen Wednesday morning, Greenberg said.&lt;/p&gt;
+    &lt;p&gt;According to preliminary flight data from FlightRadar24, the plane appeared to hit 175 feet in altitude briefly after takeoff. It would have been full of fuel for the flight to Hawaii, which likely led to the significant fire as seen from CBS affiliate WLKY-TV's chopper.&lt;/p&gt;
+    &lt;p&gt;The three-engine McDonnell Douglas MD-11 was manufactured in 1991, according to FAA data.&lt;/p&gt;
+    &lt;p&gt;It was carrying approximately 38,000 gallons of fuel, which weighs about 233,000 pounds, Louisville Fire Chief Brian O'Neill said. The area affected by the crash is about a city block wide, he said, but it has been difficult to contain the fire due to surrounding hazardous materials.&lt;/p&gt;
+    &lt;p&gt;Greenberg urged any residents who find debris on their property not to touch it, and instead report it through a website that should be live by Wednesday.&lt;/p&gt;
+    &lt;p&gt;The crash is where UPS Worldport, an international air hub for the parcel service, is located. UPS said it was halting package sorting operations at Worldport on Tuesday night.&lt;/p&gt;
+    &lt;p&gt;"This is a UPS town," Louisville Metro Councilwoman Betsy Ruhe, whose district is part of the crash site, said during the news conference Tuesday night. "We all know somebody who works at UPS, and they're all texting their friends, their family, trying to make sure everyone is safe. Sadly, some of those texts are probably going to go unanswered."&lt;/p&gt;
+    &lt;p&gt;The 5.2 million-square-foot facility processes more than 400,000 packages an hour and is home to 20,000 UPS workers and 300 daily flights, according to the company.&lt;/p&gt;
+    &lt;p&gt;"My team and I are closely monitoring the plane crash near Louisville Muhammad Ali International Airport," Kentucky Sen. Rand Paul said. "We continue to pray for the safety of the aircrew, everyone in the area, and for the first-responders on the scene."&lt;/p&gt;
+    &lt;p&gt;The National Transportation Safety Board will lead the investigation into the crash. A team of 28 investigators is expected to arrive Wednesday, Greenberg said.&lt;/p&gt;
+    &lt;p&gt;All public schools in the Jefferson County School District, the largest school district in Kentucky with a little under 100,000 students, will be closed Wednesday, Greenberg said.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://www.cbsnews.com/news/ups-plane-crash-louisville-kentucky/"/><published>2025-11-04T23:10:53+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45816968</id><title>Google Removed 749M Anna's Archive URLs from Its Search Results</title><updated>2025-11-05T09:12:32.712355+00:00</updated><content>&lt;doc fingerprint="3b2013d053b71323"&gt;
   &lt;main&gt;
     &lt;p&gt;Anna’s Archive is a meta-search engine for shadow libraries that allows users to find pirated books and other related sources.&lt;/p&gt;
     &lt;p&gt;The site launched in the fall of 2022, just days after Z-Library was targeted in a U.S. criminal crackdown, to ensure continued availability of ‘free’ books and articles to the broader public.&lt;/p&gt;
@@ -1886,7 +1509,7 @@ int gs_write_pgm(struct gs_image img, const char *path);&lt;/code&gt;
     &lt;p&gt;That said, the Anna’s Archive website is certainly not unfindable. Searching for the site’s name in Google still shows the main domain as the top search result.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://torrentfreak.com/google-removed-749-million-annas-archive-urls-from-its-search-results/"/><published>2025-11-04T23:11:20+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45817114</id><title>Bluetui – A TUI for managing Bluetooth on Linux</title><updated>2025-11-05T08:45:58.564008+00:00</updated><content>&lt;doc fingerprint="e4d181ddbeaa2ea"&gt;
+&lt;/doc&gt;</content><link href="https://torrentfreak.com/google-removed-749-million-annas-archive-urls-from-its-search-results/"/><published>2025-11-04T23:11:20+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45817114</id><title>Bluetui – A TUI for managing Bluetooth on Linux</title><updated>2025-11-05T09:12:32.068781+00:00</updated><content>&lt;doc fingerprint="e4d181ddbeaa2ea"&gt;
   &lt;main&gt;
     &lt;p&gt;A Linux based OS with bluez installed.&lt;/p&gt;
     &lt;p&gt;Note&lt;/p&gt;
@@ -1945,7 +1568,7 @@ rename = "e"&lt;/code&gt;
     &lt;p&gt;Bluetui logo: Marco Bulgarelli&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/pythops/bluetui"/><published>2025-11-04T23:29:31+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45817167</id><title>Uncle Sam wants to scan your iris and collect your DNA, citizen or not</title><updated>2025-11-05T08:45:58.323867+00:00</updated><content>&lt;doc fingerprint="fbca09582881b604"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/pythops/bluetui"/><published>2025-11-04T23:29:31+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45817167</id><title>Uncle Sam wants to scan your iris and collect your DNA, citizen or not</title><updated>2025-11-05T09:12:31.742387+00:00</updated><content>&lt;doc fingerprint="fbca09582881b604"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Uncle Sam wants to scan your iris and collect your DNA, citizen or not&lt;/head&gt;
     &lt;head rend="h2"&gt;DHS rule would expand biometric collection to immigrants and some citizens linked to them&lt;/head&gt;
@@ -1973,7 +1596,27 @@ rename = "e"&lt;/code&gt;
     &lt;p&gt;DHS is taking comments on the proposal until January 2; so far the submissions are nearly entirely negative, with posters decrying the plan as government overreach, comparing the proposal to communist China, and calling it a violation of Constitutional guarantees against unreasonable search and seizure. ®&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.theregister.com/2025/11/04/dhs_wants_to_collect_biometric_data/"/><published>2025-11-04T23:35:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45818319</id><title>Direct File won't happen in 2026, IRS tells states</title><updated>2025-11-05T08:45:58.177453+00:00</updated><content>&lt;doc fingerprint="b8a1c09cd9635069"&gt;
+&lt;/doc&gt;</content><link href="https://www.theregister.com/2025/11/04/dhs_wants_to_collect_biometric_data/"/><published>2025-11-04T23:35:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45818123</id><title>Munich's surfers left stunned after famed river wave vanishes</title><updated>2025-11-05T09:12:31.498007+00:00</updated><content>&lt;doc fingerprint="fe1b0d4e24b3d61d"&gt;
+  &lt;main&gt;
+    &lt;p&gt;The “mother of all river waves” in a German canal that is often credited as the birthplace of freshwater surfing has mysteriously disappeared after decades of flowing smoothly, leaving enthusiasts dumbfounded.&lt;/p&gt;
+    &lt;p&gt;The famous stationary wave in the southern city of Munich is known as the Eisbach, or “ice brook”, for its frigid temperatures, and has become a pilgrimage site for surfers worldwide.&lt;/p&gt;
+    &lt;p&gt;Unlike ocean surfing, its freshwater cousin takes place on a “standing wave”, which is often human-made, with currents often flowing over a concrete slab that manipulates the water into a permanent wave.&lt;/p&gt;
+    &lt;p&gt;The sport’s origin is often cited as dating back to the early 1970s, when rule-breaking daredevils rode the naturally forming wave in Munich for the first time.&lt;/p&gt;
+    &lt;p&gt;Today, river surfing has a global following, including in the River Severn in the United Kingdom, where surfers ride tidal bores, a phenomenon in which incoming tides form waves that move up a river.&lt;/p&gt;
+    &lt;p&gt;In Hawaii, surfers also make river waves by digging a trench between a river and the ocean, with water flowing violently over the sand.&lt;/p&gt;
+    &lt;p&gt;The Eisbach wave was originally believed to be formed by gravel, but the Munich surfing community later installed wooden planks that helped artificially stabilise the wave. Over the decades, it has become a major tourist draw for Bavaria’s state capital.&lt;/p&gt;
+    &lt;p&gt;Largest during the winter months – when ice melt can push the wave up to one metre high – the river is now officially managed, including being drained once a year to clean away debris and inspect the streambed.&lt;/p&gt;
+    &lt;p&gt;But after torrents were released back into the canal following its cleanup on Friday, the Eisbach wave did not form as usual, instead leaving unstable white water rapids.&lt;/p&gt;
+    &lt;p&gt;“We’re at a loss,” surfer Klaus Rudolf told Stern magazine. “I was standing at the edge with my board on Friday evening and couldn’t believe it.”&lt;/p&gt;
+    &lt;p&gt;Authorities were looking into the cause of the wave’s disappearance, including whether it could be due to the cleaning or a lack of water.&lt;/p&gt;
+    &lt;p&gt;“No structural changes were made to the Eisbach wave or its banks during the cleanup,” the city said. An inspection of the site on Monday also did not reveal any damage.&lt;/p&gt;
+    &lt;p&gt;On Tuesday, Mayor Dieter Reiter said in a statement that the city administration was “working with the Water Management Office and surfers to find a quick solution so that the famous surf wave will soon be available again as usual”.&lt;/p&gt;
+    &lt;p&gt;Officials now plan to divert more water into the canal in hopes of a reappearance of the Eisbach, which SurferToday.com describes as “the mother of all river waves”. Standing waves require delicately balanced water levels and speeds.&lt;/p&gt;
+    &lt;p&gt;The Eisbach wave closed earlier this year for several months after the death of a 33-year-old Munich woman who became trapped under the surface at night. Since it reopened, new rules have banned night-time surfing.&lt;/p&gt;
+    &lt;p&gt;Agence France-Presse contributed to this report&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://www.theguardian.com/world/2025/nov/04/munichs-surfers-left-stunned-after-famed-river-wave-vanishes"/><published>2025-11-05T01:51:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45818319</id><title>Direct File won't happen in 2026, IRS tells states</title><updated>2025-11-05T09:12:30.982733+00:00</updated><content>&lt;doc fingerprint="b8a1c09cd9635069"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Direct File won’t happen in 2026, IRS tells states&lt;/head&gt;
     &lt;head rend="h2"&gt;The free service that allowed taxpayers to file online directly with the IRS was used by hundreds of thousands of taxpayers in 2024 and 2025, who gave it high marks — although tax prep companies and Republicans have sought its end.&lt;/head&gt;
@@ -1993,7 +1636,7 @@ rename = "e"&lt;/code&gt;
     &lt;p&gt;NEXT STORY: CBP expands facial recognition for non-citizens at borders&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.nextgov.com/digital-government/2025/11/direct-file-wont-happen-2026-irs-tells-states/409309/"/><published>2025-11-05T02:30:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45818471</id><title>The Microsoft SoftCard for the Apple II: Getting two processors to share memory</title><updated>2025-11-05T08:45:58.029884+00:00</updated><content>&lt;doc fingerprint="a2dfd9092d34a089"&gt;
+&lt;/doc&gt;</content><link href="https://www.nextgov.com/digital-government/2025/11/direct-file-wont-happen-2026-irs-tells-states/409309/"/><published>2025-11-05T02:30:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45818471</id><title>The Microsoft SoftCard for the Apple II: Getting two processors to share memory</title><updated>2025-11-05T09:12:30.820143+00:00</updated><content>&lt;doc fingerprint="a2dfd9092d34a089"&gt;
   &lt;main&gt;
     &lt;p&gt;The Microsoft Z-80 SoftCard was a plug-in expansion card for the Apple II that added the ability to run CP/M software. According to Wikipedia, it was Microsoft’s first hardware product and in 1980 was the single largest revenue source for the company.&lt;/p&gt;
     &lt;p&gt;CP/M runs on an 8080 processor, but the Apple II has a 6502 processor. So how can you run CP/M on an Apple II? Answer: The card comes with its own 8080-compatible processor, the Zilog Z80, which was arguable better than the 8080 for a bunch of reasons given on its Wikipedia page.¹&lt;/p&gt;
@@ -2108,7 +1751,7 @@ rename = "e"&lt;/code&gt;
     &lt;p&gt;³ There were also two high resolution graphics frame buffers, one at $2000–$3FFF, and another at $4000–$5FFF. These were right in the middle of the Z80 memory map, but in practice it wasn’t a problem because CP/M was a text-mode operating system, so the programs you were running didn’t try to do graphics anyway.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://devblogs.microsoft.com/oldnewthing/20251104-00/?p=111758"/><published>2025-11-05T02:58:25+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45818499</id><title>Preventing Kubernetes from Pulling the Pause Image from the Internet</title><updated>2025-11-05T08:45:57.211552+00:00</updated><content>&lt;doc fingerprint="3510c03015708d17"&gt;
+&lt;/doc&gt;</content><link href="https://devblogs.microsoft.com/oldnewthing/20251104-00/?p=111758"/><published>2025-11-05T02:58:25+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45818499</id><title>Preventing Kubernetes from Pulling the Pause Image from the Internet</title><updated>2025-11-05T09:12:29.263282+00:00</updated><content>&lt;doc fingerprint="3510c03015708d17"&gt;
   &lt;main&gt;
     &lt;p&gt;I don’t normally write blog posts that regurgitate information from normal documentation, but this particular subject irks me.&lt;/p&gt;
     &lt;p&gt;If you are running an internal Kubernetes (k8s) platform, you owe it to yourself to make sure there is nothing external to your platform determining your reliability.&lt;/p&gt;
@@ -2158,7 +1801,7 @@ You can see this in code here.&lt;/p&gt;
     &lt;p&gt;Comment via email&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://kyle.cascade.family/posts/preventing-kubernetes-from-pulling-the-pause-image-from-the-internet/"/><published>2025-11-05T03:04:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45818562</id><title>Hypothesis: Property-Based Testing for Python</title><updated>2025-11-05T08:45:57.122926+00:00</updated><content>&lt;doc fingerprint="a1031a81e5b71397"&gt;
+&lt;/doc&gt;</content><link href="https://kyle.cascade.family/posts/preventing-kubernetes-from-pulling-the-pause-image-from-the-internet/"/><published>2025-11-05T03:04:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45818562</id><title>Hypothesis: Property-Based Testing for Python</title><updated>2025-11-05T09:12:29.102848+00:00</updated><content>&lt;doc fingerprint="a1031a81e5b71397"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Welcome to Hypothesis!¶&lt;/head&gt;
     &lt;p&gt;Hypothesis is the property-based testing library for Python. With Hypothesis, you write tests which should pass for all inputs in whatever range you describe, and let Hypothesis randomly choose which of those inputs to check - including edge cases you might not have thought about. For example:&lt;/p&gt;
@@ -2174,11 +1817,4 @@ You can see this in code here.&lt;/p&gt;
     &lt;p&gt;Technical API reference.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://hypothesis.readthedocs.io/en/latest/"/><published>2025-11-05T03:15:37+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=45818973</id><title>Epic vs. Google settlement: Opening up Android</title><updated>2025-11-05T08:45:56.755438+00:00</updated><content>&lt;doc fingerprint="d635f48b34542867"&gt;
-  &lt;main&gt;
-    &lt;p&gt;We’ve detected that JavaScript is disabled in this browser. Please enable JavaScript or switch to a supported browser to continue using x.com. You can see a list of supported browsers in our Help Center.&lt;/p&gt;
-    &lt;p&gt;Help Center&lt;/p&gt;
-    &lt;p&gt;Terms of Service Privacy Policy Cookie Policy Imprint Ads info © 2025 X Corp.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://twitter.com/TimSweeneyEpic/status/1985920786545123613"/><published>2025-11-05T04:12:53+00:00</published></entry></feed>
+&lt;/doc&gt;</content><link href="https://hypothesis.readthedocs.io/en/latest/"/><published>2025-11-05T03:15:37+00:00</published></entry></feed>
