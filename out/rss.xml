@@ -1,568 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Tue, 18 Nov 2025 03:31:40 +0000</lastBuildDate><item><title>Giving C a superpower: custom header file (safe_c.h)</title><link>https://hwisnu.bearblog.dev/giving-c-a-superpower-custom-header-file-safe_ch/</link><description>&lt;doc fingerprint="2c11dabd8e0b7208"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Giving C a Superpower: custom header file (safe_c.h)&lt;/head&gt;
-    &lt;p&gt;The story of how I wrote a leak-free, thread-safe grep in C23 without shooting yourself in the foot, and how you can too!&lt;/p&gt;
-    &lt;head rend="h1"&gt;Introduction&lt;/head&gt;
-    &lt;p&gt;Let's be honest: most people have a love-hate relationship with C. We love its raw speed, its direct connection to the metal, and its elegant simplicity. But we hate its footguns, its dragons, the untamed beasts. The segfaults that appear from nowhere, the memory leaks that slowly drain the life from our applications, and the endless goto cleanup; chains that make our code look like a plate of spaghetti pasta.&lt;/p&gt;
-    &lt;p&gt;This is the classic C curse: power without guardrails...at least that's the fear mongering mantra being said again and again. But is that still relevant in today's world with all the tools available for C devs like static analyzer and dynamic sanitizers? I've written about this here and here.&lt;/p&gt;
-    &lt;p&gt;What if, with the help of the modern tools and a custom header file (600 loc), you could tame those footguns beasts? What if you could keep C's power but wrap it in a suit of modern armor? That's what the custom header file safe_c.h is for. It's designed to give C some safety and convenience features from C++ and Rust, and I'm using it to build a high-performance grep clone called cgrep as my test case.&lt;/p&gt;
-    &lt;p&gt;By the end this article I hope it could provide the audience with the idea of C is super flexible and extensible, sort of "do whatever you want with it" kind of thing. And this is why C (and its close cousin: Zig) remain to be my favorite language to write programs in; it's the language of freedom!&lt;/p&gt;
-    &lt;head rend="h1"&gt;safe_c.h&lt;/head&gt;
-    &lt;p&gt;Is a custom C header file that takes features mainly from C++ and Rust and implements them into our C code ~ [write C code, get C++ and Rust features!]&lt;/p&gt;
-    &lt;p&gt;It starts by bridging the gap between old and new C. C23 gave us &lt;code&gt;[[cleanup]]&lt;/code&gt; attributes, but in the real world, you need code that compiles on GCC 11 or Clang 18. safe_c.h detects your compiler and gives you the same RAII semantics everywhere. No more &lt;code&gt;#ifdef&lt;/code&gt; soup.&lt;/p&gt;
-    &lt;code&gt;// The magic behind CLEANUP: zero overhead, maximum safety
-#if defined(__STDC_VERSION__) &amp;amp;&amp;amp; __STDC_VERSION__ &amp;gt;= 202311L
-#define CLEANUP(func) [[cleanup(func)]]
-#else
-#define CLEANUP(func) __attribute__((cleanup(func)))
-#endif
-
-// Branch prediction that actually matters in hot paths
-#ifdef __GNUC__
-#define LIKELY(x)   __builtin_expect(!!(x), 1)
-#define UNLIKELY(x) __builtin_expect(!!(x), 0)
-#else
-#define LIKELY(x)   (x)
-#define UNLIKELY(x) (x)
-#endif
-&lt;/code&gt;
-    &lt;p&gt;Your cleanup code runs even if you return early, goto out, or panic. It's &lt;code&gt;finally&lt;/code&gt;, but for C.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The Memory Management Beast: Slain with Smart Pointers (C++ feature)&lt;/head&gt;
-    &lt;p&gt;The oldest, fiercest and most feared by devs: manual memory management.&lt;/p&gt;
-    &lt;p&gt;Before: the highway path to leaks.&lt;lb/&gt; Forgetting a single &lt;code&gt;free()&lt;/code&gt; is a disaster. In cgrep, parsing command-line options the old way is a breeding ground for CVEs and its bestiary. You have to remember to free the memory on every single exit path, difficult for the undisciplined.&lt;/p&gt;
-    &lt;code&gt;// The Old Way (don't do this)
-char* include_pattern = NULL;
-if (optarg) {
-    include_pattern = strdup(optarg);
-}
-// ...200 lines later...
-if (some_error) {
-    if (include_pattern) free(include_pattern); // Did I free it? Did I??
-    return 1;
-}
-// And remember to free it at *every* return path...
-&lt;/code&gt;
-    &lt;p&gt;After: memory that automatically cleans itself up.&lt;lb/&gt; UniquePtr is a "smart pointer" that owns a resource. When the UniquePtr variable goes out of scope, its resource is automatically freed. It's impossible to forget.&lt;/p&gt;
-    &lt;p&gt;Here's the machinery inside &lt;code&gt;safe_c.h&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;// The UniquePtr machinery: a struct + automatic cleanup
-typedef struct {
-    void* ptr;
-    void (*deleter)(void*);
-} UniquePtr;
-
-#define AUTO_UNIQUE_PTR(name, ptr, deleter) \
-    UniquePtr name CLEANUP(unique_ptr_cleanup) = UNIQUE_PTR_INIT(ptr, deleter)
-
-static inline void unique_ptr_cleanup(UniquePtr* uptr) {
-    if (uptr &amp;amp;&amp;amp; uptr-&amp;gt;ptr &amp;amp;&amp;amp; uptr-&amp;gt;deleter) {
-        uptr-&amp;gt;deleter(uptr-&amp;gt;ptr);
-        uptr-&amp;gt;ptr = NULL;
-    }
-}
-&lt;/code&gt;
-    &lt;p&gt;And here's how cgrep uses it. The cleanup is automatic, even if errors happen:&lt;/p&gt;
-    &lt;code&gt;// In cgrep, we use this for command-line arguments
-AUTO_UNIQUE_PTR(include_pattern_ptr, NULL, options_string_deleter);
-
-// When we get a new pattern, the old one is automatically freed!
-unique_ptr_delete(&amp;amp;include_pattern_ptr);
-include_pattern_ptr.ptr = strdup(optarg);
-// No leaks, even if an error happens later!
-&lt;/code&gt;
-    &lt;p&gt;Sharing Safely with SharedPtr&lt;/p&gt;
-    &lt;p&gt;Before: manual, bug-prone reference counting.&lt;lb/&gt; You'd have to implement reference counting by hand, creating a complex and fragile system where a single mistake leads to a leak or a use-after-free bug.&lt;/p&gt;
-    &lt;code&gt;// The old way of manual reference counting
-typedef struct {
-    MatchStore* store;
-    int ref_count;
-    pthread_mutex_t mutex;
-} SharedStore;
-
-void release_store(SharedStore* s) {
-    pthread_mutex_lock(&amp;amp;s-&amp;gt;mutex);
-    s-&amp;gt;ref_count--;
-    bool is_last = (s-&amp;gt;ref_count == 0);
-    pthread_mutex_unlock(&amp;amp;s-&amp;gt;mutex);
-
-    if (is_last) {
-        match_store_deleter(s-&amp;gt;store);
-        free(s);
-    }
-}
-&lt;/code&gt;
-    &lt;p&gt;After: automated reference counting.&lt;lb/&gt; SharedPtr automates this entire process. The last thread to finish using the object automatically triggers its destruction. The machinery:&lt;/p&gt;
-    &lt;code&gt;// The SharedPtr machinery: reference counting without the boilerplate
-typedef struct {
-    void* ptr;
-    void (*deleter)(void*);
-    size_t* ref_count;
-} SharedPtr;
-
-#define AUTO_SHARED_PTR(name) \
-    SharedPtr name CLEANUP(shared_ptr_cleanup) = {.ptr = NULL, .deleter = NULL, .ref_count = NULL}
-
-static inline void shared_ptr_cleanup(SharedPtr* sptr) {
-    shared_ptr_delete(sptr); // Decrement and free if last reference
-}
-&lt;/code&gt;
-    &lt;p&gt;The usage is clean and safe. No more manual counting.&lt;/p&gt;
-    &lt;code&gt;// In our thread worker context, multiple threads access the same results store
-typedef struct {
-    // ...
-    SharedPtr store;  // No more worrying about who frees this!
-    SharedPtr file_counts;
-    // ...
-} FileWorkerContext;
-
-// In main(), we create it once and share it safely
-// SharedPtr: Reference-counted stores for thread-safe sharing
-SharedPtr store_shared = {0};
-shared_ptr_init(&amp;amp;store_shared, store_ptr.ptr, match_store_deleter);
-// Pass to threads: ctx-&amp;gt;store = shared_ptr_copy(&amp;amp;store_shared);
-// ref-count increments automatically; last thread out frees it.
-&lt;/code&gt;
-    &lt;head rend="h2"&gt;The Buffer Overflow Beast: Contained with Vectors and Views (C++ feature)&lt;/head&gt;
-    &lt;p&gt;Dynamically growing arrays in C is a horror show.&lt;/p&gt;
-    &lt;p&gt;Before: the realloc dance routine.&lt;lb/&gt; You have to manually track capacity and size, and every realloc risks fragmenting memory or failing, requiring careful error handling for every single element you add.&lt;/p&gt;
-    &lt;code&gt;// The old way: manual realloc is inefficient and complex
-MatchEntry** matches = NULL;
-size_t matches_count = 0;
-size_t matches_capacity = 0;
-
-for (/*...each match...*/) {
-    if (matches_count &amp;gt;= matches_capacity) {
-        matches_capacity = (matches_capacity == 0) ? 8 : matches_capacity * 2;
-        MatchEntry** new_matches = realloc(matches, matches_capacity * sizeof(MatchEntry*));
-        if (!new_matches) {
-            free(matches); // Don't leak!
-            /* handle error */
-        }
-        matches = new_matches;
-    }
-    matches[matches_count++] = current_match;
-}
-&lt;/code&gt;
-    &lt;p&gt;After: a type-safe, auto-growing vector.&lt;lb/&gt; safe_c.h generates an entire type-safe vector for you. It handles allocation, growth, and cleanup automatically. The magic that generates the vector:&lt;/p&gt;
-    &lt;code&gt;// The magic that generates a complete vector type from a single line
-#define DEFINE_VECTOR_TYPE(name, type) \
-    typedef struct { \
-        Vector base; \
-        type* data; \
-    } name##Vector; \
-    \
-    static inline bool name##_vector_push_back(name##Vector* vec, type value) { \
-        bool result = vector_push_back(&amp;amp;vec-&amp;gt;base, &amp;amp;value); \
-        vec-&amp;gt;data = (type*)vec-&amp;gt;base.data; /* Sync pointer after potential realloc */ \
-        return result; \
-    } \
-    \
-    static inline bool name##_vector_reserve(name##Vector* vec, size_t new_capacity) { \
-        bool result = vector_reserve(&amp;amp;vec-&amp;gt;base, new_capacity); \
-        vec-&amp;gt;data = (type*)vec-&amp;gt;base.data; /* Sync pointer after potential realloc */ \
-        return result; \
-    } \
-
-
-    /* more helper functions not outlined here */
-
-// And the underlying generic Vector implementation
-typedef struct {
-    size_t size;
-    size_t capacity;
-    void* data;
-    size_t element_size;
-} Vector;
-&lt;/code&gt;
-    &lt;p&gt;Using it in cgrep is simple and safe. The vector cleans itself up when it goes out of scope.&lt;/p&gt;
-    &lt;code&gt;// Type-safe vector for collecting matches
-DEFINE_VECTOR_TYPE(MatchEntryPtr, MatchEntry*)
-
-AUTO_TYPED_VECTOR(MatchEntryPtr, all_matches_vec);
-MatchEntryPtr_vector_reserve(&amp;amp;all_matches_vec, store-&amp;gt;total_matches);
-
-// Pushing elements is safe and simple
-for (MatchEntry* entry = store-&amp;gt;buckets[i]; entry; entry = entry-&amp;gt;next) {
-    MatchEntryPtr_vector_push_back(&amp;amp;all_matches_vec, entry);
-}
-&lt;/code&gt;
-    &lt;head rend="h2"&gt;Views: Look, Don't Touch (or malloc) - C++ feature&lt;/head&gt;
-    &lt;p&gt;Before: needless allocations.&lt;lb/&gt; To handle a substring or a slice of an array, you'd often malloc a new buffer and copy the data into it, which is incredibly slow in a tight loop.&lt;/p&gt;
-    &lt;code&gt;// The old way: allocating a new string just to get a substring
-const char* line = "this is a long line of text";
-char* pattern = "long line";
-// To pass just the pattern to a function, you might do this:
-char* sub = malloc(strlen(pattern) + 1);
-strncpy(sub, pattern, strlen(pattern) + 1);
-// ... use sub ...
-free(sub); // And hope you remember this free call
-&lt;/code&gt;
-    &lt;p&gt;After: zero-cost, non-owning views.&lt;lb/&gt; A StringView or a Span is just a pointer and a length. It's a non-owning reference that lets you work with slices of data without any allocation. The definitions are pure and simple:&lt;/p&gt;
-    &lt;code&gt;// The StringView and Span definitions: pure, simple, zero-cost
-typedef struct {
-    const char* data;
-    size_t size;
-} StringView;
-
-typedef struct {
-    void* data;
-    size_t size;
-    size_t element_size;
-} Span;
-&lt;/code&gt;
-    &lt;p&gt;In cgrep, the search pattern becomes a StringView, avoiding allocation entirely.&lt;/p&gt;
-    &lt;code&gt;// Our options struct holds a StringView, not a char*
-typedef struct {
-    StringView pattern; // Clean, simple, and safe
-    // ...
-} GrepOptions;
-
-// Initializing it is a piece of cake
-options.pattern = string_view_init(argv[optind]);
-&lt;/code&gt;
-    &lt;p&gt;For safe array access, Span provides a bounds-checked window into existing data.&lt;/p&gt;
-    &lt;code&gt;// safe_c.h
-#define DEFINE_SPAN_TYPE(name, type) \
-    typedef struct { \
-        type* data; \
-        size_t size; \
-    } name##Span; \
-    \
-    static inline name##Span name##_span_init(type* data, size_t size) { \
-        return (name##Span){.data = data, .size = size}; \
-    } \
-    \
-
-    /* other helper functions not outlined here */
-&lt;/code&gt;
-    &lt;code&gt;// Span: Type-safe array slices for chunk processing
-DEFINE_SPAN_TYPE(LineBuffer, char)
-LineBufferSpan input_span = LineBuffer_span_init((char*)start, len);
-
-for (size_t i = 0; i &amp;lt; LineBuffer_span_size(&amp;amp;input_span); i++) {
-    char* line = LineBuffer_span_at(&amp;amp;input_span, i); // asserts i &amp;lt; span.size
-}
-&lt;/code&gt;
-    &lt;head rend="h2"&gt;The Error-Handling &lt;code&gt;goto&lt;/code&gt; Beast: Replaced with Results (Rust feature) and RAII (C++ feature)&lt;/head&gt;
-    &lt;p&gt;C's error handling is notoriously messy.&lt;/p&gt;
-    &lt;p&gt;Before: goto cleanup spaghetti carbonara.&lt;lb/&gt; Functions return special values like -1 or NULL, and you have to check errno. This leads to deeply nested if statements and a single goto cleanup; label that has to handle every possible failure case.&lt;/p&gt;
-    &lt;code&gt;// The old way: goto cleanup
-int do_something(const char* path) {
-    int fd = open(path, O_RDONLY);
-    if (fd &amp;lt; 0) {
-        return -1; // Error
-    }
-
-    void* mem = malloc(1024);
-    if (!mem) {
-        close(fd); // Manual cleanup
-        return -1;
-    }
-    
-    // ... do more work ...
-
-    free(mem);
-    close(fd);
-    return 0; // Success
-}
-&lt;/code&gt;
-    &lt;p&gt;After: explicit, type-safe result.&lt;lb/&gt; Inspired by Rust, Result&lt;/p&gt;
-    &lt;code&gt;// The Result type machinery: tagged unions for success/failure
-typedef enum { RESULT_OK, RESULT_ERROR } ResultStatus;
-
-#define DEFINE_RESULT_TYPE(name, value_type, error_type) \
-    typedef struct { \
-        ResultStatus status; \
-        union { \
-            value_type value; \
-            error_type error; \
-        }; \
-    } Result##name;
-&lt;/code&gt;
-    &lt;p&gt;Handling errors becomes easy. You can't accidentally use an error as a valid value.&lt;/p&gt;
-    &lt;code&gt;// Define a Result for file operations
-DEFINE_RESULT_TYPE(FileOp, i32, const char*)
-
-// Our function now returns a clear Result
-static ResultFileOp submit_stat_request_safe(...) {
-    // ...
-    if (!sqe) {
-        return RESULT_ERROR(FileOp, "Could not get SQE for stat");
-    }
-    return RESULT_OK(FileOp, 0);
-}
-
-// And handling it is clean
-ResultFileOp result = submit_stat_request_safe(path, &amp;amp;ring, &amp;amp;pending_ops);
-if (!RESULT_IS_OK(result)) {
-    fprintf(stderr, "Error: %s\n", RESULT_UNWRAP_ERROR(result));
-}
-&lt;/code&gt;
-    &lt;p&gt;This is powered by RAII. The &lt;code&gt;CLEANUP&lt;/code&gt; attribute ensures resources are freed no matter how a function exits.&lt;/p&gt;
-    &lt;code&gt;#define AUTO_MEMORY(name, size) \
-    void* name CLEANUP(memory_cleanup) = malloc(size)
-
-// DIR pointers are automatically closed, even on an early return.
-DIR* dir CLEANUP(dir_cleanup) = opendir(req-&amp;gt;path);
-if (!dir) {
-    return RESULT_ERROR(FileOp, "Failed to open dir"); // dir_cleanup is NOT called
-}
-if (some_condition) {
-    return RESULT_OK(FileOp, 0); // closedir() is called automatically HERE!
-}
-&lt;/code&gt;
-    &lt;head rend="h2"&gt;The Assumption Beast: Challenged with Contracts and Safe Strings&lt;/head&gt;
-    &lt;p&gt;Before: &lt;code&gt;assert()&lt;/code&gt; and pray.&lt;lb/&gt; A standard &lt;code&gt;assert(ptr != NULL)&lt;/code&gt; is good, but when it fails, the message is generic. You know the condition failed, but not the context or why it was important.&lt;/p&gt;
-    &lt;p&gt;After: self-documenting contracts.&lt;code&gt;requires()&lt;/code&gt; and &lt;code&gt;ensures()&lt;/code&gt; make function contracts explicit. The failure messages tell you exactly what went wrong.
-The contract macros:&lt;/p&gt;
-    &lt;code&gt;#define requires(cond) assert_msg(cond, "Precondition failed")
-#define ensures(cond) assert_msg(cond, "Postcondition failed")
-
-#define assert_msg(cond, msg) /* ... full implementation ... */
-&lt;/code&gt;
-    &lt;p&gt;This turns assertions into executable documentation:&lt;/p&gt;
-    &lt;code&gt;// Preconditions that document and enforce contracts
-static inline bool arena_create(Arena* arena, size_t size)
-{
-    requires(arena != NULL);  // Precondition: arena must not be null
-    requires(size &amp;gt; 0);       // Precondition: size must be positive
-    
-    // ... implementation ...
-    
-    ensures(arena-&amp;gt;buffer != NULL);  // Postcondition: buffer is allocated
-    ensures(arena-&amp;gt;size == size);    // Postcondition: size is set correctly
-    
-    return true;
-}
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;&lt;code&gt;strcpy()&lt;/code&gt; is a Security Vulnerability&lt;/head&gt;
-    &lt;p&gt;Before: buffer overflows.&lt;lb/&gt; strcpy has no bounds checking. It's the source of countless security holes. &lt;code&gt;strncpy&lt;/code&gt; is little better, as it might not null-terminate the destination string.&lt;/p&gt;
-    &lt;code&gt;// The old, dangerous way
-char dest[20];
-const char* src = "This is a very long string that will overflow the buffer";
-strcpy(dest, src); // Undefined behavior! Stack corruption!
-&lt;/code&gt;
-    &lt;p&gt;After: safe, bounds-checked operations.&lt;lb/&gt; safe_c.h provides alternatives that check bounds and return a success/failure status. No surprises. The safe implementation:&lt;/p&gt;
-    &lt;code&gt;// The safe string operations: bounds checking that can't be ignored
-static inline bool safe_strcpy(char* dest, size_t dest_size, const char* src) {
-    if (!dest || dest_size == 0 || !src) return false;
-    size_t src_len = strlen(src);
-    if (src_len &amp;gt;= dest_size) return false;
-    memcpy(dest, src, src_len + 1);
-    return true;
-}
-&lt;/code&gt;
-    &lt;p&gt;In cgrep, this prevents path buffer overflows cleanly:&lt;/p&gt;
-    &lt;code&gt;// Returns bool, not silent truncation
-if (!safe_strcpy(req-&amp;gt;path, PATH_MAX, path)) {
-    free(req);
-    return RESULT_ERROR(FileOp, "Path is too long");
-}
-&lt;/code&gt;
-    &lt;head rend="h2"&gt;Concurrency: Mutexes That Unlock Themselves (Rust feature)&lt;/head&gt;
-    &lt;p&gt;Before: leaked locks and deadlocks.&lt;lb/&gt; Forgetting to unlock a mutex, especially on an error path, is a catastrophic bug that causes your program to deadlock.&lt;/p&gt;
-    &lt;code&gt;// The Buggy Way
-pthread_mutex_lock(&amp;amp;mutex);
-if (some_error) {
-    return; // Oops, mutex is still locked! Program will deadlock.
-}
-pthread_mutex_unlock(&amp;amp;mutex);
-&lt;/code&gt;
-    &lt;p&gt;After: RAII-based locks.&lt;lb/&gt; Using the same CLEANUP attribute, we can ensure a mutex is always unlocked when the scope is exited. This bug becomes impossible to write.&lt;/p&gt;
-    &lt;code&gt;// With a cleanup function, unlocking is automatic.
-void mutex_unlock_cleanup(pthread_mutex_t** lock) {
-    if (lock &amp;amp;&amp;amp; *lock) pthread_mutex_unlock(*lock);
-}
-
-// RAII lock guard via cleanup attribute
-pthread_mutex_t my_lock;
-pthread_mutex_t* lock_ptr CLEANUP(mutex_unlock_cleanup) = &amp;amp;my_lock;
-pthread_mutex_lock(lock_ptr);
-
-if (some_error) {
-    return; // Mutex is automatically unlocked here!
-}
-&lt;/code&gt;
-    &lt;p&gt;Simple wrappers also clean up the boilerplate of managing threads:&lt;/p&gt;
-    &lt;code&gt;// The concurrency macros: spawn and join without boilerplate
-#define SPAWN_THREAD(name, func, arg) \
-    thrd_t name; \
-    thrd_create(&amp;amp;name, (func), (arg))
-
-#define JOIN_THREAD(name) \
-    thrd_join(name, NULL)
-&lt;/code&gt;
-    &lt;p&gt;And in cgrep:&lt;/p&gt;
-    &lt;code&gt;// Thread pool spawn without boilerplate
-SPAWN_THREAD(workers[i], file_processing_worker, &amp;amp;contexts[i]);
-JOIN_THREAD(workers[i]); // No manual pthread_join() error handling
-&lt;/code&gt;
-    &lt;head rend="h2"&gt;Performance: Safety at -O2, Not -O0&lt;/head&gt;
-    &lt;p&gt;Safety doesn't mean slow. The UNLIKELY() macro tells the compiler which branches are cold, adding zero overhead in hot paths.&lt;/p&gt;
-    &lt;code&gt;#ifdef __GNUC__
-#define LIKELY(x)   __builtin_expect(!!(x), 1)
-#define UNLIKELY(x) __builtin_expect(!!(x), 0)
-#else
-#define LIKELY(x)   (x)
-#define UNLIKELY(x) (x)
-#endif
-&lt;/code&gt;
-    &lt;p&gt;The real win is in the fast paths:&lt;/p&gt;
-    &lt;code&gt;// In hot allocation path: branch prediction
-if (UNLIKELY(store-&amp;gt;local_buffer_sizes[thread_id] &amp;gt;= LOCAL_BUFFER_CAPACITY)) {
-    match_store_flush_buffer(store, thread_id); // Rarely taken
-}
-
-// In match checking: likely path first
-if (!options-&amp;gt;case_insensitive &amp;amp;&amp;amp; options-&amp;gt;fixed_string) {
-    // Most common case: fast path with no branches
-    const char* result = strstr(line, options-&amp;gt;pattern.data);
-    return result != NULL;
-}
-&lt;/code&gt;
-    &lt;p&gt;The above is similar to what a PGO (Profile Guided Optimization) would have.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The Final Word: C That Doesn't Blow Your Own Foot!&lt;/head&gt;
-    &lt;p&gt;This is what main() looks like when you stop fighting the language:&lt;/p&gt;
-    &lt;code&gt;int main(int argc, char* argv[]) {
-    initialize_simd();
-    output_buffer_init(); // Auto-cleanup on exit
-    
-    GrepOptions options = {0};
-    AUTO_UNIQUE_PTR(include_pattern_ptr, NULL, options_string_deleter);
-    
-    // ... parse args with getopt_long ...
-    
-    AUTO_UNIQUE_PTR(store_ptr, NULL, match_store_deleter);
-    SharedPtr store_shared = {0};
-    if (need_match_store) {
-        store_ptr.ptr = malloc(sizeof(ConcurrentMatchStore));
-        if (!store_ptr.ptr || !match_store_create(store_ptr.ptr, hash_capacity, 1000)) {
-            return 1; // All allocations cleaned up automatically
-        }
-        shared_ptr_init(&amp;amp;store_shared, store_ptr.ptr, match_store_deleter);
-    }
-    
-    // Process files with thread pool...
-    
-cleanup: // Single cleanup label needed -- RAII handles the rest
-    output_buffer_destroy(); // Flushes and destroys
-    return 0;
-}
-&lt;/code&gt;
-    &lt;head rend="h1"&gt;Conclusion&lt;/head&gt;
-    &lt;p&gt;In the end, cgrep is 2,300 lines of C. Without safe_c.h, it would have required over 50 manual free() calls ~ a recipe for leaks and segfaults. With the custom header file, it's 2,300 lines that compile to the same assembly, run just as fast, and are fundamentally safer.&lt;/p&gt;
-    &lt;p&gt;This proves that the best abstraction is the one you don't pay for and can't forget to use. It enables a clear and powerful development pattern: validate inputs at the boundary, then unleash C's raw speed on the core logic. You get all the power of C without the infamous self-inflicted footgun wounds.&lt;/p&gt;
-    &lt;p&gt;C simplicity makes writing programs with it becomes fun, however there are ways to make it both fun and safe..just like using condoms, you know?&lt;/p&gt;
-    &lt;p&gt;This post has gotten too long for comfort, but I have one final food for thought for you the readers: after all these guard rails, what do you think of cgrep's performance? Check the screenshots below:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;
-        &lt;p&gt;grep bench on recursive directories&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;grep bench on single large file NOTE: make sure you check the memory usage comparison between cgrep and ripgrep&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;In the next article, I will discuss how I built cgrep, the design I chose for it, why and how cgrep managed to be a couple of times faster than ripgrep (more than 2x faster in the recursive directory bench) while being super efficient with resource usage (20x smaller memory footprint in the single large file bench).&lt;/p&gt;
-    &lt;p&gt;It's gonna be a lot of fun! Cheers!&lt;/p&gt;
-    &lt;head rend="h3"&gt;Comments section here&lt;/head&gt;
-    &lt;p&gt;If you enjoyed this post, click the little up arrow chevron on the bottom left of the page to help it rank in Bear's Discovery feed and if you got any questions or anything, please use the comments section.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45952428</guid><pubDate>Mon, 17 Nov 2025 10:40:55 +0000</pubDate></item><item><title>FreeMDU: Open-source Miele appliance diagnostic tools</title><link>https://github.com/medusalix/FreeMDU</link><description>&lt;doc fingerprint="af8dedd4595f4be1"&gt;
-  &lt;main&gt;
-    &lt;p&gt;The FreeMDU project provides open hardware and software tools for communicating with Miele appliances via their optical diagnostic interface. It serves as a free and open alternative to the proprietary Miele Diagnostic Utility (MDU) software, which is only available to registered service technicians.&lt;/p&gt;
-    &lt;p&gt;Most Miele devices manufactured after 1996 include an optical infrared-based diagnostic interface, hidden behind one of the indicator lights on the front panel. On older appliances, this interface is marked by a Program Correction (PC) label.&lt;/p&gt;
-    &lt;p&gt;Until now, communication with this interface required an expensive infrared adapter sold exclusively by Miele, along with their closed-source software. The goal of FreeMDU is to make this interface accessible to everyone for diagnostic and home automation purposes.&lt;/p&gt;
-    &lt;p&gt;The project is split into three main components:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Protocol: core protocol library and device implementations&lt;/item&gt;
-      &lt;item&gt;TUI: terminal-based device diagnostic and testing tool&lt;/item&gt;
-      &lt;item&gt;Home: communication adapter firmware with MQTT integration for Home Assistant&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;More details about the proprietary diagnostic interface and the reverse-engineering process behind this project can be found in this blog post.&lt;/p&gt;
-    &lt;p&gt;Caution&lt;/p&gt;
-    &lt;p&gt;This project is highly experimental and can cause permanent damage to your Miele devices if not used responsibly. Proceed at your own risk.&lt;/p&gt;
-    &lt;p&gt;When a connection is established via the diagnostic interface, the appliance responds with its software ID, a 16-bit number that uniquely identifies the firmware version running on the device's microcontroller. However, this ID does not directly correspond to a specific model or board type, so it's impossible to provide a comprehensive list of supported models.&lt;/p&gt;
-    &lt;p&gt;The following table lists the software IDs and device/board combinations that have been confirmed to work with FreeMDU:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="6"&gt;
-        &lt;cell role="head"&gt;Software ID&lt;/cell&gt;
-        &lt;cell role="head"&gt;Device&lt;/cell&gt;
-        &lt;cell role="head"&gt;Board&lt;/cell&gt;
-        &lt;cell role="head"&gt;Microcontroller&lt;/cell&gt;
-        &lt;cell role="head"&gt;Optical interface location&lt;/cell&gt;
-        &lt;cell role="head"&gt;Status&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="6"&gt;
-        &lt;cell&gt;360&lt;/cell&gt;
-        &lt;cell&gt;Bare board&lt;/cell&gt;
-        &lt;cell&gt;EDPW 223-A&lt;/cell&gt;
-        &lt;cell&gt;Mitsubishi M38078MC-065FP&lt;/cell&gt;
-        &lt;cell&gt;Check inlet (PC) indicator&lt;/cell&gt;
-        &lt;cell&gt;🟢 Fully supported&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="6"&gt;
-        &lt;cell&gt;419&lt;/cell&gt;
-        &lt;cell&gt;Bare board&lt;/cell&gt;
-        &lt;cell&gt;EDPW 206&lt;/cell&gt;
-        &lt;cell&gt;Mitsubishi M37451MC-804FP&lt;/cell&gt;
-        &lt;cell&gt;Check inlet (PC) indicator&lt;/cell&gt;
-        &lt;cell&gt;🟢 Fully supported&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="6"&gt;
-        &lt;cell&gt;605&lt;/cell&gt;
-        &lt;cell&gt;G 651 I PLUS-3&lt;/cell&gt;
-        &lt;cell&gt;EGPL 542-C&lt;/cell&gt;
-        &lt;cell&gt;Mitsubishi M38027M8&lt;/cell&gt;
-        &lt;cell&gt;Salt (PC) indicator&lt;/cell&gt;
-        &lt;cell&gt;🟢 Fully supported&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;629&lt;/cell&gt;
-        &lt;cell&gt;W 2446&lt;/cell&gt;
-        &lt;cell&gt;EDPL 126-B&lt;/cell&gt;
-        &lt;cell&gt;Mitsubishi M38079MF-308FP&lt;/cell&gt;
-        &lt;cell&gt;Check inlet (PC) indicator&lt;/cell&gt;
-        &lt;cell&gt;🟢 Fully supported&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;If your appliance is not listed here but has a model number similar to one of the above, it might already be compatible. In all other cases, determining the software ID is the first step toward adding support for new devices.&lt;/p&gt;
-    &lt;p&gt;Details for adding support for new devices will be provided soon.&lt;/p&gt;
-    &lt;p&gt;Before using any FreeMDU components, make sure you have the Rust toolchain installed on your system.&lt;/p&gt;
-    &lt;p&gt;Next, you'll need to build a communication adapter to interface with your Miele device. Once the adapter is ready, choose the appropriate use case from the options below:&lt;/p&gt;
-    &lt;p&gt;If you want to repair or test your appliance:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;
-        &lt;p&gt;Flash the home firmware in bridge mode onto your communication adapter and attach it to your device.&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Run the TUI application on your desktop computer.&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;If you want to integrate your appliance into Home Assistant or another home automation system:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Flash the home firmware in standalone mode onto your communication adapter and attach it to your device.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;If you want to develop your own software to communicate with Miele devices:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;
-        &lt;p&gt;Flash the home firmware in bridge mode onto your communication adapter and attach it to your device.&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Use the protocol crate to implement your custom software.&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;This is an independent, open-source project and is not affiliated with, endorsed by, or sponsored by Miele &amp;amp; Cie. KG or its affiliates. All product names and trademarks are the property of their respective owners. References to Miele appliances are for descriptive purposes only and do not imply any association with Miele.&lt;/p&gt;
-    &lt;p&gt;Licensed under either of&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)&lt;/item&gt;
-      &lt;item&gt;MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;at your option.&lt;/p&gt;
-    &lt;p&gt;Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45953452</guid><pubDate>Mon, 17 Nov 2025 13:40:40 +0000</pubDate></item><item><title>The time has finally come for geothermal energy</title><link>https://www.newyorker.com/magazine/2025/11/24/why-the-time-has-finally-come-for-geothermal-energy</link><description>&lt;doc fingerprint="254a117fb8a4a7aa"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Tue, 18 Nov 2025 04:14:37 +0000</lastBuildDate><item><title>The time has finally come for geothermal energy</title><link>https://www.newyorker.com/magazine/2025/11/24/why-the-time-has-finally-come-for-geothermal-energy</link><description>&lt;doc fingerprint="254a117fb8a4a7aa"&gt;
   &lt;main&gt;
     &lt;p&gt;When I arrived in Reykjavík, Iceland, last March, a gravel barrier, almost thirty feet at its highest point, had been constructed to keep lava from the Reykjanes volcano from inundating a major geothermal power station not far from downtown. So far, it had worked, but daily volcano forecasts were being broadcast on a small television at the domestic airport where I was waiting to take a short flight to Akureyri, a town on the north coast about an hour’s drive from one of the country’s oldest geothermal plants, the Krafla Geothermal Station. Until the early nineteen-seventies, Iceland relied on imported fossil fuels for nearly three-quarters of its energy. The resources of the country—a landscape of hot springs, lava domes, and bubbling mud pots—were largely untapped. “In the past, people here in the valley lacked most things now considered essential to human life, except for a hundred thousand million tons of boiling-hot water,” the Icelandic Nobelist Halldór Laxness wrote in “A Parish Chronicle,” his 1970 novel. “For a hundred thousand years this water, more valuable than all coal mines, ran in torrents out to sea.” The oil crisis of 1973, when prices more than tripled, proved a useful emergency. Among other efforts to develop local energy, public-investment funds provided loans for geothermal projects, whose upfront costs were considerable. By the early eighties, almost all the country’s homes were heated geothermally; in Reykjavík, a subterranean geothermal-powered system is in place to melt snow and ice off sidewalks and roads. Today, more than a quarter of the country’s electricity comes from geothermal sources, a higher proportion than in almost any other nation. Most of the rest is from hydropower.&lt;/p&gt;
     &lt;p&gt;In some ways, the process of harnessing geothermal energy is simple. The deeper you dig, the hotter the temperatures get. For direct heating, you dig relatively shallow wells (typically several hundred metres deep), to access natural reservoirs of hot water or steam, which can be piped into a structure. For electricity, wells are dug farther down, to where temperatures are above a hundred and fifty degrees Celsius. (In Iceland, this temperature is reached at around one thousand to two thousand metres deep.) Pressurized steam spins a turbine that in turn spins a generator. Thermal energy (steam) is translated into mechanical energy (the spinning turbine), which is translated into electrical energy (via the generator). Geothermal energy is essentially carbon-free, it is available at any time of day and in any weather, and it leaves a small—albeit very deep—footprint on the landscape.&lt;/p&gt;
@@ -2059,7 +1496,65 @@ cd ..
 &lt;/code&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45958717</guid><pubDate>Mon, 17 Nov 2025 21:46:06 +0000</pubDate></item><item><title>Show HN: Parqeye – A CLI tool to visualize and inspect Parquet files</title><link>https://github.com/kaushiksrini/parqeye</link><description>&lt;doc fingerprint="35fc99af4d856b82"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45958717</guid><pubDate>Mon, 17 Nov 2025 21:46:06 +0000</pubDate></item><item><title>Ion: Modern System Shell in Rust</title><link>https://github.com/redox-os/ion</link><description>&lt;doc fingerprint="62441e1b83073d84"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Ion is a modern system shell that features a simple, yet powerful, syntax. It is written entirely in Rust, which greatly increases the overall quality and security of the shell. It also offers a level of performance that exceeds that of Dash, when taking advantage of Ion's features. While it is developed alongside, and primarily for, RedoxOS, it is a fully capable on other *nix platforms.&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Ion is still a WIP, and both its syntax and rules are subject to change over time. It is still quite a ways from becoming stabilized, but we are getting very close. Changes to the syntax at this time are likely to be minimal.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Ion has a RFC process for language proposals. Ion's formal specification is located within the rfcs branch. The RFC process is still in the early stages of development, so much of the current and future implementation ideas have yet to be written into the specification.&lt;/p&gt;
+    &lt;p&gt;The Ion manual online is generated automatically on each commit via mdBook and hosted on Redox OS's website.&lt;/p&gt;
+    &lt;p&gt;Building the manual for local reference&lt;/p&gt;
+    &lt;p&gt;Sources for the manual are located in the &lt;code&gt;manual&lt;/code&gt; directory.&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Build the documentation file for the builtins&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;code&gt;make manual&lt;/code&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Then build the rest of the Ion manual via mdbook&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;code&gt;mdbook build manual&lt;/code&gt;
+    &lt;p&gt;Or you can build and open it in the your default browser via&lt;/p&gt;
+    &lt;code&gt;mdbook serve manual --open&lt;/code&gt;
+    &lt;p&gt;Or you can build and host the manual on your localhost via&lt;/p&gt;
+    &lt;code&gt;mdbook serve manual &lt;/code&gt;
+    &lt;p&gt;See the examples folder and the Parallelion project&lt;/p&gt;
+    &lt;p&gt;The following PPA supports the 18.04 (bionic) and 19.04 (disco) releases. Bionic builds were made using the Pop_OS PPA's rustc 1.39.0 package.&lt;/p&gt;
+    &lt;code&gt;sudo add-apt-repository ppa:mmstick76/ion-shell
+&lt;/code&gt;
+    &lt;p&gt;Those who are developing software with Rust should install the Rustup toolchain manager. After installing rustup, run &lt;code&gt;rustup override set 1.56.0&lt;/code&gt; to set your Rust toolchain to the version that Ion is
+targeting at the moment. To build for Redox OS, &lt;code&gt;rustup override set nightly&lt;/code&gt; is required to build the Redox
+dependencies.&lt;/p&gt;
+    &lt;p&gt;Please ensure that both cargo and rustc 1.56.0 or higher is installed for your system. Release tarballs have not been made yet due to Ion being incomplete in a few remaining areas.&lt;/p&gt;
+    &lt;code&gt;git clone https://gitlab.redox-os.org/redox-os/ion/
+cd ion
+cargo install --path=. --force &lt;/code&gt;
+    &lt;p&gt;This way the ion executable will be installed into the folder "~/.cargo/bin"&lt;/p&gt;
+    &lt;p&gt;As an alternative you can do it like this&lt;/p&gt;
+    &lt;code&gt;git clone https://gitlab.redox-os.org/redox-os/ion/
+cd ion
+cargo build --release 
+# Install to path which is included in the $PATH enviromnent variable
+DESTDIR=~/.local/bin bash/install.sh&lt;/code&gt;
+    &lt;code&gt;git clone https://gitlab.redox-os.org/redox-os/ion/
+cd ion
+cargo build --release 
+sudo DESTDIR=/usr/local/bin bash/install.sh
+# Optional: Do this if Ion shell shoulb be login shell on your system
+sudo make update-shells prefix=/usr&lt;/code&gt;
+    &lt;p&gt;There are plugins for ion. These plugins are additional aliases and function definitions written in Ion for Ion. They can be found under this repository.&lt;/p&gt;
+    &lt;p&gt;For vim/nvim users there is an officially-supported syntax highlighting plugin.&lt;/p&gt;
+    &lt;code&gt;Plugin 'vmchale/ion-vim'&lt;/code&gt;
+    &lt;p&gt;For emacs users there is a kindly-supported syntax highlighting plugin.&lt;/p&gt;
+    &lt;code&gt;(add-to-list 'load-path  (expand-file-name "/path/to/ion-mode"))
+(require 'ion-mode)
+(autoload 'ion-mode (locate-library "ion-mode") "Ion majore mode" t)
+(add-to-list 'auto-mode-alist '("\\.ion\\'" . ion-mode))
+(add-to-list 'auto-mode-alist '("/ion/initrc" . ion-mode))&lt;/code&gt;
+    &lt;p&gt;There is a LSP-server for the scripting language of this shell. You can install the LSP-server via crates.io to get IDE support like error messages for an code editor or IDE which understands the client side of LSP. Link to LSP server on crates.io : https://crates.io/crates/ion_shell_lsp_server . The source code of the LSP server can be found here: https://gitlab.redox-os.org/redox-os/ion_lsp .&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45958815</guid><pubDate>Mon, 17 Nov 2025 21:56:58 +0000</pubDate></item><item><title>Show HN: Parqeye – A CLI tool to visualize and inspect Parquet files</title><link>https://github.com/kaushiksrini/parqeye</link><description>&lt;doc fingerprint="35fc99af4d856b82"&gt;
   &lt;main&gt;
     &lt;p&gt;&lt;code&gt;parqeye&lt;/code&gt; lets you peek inside your Parquet files. Instantly inspect their contents, schema, and metadata — right from your terminal.&lt;/p&gt;
     &lt;p&gt;Features&lt;/p&gt;
@@ -2169,4 +1664,62 @@ cd ..
     &lt;p&gt;Please logout and then login again, you will then be prompted to enter your display name.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45960368</guid><pubDate>Tue, 18 Nov 2025 01:25:54 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45960368</guid><pubDate>Tue, 18 Nov 2025 01:25:54 +0000</pubDate></item><item><title>Core Devices keeps stealing our work</title><link>https://rebble.io/2025/11/17/core-devices-keeps-stealing-our-work.html</link><description>&lt;doc fingerprint="fe4b95d9db3565f0"&gt;
+  &lt;main&gt;
+    &lt;head rend="h2"&gt;Core Devices Keeps Stealing Our Work&lt;/head&gt;
+    &lt;p&gt;This is a post that we don’t take any joy in writing. When we wrote last month about our agreement with Core Devices, we went into it believing that cooperation between Core and Rebble would be the best decision for the Pebble community. Core would spearhead the development of brand new watches, and we’d be there to provide our Rebble Web Services to go with them.&lt;/p&gt;
+    &lt;p&gt;Unfortunately, our agreement is already breaking down. We hoped that by putting on a kind face, and publishing an optimistic-sounding blog post along with Eric, that we’d be able to collaborate in a way that met our responsibilities to you, our users. We knew that neither of us would be able to get all we wanted, but we thought we had enough common ground that we could serve Pebble users together.&lt;/p&gt;
+    &lt;p&gt;Rebble has been working since the beginning to keep the Pebble experience alive – maintaining the App Store, building new services like Bobby, and running frontline support for people keeping their Pebbles ticking the whole time. (The Pebble App Store that Core offers right now is backed by Rebble!) But Eric and Core recently demanded that, instead of working together, we need to just give them all of our work from the last decade so that they could do whatever they want with it. And in Eric’s latest newsletter, he hasn’t told you the truth about where the work that makes his business run came from. We’d rather have cooperated with them to build something great together, but we’ve reached an impasse. So now, we’re asking you – our community – what to do with Core.&lt;/p&gt;
+    &lt;head rend="h1"&gt;How we got here&lt;/head&gt;
+    &lt;p&gt;Nine years ago, Eric Migicovsky’s company, Pebble Technology Corporation, went out of business and dropped support for the hundreds of thousands of Pebble smartwatches out there. Rebble – and our community! – put together a Herculean effort to salvage the data that was left on the Pebble app store.&lt;/p&gt;
+    &lt;p&gt;Since then, we built a replacement app store API that was compatible with the old app store front end. We built a storage backend for it, and then we spent enormous effort to import the data that we salvaged. We’ve built a totally new dev portal, where y’all submitted brand new apps that never existed while Pebble was around. So far, we’ve spent hundreds of thousands of dollars on storing and hosting the data. And the humans who run the Rebble servers have also spent incredibly late nights upgrading Kubernetes clusters, responding to outages, and generally keeping things ticking.&lt;/p&gt;
+    &lt;p&gt;What you now know as the Pebble App Store from Eric’s new company, Core Devices, is the result of nearly a decade of our work. The data behind the Pebble App Store is 100% Rebble. And the App Store that we’ve built together is much more than it was when Pebble stopped existing. We’ve patched hundreds of apps with Timeline and weather endpoint updates. We’ve curated removal requests from people who wanted to unpublish their apps. And it has new versions of old apps, and brand new apps from the two hackathons we’ve run!&lt;/p&gt;
+    &lt;p&gt;We’ve been negotiating with Eric for months now. We’ll compromise on almost everything else, but our one red line is this:&lt;/p&gt;
+    &lt;p&gt;Whatever we agree on, there has to be a future for Rebble in there.&lt;/p&gt;
+    &lt;p&gt;We want to give Core’s users access to the Rebble App Store. (We thought we agreed on that last month.) We’re happy to commit to maintaining the Web Services. We’d be happy to let them contribute and build new features. And what we want in return is simple: if we give Core access to our data, we want to make sure they’re not just going to build a walled garden app store around our hard work.&lt;/p&gt;
+    &lt;p&gt;The problem is, Core won’t commit to this. Core wants unrestricted access to do whatever they want with the data that we archived and have spent the last years curating, maintaining servers for, and keeping relevant. If we gave Core the rights to use the App Store data however they want, they could build their own Core-private App Store, replace Rebble, and keep any new changes proprietary – leaving the community with nothing.&lt;/p&gt;
+    &lt;p&gt;We’ve asked Eric about this every time we talk. He has occasionally said verbally that that isn’t their plan… but when it comes time to put it in writing, he has repeatedly refused to guarantee that. A week ago, we asked him to chat about this one more time – he delayed our conversation, and then in the intervening time, scraped our app store, in violation of the agreement that we reached with him previously.&lt;/p&gt;
+    &lt;head rend="h1"&gt;What’s in an agreement?&lt;/head&gt;
+    &lt;p&gt;We’re sad that the Rebble community has had tension with Core Devices ever since Google released the original PebbleOS source code. We’ve been pretty quiet about it for a while – we thought that we had a chance of working together if we tried hard not to fracture the community. But by now, a verbal promise isn’t enough.&lt;/p&gt;
+    &lt;p&gt;When the code was released in January, we immediately branched the repository and started maintaining PebbleOS. The Rebble community began porting an open-source Bluetooth stack to PebbleOS, to support classic Pebble devices. Eric mentions this in his blog post, but what he doesn’t say is that Rebble paid for the work that he took as a base for his commercial watches!&lt;/p&gt;
+    &lt;p&gt;Shortly after, Core forked PebbleOS1 away from public maintainership. Back in June, they said that they would merge back periodically2; it’s now November, and we’re yet to see anything get merged back. Multiple efforts to contribute to PebbleOS were put on hold3 while we waited for Core to merge upstream. It never happened. Eric, in his blog post, now says that he will run PebbleOS as a “benevolent dictatorship”.&lt;/p&gt;
+    &lt;p&gt;Rebble’s work is the backbone of Core in other ways. The Core Devices app is based on &lt;code&gt;libpebble3&lt;/code&gt;; in Eric’s blog post, he said that Core built it.  The reality is that it started life as &lt;code&gt;libpebblecommon&lt;/code&gt;, which Rebblers wrote as part of our mobile app project (Cobble), and we funded through the Rebble Grants program.  The work that we did together saved Core a month or two of engineering effort at the beginning; Core took Rebble’s work, added to it, and then paid us back by putting a more restrictive license on their contributions and wrapping a closed-source UI around it.&lt;/p&gt;
+    &lt;p&gt;A few months ago, Core promised that they would let Rebble maintain and own the developer site, after Rebblers spent days making it build again, importing new content, etc. Then, in Eric’s original proposed agreement, he demanded not only that Core publish the developer site on their domain, but that we remove our copy of the developer site and redirect to theirs.&lt;/p&gt;
+    &lt;p&gt;These have been blows to our community, to be sure. We’ve tried not to let this affect our negotiations: we want to work together. But we went into this wary, knowing what a promise from Core meant.&lt;/p&gt;
+    &lt;p&gt;The last straw was two weeks ago. We’d already agreed to give Core a license to our database to build a recommendation engine on. Then, Eric said that he instead demanded that we give them all of the data that we’ve curated, unrestricted, for him to do whatever he’d like with. We asked to have a conversation last week; he said that was busy and could meet the following week. Instead, the same day, our logs show that he went and scraped our servers.&lt;/p&gt;
+    &lt;head rend="h1"&gt;What’s at stake?&lt;/head&gt;
+    &lt;p&gt;Rebble’s goal is to have a community-driven place to develop for these watches that we all love – today, and also in the future, if (love forbid!) something were to happen to Core Devices.&lt;/p&gt;
+    &lt;p&gt;If we gave Eric an unrestricted license to our data, he could do the same thing he did to our firmware work, and our mobile app work. He’d have the right to take it and build his own app store – and the work that we’ve done together as a community for the past decade would no longer be in our control.&lt;/p&gt;
+    &lt;p&gt;We watched this happen ten years ago when Pebble went under (Rebble has been around longer than Pebble and Core combined by now!). We don’t know that Core can commit to supporting this ecosystem in the long term. After all, the warranty on Pebble 2 Duo is 30 days long, and early users are already reporting that their buttons are falling apart!&lt;/p&gt;
+    &lt;p&gt;But even if Eric has the best intentions now and can find the funds to keep Core afloat, you could imagine that OpenAI, or someone else, would want to acquire Core and make him an offer he couldn’t refuse. We’ve watched this play out so many times, from so many other companies, in the decade since – a product we love gets released, and then gets killed off, another victim of closed-source enshittification for profit. We love these watches, and we’d be sad if that happened. And more to the point, we love this community that we’ve been a hub for.&lt;/p&gt;
+    &lt;head rend="h1"&gt;This is your choice&lt;/head&gt;
+    &lt;p&gt;In our last post, we said that Rebble belongs to you. We mean it. These are the apps that you’ve written and contributed to your fellow Pebblers. These are the watches that you spent so long caring about and loving. This is your community, where you make awesome happen. So we see two directions from here, and we need the community’s help to decide.&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;If y’all would like, one option is that we could aggressively protect the work we’ve done, and try to protect the community going forward. If Eric had the foresight to back up this data nine years ago and maintain it himself, there’s nothing we could say about this. But he didn’t, and we, together, did. We made it absolutely clear to Eric that scraping for commercial purposes was not an authorized use of the Rebble Web Services.&lt;/p&gt;
+        &lt;p&gt;This gets ugly in a hurry, but we have legal resources that can protect us. We’d rather spend our time on building a next-generation open source mobile app than spend it on a fight, but if it’s what we have to do, we’re not afraid. If we want to keep what we built, we’re going to have to use our energy to protect it.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The other option is that we could just let Eric do whatever he wants. Eric believes that our database should be free for anyone to make their own copy of, because we are a non-profit Foundation. We don’t agree, but maybe you do! Nothing has to live forever, and we’ve done great work together. If the community prefers that we pass the mantle onwards, we’ll do what y’all think is right.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;These are both painful options for us. And to be clear, we’d rather do neither! If Eric and Core are willing to give us a legal commitment that they’re not just going to kick us out, and that they’ll work with us, we’d much rather do that. We’re happy to let them build whatever they want as long as it doesn’t hurt Rebble. Eric, you’re the best in the world at making quirky hardware for people who genuinely love what they wear. We’re great at building a community. Use our locker, use our timeline, use our App Store – we’ve built it just for you. Just as long as we can work together as partners.&lt;/p&gt;
+    &lt;p&gt;But in the mean time, we’re here at a crossroads.&lt;/p&gt;
+    &lt;head rend="h1"&gt;We need you&lt;/head&gt;
+    &lt;p&gt;For our friends who have supported us over the past years: we’re sorry that you’re caught in the middle of this. We think Rebble can be the hub of community, and Core can make awesome products, and these don’t have to be in conflict. Eric’s new devices, Pebble 2 Duo and Pebble Time 2, look absolutely amazing! We want to support him in making beautiful hardware long into the future – without exposing our users to the classic walled garden enshittification trap.&lt;/p&gt;
+    &lt;p&gt;But we want your input. If Eric and Core can’t play nice, we need you, our community, to tell us what to do. We’re serious: if you think we should do something different, we will. So we’re posting this on Reddit /r/pebble and a handful of other places. We’ll be (gulp!) reading the comments – the top rated and the long tail – to try to understand what the community’s sentiment is. We’ll be watching the discussion on Discord. And, of course, if you want, you can e-mail the Rebble Foundation Board of Directors directly. We’d like to hear from you.&lt;/p&gt;
+    &lt;p&gt;Yours in hope – so many of us from the Rebble team over the past 9 years, including: David, Joshua, Will, Ruby, Stasia (LCP), Siân (astosia), Harrison (Link Sky), Lavender, Ben, Ephraim (gibbiemonster), Jakob (Jackie)&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;May 20, 2025: “FYI, we’ll be moving firmware development to https://github.com/coredevices/pebbleos for now as we need to move faster than what the current repository permits (e.g. merge without reviews). This means we assume a certain technical debt, as there’ll be things that may need cleanup before bringing them back upstream. However, Core is de-facto the only contributor at this point, so it’s more efficient to develop in a fork and sync later. Note that the same rules will still apply (apache-2.0, keep old device builds, etc.), so things do not get out of control quickly.”” ↩&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;June 23, 2025: “FYI, what we’ll do for now, once https://github.com/pebble-dev/pebble-firmware/pull/251 is merged (thanks @hexxeh), is to rebase our fork against it. Then, from time to time, post other merge back PRs, like e.g. Obelix initial support. If there’s anything that needs to be fixed on those PRs, we’re of course open to doing it (we assumed a tech debt when forking). Over time, upstream will become the main source of truth as our fork will contain fewer patches, and it will actually be more efficient to use upstream directly because there’ll also be other potential contributions we benefit from.” ↩&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;June 22, 2025: re: PR #58: “I thought previously the stance was not to accept any PRs that were functionality changes yet anyway? Only stuff to fix existing devices or bring up new ones.”; “I defer that to @ericmigi , I do not merge these kind of changes w/o him approving. Last one I merged was really a UI bugfix”. See also, March 4, 2025: “From Core’s perspective, we’re not planning to touch the UI at least until we get PebbleOS working on a real watch. So we won’t be merging any UI changes until later.”. Other discussions in PRs. ↩&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45960893</guid><pubDate>Tue, 18 Nov 2025 02:53:28 +0000</pubDate></item></channel></rss>
