@@ -1,1446 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Tue, 18 Nov 2025 23:32:51 +0000</lastBuildDate><item><title>A 'small' vanilla Kubernetes install on NixOS</title><link>https://stephank.nl/p/2025-11-17-a-small-vanilla-kubernetes-install-on-nixos.html</link><description>&lt;doc fingerprint="ec90c159b0a1bba4"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Kubernetes is a complex piece of technology that abstracts away many system administration tasks, but does also solve and automate some processes useful at a smaller scale, like blue-green deployments. Having administered managed Kubernetes for a while now, I wanted to find out what a self-managed, small-but-multi-node Kubernetes install looks like.&lt;/p&gt;
-    &lt;p&gt;Most of the non-Kubernetes machines I manage are individual machines, or single database + multiple workers. For this step I'm not really interested in much more than that, like making everything redundant, self-healing, etc. I just want to introduce Kubernetes in something that matches my existing setups.&lt;/p&gt;
-    &lt;p&gt;Getting things fully functional was a long process of trial-and-error, during which I learned about even more things I didn't want to touch:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;
-        &lt;p&gt;Public-Key Infrastructure (PKI). Kubernetes definitely leans into this and prefers you manage keys and certificates for all of its components, but I feel like this is a whole separate article in itself.&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;The NixOS Kubernetes modules. These have their own opinions, and there's nothing wrong with their implementation, but using them goes against some of the learning and experimenting I wanted to do here.&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;K3s, K0s or any other Kubernetes 'distribution'. These are an extra layer to learn, and an extra layer to trust. They sometimes offer valuable extra functionality, for example I wish the SQLite backend was in upstream Kubernetes. But again, I avoided these in the interest of learning.&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;NixOS in general is great, and I'm a big fan, but something Kubernetes can potentially do well (in terms of configuration) is provide a clear boundary between the system and application. In NixOS, configuring an app is often interwoven with system config, and there's a lack of options to prevent that.&lt;/p&gt;
-    &lt;p&gt;Still, I'll be using the Kubernetes package (not module!) from Nixpkgs, as well as building everything on top of NixOS and its excellent systemd parts.&lt;/p&gt;
-    &lt;p&gt;A fully functioning QEMU setup for the end result can be found at: https://codeberg.org/kosinus/nixos-kubernetes-experiment&lt;/p&gt;
-    &lt;head rend="h3"&gt;Basic NixOS configuration&lt;/head&gt;
-    &lt;p&gt;At the time of writing, NixOS 25.11 is mere weeks away, so that is my target.&lt;/p&gt;
-    &lt;p&gt;There's a bunch of stuff I enable on all of my NixOS machines that is relevant to the rest of this article.&lt;/p&gt;
-    &lt;p&gt;I prefer nftables over iptables, because it's the future. In practice, the &lt;code&gt;iptables&lt;/code&gt; command is already a compatibility layer in many Linux distributions, but these options additionally enable the nftables-based firewall in NixOS:&lt;/p&gt;
-    &lt;code&gt;{
-  networking.nftables.enable = true;
-  # We want to filter forwarded traffic.
-  # Also needed for `networking.firewall.extraForwardRules` to do anything.
-  networking.firewall.filterForward = true;
-}
-&lt;/code&gt;
-    &lt;p&gt;I enable systemd-networkd, because it's the future. I wouldn't even know how to set up all the networking parts in other setups; systemd-networkd is just really nice when you have a bunch of moving parts in your networking.&lt;/p&gt;
-    &lt;code&gt;{
-  networking.useNetworkd = true;
-}
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;Kubernetes version&lt;/head&gt;
-    &lt;p&gt;The current version of Kubernetes at the time of writing is 1.34. It's useful to check the package version, because Kubernetes requires step-by-step minor version upgrades:&lt;/p&gt;
-    &lt;code&gt;{ lib, pkgs, ... }:
-{
-  # Ensure we carefully upgrade Kubernetes versions.
-  # We need to step 1 minor version at a time.
-  assertions = [
-    {
-      assertion = lib.hasPrefix "1.34." pkgs.kubernetes.version;
-      message = "Unexpected Kubernetes package version: ${pkgs.kubernetes.version}";
-    }
-  ];
-}
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;Networking&lt;/head&gt;
-    &lt;p&gt;If you've ever used Docker or Podman, your typical networking setup looks like this:&lt;/p&gt;
-    &lt;quote&gt;&lt;p&gt;The machine is logically split up in host and container network namespaces. Each container is assigned half of a veth pair, the other half is part of a a bridge interface on the host. The host assigns a subnet to the bridge with an address for itself, like&lt;/p&gt;&lt;code&gt;172.16.0.1/24&lt;/code&gt;, and an address for each container. The host is then the gateway for containers, performing layer 3 routing and NAT on outgoing traffic to the internet.&lt;/quote&gt;
-    &lt;p&gt;Kubernetes wants you to connect these container subnets across multiple machines. In this article I assume there is a private network connecting all nodes together:&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;In addition to the 'outward' link from the host to the internet, the host now has an additional outward link to a network switch that brings hosts together in a private network. We intend to route traffic between container subnets across this private network somehow. Notably, NAT is still only performed on traffic to the internet, and not traffic between containers.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;Even if you have a private network like this, you may not be able to simply route traffic from container subnets across it. Cloud providers often restrict the addresses a machine can use on its network interface to what is preconfigured in the cloud resources.&lt;/p&gt;
-    &lt;p&gt;There are a lot of ways to actually connect the subnets together, but I chose Wireguard because I know it, and because I wanted to test drive the overhead of encrypted links with real applications. It's potentially an additional layer of security if you're running this on the network of a cloud provider that otherwise doesn't encrypt customer traffic on internal networks. (But some may call you paranoid.)&lt;/p&gt;
-    &lt;p&gt;Some alternatives here:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Use some other tunneling protocol like GENEVE or VXLAN. Maybe GRE works too?&lt;/item&gt;
-      &lt;item&gt;Instead use TLS at the application layer for securing connections, e.g. HTTPS between proxy and backend, TLS to your database, etc.&lt;/item&gt;
-      &lt;item&gt;If you control the physical network (or even just layer 2), you can actually connect containers directly to the network using macvlan and even have your existing DHCP server assign addresses.&lt;/item&gt;
-      &lt;item&gt;Something like flannel can help you make the whole setup dynamic, if your machines tend to come and go.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h3"&gt;Container subnets&lt;/head&gt;
-    &lt;p&gt;First, let's determine our addressing scheme for all of our containers across machines.&lt;/p&gt;
-    &lt;code&gt;{ config, lib, ... }:
-{
-  # I like to create NixOS options for variables that are going to be used
-  # across multiple files, so I can reach them (without imports) via the
-  # `config` parameter of a NixOS module.
-  options.kube = {
-    # We're going to assign each node a one-based index, and derive the
-    # container subnet from that.
-    nodeIndex = lib.mkOption { type = lib.types.ints.positive; };
-    # Having a zero-based index on hand will become useful later,
-    nodeIndex0 = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = config.kube.nodeIndex - 1;
-    };
-    # Functions that take a node index and build a subnet in CIDR-notation.
-    mkNodeCidr6 = lib.mkOption {
-      type = with lib.types; functionTo str;
-      default = index: "fd88:${toString index}::/32";
-    };
-    mkNodeCidr4 = lib.mkOption {
-      type = with lib.types; functionTo str;
-      default = index: "10.88.${toString index}.0/24";
-    };
-    # On each node, the host will take the first IP in the subnet.
-    # Containers will use this IP as the gateway.
-    mkHostIp6 = lib.mkOption {
-      type = with lib.types; functionTo str;
-      default = index: "fd88:${toString index}::1";
-    };
-    mkHostIp4 = lib.mkOption {
-      type = with lib.types; functionTo str;
-      default = index: "10.88.${toString index}.1";
-    };
-    # For each of the above functions, define the values for the local node.
-    nodeCidr6 = lib.mkOption {
-      type = lib.types.str;
-      default = config.kube.mkNodeCidr6 config.kube.nodeIndex;
-    };
-    nodeCidr4 = lib.mkOption {
-      type = lib.types.str;
-      default = config.kube.mkNodeCidr4 config.kube.nodeIndex;
-    };
-    hostIp6 = lib.mkOption {
-      type = lib.types.str;
-      default = config.kube.mkHostIp6 config.kube.nodeIndex;
-    };
-    hostIp4 = lib.mkOption {
-      type = lib.types.str;
-      default = config.kube.mkHostIp4 config.kube.nodeIndex;
-    };
-    # The zero subnet is for Kubernetes Cluster IPs used in Service resources.
-    # NOTE: Would love to use IPv6 here, but that is trouble for many apps.
-    servicesCidr = lib.mkOption {
-      type = lib.types.str;
-      default = "10.88.0.0/24";
-    };
-  };
-}
-&lt;/code&gt;
-    &lt;p&gt;Now each machine needs to assign the node index in per-machine configuration:&lt;/p&gt;
-    &lt;code&gt;{
-  kube.nodeIndex = 1;
-}
-&lt;/code&gt;
-    &lt;p&gt;Now we have everything to configure the bridge interface we'll connect containers to. Unlike Docker / Podman, we'll be managing this manually:&lt;/p&gt;
-    &lt;code&gt;{ config, pkgs, ... }:
-{
-  # We need a separate netdev unit to create the bridge interface.
-  systemd.network.netdevs."10-brkube" = {
-    netdevConfig = {
-      Kind = "bridge";
-      Name = "brkube";
-    };
-  };
-  # Now configure the interface with a network unit.
-  systemd.network.networks."10-brkube" = {
-    matchConfig = {
-      Name = "brkube";
-    };
-    networkConfig = {
-      # We want this interface to always be configured and have addresses.
-      # Bridges specifically report no-carrier while there are no members.
-      ConfigureWithoutCarrier = true;
-      # Disable all link-local addressing. (`169.254.0.0/16` / `fe80::/64`)
-      LinkLocalAddressing = false;
-      # Don't allow containers to maliciously become IPv6 routers.
-      IPv6AcceptRA = false;
-    };
-    # Configure the host addresses.
-    # This also configures the direct routes on the host.
-    #
-    # NOTE: Disable DuplicateAddressDetection because otherwise the address
-    # can remain in a 'tentative' state, and Linux won't allow us to use it
-    # as a source address in other routes. This is important for later.
-    addresses = [
-      {
-        Address = "${config.kube.hostIp6}/32";
-        DuplicateAddressDetection = "none";
-      }
-      {
-        Address = "${config.kube.hostIp4}/24";
-        DuplicateAddressDetection = "none";
-      }
-    ];
-  };
-  # To inspect the bridge interface at runtime using the `brctl` tool.
-  environment.systemPackages = [ pkgs.bridge-utils ];
-}
-&lt;/code&gt;
-    &lt;p&gt;Next we can setup the Wireguard links. For this we need to generate keypairs, and it is at this point that we introduce secrets into the NixOS config. I like to use agenix for this, but there are other choices here, like sops-nix. With agenix, machines decrypt files using their OpenSSH host key.&lt;/p&gt;
-    &lt;p&gt;For simplicity, I'm going to put all keys in &lt;code&gt;keys/&lt;/code&gt; directory, and add a master key so we can always edit all files locally:&lt;/p&gt;
-    &lt;code&gt;mkdir keys
-cd keys/
-
-# Handle this private key file with care!
-# The public key is printed on success.
-age-keygen -o master_key
-&lt;/code&gt;
-    &lt;p&gt;Now create a &lt;code&gt;keys/secrets.nix&lt;/code&gt; configuration file for agenix:&lt;/p&gt;
-    &lt;code&gt;let
-  # Public key printed by age-keygen above.
-  # The master key should be included in every set of publicKeys.
-  master = "age...";
-  # OpenSSH host keys of our nodes.
-  node1 = "ssh-ed25519 AAA...";
-  node2 = "ssh-ed25519 AAA...";
-in
-{
-  # Set recipients of Wireguard private keys to their respective nodes.
-  "wgkube1.key.age".publicKeys = [ master node1 ];
-  "wgkube2.key.age".publicKeys = [ master node2 ];
-}
-&lt;/code&gt;
-    &lt;p&gt;Then generate the Wireguard keys and immediately encrypt them:&lt;/p&gt;
-    &lt;code&gt;wg genkey | agenix -i master_key -e wgkube1.key.age
-wg genkey | agenix -i master_key -e wgkube2.key.age
-&lt;/code&gt;
-    &lt;p&gt;Now we can decrypt these files in NixOS configuration:&lt;/p&gt;
-    &lt;code&gt;{ config, ... }:
-{
-  # This will make the private key available in `/run/agenix/` as `wgkube.key`.
-  age.secrets."wgkube.key" = {
-    file = ./keys + "/wgkube${toString config.kube.nodeIndex}.key.age";
-    # Make sure systemd-networkd can read this file.
-    group = "systemd-network";
-    mode = "0440";
-  };
-}
-&lt;/code&gt;
-    &lt;p&gt;Next I like to use a &lt;code&gt;peers.json&lt;/code&gt; as input to generate the Wireguard configuration. That JSON looks like this:&lt;/p&gt;
-    &lt;code&gt;[
-  {
-    "PublicKey": "pHEYIfgWiJEgnR8zKYGnWlbZbQZ0xb5eEyzVSpzz3BM=",
-    "PeerIP": "192.168.0.1"
-  },
-  {
-    "PublicKey": "TPB2lwnWPjjAZ1Pnn5A6sdhGAePztE5VlbQ/RmU89w4=",
-    "PeerIP": "192.168.0.2"
-  }
-]
-&lt;/code&gt;
-    &lt;p&gt;This array is ordered by node index. You can get the public keys as follows:&lt;/p&gt;
-    &lt;code&gt;agenix -i master_key -d wgkube1.key.age | wg pubkey
-agenix -i master_key -d wgkube2.key.age | wg pubkey
-&lt;/code&gt;
-    &lt;p&gt;The &lt;code&gt;PeerIP&lt;/code&gt; fields are local network IPs in this example. These could be IPs on the private network provided by your cloud provider, but because this is Wireguard, you can also safely cross the internet. (Though the internet is not necessarily always fast, reliable and within you control.)&lt;/p&gt;
-    &lt;p&gt;I use a JSON file like this because I actually generate it using tofu, but to keep things focused, the tofu configuration will not be in scope of this article. There is a neat little Wireguard provider for it, though.&lt;/p&gt;
-    &lt;p&gt;Now we can configure the links in NixOS:&lt;/p&gt;
-    &lt;code&gt;{
-  config,
-  lib,
-  pkgs,
-  ...
-}:
-let
-  # Grab helpers and variables.
-  # NOTE: Some of these are defined below.
-  inherit (config.kube)
-    mkNodeCidr6
-    mkNodeCidr4
-    nodeIndex0
-    wgPort
-    peers
-    ;
-in
-{
-  options.kube = {
-    # Define the Wireguard port.
-    # This variable is useful later in firewall config.
-    wgPort = lib.mkOption {
-      type = lib.types.port;
-      default = 51820;
-    };
-    # Parse the `peers.json` file.
-    peers = lib.mkOption {
-      type = with lib.types; listOf attrs;
-      default = builtins.fromJSON (builtins.readFile ./keys/peers.json);
-    };
-  };
-
-  config = {
-    # We need a separate netdev unit to create the Wireguard interface.
-    systemd.network.netdevs."11-wgkube" = {
-      netdevConfig = {
-        Kind = "wireguard";
-        Name = "wgkube";
-      };
-      wireguardConfig = {
-        PrivateKeyFile = config.age.secrets."wgkube.key".path;
-        ListenPort = wgPort;
-      };
-      # Generate Wireguard peers from the JSON input.
-      wireguardPeers = lib.pipe peers [
-        (lib.imap1 (
-          index: entry: {
-            PublicKey = entry.PublicKey;
-            Endpoint = "${entry.PeerIP}:${toString wgPort}";
-            # This instructs Wireguard what ranges belong to what peers. It'll
-            # reject incoming traffic from an incorrect subnet, but also direct
-            # outgoing traffic to the correct peer based on this. Note that
-            # this doesn't create routes, however; we do that below.
-            AllowedIPs = [
-              (mkNodeCidr6 index)
-              (mkNodeCidr4 index)
-            ];
-          }
-        ))
-        # Filter out ourselves based on index.
-        # There's unfortunately no ifilter1 for one-based indexing.
-        (lib.ifilter0 (index0: value: index0 != nodeIndex0))
-      ];
-    };
-    # Now configure the interface with a network unit.
-    systemd.network.networks."11-wgkube" = {
-      matchConfig = {
-        Name = "wgkube";
-      };
-      networkConfig = {
-        # Set these options for reasons similar to brkube.
-        ConfigureWithoutCarrier = true;
-        LinkLocalAddressing = false;
-        IPv6AcceptRA = false;
-      };
-      # Configures routes for the container subnets of peers.
-      #
-      # NOTE: We don't need to configure an address on this interface. As
-      # long as we route traffic destined for other nodes to this interface,
-      # Wireguard will send it to the correct peer based on AllowedIPs.
-      #
-      # For traffic from the host itself (not forwarded for containers), we
-      # set PreferredSource to the host IP from brkube.
-      routes = lib.pipe peers [
-        # NOTE: This results in a list of lists.
-        (lib.imap1 (
-          index: entry: [
-            {
-              Destination = mkNodeCidr6 index;
-              PreferredSource = config.kube.hostIp6;
-            }
-            {
-              Destination = mkNodeCidr4 index;
-              PreferredSource = config.kube.hostIp4;
-            }
-          ]
-        ))
-        # Filter out ourselves based on index.
-        (lib.ifilter0 (index0: value: index0 != nodeIndex0))
-        # After filtering we can take the flat list of routes.
-        lib.flatten
-      ];
-    };
-    # To inspect the Wireguard interface at runtime using the `wg` tool.
-    environment.systemPackages = [ pkgs.wireguard-tools ];
-  };
-}
-&lt;/code&gt;
-    &lt;p&gt;Finally, we configure our firewall and NAT rules:&lt;/p&gt;
-    &lt;code&gt;{ config, ... }:
-{
-  boot.kernel.sysctl = {
-    # Enable forwarding on all interfaces.
-    "net.ipv4.conf.all.forwarding" = 1;
-    "net.ipv6.conf.all.forwarding" = 1;
-  };
-  networking.firewall.extraInputRules = ''
-    # Open the Wireguard port.
-    # You probably have to adjust this for your network situation.
-    ip saddr 192.168.0.0/24 udp dport ${toString config.kube.wgPort} accept
-    # Accept connections to Kubernetes Cluster IPs.
-    # These are virtual IPs that every node makes available locally.
-    ip daddr ${config.kube.servicesCidr} accept
-  '';
-  networking.firewall.extraForwardRules = ''
-    # Route all container traffic anywhere (internet and internode).
-    iifname brkube accept
-    # Route Wireguard traffic destined for local containers.
-    iifname wgkube ip6 daddr ${config.kube.nodeCidr6} accept
-    iifname wgkube ip daddr ${config.kube.nodeCidr4} accept
-  '';
-  # Apply NAT to traffic from containers to the internet.
-  # Here we create an `accept` rule to short-circuit traffic that
-  # _shouldn't_ have NAT, then apply NAT to the rest.
-  networking.nftables.tables = {
-    "kube-nat6" = {
-      family = "ip6";
-      name = "kube-nat";
-      content = ''
-        chain post {
-          type nat hook postrouting priority srcnat;
-          iifname brkube ip6 daddr fd88::/16 accept
-          iifname brkube masquerade
-        }
-      '';
-    };
-    "kube-nat4" = {
-      family = "ip";
-      name = "kube-nat";
-      content = ''
-        chain post {
-          type nat hook postrouting priority srcnat;
-          iifname brkube ip daddr 10.88.0.0/16 accept
-          iifname brkube masquerade
-        }
-      '';
-    };
-  };
-}
-&lt;/code&gt;
-    &lt;p&gt;At this point nodes should be able to ping eachother across the tunnel on their private IPs (&lt;code&gt;fd88:*::1&lt;/code&gt;), but we won't be able to test the full networking setup until we have some containers running.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Hostnames&lt;/head&gt;
-    &lt;p&gt;Kubernetes needs to be configured with a domain name where it will advertise Services in DNS. Many examples use &lt;code&gt;cluster.local&lt;/code&gt;, but I find this a bad idea, because .local is for mDNS. Instead, I'll be using &lt;code&gt;k8s.internal&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;Nodes in Kubernetes register themselves with a name, typically whatever hostname is configured in the OS. However, I'm going to decouple this from the OS hostname and instruct Kubernetes to use &lt;code&gt;k8s.internal&lt;/code&gt; everywhere, leaving the OS hostname untouched.&lt;/p&gt;
-    &lt;code&gt;{
-  config,
-  lib,
-  pkgs,
-  ...
-}:
-let
-  inherit (config.kube)
-    peers
-    nodeIndex
-    mkHostIp6
-    mkHostIp4
-    domain
-    mkNodeHost
-    ;
-in
-{
-  options.kube = {
-    # The internal domain name we use for all purposes Kubernetes.
-    domain = lib.mkOption {
-      type = lib.types.str;
-      default = "k8s.internal";
-    };
-    # Function that defines the format for node hostnames.
-    mkNodeHost = lib.mkOption {
-      type = with lib.types; functionTo str;
-      default = index: "node${toString index}.${domain}";
-    };
-    # The hostname of the local node.
-    nodeHost = lib.mkOption {
-      type = lib.types.str;
-      default = mkNodeHost nodeIndex;
-    };
-    # All static hosts to add to the Kubernetes domain.
-    # This is in a similar format to `networking.hosts`.
-    allHosts = lib.mkOption {
-      type = with lib.types; attrsOf (listOf str);
-    };
-    # `allHosts` as a file in `/etc/hosts` format.
-    allHostsFile = lib.mkOption {
-      type = lib.types.path;
-      default = lib.pipe config.kube.allHosts [
-        (lib.mapAttrsToList (ip: hosts: "${ip} ${lib.concatStringsSep " " hosts}\n"))
-        lib.concatStrings
-        (pkgs.writeText "kubernetes-static-hosts.txt")
-      ];
-    };
-  };
-
-  config = {
-    # Add all node hosts to the Kubernetes domain.
-    # The `mkBefore` ensures the node host is the first listed,
-    # which is what a reverse IP lookup resolves to.
-    kube.allHosts = lib.pipe peers [
-      (lib.imap1 (
-        index: entry: {
-          ${mkHostIp6 index} = lib.mkBefore [ (mkNodeHost index) ];
-          ${mkHostIp4 index} = lib.mkBefore [ (mkNodeHost index) ];
-        }
-      ))
-      (lib.mergeAttrsList)
-    ];
-
-    # Also add the static hosts to `/etc/hosts`.
-    networking.hostFiles = [ config.kube.allHostsFile ];
-  };
-}
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;kube-apiserver&lt;/head&gt;
-    &lt;p&gt;We're going to build a multi-node setup, but keep it close to a traditional setup of 1 database server + multiple workers. In this setup, the database server is the ideal place for any kind of centralized processing, so we'll be running those parts of Kubernetes there as well. Instead of calling it a database server, I'll call it the 'primary' server going forward.&lt;/p&gt;
-    &lt;code&gt;{ config, lib, ... }:
-{
-  options.kube = {
-    # Define roles for nodes. The first node will be the 'primary' node.
-    role = lib.mkOption {
-      type = lib.types.str;
-      default = if config.kube.nodeIndex == 1 then "primary" else "worker";
-    };
-    # The IP of the primary node.
-    primaryIp = lib.mkOption {
-      type = lib.types.str;
-      default = config.kube.mkHostIp6 1;
-    };
-  };
-}
-&lt;/code&gt;
-    &lt;p&gt;We'll add some further variables in &lt;code&gt;kube.api&lt;/code&gt; to describe the API endpoint:&lt;/p&gt;
-    &lt;code&gt;{ config, lib, ... }:
-{
-  options.kube.api = {
-    # Kubernetes creates a Service with Cluster IP for its own API.
-    # This is always the first IP in the services subnet.
-    serviceIp = lib.mkOption {
-      type = lib.types.str;
-      default = "10.88.0.1";
-    };
-    # The HTTPS port the API server will listen on.
-    # This is only important when connecting directly to the primary node.
-    # When using the Kubernetes Service, it's translated to regular 443.
-    port = lib.mkOption {
-      type = lib.types.port;
-      default = 6443;
-    };
-    # Define an internal hostname for the API.
-    # This is only used when a node host needs to talk to the API.
-    # Containers instead use the Kubernetes Service to reach the API.
-    internalHost = lib.mkOption {
-      type = lib.types.str;
-      default = "api.${config.kube.domain}";
-    };
-    # Build the full internal URL to the API.
-    internalUrl = lib.mkOption {
-      type = lib.types.str;
-      default = "https://${config.kube.api.internalHost}:${toString config.kube.api.port}";
-    };
-    # An externally reachable host for the API.
-    # The API server builds URLs using this hostname, so you'll want to add
-    # this to DNS. Doesn't have to be fully public, could still be internal to
-    # your organization.
-    externalHost = lib.mkOption {
-      type = lib.types.str;
-      default = "test-kube.example.com";
-    };
-    # Build the full external URL to the API.
-    # We also use this as the 'audience' of API server JWTs.
-    externalUrl = lib.mkOption {
-      type = lib.types.str;
-      default = "https://${config.kube.api.externalHost}:${toString config.kube.api.port}";
-    };
-  };
-
-  config = {
-    # Add the internal API host to the Kubernetes domain.
-    kube.allHosts.${config.kube.primaryIp} = [ config.kube.api.internalHost ];
-  };
-}
-&lt;/code&gt;
-    &lt;p&gt;The API server uses etcd for storage by default. We'll be creating a very simple installation here and protect it using Unix sockets with limited permissions.&lt;/p&gt;
-    &lt;p&gt;In a production setup, you want to make periodic backups of the data in etcd. You can do this using &lt;code&gt;etcdctl snapshot save&lt;/code&gt;, or simply backup the files in
-&lt;code&gt;/var/lib/etcd/member/snap/db&lt;/code&gt;. (The former method can't be piped into some other command, but the latter method excludes the database WAL file. See etcd disaster recovery.)&lt;/p&gt;
-    &lt;code&gt;{
-  config,
-  lib,
-  pkgs,
-  ...
-}:
-
-# Only on the primary node.
-lib.mkIf (config.kube.role == "primary") {
-
-  # Create a dedicated user and group so we can control access to the socket.
-  users.groups.etcd = { };
-  users.users.etcd = {
-    isSystemUser = true;
-    group = "etcd";
-  };
-
-  # Configure the systemd service unit.
-  systemd.services.etcd = {
-    wantedBy = [ "multi-user.target" ];
-    serviceConfig = {
-      Type = "notify";
-      User = "etcd";
-      ExecStart =
-        "${pkgs.etcd}/bin/etcd"
-        + " --data-dir /var/lib/etcd"
-        # Compaction is disabled by default, but that apparently risks the
-        # database eventually exploding on itself. Weird default.
-        + " --auto-compaction-retention=8h"
-        # Minimum set of options for secure local-only setup without auth.
-        # Access is limited to users in the 'etcd' group.
-        + " --listen-peer-urls unix:/run/etcd/peer"
-        + " --listen-client-urls unix:/run/etcd/grpc"
-        + " --listen-client-http-urls unix:/run/etcd/http"
-        # This is required but not actually used in our case.
-        + " --advertise-client-urls http://localhost:2379";
-      Restart = "on-failure";
-      RestartSec = 10;
-      # Actual data storage in /var/lib/etcd.
-      StateDirectory = "etcd";
-      StateDirectoryMode = "0700";
-      # Place our Unix sockets in /run/etcd.
-      RuntimeDirectory = "etcd";
-      RuntimeDirectoryMode = "0750";
-    };
-    postStart = ''
-      # Need to make sockets group-writable to allow connections.
-      chmod 0660 /run/etcd/{grpc,http}
-    '';
-  };
-
-  # For the `etcdctl` tool.
-  environment.systemPackages = [ pkgs.etcd ];
-
-}
-&lt;/code&gt;
-    &lt;p&gt;Now we are almost ready to start the API server! First we need to put some secrets in place for it.&lt;/p&gt;
-    &lt;p&gt;You'll want an EncryptionConfiguration to tell Kubernetes how to encrypt Secret resources on disk. I recommend using a configuration with just &lt;code&gt;secretbox&lt;/code&gt; to start:&lt;/p&gt;
-    &lt;code&gt;# Extend keys/secrets.nix.
-"EncryptionConfiguration.yaml.age".publicKeys = [ master node1 ];
-&lt;/code&gt;
-    &lt;code&gt;# Edit the encrypted file.
-agenix -i master_key -e EncryptionConfiguration.yaml.age
-&lt;/code&gt;
-    &lt;code&gt;apiVersion: apiserver.config.k8s.io/v1
-kind: EncryptionConfiguration
-resources:
-  # Expand this if you have custom resources that store sensitive data.
-  - resources:
-      - secrets
-    providers:
-      - secretbox:
-          keys:
-            - name: key1
-              # Generate this with: head --bytes=32 /dev/random | base64
-              secret: "&amp;lt;BASE 64 ENCODED SECRET&amp;gt;"
-&lt;/code&gt;
-    &lt;p&gt;Next we need credentials for API server authentication. There are a bunch of methods available for this, but we'll be using the 'static token file' method, and handing a CSV file to the API server. A major downside of this is that the API server can't reload this at runtime, so changing any of these (such as when adding nodes) requires an API server restart.&lt;/p&gt;
-    &lt;p&gt;We're going to create a &lt;code&gt;root&lt;/code&gt; user in the API with full admin access.&lt;/p&gt;
-    &lt;code&gt;# Extend keys/secrets.nix.
-"kube_token_root.age".publicKeys = [ master node1 ];
-&lt;/code&gt;
-    &lt;code&gt;# Generate and encrypt the token.
-pwgen -s 64 | agenix -i master_key -e kube_token_root.age
-&lt;/code&gt;
-    &lt;p&gt;Nodes also need tokens to register themselves in the API, and I'm going to use a dirty trick here: reuse the Wireguard private keys as tokens. This means the API server has access to all Wireguard private keys, but I figure compromise of the API server means you can execute arbitrary code on any node anyway. If you're more concerned, you could just generate separate tokens instead. In any case, to reuse the Wireguard keys, the primary node needs access:&lt;/p&gt;
-    &lt;code&gt;# Update keys/secrets.nix and ensure node1 is listed for every Wireguard key.
-"wgkube1.key.age".publicKeys = [ master node1 ];
-"wgkube2.key.age".publicKeys = [ master node1 node2 ];
-&lt;/code&gt;
-    &lt;p&gt;We also need some tokens for Kubernetes components that run alongside the API server on the primary node. I'm going to use the &lt;code&gt;kube_token_system_&lt;/code&gt; prefix for these, followed by the service name. That naming convention allows us to iterate files later.&lt;/p&gt;
-    &lt;code&gt;# Extend keys/secrets.nix.
-"kube_token_system_kube-controller-manager.age".publicKeys = [ master node1 ];
-"kube_token_system_kube-scheduler.age".publicKeys = [ master node1 ];
-&lt;/code&gt;
-    &lt;code&gt;# Generate and encrypt the tokens.
-for uid in kube-controller-manager kube-scheduler; do
-  pwgen -s 64 | agenix -i master_key -e "kube_token_system_${uid}.age"
-done
-&lt;/code&gt;
-    &lt;p&gt;To connect these components to the API server, we provide a tool to help generate a kubeconfig file:&lt;/p&gt;
-    &lt;code&gt;{
-  config,
-  lib,
-  pkgs,
-  ...
-}:
-{
-  options.kube = {
-    # Small utility that helps us build a kubeconfig for our cluster.
-    # The caller should set $KUBECONFIG to the file to create / modify.
-    mkkubeconfig = lib.mkOption {
-      type = lib.types.package;
-      default = pkgs.writeShellApplication {
-        name = "mkkubeconfig";
-        runtimeInputs = [ pkgs.kubectl ];
-        text = ''
-          if [[ $# -ne 1 ]]; then
-            echo &amp;gt;&amp;amp;2 'Usage: mkkubeconfig &amp;lt;token file&amp;gt;'
-            exit 64
-          fi
-
-          # NOTE: The API server uses self-signed certificates. In this
-          # testing setup we instead rely on the Wireguard tunnel for security.
-          kubectl config set-cluster local --server '${config.kube.api.internalUrl}' --insecure-skip-tls-verify=true
-          kubectl config set users.default.token "$(&amp;lt;"$1")"
-          kubectl config set-context local --cluster=local --user=default
-          kubectl config use-context local
-        '';
-      };
-    };
-  };
-}
-&lt;/code&gt;
-    &lt;p&gt;We can finally slap together a NixOS module to start the API server. This is probably the most complex piece of Nix machinery in the setup.&lt;/p&gt;
-    &lt;code&gt;{
-  config,
-  lib,
-  pkgs,
-  ...
-}:
-
-let
-
-  package = lib.getBin pkgs.kubernetes;
-  apiPortStr = toString config.kube.api.port;
-
-  # NOTE: We put secerts in a separate variable here so we can easily gather
-  # all secrets in `LoadCredential` below. Using `config.age.secrets` would pull
-  # in secrets from elsewhere too, which is bad.
-  keysDirListing = builtins.readDir ./keys;
-  ageSecrets = lib.mergeAttrsList [
-    # Decrypt EncryptionConfiguration.
-    { "EncryptionConfiguration.yaml".file = ./keys/EncryptionConfiguration.yaml.age; }
-    # Decrypt all API server tokens.
-    (lib.pipe keysDirListing [
-      (lib.filterAttrs (name: type: lib.hasPrefix "kube_token_" name))
-      (lib.mapAttrs' (
-        name: type: {
-          name = lib.removeSuffix ".age" name;
-          value.file = ./keys + "/${name}";
-        }
-      ))
-    ])
-    # Decrypt all Wireshark keys we reuse as tokens.
-    (lib.pipe keysDirListing [
-      (lib.filterAttrs (name: type: lib.hasPrefix "wgkube" name))
-      (lib.mapAttrs' (
-        name: type: {
-          name = "kube_token_node" + (lib.removePrefix "wgkube" (lib.removeSuffix ".key.age" name));
-          value.file = ./keys + "/${name}";
-        }
-      ))
-    ])
-  ];
-
-in
-
-# Only on the primary node.
-lib.mkIf (config.kube.role == "primary") {
-
-  age.secrets = ageSecrets;
-
-  # Create a dedicated user for kube-apiserver, so we can add it to the etcd group.
-  users.groups.kube-apiserver = { };
-  users.users.kube-apiserver = {
-    isSystemUser = true;
-    group = "kube-apiserver";
-    extraGroups = [ "etcd" ];
-  };
-
-  # Open the API server port in the firewall.
-  networking.firewall.extraInputRules = ''
-    tcp dport ${apiPortStr} accept
-  '';
-
-  systemd.services.kube-apiserver = {
-    wantedBy = [ "multi-user.target" ];
-    after = [ "etcd.service" ];
-    serviceConfig = {
-      Type = "notify";
-      ExecStart =
-        "${package}/bin/kube-apiserver"
-        # Connect to etcd.
-        + " --etcd-servers='unix:/run/etcd/grpc'"
-        # HTTPS listener config.
-        # The certificate is generated in `preStart` below.
-        + " --secure-port=${apiPortStr}"
-        + " --tls-private-key-file='/var/lib/kube-apiserver/apiserver.key'"
-        + " --tls-cert-file='/var/lib/kube-apiserver/apiserver.crt'"
-        # Authentication and authorization config.
-        # `tokens.csv` is generated in `preStart` below.
-        + " --anonymous-auth=false"
-        + " --token-auth-file='/var/lib/kube-apiserver/tokens.csv'"
-        + " --authorization-mode='RBAC,Node'"
-        # Virtual IP range used for Service resources.
-        # These IPs are routed by kube-proxy on each machine, usually via NAT.
-        + " --service-cluster-ip-range='${config.kube.servicesCidr}'"
-        # For the Service of the API server, advertise the node address.
-        # Because this also uses NAT, it must also be IPv4.
-        + " --advertise-address='${config.kube.hostIp4}'"
-        # The externally reachable hostname for building API URLs.
-        + " --external-hostname='${config.kube.api.externalHost}'"
-        # Configures signing and verification of JWTs used as service account tokens.
-        + " --service-account-issuer='${config.kube.api.externalUrl}'"
-        + " --api-audiences='api,${config.kube.api.externalUrl}'"
-        + " --service-account-key-file='/var/lib/kube-apiserver/issuer.key'"
-        + " --service-account-signing-key-file='/var/lib/kube-apiserver/issuer.key'"
-        # This sets up the encryption of Secret resources:
-        # https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/
-        + " --encryption-provider-config='%d/EncryptionConfiguration.yaml'";
-      User = "kube-apiserver";
-      Restart = "on-failure";
-      RestartSec = 10;
-      # For generated keys and certificates.
-      StateDirectory = "kube-apiserver";
-      # Make secrets available.
-      LoadCredential = map (name: "${name}:/run/agenix/${name}") (lib.attrNames ageSecrets);
-      # For the `postStart` script.
-      PrivateTmp = true;
-    };
-    preStart = ''
-      openssl=${lib.getExe pkgs.openssl}
-      cd /var/lib/kube-apiserver
-
-      # Ensure a tokens file is present, or create an empty one.
-      [[ -e tokens.csv ]] || touch tokens.csv
-      chmod 0600 tokens.csv
-
-      # Ensure the token for the root user is present.
-      file="$CREDENTIALS_DIRECTORY/kube_token_root"
-      if ! grep -q ",root," tokens.csv; then
-        echo "$(&amp;lt;"$file"),root,root,system:masters" &amp;gt;&amp;gt; tokens.csv
-      fi
-
-      # Ensure tokens for system users are present.
-      for file in $CREDENTIALS_DIRECTORY/kube_token_system_*; do
-        filename="$(basename "$file")"
-        uid="''${filename#kube_token_system_}"
-        if ! grep -q ",system:$uid," tokens.csv; then
-          echo "$(&amp;lt;"$file"),system:$uid,system:$uid" &amp;gt;&amp;gt; tokens.csv
-        fi
-      done
-
-      # Ensure tokens for nodes are present.
-      for file in $CREDENTIALS_DIRECTORY/kube_token_node*; do
-        filename="$(basename "$file")"
-        uid="''${filename#kube_token_}.${config.kube.domain}"
-        if ! grep -q ",system:node:$uid," tokens.csv; then
-          echo "$(&amp;lt;"$file"),system:node:$uid,system:node:$uid,system:nodes" &amp;gt;&amp;gt; tokens.csv
-        fi
-      done
-
-      # Ensure a private key for HTTPS exists.
-      [[ -e apiserver.key ]] || $openssl ecparam -out apiserver.key -name secp256r1 -genkey
-      chmod 0600 apiserver.key
-
-      # Generate a new self-signed certificate on every startup.
-      # Assume services are restarted somewhere in this timeframe so that we
-      # never have an expired certificate.
-      $openssl req -new -x509 -nodes -days 3650 \
-        -subj '/CN=${config.kube.api.externalHost}' \
-        -addext 'subjectAltName=${
-          lib.concatStringsSep "," [
-            "DNS:${config.kube.api.externalHost}"
-            "DNS:${config.kube.api.internalHost}"
-            "IP:${config.kube.api.serviceIp}"
-          ]
-        }' \
-        -key apiserver.key \
-        -out apiserver.crt
-
-      # Ensure a private key exists for issuing service account tokens.
-      [[ -e issuer.key ]] || $openssl ecparam -out issuer.key -name secp256r1 -genkey
-      chmod 0600 issuer.key
-    '';
-    postStart = ''
-      # Wait for the API server port to become available.
-      # The API server doesn't support sd_notify, so we do this instead to
-      # properly signal any dependant services that the API server is ready.
-      export KUBECONFIG=/tmp/kubeconfig
-      ${lib.getExe config.kube.mkkubeconfig} "$CREDENTIALS_DIRECTORY/kube_token_root"
-      tries=60
-      while ! ${package}/bin/kubectl get namespaces default &amp;gt;&amp;amp; /dev/null; do
-        if [[ $((--tries)) -eq 0 ]]; then
-          echo "&amp;gt;&amp;gt; Timeout waiting for the API server to start"
-          exit 1
-        fi
-        sleep 1
-      done
-      rm $KUBECONFIG
-    '';
-  };
-
-}
-&lt;/code&gt;
-    &lt;p&gt;We setup a kubeconfig for &lt;code&gt;root&lt;/code&gt; on the primary node to use the &lt;code&gt;root&lt;/code&gt; API user. This allows using &lt;code&gt;kubectl&lt;/code&gt; from the shell for easy administration:&lt;/p&gt;
-    &lt;code&gt;{
-  config,
-  lib,
-  pkgs,
-  ...
-}:
-
-# Only on the primary node.
-lib.mkIf (config.kube.role == "primary") {
-
-  # Generate a kubeconfig for root, so that `kubectl` simply works.
-  system.activationScripts.kubeconfig-root = ''
-    HOME=/root ${lib.getExe config.kube.mkkubeconfig} "/run/agenix/kube_token_root"
-  '';
-
-  environment.systemPackages = [ pkgs.kubectl ];
-
-}
-&lt;/code&gt;
-    &lt;p&gt;And we also make node credentials available on each node, which will be used by services later:&lt;/p&gt;
-    &lt;code&gt;{ lib, config, ... }:
-{
-
-  # Creates /run/kubeconfig-node containing the node credentials.
-  # This is used by per-node services like kubelet, kube-proxy, coredns, etc.
-  systemd.services.generate-kubeconfig-node = {
-    wantedBy = [ "multi-user.target" ];
-    environment.KUBECONFIG = "/run/kubeconfig-node";
-    serviceConfig = {
-      Type = "oneshot";
-      ExecStart = "${lib.getExe config.kube.mkkubeconfig} /run/agenix/wgkube.key";
-    };
-  };
-
-}
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;Add-ons&lt;/head&gt;
-    &lt;p&gt;It's useful to have a way to load some YAML into the API server on startup. I use the term add-ons because I've seen it used for some now-deprecated functionality that was similar in function, but the term add-on has also been overloaded in various ways.&lt;/p&gt;
-    &lt;code&gt;{
-  config,
-  lib,
-  pkgs,
-  ...
-}:
-let
-  cfg = config.kube;
-in
-{
-  options.kube = {
-    # Run an activation script once the API is up.
-    activationScript = lib.mkOption {
-      type = lib.types.lines;
-      default = "";
-    };
-    # Apply addons once the API is up.
-    addons = lib.mkOption {
-      type = lib.types.listOf lib.types.path;
-      default = [ ];
-    };
-  };
-
-  config = {
-
-    assertions = [
-      {
-        assertion = cfg.activationScript != "" -&amp;gt; cfg.role == "primary";
-        message = "kube.activationScript and kube.addons can only be used on the primary node";
-      }
-    ];
-
-    # NOTE: This not a postStart in kube-apiserver, because that would cause
-    # kube-apiserver to restart on changes.
-    systemd.services.kube-activation = lib.mkIf (cfg.activationScript != "") {
-      wantedBy = [ "multi-user.target" ];
-      bindsTo = [ "kube-apiserver.service" ];
-      after = [ "kube-apiserver.service" ];
-      path = [ pkgs.kubectl ];
-      # Connect to the API using the root credentials.
-      environment.KUBECONFIG = "/root/.kube/config";
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-      };
-      script = cfg.activationScript;
-    };
-
-    # Activation script that processes `kube.addons`.
-    kube.activationScript = lib.mkIf (cfg.addons != [ ]) ''
-      for file in ${lib.escapeShellArgs (pkgs.copyPathsToStore cfg.addons)}; do
-        echo &amp;gt;&amp;amp;2 "# $file"
-        kubectl apply --server-side --force-conflicts -f "$file"
-      done
-    '';
-
-  };
-}
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;kube-scheduler&lt;/head&gt;
-    &lt;p&gt;Next we need to run kube-scheduler to actually schedule pods:&lt;/p&gt;
-    &lt;code&gt;{
-  config,
-  lib,
-  pkgs,
-  ...
-}:
-
-# Only on the primary node.
-lib.mkIf (config.kube.role == "primary") {
-
-  systemd.services.kube-scheduler = {
-    wantedBy = [ "multi-user.target" ];
-    requires = [ "kube-apiserver.service" ];
-    after = [ "kube-apiserver.service" ];
-    serviceConfig = {
-      ExecStart =
-        "${pkgs.kubernetes}/bin/kube-scheduler"
-        # Connect to the API.
-        + " --kubeconfig='/tmp/kubeconfig'"
-        # Disable listener, only useful for metrics.
-        + " --secure-port=0";
-      Restart = "on-failure";
-      RestartSec = 10;
-      # Let systemd assign a user for this service.
-      DynamicUser = true;
-      # For the below `preStart` that generates kubeconfig.
-      PrivateTmp = true;
-      LoadCredential = "kube-token:/run/agenix/kube_token_system_kube-scheduler";
-    };
-    preStart = ''
-      # Generate a kubeconfig for the scheduler. Relies on PrivateTmp.
-      KUBECONFIG=/tmp/kubeconfig ${lib.getExe config.kube.mkkubeconfig} "$CREDENTIALS_DIRECTORY/kube-token"
-    '';
-  };
-
-}
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;kube-controller-manager&lt;/head&gt;
-    &lt;p&gt;Similarly, we need to run kube-controller-manager, which contains all the standard Kubernetes controllers:&lt;/p&gt;
-    &lt;code&gt;{
-  config,
-  lib,
-  pkgs,
-  ...
-}:
-
-# Only on the primary node.
-lib.mkIf (config.kube.role == "primary") {
-
-  systemd.services.kube-controller-manager = {
-    wantedBy = [ "multi-user.target" ];
-    # NOTE: This 'bindsTo' also ensures an up-to-date API certificate is published.
-    # When separating kube-controller-manager from kube-apiserver, some other mechanism
-    # is required to distribute certificates.
-    bindsTo = [ "kube-apiserver.service" ];
-    after = [ "kube-apiserver.service" ];
-    serviceConfig = {
-      ExecStart =
-        "${pkgs.kubernetes}/bin/kube-controller-manager"
-        # Connect to the API.
-        + " --kubeconfig='/tmp/kubeconfig'"
-        # Disable listener, only useful for metrics.
-        + " --secure-port=0"
-        # This makes the controller manager automagically create a service
-        # account for each of its controllers. Neat.
-        + " --use-service-account-credentials=true"
-        # This publishes the correct API certificate in the API itself.
-        # Pods see this as `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`.
-        + " --root-ca-file='/var/lib/kube-apiserver/apiserver.crt'";
-      Restart = "on-failure";
-      RestartSec = 10;
-      # Let systemd assign a user for this service.
-      DynamicUser = true;
-      # For the below `preStart` that generates kubeconfig.
-      PrivateTmp = true;
-      LoadCredential = "kube-token:/run/agenix/kube_token_system_kube-controller-manager";
-    };
-    preStart = ''
-      # Generate a kubeconfig for the controller manager. Relies on PrivateTmp.
-      KUBECONFIG=/tmp/kubeconfig ${lib.getExe config.kube.mkkubeconfig} "$CREDENTIALS_DIRECTORY/kube-token"
-    '';
-  };
-
-}
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;CoreDNS&lt;/head&gt;
-    &lt;p&gt;We need to provide DNS resolution based on Services in the Kubernetes API.&lt;/p&gt;
-    &lt;p&gt;Many deployments run CoreDNS inside Kubernetes, but there's really no standard for how you implement DNS resolution, and different deployments have different needs. As long as you have something that fetches Services from the Kubernetes API.&lt;/p&gt;
-    &lt;p&gt;Here we setup CoreDNS, but not inside Kubernetes, instead managed by NixOS. We run an instance on every node for simplicity.&lt;/p&gt;
-    &lt;code&gt;{
-  config,
-  lib,
-  pkgs,
-  ...
-}:
-{
-
-  services.coredns = {
-    enable = true;
-    config = ''
-      . {
-        bind ${config.kube.hostIp6}
-        errors
-
-        # Resolve Kubernetes hosts.
-        hosts ${config.kube.allHostsFile} ${config.kube.domain} {
-          reload 0
-          fallthrough
-        }
-
-        # Resolve Kubernetes services.
-        kubernetes ${config.kube.domain} {
-          kubeconfig {$CREDENTIALS_DIRECTORY}/kubeconfig-node
-          ttl 30
-          # NOTE: No fallthrough, to prevent a loop with systemd-reoslved.
-        }
-
-        # Forward everything else to systemd-resolved.
-        forward . 127.0.0.53 {
-          max_concurrent 1000
-        }
-
-        cache 30
-        loadbalance
-      }
-    '';
-  };
-
-  # Provide kubeconfig-node to CoreDNS.
-  systemd.services.coredns = {
-    requires = [ "generate-kubeconfig-node.service" ];
-    after = [
-      "generate-kubeconfig-node.service"
-      "kube-activation.service"
-    ];
-    serviceConfig.LoadCredential = "kubeconfig-node:/run/kubeconfig-node";
-  };
-
-  # Setup systemd-resolved to forward the Kubernetes domain to CoreDNS.
-  environment.etc."systemd/dns-delegate.d/kubernetes.dns-delegate".text = ''
-    [Delegate]
-    Domains=${config.kube.domain}
-    DNS=${config.kube.hostIp6}
-  '';
-
-  # Open the DNS port to containers.
-  networking.firewall.extraInputRules = ''
-    ip6 saddr ${config.kube.nodeCidr6} udp dport 53 accept
-    ip6 saddr ${config.kube.nodeCidr6} tcp dport 53 accept
-  '';
-
-  # API resources needed for CoreDNS.
-  kube.addons = lib.mkIf (config.kube.role == "primary") [
-    ./addons/coredns.yaml
-  ];
-
-  # For inspecting DNS servers.
-  environment.systemPackages = [ pkgs.dig ];
-
-}
-&lt;/code&gt;
-    &lt;p&gt;The referenced add-on file &lt;code&gt;addons/coredns.yaml&lt;/code&gt; creates the permissions needed for CoreDNS to access the Kubernetes API:&lt;/p&gt;
-    &lt;code&gt;# Define the coredns role and bind it to the regular node group,
-# so that the same node credentials can be used for CoreDNS.
-#
-# Based on the roles from the upstream addon:
-# https://github.com/kubernetes/kubernetes/blob/v1.34.2/cluster/addons/dns/coredns/coredns.yaml.base
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: system:coredns
-  namespace: kube-system
-rules:
-  - apiGroups:
-      - ""
-    resources:
-      - endpoints
-      - services
-      - pods
-      - namespaces
-    verbs:
-      - list
-      - watch
-  - apiGroups:
-      - discovery.k8s.io
-    resources:
-      - endpointslices
-    verbs:
-      - list
-      - watch
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: system:coredns
-  namespace: kube-system
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: system:coredns
-subjects:
-  - kind: Group
-    name: system:nodes
-    apiGroup: rbac.authorization.k8s.io
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;kube-proxy&lt;/head&gt;
-    &lt;p&gt;Kube-proxy is what implements cluster IPs assigned to Service resources in the API. It generates firewall rules to NAT cluster IPs to destination pods. It needs to run on every node.&lt;/p&gt;
-    &lt;p&gt;(NOTE: If you decide not to run kubelet on your control plane / primary node, you still need to run kube-proxy! The API server may sometimes contact Services via their Cluster IP too.)&lt;/p&gt;
-    &lt;code&gt;{
-  lib,
-  config,
-  pkgs,
-  ...
-}:
-{
-
-  systemd.services.kube-proxy = {
-    wantedBy = [ "multi-user.target" ];
-    requires = [ "generate-kubeconfig-node.service" ];
-    after = [
-      "generate-kubeconfig-node.service"
-      "kube-activation.service"
-    ];
-    path = [ pkgs.nftables ];
-    serviceConfig = {
-      ExecStart =
-        "${lib.getBin pkgs.kubernetes}/bin/kube-proxy"
-        # Connect to the API using node credentials.
-        + " --kubeconfig='/run/kubeconfig-node'"
-        + " --hostname-override='${config.kube.nodeHost}'"
-        # Prefer nftables mode.
-        + " --proxy-mode=nftables"
-        # Local traffic can be detected by the bridge interface.
-        + " --detect-local-mode=BridgeInterface"
-        + " --pod-bridge-interface=brkube"
-        # Addresses to accept NodePort service ports on.
-        + " --nodeport-addresses='${config.kube.hostIp6}/128,${config.kube.hostIp4}/32'"
-        # Can't seem to disable these listeners, so make sure they only listen on localhost.
-        + " --healthz-bind-address=[::1]:10256"
-        + " --metrics-bind-address=[::1]:10249";
-      Restart = "on-failure";
-      RestartSec = 10;
-    };
-  };
-
-  # API resources needed for CoreDNS.
-  kube.addons = lib.mkIf (config.kube.role == "primary") [
-    ./addons/kube-proxy.yaml
-  ];
-
-}
-&lt;/code&gt;
-    &lt;p&gt;The referenced add-on file &lt;code&gt;addons/kube-proxy.yaml&lt;/code&gt; is again necessary to setup permissions in the Kubernetes API:&lt;/p&gt;
-    &lt;code&gt;# Bind the kube-proxy role to the regular node group,
-# so that the same node credentials can be used for kube-proxy.
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: system:kube-proxy
-  namespace: kube-system
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: system:node-proxier
-subjects:
-  - kind: Group
-    name: system:nodes
-    apiGroup: rbac.authorization.k8s.io
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;kubelet&lt;/head&gt;
-    &lt;p&gt;Kubelet is the meat that starts containers on a node, when a pod is assigned to that node. Here we also do the work to setup the cri-o container runtime and the CNI configuration that tells it how containers get network.&lt;/p&gt;
-    &lt;p&gt;You technically only need kubelet on machines that run workloads. We simply start it everywhere, including our primary node, but mark the primary as non-schedulable to demonstrate &lt;code&gt;registerWithTaints&lt;/code&gt;.&lt;/p&gt;
-    &lt;code&gt;{
-  lib,
-  config,
-  pkgs,
-  ...
-}:
-
-let
-
-  yaml = pkgs.formats.yaml { };
-
-  kubeletConfig = yaml.generate "kubelet.conf" {
-    apiVersion = "kubelet.config.k8s.io/v1beta1";
-    kind = "KubeletConfiguration";
-    # Allow anonymous access, but bind to the secure Wireguard IP.
-    # This is further locked down by firewall rules.
-    address = config.kube.hostIp6;
-    authentication.anonymous.enabled = true;
-    authorization.mode = "AlwaysAllow";
-    # Disable other listeners.
-    healthzPort = 0;
-    # Use CRI-O.
-    containerRuntimeEndpoint = "unix:///var/run/crio/crio.sock";
-    # Don't complain about swap, but don't account for it either.
-    failSwapOn = false;
-    memorySwap.swapBehavior = "LimitedSwap";
-    # Configure DNS using the local CoreDNS server.
-    clusterDomain = config.kube.domain;
-    clusterDNS = [ config.kube.hostIp6 ];
-    # Prevent scheduling pods on the primary node.
-    registerWithTaints = lib.optional (config.kube.role == "primary") {
-      key = "role";
-      value = config.kube.role;
-      effect = "NoSchedule";
-    };
-  };
-
-in
-{
-
-  virtualisation.cri-o = {
-    enable = true;
-    extraPackages = [ pkgs.nftables ];
-    settings.crio.runtime.log_to_journald = true;
-  };
-
-  systemd.services.kubelet = {
-    wantedBy = [ "multi-user.target" ];
-    requires = [
-      "generate-kubeconfig-node.service"
-      "crio.service"
-    ];
-    after = [
-      "generate-kubeconfig-node.service"
-      "crio.service"
-      "kube-activation.service"
-    ];
-    path = [ pkgs.util-linux ];
-    serviceConfig = {
-      Type = "notify";
-      ExecStart =
-        "${lib.getBin pkgs.kubernetes}/bin/kubelet"
-        # Connect to the API using node credentials.
-        + " --kubeconfig='/run/kubeconfig-node'"
-        # Ensure the Node is registered with the expected hostname.
-        + " --hostname-override='${config.kube.nodeHost}'"
-        # Publish our preferred IPv6 node IP.
-        + " --node-ip='${config.kube.hostIp6}'"
-        # Announce the role of this node as a label.
-        + " --node-labels='role=${config.kube.role}'"
-        # Most other flags are deprecated in favour of a config file.
-        + " --config='${kubeletConfig}'";
-      Restart = "on-failure";
-      RestartSec = 10;
-      StateDirectory = "kubelet";
-    };
-  };
-
-  # cri-o bundles an example config file that NixOS installs by default, but we
-  # override that here with our own configuration.
-  environment.etc."cni/net.d/10-crio-bridge.conflist".text = lib.mkForce (
-    builtins.toJSON {
-      cniVersion = "1.0.0";
-      name = "brkube";
-      plugins = [
-        {
-          type = "bridge";
-          bridge = "brkube";
-          isGateway = true;
-          ipam = {
-            type = "host-local";
-            ranges = [
-              [ { subnet = config.kube.nodeCidr6; } ]
-              [ { subnet = config.kube.nodeCidr4; } ]
-            ];
-            routes = [
-              { dst = "::/0"; }
-              { dst = "0.0.0.0/0"; }
-            ];
-          };
-        }
-      ];
-    }
-  );
-
-  # Ensure kube-apiserver can connect to this kubelet.
-  # This is necessary for `kubectl logs`, `kubectl exec`, etc.
-  networking.firewall.extraInputRules = ''
-    ip6 saddr ${config.kube.primaryIp} tcp dport 10250 accept
-    tcp dport 10250 reject
-  '';
-
-}
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;Testing&lt;/head&gt;
-    &lt;p&gt;The setup should now be fully functional! If you login as root on the primary node, you can use &lt;code&gt;kubectl&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;# kubectl get node
-NAME                 STATUS   ROLES    AGE   VERSION
-node1.k8s.internal   Ready    &amp;lt;none&amp;gt;   19s   v1.34.1
-node2.k8s.internal   Ready    &amp;lt;none&amp;gt;   12s   v1.34.1
-&lt;/code&gt;
-    &lt;p&gt;With node2 in the listing, we know connectivity works from kubelet to API server. Starting a container with an interactive session also tests the opposite direction. In addition, we can test connectivity from the container to the internet:&lt;/p&gt;
-    &lt;code&gt;# kubectl run --rm -it --image=docker.io/alpine test
-/ # wget -O - https://example.com/
-Connecting to example.com (23.220.75.245:443)
-writing to stdout
-&amp;lt;!doctype html&amp;gt;&amp;lt;html ...
-&lt;/code&gt;
-    &lt;head rend="h3"&gt;What next?&lt;/head&gt;
-    &lt;p&gt;While this setup has all the essentials for workloads, a bunch of stuff is missing to make it more broadly useful.&lt;/p&gt;
-    &lt;p&gt;An Ingress / Gateway controller helps route traffic to containers. The go-to used to be nginx-ingress, but nginx-ingress is going the way of the dodo. I had some fun hacking on caddy-ingress, but that's still experimental. There's a list of Gateway controllers and a list of Ingress controllers if you want to explore.&lt;/p&gt;
-    &lt;p&gt;A storage provsioner can help with data persistence. The modern solution for this is CSI drivers. Provided are drivers for NFS and SMB shares, which are really useful if you're coming from a setup where applications share some NFS directories hosted on the primary node. But storage for databases is ideally block storage, which is a bit more work.&lt;/p&gt;
-    &lt;p&gt;Speaking of databases, the nice thing about this setup is that you can simply run services outside Kubernetes, so you can just start a database using regular NixOS config on the primary node for example. I had some fun writing my own controller that allows managing MySQL databases with custom Kubernetes resources: external-mysql-operator. Again, very experimental.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Takeaways&lt;/head&gt;
-    &lt;p&gt;Would I take this into production? Not anytime soon, because I feel like there are a whole bunch of failure modes I've not yet seen. My testing has been limited to QEMU VMs and some AWS EC2 instances.&lt;/p&gt;
-    &lt;p&gt;Especially on VMs, which are typically quite small compared to dedicated servers, Kubernetes itself uses up a chunk of memory and CPU just sitting there.&lt;/p&gt;
-    &lt;p&gt;With the traction Kubernetes has, it does feel like there must be many small installations out there. And if that's the case, it seems to me that Kubernetes could easily reduce some complexity for that type of installation.&lt;/p&gt;
-    &lt;p&gt;For example, do you really need etcd and API server redundancy? It seems upstream SQLite support in combination with Litestream backups would be far more beneficial for smaller installations, when you're happy to deal with some Kubernetes API downtime during upgrades or incidents.&lt;/p&gt;
-    &lt;p&gt;Another easy win (in my opinion) would be runtime reloading of the token auth file. It would instantly make it a more viable option beyond testing. Though with a bit of extra work it can also be accomplished using the webhook or reverse proxy mechanisms supported by Kubernetes.&lt;/p&gt;
-    &lt;p&gt;Overall, though, it feels like Kubernetes itself is maybe only half the complexity, with the other half going to network configuration.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45963592</guid><pubDate>Tue, 18 Nov 2025 11:01:21 +0000</pubDate></item><item><title>Gemini 3 Pro Model Card [pdf]</title><link>https://storage.googleapis.com/deepmind-media/Model-Cards/Gemini-3-Pro-Model-Card.pdf</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45963670</guid><pubDate>Tue, 18 Nov 2025 11:12:20 +0000</pubDate></item><item><title>Cloudflare Global Network experiencing issues</title><link>https://www.cloudflarestatus.com/incidents/8gmgl950y3h7</link><description>&lt;doc fingerprint="40d4ee565e054cd0"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Cloudflare services are currently operating normally. We are no longer observing elevated errors or latency across the network.&lt;/p&gt;
-    &lt;p&gt;Our engineering teams continue to closely monitor the platform and perform a deeper investigation into the earlier disruption, but no configuration changes are being made at this time.&lt;/p&gt;
-    &lt;p&gt;At this point, it is considered safe to re-enable any Cloudflare services that were temporarily disabled during the incident. We will provide a final update once our investigation is complete.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 17:44 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;We continue to monitor the system through recovery and we are seeing errors and latency return to normal levels. A full post-incident investigation and details about the incident will be made available asap.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 17:14 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;We continue to see errors drop as we work through services globally and clearing remaining errors and latency.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 16:46 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;We continue to see errors and latency improve but still have reports of intermittent errors. The team continues to monitor the situation as it improves, and looking for ways to accelerate full recovery.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 16:27 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;Bot scores will be impacted intermittently while we undergo global recovery. We will update once we believe bot scores are fully recovered.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 16:04 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;The team is continuing to focus on restoring service post-fix. We are mitigating several issues that remain post-deployment.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 15:40 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;We are continuing to monitor for any further issues.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 15:23 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;Some customers may be still experiencing issues logging into or using the Cloudflare dashboard. We are working on a fix to resolve this, and continuing to monitor for any further issues.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 14:57 UTC&lt;/p&gt;
-    &lt;p&gt;Monitoring&lt;/p&gt;
-    &lt;p&gt;A fix has been implemented and we believe the incident is now resolved. We are continuing to monitor for errors to ensure all services are back to normal.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 14:42 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;We've deployed a change which has restored dashboard services. We are still working to remediate broad application services impact&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 14:34 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;We are continuing to work on a fix for this issue.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 14:22 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;We are continuing working on restoring service for application services customers.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 13:58 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;We are continuing working on restoring service for application services customers.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 13:35 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;We have made changes that have allowed Cloudflare Access and WARP to recover. Error levels for Access and WARP users have returned to pre-incident rates. We have re-enabled WARP access in London.&lt;/p&gt;
-    &lt;p&gt;We are continuing to work towards restoring other services.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 13:13 UTC&lt;/p&gt;
-    &lt;p&gt;Identified&lt;/p&gt;
-    &lt;p&gt;The issue has been identified and a fix is being implemented.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 13:09 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;During our attempts to remediate, we have disabled WARP access in London. Users in London trying to access the Internet via WARP will see a failure to connect.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 13:04 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;We are continuing to investigate this issue.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 12:53 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;We are continuing to investigate this issue.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 12:37 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;We are seeing services recover, but customers may continue to observe higher-than-normal error rates as we continue remediation efforts.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 12:21 UTC&lt;/p&gt;
-    &lt;p&gt;Update&lt;/p&gt;
-    &lt;p&gt;We are continuing to investigate this issue.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 12:03 UTC&lt;/p&gt;
-    &lt;p&gt;Investigating&lt;/p&gt;
-    &lt;p&gt;Cloudflare is experiencing an internal service degradation. Some services may be intermittently impacted. We are focused on restoring service. We will update as we are able to remediate. More updates to follow shortly.&lt;/p&gt;
-    &lt;p&gt;Posted Nov 18, 2025 - 11:48 UTC&lt;/p&gt;
-    &lt;p&gt;This incident affected: Cloudflare Sites and Services (Access, Bot Management, CDN/Cache, Dashboard, Firewall, Network, WARP, Workers).&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45963780</guid><pubDate>Tue, 18 Nov 2025 11:35:10 +0000</pubDate></item><item><title>Nearly all UK drivers say headlights are too bright</title><link>https://www.bbc.com/news/articles/c1j8ewy1p86o</link><description>&lt;doc fingerprint="24df8d635d03762d"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 19 Nov 2025 00:49:57 +0000</lastBuildDate><item><title>Nearly all UK drivers say headlights are too bright</title><link>https://www.bbc.com/news/articles/c1j8ewy1p86o</link><description>&lt;doc fingerprint="24df8d635d03762d"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Nearly all drivers say headlights are too bright&lt;/head&gt;
     &lt;p&gt;Nearly all UK drivers said they thought headlights were too bright and that they have been dazzled by oncoming vehicles, according to a major study.&lt;/p&gt;
@@ -2569,4 +1128,427 @@ output, _ := ts.Serialize()&lt;/code&gt;
     &lt;p&gt;Oh, and while I’m far from an expert on typography, if you need a hand with anything font-related, please reach out. I’d be happy to help in any way that I can :)&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45973261</guid><pubDate>Tue, 18 Nov 2025 22:42:45 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45973261</guid><pubDate>Tue, 18 Nov 2025 22:42:45 +0000</pubDate></item><item><title>Rebecca Heineman – from homelessness to porting Doom</title><link>https://corecursive.com/doomed-to-fail-with-burger-becky/</link><description>&lt;doc fingerprint="2f43d15529a6bff9"&gt;
+  &lt;main&gt;
+    &lt;head rend="h2"&gt;Introduction&lt;/head&gt;
+    &lt;p&gt;Adam: Hi. This is CoRecursive, and I’m Adam Gordon Bell. Each episode is the story of a piece of software being built. Why don’t you tell me what you do and who you are?&lt;/p&gt;
+    &lt;p&gt;Becky: Okay. Yeah. I’m Rebecca Ann Heineman. I’ve been in the video game industry since the beginning of time. I started by winning the Atari 2600 Space Invaders tournament in November of 1980. Since then, went to work at companies like Avalon Hill, and then Boone Corporation until Boone imploded, and then we formed Interplay out of the ashes of Boone.&lt;/p&gt;
+    &lt;p&gt;Adam: Becky’s a bit famous, she’s worked on hundreds of games. And her specialty was porting games from one platform to another. Today is about a game port that went sideways, porting a little game called Doom, and the struggles involved.&lt;/p&gt;
+    &lt;p&gt;Becky: And I said, “Okay, see this golden master I’ve got right here? I just encrypted, ready to go for duplication. Where’s my other $20,000?” “Where’s the new weapons?” It’s like, “Didn’t have enough space, didn’t have enough time.” And he’s like, “Oh, but I promised people knew weapons.” Like, “Can’t do it. Don’t have time.” “But I gave you JPEGs.” “I put them in the trash. Sorry.” He was mad. Oh gosh, he was mad.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Childhood&lt;/head&gt;
+    &lt;p&gt;Adam: So that’s today’s story. The story of Burger Becky porting Doom to the 3DO. It’s kind of a retro software story, but it’s also a story about project management and software development going a little bit sideways. There’s engines to tweak, there’s deadlines to hit, hardware acceleration to get working. And dramatic rock anthems to record.&lt;/p&gt;
+    &lt;p&gt;The path that led Burger Becky into video game development, which he’s still doing today, it started back when she was a young teen. This was the late 70s, the Atari 2600 had recently come out, and so had the Apple II. And Becky’s childhood set her on a path that eventually led her right towards that port. But even so, she wouldn’t wish her early years on anyone.&lt;/p&gt;
+    &lt;p&gt;Becky: If I was in my 20s, I would basically not even bring it up. In my 30s, I would probably burst into tears halfway through any of this. By the time I was in my 40s, my parents have already passed away. I’m like, okay, the people who caused this are gone. And now I could finally set myself free and no longer have to have nightmares of my dad bursting in the door to beat the crap out of me because he was drunk again. Which is one of the reasons why I don’t smoke or drink, because it reminds me of my shitty parents.&lt;/p&gt;
+    &lt;p&gt;Adam: Becky normally doesn’t talk about this stuff because, well, the specifics are hard to hear.&lt;/p&gt;
+    &lt;p&gt;Becky: My mom and dad married because my mom was already pregnant, and they couldn’t have a child out of wedlock. And my dad was not my dad, it was someone else. Then in time, they had two more children, two sons. I was the eldest. My dad would favor my two brothers, and he would treat them like princes. Whereas, I was being treated as the help. And so I was always having to clean the dishes, do this. And every time my dad got mad, which every other day, I would be the one he would beat the crap out of. And then when we had dinner with the family, I was the one serving the meals while everybody else was eating around there. And of course I didn’t get a plate. And then by the time it was all done, I would eat the leftovers. And of course if they saw me eating the leftovers, I would get punished.&lt;/p&gt;
+    &lt;p&gt;Adam: As an adult, she’s never totally gotten past this food insecurity. Coworkers would spread rumors about her hiding burgers in her desks to nibble on when no one was looking.&lt;/p&gt;
+    &lt;p&gt;Becky: Honestly, there’s truth to that. I was not picky about the condition of the food I was eating because I was conditioned from my earliest memory to the time I got out of that hell hole that food is life. Don’t be picky about it, because otherwise starving is your only other option.&lt;/p&gt;
+    &lt;p&gt;Adam: Her nickname came from her food insecurities and from a rough childhood. And eventually it was all too much for her.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Homeless&lt;/head&gt;
+    &lt;p&gt;Becky: Somewhere when I was 15-ish I just had it. And I went to school and I just didn’t go home. And to put it in perspective, my family never sent out a missing persons report, or anything like that. That’s how much they cared. I then lived behind a dumpster of a store, I think was called Market Basket at the time. But I just lived either in the dumpster when it was raining or behind it, because they had blankets and stuff like that.&lt;/p&gt;
+    &lt;p&gt;Adam: Becky got a job at JC Penny.&lt;/p&gt;
+    &lt;p&gt;Becky: I just went in there and just said, “Hey, I’m 18.” And they didn’t bother checking anything, because back then we weren’t so anal about immigration status and shit like that. Then Christmas was done, then they had me transfer to their warehouse, but I was just in there moving boxes around, moving shit around. And that was it until finally I ended up at a video game contest.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Atari Space Invaders&lt;/head&gt;
+    &lt;p&gt;Adam: The video game contest ends up being her entry into the industry, and it went like this. Space Invaders was pretty big at the time, and Atari decided as a publicity stunt to have a national tournament. It was the first eSport tournament in North America.&lt;/p&gt;
+    &lt;p&gt;Becky: They had people come into five different cities. It was San Jose, Los Angeles, Dallas, Chicago, and New York. And then each of the winners were then flown to New York City, and then that contest was televised.&lt;/p&gt;
+    &lt;p&gt;Adam: Becky’s friend convinced her to compete in the LA contest, and she won, and was flown off to New York for the championship.&lt;/p&gt;
+    &lt;p&gt;Becky: It was more terrifying than exciting because I didn’t really understand what the heck was going on, I was just a kid. And I was there without my parents. They didn’t factor in that kids would be winning these contests, so they lucked out in which the parents of the other four contestants actually paid their own way and came to the nationals. I went by myself to which Atari, to their horror was like, “Where’s your parents?” “You only gave me one ticket.” There was a comedy of errors, but it was back to the fact that it was never been done before. And hence, when it was the first contest, yeah, you can imagine some growing pains.&lt;/p&gt;
+    &lt;p&gt;Adam: All of a sudden they have a moment where they’re like, wait, are we just paying to fly minors across state lines without…&lt;/p&gt;
+    &lt;p&gt;Becky: Oh, I’m certain their liability attorneys were just crapping their pants in the other room going like, oh, please don’t fall down the stairs. Please don’t stub her toe. Please don’t get food poisoning. Please don’t get in an accident, the liability, because we are taking care of a minor.&lt;/p&gt;
+    &lt;p&gt;Adam: Becky won, and she became the first championship competitive gamer in the US.&lt;/p&gt;
+    &lt;p&gt;Becky: They had people from the news all behind us, like 200 people from different newspapers. And CNN, which was just brand new. I think CNN was only three months old at the time. And then ABC, NBC, CBS, et cetera. And of course they recorded it. And then once the contest was over, then I had microphones shoved in my face and they interviewed me, and then sent it off.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Arcade Repair&lt;/head&gt;
+    &lt;p&gt;Adam: Back at home, after the tournament, Becky’s a bit famous and she gets some opportunities thrown in her lap. She gets a job at an arcade where she’s making change and repairing machines because they thought it would be pretty cool to be able to say they had the national champ there.&lt;/p&gt;
+    &lt;p&gt;Becky: But then I found I had a talent for fixing video games, and I met a friend there who taught me the fine art of video game logic board repair. Which then, now that’s why I learned all my TTL logic and stuff like that, which helped me design boards that would allow me to copy Atari 2600 cartridges. But yeah, I was homeless not that long. It was maybe three or four months, because every now and then I would go back to my old house. But then one day I went there and I saw a moving van. And, that’s weird. And then I saw my mom and she was like, “Oh, where have you been?” It’s like, “Been away.” And she’s like, “Well, we’re getting a divorce. I’m moving to this place.” And says, “Oh, so dad’s not going to be with you.” It’s like, “No, he’s staying here.” “Okay. Then, can I move in with you?” And at that point, moved back in. And that was my home base until I moved to Towson, Maryland.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Apple II and The 2600&lt;/head&gt;
+    &lt;p&gt;Adam: At home with her mom, Becky had an Apple II she was tinkering around with, and she kept working at the arcade repairing video game boards. And this gave her some familiarity with game hardware. And meanwhile, the video game industry is exploding.&lt;/p&gt;
+    &lt;p&gt;Becky: The Quaker Oats company formed a video game company. Milton Bradley had game company. 20th Century Fox made a game company. Of course, you know the big players, Imagic and Activision. And even Mattel making Atari cartridges. It’s like, this is also at a time when every video game console, the Atari, the Intellivision, and the Coleco, they were closely guarding how their machines worked because they did not license their technology to anyone because it had not been heard of. And you may remember when a bunch of Atari employees left to form Activision, Atari immediately sued them. And the grounds was, you can’t make cartridges for our player, the Atari 2600, because it’s covered under patent, covered under all this other copyright and other gobbledygook.&lt;/p&gt;
+    &lt;p&gt;Adam: But the lawsuit failed, and the market for third party games opened up on the 2600. If you could hire an Atari game maker, you could boot up a game company and make a bunch of money. It was a bubble. And while all this was happening, Becky was using her arcade repair knowledge to pirate Atari cartridges. And then she starts figuring out how video game software works through an odd coincidence.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The 6502&lt;/head&gt;
+    &lt;p&gt;Becky: The Apple II uses a 6502 processor. The Atari 2600 uses a 6502 processor. Now, in the Apple II, if you put data in your memory, go into what’s called the monitor, which allows you to disassemble 6502 code. I was constantly looking at the ROMs of the Apple II, and disassemble it and saw all this instructions, and figured out how the instructions worked. And so I can write my own little Apple II programs. Well, when I was piloting Atari 2600 cartridges, I put them in memory. I said, let’s take a look what’s in there. And I saw code, and it all made sense. It was 6502.&lt;/p&gt;
+    &lt;p&gt;So I was disassembling I was like, what does this code do? What does this do? Then I would, let’s say, okay, it loaded value in this register. Let’s change that value, upload the game into an Atari 2600, see what happens. And eventually I found, oh, this register changes the background color. This changes the left Sprite, this changes the right Sprite. And then just through iteration, iteration, iteration, trial and error, I was able to figure out how to generate an Atari 2600 screen. And of course, yeah, there was a couple of registers I didn’t know what they did, but over time I figured them all out.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Avalon Games&lt;/head&gt;
+    &lt;p&gt;Adam: She mentions this, that she’s creating her own cartridges to someone who works in the industry.&lt;/p&gt;
+    &lt;p&gt;Becky: And he’s like, “You reversed the Atari 2600?” Says, “Yeah, I did.” And he goes, “I’ve got a company to talk to.” And he introduced me to the owners of a company called the Avalon Hill Game Company, who called me up. And I told him, “Yeah, I know how to program the 2600. I got demo carts and everything.”&lt;/p&gt;
+    &lt;p&gt;Adam: Avalon Games was a maker of board games, and they had produced some computer games as well. But they were small players, they couldn’t afford to get some Atari employee to work there and port their games to cartridges. But now they didn’t have to, they had their own cartridge expert in teenage Becky.&lt;/p&gt;
+    &lt;p&gt;Becky: They hired me right there on the phone. And then a couple of days later I had a plane ticket and everything, and I relocated to Towson, Maryland from Whittier, California. And that was my first paid programming job. And I had never had any training whatsoever, it was just me learning on my own.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Port Master&lt;/head&gt;
+    &lt;p&gt;Adam: And so Becky’s career took off from there, she became the go-to person for porting games. And eventually masters not just the Apple II, but the 2600 and the Commodore, and PCs, and much more. She was on the founding team of the company Interplay, and was their go-to person for ports and everything Apple. And then a new console came out.&lt;/p&gt;
+    &lt;p&gt;Becky: This was around 1994, and I’d already gotten a reputation at Interplay that I can assimilate a new console or a new platform within weeks, and already start generating code on it. Everything from the Super Nintendo, the 8 bit Nintendo, the Game Boy. And of course, I already had an affection for Macintosh’s, because I had written so many games for Mac Play. But that aside, what happened was that a new console was coming out called the 3DO.&lt;/p&gt;
+    &lt;p&gt;Adam: The 3DO was a gaming console proposed by EA founder Trip Hawkins, and produced by Panasonic among others. It was competing with the Atari Jaguar and the Sega Saturn. But it was the one with all the buzz. It had such a huge buzz that Time Magazine called it 1993’s Product of the Year.&lt;/p&gt;
+    &lt;p&gt;Becky: Since it acquired a Mac for development, I was of course the logical choice. So I got a 3DO dev kit, got the software, and started just testing stuff to see what in the world I could do on this new console.&lt;/p&gt;
+    &lt;p&gt;Adam: What does the dev kit look like? How does it work? What am I seeing?&lt;/p&gt;
+    &lt;head rend="h2"&gt;3DO Dev Kit&lt;/head&gt;
+    &lt;p&gt;Becky: The dev kit looks like a big PC. It literally is in a PC case, vertical orientation, popular among the 90s PCs. The only thing that you’ll notice is different is that in the front just below where the CD is, is a little panel which just says Reset, Debug, and has a 3DO logo on it, and a little switch that says Encrypted and Not. And the whole idea behind that is if you turn on encrypted, then you could put encrypted retail discs inside of it and run the game. But if you turn non-encrypted, then you don’t need to be encrypted. And then you could also use the debugging feature. There was a NuBus card made by 3DO that plugs into your 68K Mac on a NuBus card. And then you had a fiber optic cable, which goes from the 3DO into the Macintosh.&lt;/p&gt;
+    &lt;p&gt;Adam: You did the development for the 3DO using your Mac over that cable using MPW, the Macintosh programmer’s workshop.&lt;/p&gt;
+    &lt;p&gt;Becky: It essentially is their idea of an IDE/command line. In which you have text editors, you have a command line, and you could go ahead and issue commands and so forth, but it’s all hybrided. You could be in the middle of editing text, but if you hit command return or something like that, that line would execute it as a command line. It’s kind of weird. But I think VS code is now doing something like this these days. But what goes on is that you have a bunch of command lines, much like you do with a modern operating system, where you have a shell and a bunch of tools and so forth. Except of course the tools here you have is the Norcroft C compiler, which just compiles into ARM. Because it was like, as far as I know, the 3DO was the first console that used an ARM CPU.&lt;/p&gt;
+    &lt;p&gt;Adam: So you wrote C code, compiled it on the 3DO operating system, and then you generate art using Electronic Arts 3D Studio.&lt;/p&gt;
+    &lt;p&gt;Becky: And they had plugins specifically for 3DO. So you draw some art, when it’s all done, the plugin would convert it to 3DO cell format, which is the hardware blitters format.&lt;/p&gt;
+    &lt;p&gt;Adam: A blitter is a graphics co-processor. It’s sort of an early version of a GPU.&lt;/p&gt;
+    &lt;p&gt;Becky: And then you just take these files and put them in your game, and you’d run your game.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Wolfenstien for the 3DO&lt;/head&gt;
+    &lt;p&gt;Adam: The first game Becky ported to the 3DO was a personal favorite of mine, it was Wolfenstein.&lt;/p&gt;
+    &lt;p&gt;Becky: And I just simply took the source code I had for Wolfenstein. At the time, it was the Mac. Put that here, built it for 3DO. Made a 3DO shell, added a console-like control panel. Because the Macintosh used a mouse and keyboard. The 3DO uses exclusively the console controller. Wrote that all together, put it out there, and the game shift. And then, yeah, it was very easy. And the 3DO really worked well with what Wolfenstein 3D wanted. The game ran at 30 frames per second, and it was perfect for the platform. And then I did games like Battle Chess, Siberia, Casper, Shadowland, Kingdom of Far Reaches. There’s games I’m even forgetting that I did on the 3DO. Out of This World, that’s another one. The 3DO version of Out of This World, we took all the backgrounds, sent them to an animation studio who does backgrounds for cartoons. And then they drew paintings of each background. We then scanned them, and then that is what was used in the video game.&lt;/p&gt;
+    &lt;p&gt;Adam: In an upcoming Supporters episode, Becky’s going to go deep on this Out of the World port. It’s a wild story. But yeah, Becky becomes the 3DO expert, and so more of this work keeps coming her way.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The DOOM Project&lt;/head&gt;
+    &lt;p&gt;Becky: The guys at 3DO were very impressed with the port, because it was something that was really showcasing the 3DO. We sold a lot of copies on that platform. Well, then they told me that, “Hey, you’re still doing in software conversions?” “Yeah, I still do that.” They said they had a company that has the rights to Doom for the 3DO. The problem was that they were having a hard time getting a copy of this game from 3DO, despite the fact that they’ve been telling people that it’s 90% complete. And that it’s going to have new weapons, new stuff, whatever. And the latest excuse they’re getting from them is that the game is 90% complete, but their developer flaked on them. So now they need someone to help them finish the game. They said, “Can you handle this?” And I go, “Yeah, if the game’s 90% complete, no problem.”&lt;/p&gt;
+    &lt;p&gt;Adam: This seems like it would be a pretty sweet gig. The game had to be ready for Christmas, but it’s August and there’s only 10% left. Plus then Becky would be able to say she worked on the Doom port. It seems like a great deal. The thing was, Becky had been around in the industry and she knew a lot of the players, but she had never heard of Art Data. That actually wasn’t that surprising, considering what was going on in the industry at that time. The thing was, Becky knew a lot of the players in the industry, and she had never heard of Art Data. But that actually wasn’t that surprising considering what was going on at the industry at that time.&lt;/p&gt;
+    &lt;head rend="h2"&gt;CD Multimedia Hype&lt;/head&gt;
+    &lt;p&gt;Becky: 3DO was so hyped as they’re becoming the next wave of multimedia. Because in addition to being a new video game console, they were bragging about how the 3DO could play movie DVDs. It was actually not a DVD, it was a CD format, but it was called a CDV or something like that. So you could buy movies, put them on the 3DO and watch a movie on it. They had the idea that was going to be streaming, they were going to have some sort of add-on that allows you to connect to your cable TV box. There was going to be an add-on lets you have ethernet so you can go ahead and get on the web. So it was going to be like this all-in-one set-top box. That in addition to playing games, it was supposed to be the center of your entertainment center. And that the Trip Hawkins behind it, they were already putting in millions of dollars and Electronic Arts was devoting a large percentage of their game development into 3DO titles.&lt;/p&gt;
+    &lt;p&gt;That’s why 3DO titles, there’s so many EA games. And then of course you had Samsung, Panasonic, et cetera, all making 3DO consoles. And there was plans that you’re going to buy a TV that had a 3DO built-in. And then eventually everything was going to have 3DO in it. So with that kind of hype, a lot of companies started coming out of the woodwork and say, “We got to get into CD multimedia.” And much like today where you say, “We’re based on the blockchain,” that’s all an investor has to know in order to start dumping money in your company. Despite the fact that you’re going to say, “Well, what we really do is we milk cows, but we’re based on the blockchain.” But it shows you exactly how people who just love buzzwords jump into the market. Well, that’s what happened with the CEO of Art Data.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Art Data&lt;/head&gt;
+    &lt;p&gt;Becky: He was a guy who lived up in Simi Valley, or something like that. He somehow convinced his friends and congregants at a church, and they gave him something like $250,000 or some God awful lot of money to form Art Data. And the first game they did was called Chess Wars, a Medieval fantasy which is essentially a ripoff of Battle Chess, but done very poorly. And then they licensed the game, which became Rise of the Robots, I believe. But then later on, the word got out that the rights to Doom for 3DO were up for grabs. But since ID Software wasn’t really that enthused about the 3DO platform, they just put an insane price. It was like $250,000.&lt;/p&gt;
+    &lt;p&gt;Which in that year, $250,000 for the rights to Doom was a lot of money. And the 3DO wasn’t really selling that well. So to sell enough copies to recoup that amount of money, you’d have to either have the best version of Doom ever, or you just simply want Doom in your catalog as a loss leader and are trying to push for other titles. But Randy believed that if he got Doom, he would put his company on the map, and then he was going to have this game with new levels, new maps, new stuff like that.&lt;/p&gt;
+    &lt;p&gt;Adam: So Randy raised the money, and Art Data bought the rights to Doom on the 3DO. And Doom at this time was huge. People were dragging their computers to each other’s houses to play Doom multiplayer. It was the birth of LAN parties. And Randy knew a good press opportunity when he saw one, so he started doing interviews.&lt;/p&gt;
+    &lt;p&gt;Becky: There are videos and magazine articles of him, mostly in Japanese magazines, of him showing off mock-up screens with new weapons and new monsters and things like that. And then somewhere around April, there’s this video I saw him in April of ‘95 of him holding a CD that says Doom 3DO on it.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Development Plan&lt;/head&gt;
+    &lt;p&gt;Adam: That Doom that’s on that CD in the photo shoot is what Becky’s going to polish up for release. And she’s been doing this for a while. She’s worked with the Doom code base before, so she immediately knows how she would tackle a port. The trick is to get the game engine simplified so it can run on the lower memory constraints of a console, and then optimizing it to get a good frame rate because resources are more constrained.&lt;/p&gt;
+    &lt;p&gt;Becky: I would’ve allocated at least three people and at least six months to maybe nine months to do the actual port. One person writing, there’s nothing but a brand new game engine designed to run a Doom-like game on the 3DO. And the walls would be the perfect 3D walls, because that’s what I did with Wolfenstein. It was perfect 3D. But the floor and ceilings would be sliding textures and stuff like that with some error correction to get it to work somewhat nicely on the 3DO. But then we would actually do some new weapons, new players. We would plan them out because we’d actually have to make an editor, taking the Jaguar levels, planting new objects in them, and probably even making a few more new levels specifically to highlight the new weapons and add some more storyline or something like that.&lt;/p&gt;
+    &lt;p&gt;And lastly, I would’ve had to hire a musician to do a kicking soundtrack, because that was something that I really would’ve wanted to do on the 3DO no matter what happened. But it would’ve come out in which the game would’ve been running at 30 frames per second. And with that, we would’ve shipped a pretty decent game, and it probably would’ve sold 20,000 units.&lt;/p&gt;
+    &lt;head rend="h2"&gt;90% Complete&lt;/head&gt;
+    &lt;p&gt;Adam: Becky assumes the Art Data people are doing something similar to her plan, and she’s pretty excited to help them finish. And also help the 3DO people, because they’ve been pumping up this game as well. So she reaches out to Art Data.&lt;/p&gt;
+    &lt;p&gt;Becky: They kept with the story. They said the game was 90% done. They needed me to add in a couple of new weapons and a couple of new maps. So I asked him, “Great, do you have the maps?” He says, “Yes, we do.” “Do you have the new weapons?” “Yes we do.” “Can I have the source code?” “Eventually. Once you sign.” I was like, “But I need to do a code review before I sign.” And they’re like, “Well, it’s 90% done. You don’t need to really do that.” I should have taken that red flag, but I didn’t, because I was excited to bring Doom to the 3DO. And if the game was already 90% complete, then yeah, I could put my credit on there even though I only worked on 10% of it. We negotiated a price for doing the project and then I said, “Okay, let’s get going.”&lt;/p&gt;
+    &lt;p&gt;Adam: How much were they going to pay you?&lt;/p&gt;
+    &lt;p&gt;Becky: They were going to pay me $10,000 to do the conversion at 90%, just to finish the game. Which is fine, $10,000 to finish a game, that’s reasonable. Well then I then waited, and waited, and waited. And said, “Where is the source code?” So I said, “Oh, okay, I thought you already had it.” It’s like, “No, you’re supposed to give me the game. You say it’s 90% complete.” So they gave me a copy of Doom two on a CD. It was a copy of the game for the PC.&lt;/p&gt;
+    &lt;p&gt;Adam: They gave her a retail version of the game for the PC, a CD-ROM. The compiled final version of the game, compiled for a completely different platform with a different architecture, but it’s on a CD and the 3DO has a CD drive.&lt;/p&gt;
+    &lt;p&gt;Becky: Said it runs on the PC, so we just say that’s 90% complete. And I’m like, “That’s not how this works.” So I then ask, “Who is the developer that you said flaked on you?” And they gave me radio silence. “Oh, the developer doesn’t want to talk to us. The developer can’t be reached because we owe them money.” “You owe them money? Okay. At least give me the name of the developer so I will speak to them directly.” Chirp, chirp, chirp.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Payment Issue&lt;/head&gt;
+    &lt;p&gt;Adam: Okay, so maybe it’s just a payment issue. Not great, but maybe they didn’t pay the developer and so he didn’t hand over the new version of the game that has the new engine that works on the 3DO and the new levels and the new maps and all that. Maybe Becky can talk to them, get them paid, get the game, and start working on that final 10% of optimization and polish. Get the frame rate up and so on. But nope, that wasn’t the case.&lt;/p&gt;
+    &lt;p&gt;Becky: An employee at Art Data came to me privately and said, “We don’t have anything. There is no developer, there’s nothing.” At this point I’m in a panic and I then call 3DO. It’s like, “Project canceled. We’re done. We’re not doing this because the tenants of the contract is that 90% complete. Get the source code, finish it. If you want me to do a full port, we’re going to talk something different.”&lt;/p&gt;
+    &lt;p&gt;Adam: That doesn’t sound good to 3DO though. They want to pump up this release. They thought Doom could sell some consoles. And now the deadline to get something in stores for Christmas is getting closer. There’s only 10 weeks of development left if the game needs to be handed off to 3DO in time to get in shelves for Christmas. But 3DO and Art Data aren’t the only parties here. Remember, ID Software had licensed the game to Art Data for the 3DO, and they were probably pretty motivated to keep their big check.&lt;/p&gt;
+    &lt;p&gt;Becky: So then I contacted ID Software, and after a small discussion with John, he then suggested, “Why don’t we just use the Jaguar version and base it off that?” Says, “Okay.” So he send me a CD with the complete assets of everything for the Jaguar version of Doom, which was perfect. The levels are already made for low memory, the code’s been simplified, networking’s been taken out, all this stuff going on. A lot of the work that I would’ve need to have done has already been done in the Jaguar version. So I then told 3DO, “Okay, let’s go get with Art Data and I’m just going to do a port, and it’s going to cost you $40,000 now.” So at that point, Art Data reluctantly said yes and says, “Great.” “I need to check for 20,000 right now. I’m not starting until I see $20,000.” So I got a check.&lt;/p&gt;
+    &lt;p&gt;So okay, let’s go. Started the work. Unfortunately, the CEO of Art Data, who honestly believed that because the game was on a CD and the 3DO has a CD player, that the game will run on the 3DO because it’s a CD. That was his interpretation of 90% complete, because the game already runs. So when I realized that I was working with Einstein here, I decided, okay, just ignore him. I’m going to focus it. Because after working on this for a little bit and having him incessantly ask me for progress on stuff because he wanted to do demos and press tours, and I’m like, “I haven’t even gotten the graphics up for this game on the 3DO yet, and you’re asking me for this crap?”&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Band&lt;/head&gt;
+    &lt;p&gt;Becky: Well, the CEO guy at Art Data was bragging about all those things that he did, and he also bragged he had a band. Oh really? I had a cassette made of all the PC music, just had the PC music, started the game, let the music play into a cassette. Went to another level, did it again, did another level, did it again. I think it was, we gave him six or seven cassettes. Each one had three songs on it or something like that. Because after we record three songs, we give them the tape, another three songs, give them the tape, and so forth. I said, “Okay, take this cassette. It’s got an hour’s worth of music on it. Do covers.” Because once you gave him a tape he was off to the races. And then he went ahead and made these really kicking music tracks, which I then converted to 3DO format and put them in the game. And it gave him a feeling of he’s contributing to Doom, which technically he was, but it got him off my back.&lt;/p&gt;
+    &lt;p&gt;Adam: What I picture is that Randy was in a church band at the same church he raised his money at, or maybe he had a old high school band. And he called them up and he put the band to work doing covers of these Doom midi tracks.&lt;/p&gt;
+    &lt;p&gt;I’m not sure what actually happened, but one thing’s for sure, the music rocks. It’s probably going to be the best thing about this game. That music, it could be played because the 3DO with its CD format had more space for rich assets. It was easy to include and play high quality music and even videos, which means that if you wanted to make Doom the definitive game for the 3DO, you needed not just rocking music, but you needed live action.&lt;/p&gt;
+    &lt;p&gt;Becky: He didn’t even notify me of it, he just did it. What had happened was that I told you about the chess game called Chess Wars. He hired an actual film crew with stunts, everything. So it was expensive. And they filmed all these scenes. Well, he then asked some of the people, says, “Hey, could you also do some scenes for a game based on Doom?” And they’re like, “Cool. Doom. We like Doom.” I understand that the director had an idea for a film in which the scenes would be shot in a way that it would actually tell a cohesive story.&lt;/p&gt;
+    &lt;p&gt;Adam: But that didn’t happen, it was all a last minute scramble. But depending on how you feel about full motion video inside of video games, what they ended up with was pretty cool looking.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Live Action Doom&lt;/head&gt;
+    &lt;p&gt;Becky: So a Hollywood costume designer had an ogre outfit for some other event, some other film shoot or whatever it was. So from the neck down it was just literally an ogre, but from the head up, it’s more like an orc from Lord of the Rings. That wasn’t going to do, so they custom made this demon bull head, which is modeled after the Baron of Hell. And the guy says, “Yeah, it would’ve been a $10,000 job had I actually charged him for it.” Now of course this is 1994 dollars. But it was awesome. The head looked great.&lt;/p&gt;
+    &lt;p&gt;And then they put that on. The guy who actually designed the costume actually put on the suit and everything. And then they had a couple of people dress up in Marine uniforms. They have a man and a woman dress up as Marines, they have prop guns, and they just did a bunch of poses. And then they took an ice cooler and put a red cross on it to mimic the health pack. They put it there and they just did a bunch of poses in front of her pictures. But then they did a bunch of scenes in which the woman and the guy would say some lines and then the monster would roar in. The monster would hold this guy… Like that.&lt;/p&gt;
+    &lt;p&gt;Adam: There was originally a plan for how the scenes would fit together with the game.&lt;/p&gt;
+    &lt;p&gt;Becky: The soldier’s going to run off away from his people and then he is going to open a door and then it’s going to be E1M1. And you start the game. And then after you get to the end of the level and you pull the switch, there’s going to be a cut scene of the soldier pulling the switch and then movie, movie, movie. Then it’ll introduce him going to the next level, which of course is reasonable. That’s actually thought out. But to do that you would have to first go through all the levels we had, which he had no knowledge because he didn’t know we switched from the PC levels to the Jaguar levels, which are different levels.&lt;/p&gt;
+    &lt;p&gt;And secondly, is that’s a lot of footage. We’re talking about at least maybe 45 minutes to a full hour worth of footage. And on a CD, that’s pushing it on what we can fit with all the music and all the other stuff in there too. Because you got to put the game in there too. It’s doable. It is doable. But the amount of time to actually script, build sets, film, add visual effects, you’re talking at least for about an hour of footage of that type, it’d be about a million dollars. And our data was squawking about 20K.&lt;/p&gt;
+    &lt;p&gt;Adam: Of course, Becky was oblivious to all this at the time because she was just heads down trying to get the game port working.&lt;/p&gt;
+    &lt;p&gt;Becky: And of course there was a day, I do remember that Randy came by with me with a disc saying, “Here are all the cut scenes.” I’m like, “I can’t use any cut scene.” So I didn’t even take the disc from him. Now I look back and I regret it because those would’ve been great on YouTube right now. I have no idea where that disc is. And I’ve been asking around, it’s been almost 25 years since that. And to this date, I haven’t found anybody who would fess up to having the actual raw footage.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Christmas Deadline&lt;/head&gt;
+    &lt;p&gt;Adam: Also, there was a deadline, right? Remember this game was supposed to be ready for Christmas. There was PR events and interviews where the game was being shown on a CD. Expectations were high.&lt;/p&gt;
+    &lt;p&gt;Becky: But there was only so much I could do without actually rewriting extensive parts of the Doom engine, which was beyond the amount of time. Because 3DO made it very, very clear they needed this game in the stores by Christmas because they wanted to do an ad campaign saying that Doom was on the 3DO. Saying the 3DO is so powerful, it runs Doom.&lt;/p&gt;
+    &lt;p&gt;Adam: But here’s the thing, the 3DO has a 12 megahertz processor. It really can’t run the Jaguar version of Doom without extensive work. The Jaguar had three CPUs, two of which ran at 25 megahertz, twice the speed.&lt;/p&gt;
+    &lt;p&gt;Becky: So after all this stuff, it turned out I just lived at the office, worked like a dog. Because halfway through the development process I’m like, how in the hell am I going to finish this? Because the game’s going to be buggy, the game’s going to have issues. I already knew the framer, it’s going to be probably laggy. And John’s going to hate my guts over at ID. Because he was still very touchy about the quality of Doom.&lt;/p&gt;
+    &lt;p&gt;Adam: But Becky gets Doom up and actually running on the 3DO, and it’s a small miracle, but it only runs at three frames per second. For comparison, the Wolfenstein port she did earlier was running on the same 3DO software at 30 frames per second, 10 times as fast. Three frames per second is totally unplayable. So Becky phones John Carmack, and instead of being unhappy with her, he suggests just making the screen smaller. So now there’s less to draw. That helps. And then with some more optimizing, she gets the frame rate up to 10 frames per second, which is a bit choppy, but playable.&lt;/p&gt;
+    &lt;p&gt;Becky: It shows that it was a 10 week port under extreme circumstances. Because while the game plays from beginning to end bug free, which is a miracle in itself, it only runs in a small window because I still had to render some of the walls, like the floor and ceiling still had to render in software. I couldn’t use the hardware blitter because I didn’t have time to make the code changes for that. But it ran, it was Doom. Doom on 3DO. But it had a kicking soundtrack.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Confrontation&lt;/head&gt;
+    &lt;p&gt;Adam: The problem with working with someone who doesn’t understand the industry is that they don’t understand when you’ve pulled off a miracle. Without the Jaguar version, without Becky working day and night, they wouldn’t have had anything. But Randy didn’t see it that way. He thought building games was a simpler proposition.&lt;/p&gt;
+    &lt;p&gt;Becky: “Well, where’s all the new weapons, and where’s the new maps as well? Look at the maps, they’re different.” It’s true, because the maps that were used in the Jaguar version are different from the PC version. “Where’s the new weapons?” Nevermind you have to place the new weapon in spawn points around the map and then also code in the weapon’s usage, what’s firing, and it’s effects. No, no, no, let’s not factor any of that in. All you had to do is draw a JPEG of a new weapon at the bottom of the screen and just put it into the directory of Doom and it automatically gives you the new weapon. Just put the JPEG in, it’s magic. It’s like, didn’t have enough space, didn’t have enough time.&lt;/p&gt;
+    &lt;p&gt;Adam: By this point, Becky had enough. She hadn’t handed over the completed game, and so she had him at her mercy. She demanded the rest of the money.&lt;/p&gt;
+    &lt;p&gt;Becky: He was mad. Oh gosh, he was mad. But I got the check. And after that gave the disc. And I think we did one revision after that. But then that was the revision that actually went out to the stores and was sold.&lt;/p&gt;
+    &lt;p&gt;Adam: Now Becky wasn’t exactly happy with the end result of the game, but the game was bug free and could be played, which left her with one thought.&lt;/p&gt;
+    &lt;p&gt;Becky: Mission accomplished. Not necessarily a game I’m going to be proud of as a game, but the very fact that I was able to deliver a title at that kind of insane deadline said I did it. I still got it.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Business of Gaming&lt;/head&gt;
+    &lt;p&gt;Adam: That’s awesome. You got it out. Did Art Data make their money back do you think?&lt;/p&gt;
+    &lt;p&gt;Becky: Oh, hell no. He made the next mistake. After the game was golden mastered, he then went and had 50,000 copies pressed because he thought the game was going to just sell because it’s Doom. It’s the adage of, hey, if you put Harry Potter on a box and put cow poop in it, it’s going to sell. So he thought that. In which, hey, the game is Doom. It plays from start to finish. It is actually a decent version of the game for the 3DO, and it’s got a kicking soundtrack. But Doom was not a game that everybody was going to buy. So he had 50,000 units pressed, which meant that he had to give a check for about $300,000 to 3DO. So he was owing that much money. And then he sold maybe about, I don’t know, 3,000, 4,000 copies.&lt;/p&gt;
+    &lt;p&gt;Adam: Oh, wow.&lt;/p&gt;
+    &lt;p&gt;Becky: Yeah.&lt;/p&gt;
+    &lt;p&gt;Adam: So there’s a warehouse somewhere Indiana Jones style?&lt;/p&gt;
+    &lt;p&gt;Becky: Oh, I’m certain there’s a landfill somewhere. But let’s just say that he didn’t do any more 3DO games after that. Art Data folded not that much longer.&lt;/p&gt;
+    &lt;p&gt;Adam: Maybe him and his band, they have a practice space, and the walls are just stacked up with all these boxes of the-&lt;/p&gt;
+    &lt;p&gt;Becky: Yeah, he could use it to layer a wall with it and use that for the soundproof acoustics.&lt;/p&gt;
+    &lt;head rend="h2"&gt;How to Learn Low Level Programming&lt;/head&gt;
+    &lt;p&gt;Adam: That’s the story of porting Doom. Doom fans know it as one of the lowest frame rate ports, but it’s playable, and it has a rocking soundtrack. Not bad for a 10 week port. The thing Becky’s story brings to mind for me is that I could never do this. You couldn’t throw me at some new hardware and get me to port a game or anything to run on it. I feel like my development skills just don’t go down that close to the metal. But Becky says it’s a trainable skill.&lt;/p&gt;
+    &lt;p&gt;Becky: Yeah. What I would advise a lot of people these days, if you really want to understand computers, first start off with one of the old classic machines. And you could do it with an emulator, but of course you could buy the real thing. Learn how to program an Apple II. Learn how to program an Atari 100 or a Commodore 64, because you have to learn a similar language. You learn the hardware, you learn how it all interacts. It takes away a lot of the magic that’s been given to modern computers. Because modern computers, they think that programming a webpage in JavaScript is programming a computer, that’s the furthest from the truth. Or writing code in Python is writing code directly to the metal. No, it’s an interpreted language. And even when you’re writing code in C++ and so forth, especially the most modern ones with their template bonanzas. When you look at the actual assembly code it generates, you see all the stuff it’s doing for the overhead and go, what the hell?&lt;/p&gt;
+    &lt;p&gt;I miss the elegance and simplicity of writing 6502 code. The code, you enter it, it just does one task, leaves. Next function does the same thing. Whereas in C++, you can write code that actually still maintains that paradigm and it works just fine. But it’s so easy if you don’t really know what’s going on to write what you think is three lines of code, this’ll do everything. But when you look at the output of the compiler, it’s a novel. That’s my main takeaway. Is that when you truly understand the instruction sets, how the stack works, how memory management works, how the hardware works, how it all interacts, then you have a true understanding of the limitations of computers.&lt;/p&gt;
+    &lt;p&gt;Adam: I think there’s a big divide between the programming that you have done and the people who never leave Java, JVM, or Python, or whatever. I wouldn’t know where to start exactly.&lt;/p&gt;
+    &lt;p&gt;Becky: Oh, there are plenty of books out there. One I would recommend highly is a book called Assembly Lines, by Roger Wagner. It’s a great investment. Just look up Roger Wagner, Assembly Lines. It’s a book about maybe 200 pages long, and it is a beginner’s guide to assembly language, programming the Apple II, and all the fundamentals. In fact, in most cases, if you read the book cover to cover, you may not even have to start up an Apple II, you will get a very good fundamental grasp of how a computer operates. And then if what you’ve read intrigues you, then pull up an Apple II emulator or the real thing. You can buy one on eBay, it’s not that expensive, and go to town and see what’s going on.&lt;/p&gt;
+    &lt;p&gt;But the end result is not for you to make a brand new Apple II video game. You could if you want, there’s still a market for them. Granted, you’ll sell a couple hundred copies instead of thousands. But what goes on is that you will truly understand how a computer works because there’s very little difference fundamentally from how an Apple II, a 1977 computer versus a modern computer. Yeah, there’s more stuff on it like memory protection, multi CPUs, and protected IO ports. But still fundamentally the same thing. A processor registers a stack, memory IO registers, and a memory map and firmware. Those exist in modern computers. They haven’t changed. So there you go.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Outro&lt;/head&gt;
+    &lt;p&gt;Adam: So there you go, that was the show. Learning the Apple II as a path towards bare metal programming sounds fun. If you attempt it, let me know on Twitter or on our Slack channel.&lt;/p&gt;
+    &lt;p&gt;And thank you so much to Becky. You could find her on Twitter @BurgerBecky, and on Twitch as Burger Becky as well.&lt;/p&gt;
+    &lt;p&gt;In an upcoming bonus episode for supporters, she’ll be sharing the porting of another game that I mentioned earlier, Out of this World for the Super Nintendo. And in this case, it’s a totally different story. It’s about a porting going very well under a different type of stress.&lt;/p&gt;
+    &lt;p&gt;And you’ll get to hear some of the background behind this interview, and me chatting with Becky. I’m up to 13 bonus episodes now for supporters, 14 once that one’s out. So I recommend that you check it out. That’s at corecursive.com/supporters.&lt;/p&gt;
+    &lt;p&gt;And until next time, enjoy this rocking Doom inspired rock anthems. I couldn’t actually include the real Doom music, because I don’t really know who owns them. But yeah, until next time, thank you so much for listening.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45973573</guid><pubDate>Tue, 18 Nov 2025 23:13:35 +0000</pubDate></item><item><title>Cloudflare outage on November 18, 2025 post mortem</title><link>https://blog.cloudflare.com/18-november-2025-outage/</link><description>&lt;doc fingerprint="bc1b3b5b0cb0a8cb"&gt;
+  &lt;main&gt;
+    &lt;div&gt;
+      &lt;p&gt;On 18 November 2025 at 11:20 UTC (all times in this blog are UTC), Cloudflare's network began experiencing significant failures to deliver core network traffic. This showed up to Internet users trying to access our customers' sites as an error page indicating a failure within Cloudflare's network.&lt;/p&gt;
+      &lt;p&gt;The issue was not caused, directly or indirectly, by a cyber attack or malicious activity of any kind. Instead, it was triggered by a change to one of our database systems' permissions which caused the database to output multiple entries into a âfeature fileâ used by our Bot Management system. That feature file, in turn, doubled in size. The larger-than-expected feature file was then propagated to all the machines that make up our network.&lt;/p&gt;
+      &lt;p&gt;The software running on these machines to route traffic across our network reads this feature file to keep our Bot Management system up to date with ever changing threats. The software had a limit on the size of the feature file that was below its doubled size. That caused the software to fail.&lt;/p&gt;
+      &lt;p&gt;After we initially wrongly suspected the symptoms we were seeing were caused by a hyper-scale DDoS attack, we correctly identified the core issue and were able to stop the propagation of the larger-than-expected feature file and replace it with an earlier version of the file. Core traffic was largely flowing as normal by 14:30. We worked over the next few hours to mitigate increased load on various parts of our network as traffic rushed back online. As of 17:06 all systems at Cloudflare were functioning as normal.&lt;/p&gt;
+      &lt;p&gt;We are sorry for the impact to our customers and to the Internet in general. Given Cloudflare's importance in the Internet ecosystem any outage of any of our systems is unacceptable. That there was a period of time where our network was not able to route traffic is deeply painful to every member of our team. We know we let you down today.&lt;/p&gt;
+      &lt;p&gt;This post is an in-depth recount of exactly what happened and what systems and processes failed. It is also the beginning, though not the end, of what we plan to do in order to make sure an outage like this will not happen again.&lt;/p&gt;
+      &lt;p&gt;The chart below shows the volume of 5xx error HTTP status codes served by the Cloudflare network. Normally this should be very low, and it was right up until the start of the outage. &lt;/p&gt;
+      &lt;p&gt;The volume prior to 11:20 is the expected baseline of 5xx errors observed across our network. The spike, and subsequent fluctuations, show our system failing due to loading the incorrect feature file. Whatâs notable is that our system would then recover for a period. This was very unusual behavior for an internal error.&lt;/p&gt;
+      &lt;p&gt;The explanation was that the file was being generated every five minutes by a query running on a ClickHouse database cluster, which was being gradually updated to improve permissions management. Bad data was only generated if the query ran on a part of the cluster which had been updated. As a result, every five minutes there was a chance of either a good or a bad set of configuration files being generated and rapidly propagated across the network.&lt;/p&gt;
+      &lt;p&gt;This fluctuation made it unclear what was happening as the entire system would recover and then fail again as sometimes good, sometimes bad configuration files were distributed to our network. Initially, this led us to believe this might be caused by an attack. Eventually, every ClickHouse node was generating the bad configuration file and the fluctuation stabilized in the failing state.&lt;/p&gt;
+      &lt;p&gt;Errors continued until the underlying issue was identified and resolved starting at 14:30. We solved the problem by stopping the generation and propagation of the bad feature file and manually inserting a known good file into the feature file distribution queue. And then forcing a restart of our core proxy.&lt;/p&gt;
+      &lt;p&gt;The remaining long tail in the chart above is our team restarting remaining services that had entered a bad state, with 5xx error code volume returning to normal at 17:06.&lt;/p&gt;
+      &lt;p&gt;The following services were impacted:&lt;/p&gt;
+      &lt;table&gt;
+        &lt;row&gt;
+          &lt;cell role="head"&gt;
+            &lt;p&gt;Service / Product&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell role="head"&gt;
+            &lt;p&gt;Impact description&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Core CDN and security services&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;HTTP 5xx status codes. The screenshot at the top of this post shows a typical error page delivered to end users.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Turnstile&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Turnstile failed to load.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Workers KV&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Workers KV returned a significantly elevated level of HTTP 5xx errors as requests to KVâs âfront endâ gateway failed due to the core proxy failing.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Dashboard&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;While the dashboard was mostly operational, most users were unable to log in due to Turnstile being unavailable on the login page.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Email Security&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;While email processing and delivery were unaffected, we observed a temporary loss of access to an IP reputation source which reduced spam-detection accuracy and prevented some new-domain-age detections from triggering, with no critical customer impact observed. We also saw failures in some Auto Move actions; all affected messages have been reviewed and remediated.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Access&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Authentication failures were widespread for most users, beginning at the start of the incident and continuing until the rollback was initiated at 13:05. Any existing Access sessions were unaffected.&lt;/p&gt;
+            &lt;p&gt;All failed authentication attempts resulted in an error page, meaning none of these users ever reached the target application while authentication was failing. Successful logins during this period were correctly logged during this incident.Â &lt;/p&gt;
+            &lt;p&gt;Any Access configuration updates attempted at that time would have either failed outright or propagated very slowly. All configuration updates are now recovered.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+      &lt;/table&gt;
+      &lt;p&gt;As well as returning HTTP 5xx errors, we observed significant increases in latency of responses from our CDN during the impact period. This was due to large amounts of CPU being consumed by our debugging and observability systems, which automatically enhance uncaught errors with additional debugging information.&lt;/p&gt;
+      &lt;div&gt;
+        &lt;head rend="h2"&gt;How Cloudflare processes requests, and how this went wrong today&lt;/head&gt;
+      &lt;/div&gt;
+      &lt;p&gt;Every request to Cloudflare takes a well-defined path through our network. It could be from a browser loading a webpage, a mobile app calling an API, or automated traffic from another service. These requests first terminate at our HTTP and TLS layer, then flow into our core proxy system (which we call FL for âFrontlineâ), and finally through Pingora, which performs cache lookups or fetches data from the origin if needed.&lt;/p&gt;
+      &lt;p&gt;We previously shared more detail about how the core proxy works here.Â &lt;/p&gt;
+      &lt;p&gt;As a request transits the core proxy, we run the various security and performance products available in our network. The proxy applies each customerâs unique configuration and settings, from enforcing WAF rules and DDoS protection to routing traffic to the Developer Platform and R2. It accomplishes this through a set of domain-specific modules that apply the configuration and policy rules to traffic transiting our proxy.&lt;/p&gt;
+      &lt;p&gt;One of those modules, Bot Management, was the source of todayâs outage.Â &lt;/p&gt;
+      &lt;p&gt;Cloudflareâs Bot Management includes, among other systems, a machine learning model that we use to generate bot scores for every request traversing our network. Our customers use bot scores to control which bots are allowed to access their sites â or not.&lt;/p&gt;
+      &lt;p&gt;The model takes as input a âfeatureâ configuration file. A feature, in this context, is an individual trait used by the machine learning model to make a prediction about whether the request was automated or not. The feature configuration file is a collection of individual features.&lt;/p&gt;
+      &lt;p&gt;This feature file is refreshed every few minutes and published to our entire network and allows us to react to variations in traffic flows across the Internet. It allows us to react to new types of bots and new bot attacks. So itâs critical that it is rolled out frequently and rapidly as bad actors change their tactics quickly.&lt;/p&gt;
+      &lt;p&gt;A change in our underlying ClickHouse query behaviour (explained below) that generates this file caused it to have a large number of duplicate âfeatureâ rows. This changed the size of the previously fixed-size feature configuration file, causing the bots module to trigger an error.&lt;/p&gt;
+      &lt;p&gt;As a result, HTTP 5xx error codes were returned by the core proxy system that handles traffic processing for our customers, for any traffic that depended on the bots module. This also affected Workers KV and Access, which rely on the core proxy.&lt;/p&gt;
+      &lt;p&gt;Unrelated to this incident, we were and are currently migrating our customer traffic to a new version of our proxy service, internally known as FL2. Both versions were affected by the issue, although the impact observed was different.&lt;/p&gt;
+      &lt;p&gt;Customers deployed on the new FL2 proxy engine, observed HTTP 5xx errors. Customers on our old proxy engine, known as FL, did not see errors, but bot scores were not generated correctly, resulting in all traffic receiving a bot score of zero. Customers that had rules deployed to block bots would have seen large numbers of false positives. Customers who were not using our bot score in their rules did not see any impact.&lt;/p&gt;
+      &lt;p&gt;Throwing us off and making us believe this might have been an attack was another apparent symptom we observed: Cloudflareâs status page went down. The status page is hosted completely off Cloudflareâs infrastructure with no dependencies on Cloudflare. While it turned out to be a coincidence, it led some of the team diagnosing the issue to believe that an attacker may be targeting both our systems as well as our status page. Visitors to the status page at that time were greeted by an error message:&lt;/p&gt;
+      &lt;p&gt;In the internal incident chat room, we were concerned that this might be the continuation of the recent spate of high volume Aisuru DDoS attacks:&lt;/p&gt;
+      &lt;div&gt;
+        &lt;head rend="h3"&gt;The query behaviour change&lt;/head&gt;
+      &lt;/div&gt;
+      &lt;p&gt;I mentioned above that a change in the underlying query behaviour resulted in the feature file containing a large number of duplicate rows. The database system in question uses ClickHouseâs software.&lt;/p&gt;
+      &lt;p&gt;For context, itâs helpful to know how ClickHouse distributed queries work. A ClickHouse cluster consists of many shards. To query data from all shards, we have so-called distributed tables (powered by the table engine &lt;code&gt;Distributed&lt;/code&gt;) in a database called &lt;code&gt;default&lt;/code&gt;. The Distributed engine queries underlying tables in a database &lt;code&gt;r0&lt;/code&gt;. The underlying tables are where data is stored on each shard of a ClickHouse cluster.&lt;/p&gt;
+      &lt;p&gt;Queries to the distributed tables run through a shared system account. As part of efforts to improve our distributed queries security and reliability, thereâs work being done to make them run under the initial user accounts instead.&lt;/p&gt;
+      &lt;p&gt;Before today, ClickHouse users would only see the tables in the &lt;code&gt;default&lt;/code&gt; database when querying table metadata from ClickHouse system tables such as &lt;code&gt;system.tables&lt;/code&gt; or &lt;code&gt;system.columns&lt;/code&gt;.&lt;/p&gt;
+      &lt;p&gt;Since users already have implicit access to underlying tables in &lt;code&gt;r0&lt;/code&gt;, we made a change at 11:05 to make this access explicit, so that users can see the metadata of these tables as well. By making sure that all distributed subqueries can run under the initial user, query limits and access grants can be evaluated in a more fine-grained manner, avoiding one bad subquery from a user affecting others.&lt;/p&gt;
+      &lt;p&gt;The change explained above resulted in all users accessing accurate metadata about tables they have access to. Unfortunately, there were assumptions made in the past, that the list of columns returned by a query like this would only include the â&lt;code&gt;default&lt;/code&gt;â database:&lt;/p&gt;
+      &lt;p&gt;
+        &lt;code&gt;SELECT
+  name,
+  type
+FROM system.columns
+WHERE
+  table = 'http_requests_features'
+order by name;&lt;/code&gt;
+      &lt;/p&gt;
+      &lt;p&gt;Note how the query does not filter for the database name. With us gradually rolling out the explicit grants to users of a given ClickHouse cluster, after the change at 11:05 the query above started returning âduplicatesâ of columns because those were for underlying tables stored in the r0 database.&lt;/p&gt;
+      &lt;p&gt;This, unfortunately, was the type of query that was performed by the Bot Management feature file generation logic to construct each input âfeatureâ for the file mentioned at the beginning of this section.Â &lt;/p&gt;
+      &lt;p&gt;The query above would return a table of columns like the one displayed (simplified example):&lt;/p&gt;
+      &lt;p&gt;However, as part of the additional permissions that were granted to the user, the response now contained all the metadata of the &lt;code&gt;r0&lt;/code&gt; schema effectively more than doubling the rows in the response ultimately affecting the number of rows (i.e. features) in the final file output.Â &lt;/p&gt;
+      &lt;p&gt;Each module running on our proxy service has a number of limits in place to avoid unbounded memory consumption and to preallocate memory as a performance optimization. In this specific instance, the Bot Management system has a limit on the number of machine learning features that can be used at runtime. Currently that limit is set to 200, well above our current use of ~60 features. Again, the limit exists because for performance reasons we preallocate memory for the features.&lt;/p&gt;
+      &lt;p&gt;When the bad file with more than 200 features was propagated to our servers, this limit was hit â resulting in the system panicking. The FL2 Rust code that makes the check and was the source of the unhandled error is shown below:&lt;/p&gt;
+      &lt;p&gt;This resulted in the following panic which in turn resulted in a 5xx error:&lt;/p&gt;
+      &lt;p&gt;
+        &lt;code&gt;thread fl2_worker_thread panicked: called Result::unwrap() on an Err value&lt;/code&gt;
+      &lt;/p&gt;
+      &lt;div&gt;
+        &lt;head rend="h3"&gt;Other impact during the incident&lt;/head&gt;
+      &lt;/div&gt;
+      &lt;p&gt;Other systems that rely on our core proxy were impacted during the incident. This included Workers KV and Cloudflare Access. The team was able to reduce the impact to these systems at 13:04, when a patch was made to Workers KV to bypass the core proxy. Subsequently, all downstream systems that rely on Workers KV (such as Access itself) observed a reduced error rate.Â &lt;/p&gt;
+      &lt;p&gt;The Cloudflare Dashboard was also impacted due to both Workers KV being used internally and Cloudflare Turnstile being deployed as part of our login flow.&lt;/p&gt;
+      &lt;p&gt;Turnstile was impacted by this outage, resulting in customers who did not have an active dashboard session being unable to log in. This showed up as reduced availability during two time periods: from 11:30 to 13:10, and between 14:40 and 15:30, as seen in the graph below.&lt;/p&gt;
+      &lt;p&gt;The first period, from 11:30 to 13:10, was due to the impact to Workers KV, which some control plane and dashboard functions rely upon. This was restored at 13:10, when Workers KV bypassed the core proxy system. The second period of impact to the dashboard occurred after restoring the feature configuration data. A backlog of login attempts began to overwhelm the dashboard. This backlog, in combination with retry attempts, resulted in elevated latency, reducing dashboard availability. Scaling control plane concurrency restored availability at approximately 15:30.&lt;/p&gt;
+      &lt;p&gt;Now that our systems are back online and functioning normally, work has already begun on how we will harden them against failures like this in the future. In particular we are:&lt;/p&gt;
+      &lt;list rend="ul"&gt;
+        &lt;item&gt;
+          &lt;p&gt;Hardening ingestion of Cloudflare-generated configuration files in the same way we would for user-generated input&lt;/p&gt;
+        &lt;/item&gt;
+        &lt;item&gt;
+          &lt;p&gt;Enabling more global kill switches for features&lt;/p&gt;
+        &lt;/item&gt;
+        &lt;item&gt;
+          &lt;p&gt;Eliminating the ability for core dumps or other error reports to overwhelm system resources&lt;/p&gt;
+        &lt;/item&gt;
+        &lt;item&gt;
+          &lt;p&gt;Reviewing failure modes for error conditions across all core proxy modules&lt;/p&gt;
+        &lt;/item&gt;
+      &lt;/list&gt;
+      &lt;p&gt;Today was Cloudflare's worst outage since 2019. We've had outages that have made our dashboard unavailable. Some that have caused newer features to not be available for a period of time. But in the last 6+ years we've not had another outage that has caused the majority of core traffic to stop flowing through our network.&lt;/p&gt;
+      &lt;p&gt;An outage like today is unacceptable. We've architected our systems to be highly resilient to failure to ensure traffic will always continue to flow. When we've had outages in the past it's always led to us building new, more resilient systems.&lt;/p&gt;
+      &lt;p&gt;On behalf of the entire team at Cloudflare, I would like to apologize for the pain we caused the Internet today. &lt;/p&gt;
+      &lt;table&gt;
+        &lt;row&gt;
+          &lt;cell role="head"&gt;
+            &lt;p&gt;Time (UTC)&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell role="head"&gt;
+            &lt;p&gt;Status&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell role="head"&gt;
+            &lt;p&gt;Description&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;11:05&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Normal.&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Database access control change deployed.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;11:28&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Impact starts.&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Deployment reaches customer environments, first errors observed on customer HTTP traffic.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;11:32-13:05&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;The team investigated elevated traffic levels and errors to Workers KV service.&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;The initial symptom appeared to be degraded Workers KV response rate causing downstream impact on other Cloudflare services.&lt;/p&gt;
+            &lt;p&gt;Mitigations such as traffic manipulation and account limiting were attempted to bring the Workers KV service back to normal operating levels.&lt;/p&gt;
+            &lt;p&gt;The first automated test detected the issue at 11:31 and manual investigation started at 11:32. The incident call was created at 11:35.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;13:05&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Workers KV and Cloudflare Access bypass implemented â impact reduced.&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;During investigation, we used internal system bypasses for Workers KV and Cloudflare Access so they fell back to a prior version of our core proxy. Although the issue was also present in prior versions of our proxy, the impact was smaller as described below.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;13:37&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Work focused on rollback of the Bot Management configuration file to a last-known-good version.&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;We were confident that the Bot Management configuration file was the trigger for the incident. Teams worked on ways to repair the service in multiple workstreams, with the fastest workstream a restore of a previous version of the file.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;14:24&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Stopped creation and propagation of new Bot Management configuration files.&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;We identified that the Bot Management module was the source of the 500 errors and that this was caused by a bad configuration file. We stopped automatic deployment of new Bot Management configuration files.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;14:24&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Test of new file complete.&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;We observed successful recovery using the old version of the configuration file and then focused on accelerating the fix globally.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;14:30&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;Main impact resolved. Downstream impacted services started observing reduced errors.&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;A correct Bot Management configuration file was deployed globally and most services started operating correctly.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+        &lt;row&gt;
+          &lt;cell&gt;
+            &lt;p&gt;17:06&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;All services resolved. Impact ends.&lt;/p&gt;
+          &lt;/cell&gt;
+          &lt;cell&gt;
+            &lt;p&gt;All downstream services restarted and all operations fully restored.&lt;/p&gt;
+          &lt;/cell&gt;
+        &lt;/row&gt;
+      &lt;/table&gt;
+    &lt;/div&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45973709</guid><pubDate>Tue, 18 Nov 2025 23:31:22 +0000</pubDate></item><item><title>Lucent 7 R/E 5ESS Telephone Switch Rescue</title><link>http://kev009.com/wp/2024/07/Lucent-5ESS-Rescue/</link><description>&lt;doc fingerprint="bf91da598eadf050"&gt;
+  &lt;main&gt;
+    &lt;p&gt;I am still recovering from the fairly challenging logistical project of saving a Lucent 5ESS. This is a whale of a project and I am still in a state of disbelief that I have gotten to this point. Thanks to my wife, brother, and a few friends for their help and the University of Arizona which has a very dedicated and professional Information Technology Services staff.&lt;/p&gt;
+    &lt;p&gt;It started when I saw some telephone history enthusiasts post about a construction bid at the University of Arizona. It turns out, U of A installed the 5ESS in the late 1980s in a rather forward thinking move that netted a phone system that handled the growth of the University, medium speed data anywhere a phone may be located (ISDN BRI or PRI), and copper and fiber plant that will continue to be used indefinitely.&lt;/p&gt;
+    &lt;p&gt;At peak, it served over 20,000 lines. They've done their own writeup, The End of An Era in Telecommunications, that is worth a read. In particular, the machine had an uptime of approximately 35 years including two significant retrofits to newer technology culminating in the current Lucent-dressed 7 R/E configuration that includes an optical packet-switched core called the Communications Module 3 (CM3) or Global Messaging Server 3 (GMS3).&lt;/p&gt;
+    &lt;p&gt;Moving 40 frames of equipment, this required a ton of planning and muscle. The whole package took up two 26' straight-trucks, which is just 1' short of an entire standard US semi-trailer.&lt;/p&gt;
+    &lt;p&gt;Coming from the computing and data networking world, the construction of the switch was quite bewildering at first. It is physically made up of standard frames which are interconnected into rows not unlike datacenter equipment, but the frames are integrated into an overhead system for cable management. Internally, they are wired up usually within the row and quite a few cables route horizontally beween frames, but some connections have to transit up and over to other rows.&lt;/p&gt;
+    &lt;p&gt;Line Trunk Peripherals hook up to a Switching Module Controller (SMC) directly or an OXU (Optical Cross Connect Unit) which hooks up to an SMC and reduces the amount of copper cabling going between rows. Alarm cables run directly to an OAU (Office Alarm Unit) or form rings in between rows that eventually end at the OAU. Optical connections go from OXUs to SMCs and then to the CM, copper test circuits home run to a Metallic Test Service Unit shelf. Communications Cables come out the top and route toward the wire frame, usually in large 128 wire cables but occasionally in smaller quantity for direct or cross connect of special services. A pair of Power Distribution Frames distribute -48V throughout the entire footprint, taking into account redundancy at every level.&lt;/p&gt;
+    &lt;p&gt;All of this was neatly cable laced with wax string. Moving a single frame required hundreds of distinct actions that vary from quick, like cutting cable lace, to time consuming removal of copper connections and bolts in all directions.&lt;/p&gt;
+    &lt;p&gt;We were able to complete the removal in a single five day workweek, and I was able to unload it to my receiving area in two days over the weekend where it now safely resides.&lt;/p&gt;
+    &lt;p&gt;The next step will be to acquire some AC and DC power distribution equipment, which will have to wait for my funds to recover.&lt;/p&gt;
+    &lt;p&gt;I should be able to boot the Administrative Module (AM), a 3B21D computer, up relatively soon by acquiring a smaller DC rectifier and that alone will be very interesting as it is the only use I know of the DMERT or UNIX-RTR operating system, a fault tolerant micro-kernel realtime UNIX from Bell Labs.&lt;/p&gt;
+    &lt;p&gt;The system came with a full set of manuals and schematics which will help greatly in rewiring and reconfiguring the machine. After the AM is up, I need to "de-grow" the disconnected equipment and I will eventually add back in an assortment of line, packet, and service units so that I can demonstrate POTS as well as ISDN voice and data. In particular, I am looking forward to interoperating with other communication and computing equipment I have.&lt;/p&gt;
+    &lt;p&gt;I will have to reduce the size of the system quite a bit for power and space reasons so will have spare parts to sell or trade.&lt;/p&gt;
+    &lt;p&gt;Additional Pictures are available here until I have a longer term project page established.&lt;/p&gt;
+    &lt;p&gt;This is too much machine for one man, and it is part of a broader project I am working on to build a computing and telecommunications museum. If you are interested in working on the system with me, please feel free to reach out.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45973955</guid><pubDate>Tue, 18 Nov 2025 23:59:14 +0000</pubDate></item></channel></rss>
