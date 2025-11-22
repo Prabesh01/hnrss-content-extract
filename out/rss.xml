@@ -1,5 +1,175 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 22 Nov 2025 10:10:11 +0000</lastBuildDate><item><title>Homeschooling hits record numbers</title><link>https://reason.com/2025/11/19/homeschooling-hits-record-numbers/</link><description>&lt;doc fingerprint="2c38d07f980997d6"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 22 Nov 2025 10:38:01 +0000</lastBuildDate><item><title>Building a Durable Execution Engine with SQLite</title><link>https://www.morling.dev/blog/building-durable-execution-engine-with-sqlite/</link><description>&lt;doc fingerprint="781aca9ef520504b"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Building a Durable Execution Engine With SQLite&lt;/head&gt;
+    &lt;p&gt;Update November 21: This post is being discussed on Hacker News&lt;/p&gt;
+    &lt;p&gt;Lately, there has been a lot of excitement around Durable Execution (DE) engines. The basic idea of DE is to take (potentially long-running) multi-step workflows, such as processing a purchase order or a user sign-up, and make their individual steps persistent. If a flow gets interrupted while running, for instance due to a machine failure, the DE engine can resume it from the last successfully executed step and drive it to completion.&lt;/p&gt;
+    &lt;p&gt;This is a very interesting value proposition: the progress of critical business processes is captured reliably, ensuring they’ll complete eventually. Importantly, any steps performed already successfully won’t be repeated when retrying a failed flow. This helps to ensure that flows are executed correctly (for instance preventing inventory from getting assigned twice to the same purchase order), efficiently (e.g. avoiding repeated remote API calls), and deterministically. One particular category of software which benefits from this are agentic systems, or more generally speaking, any sort of system which interacts with LLMs. LLM calls are slow and costly, and their results are non-deterministic. So it is desirable to avoid repeating any previous LLM calls when continuing an agentic flow after a failure.&lt;/p&gt;
+    &lt;p&gt;Now, at a high level, "durable execution" is nothing new. A scheduler running a batch job for moving purchase orders through their lifecycle? You could consider this a form of durable execution. Sending a Kafka message from one microservice to another and reacting to the response message in a callback? Also durable execution, if you squint a little. A workflow engine running a BPMN job? Implementing durable execution, before the term actually got popularized. All these approaches model multi-step business transactions—making the logical flow of the overall transaction more or less explicit—in a persistent way, ensuring that transactions progress safely and reliably and eventually complete.&lt;/p&gt;
+    &lt;p&gt;However, modern DE typically refers to one particular approach for achieving this goal: Workflows defined in code, using general purpose programming languages such as Python, TypeScript, or Java. That way, developers don’t need to pick up a new language for defining flows, as was the case with earlier process automation platforms. They can use their familiar tooling for editing flows, versioning them, etc. A DE engine transparently tracks program progress, persists execution state in the form of durable checkpoints, and enables resumption after failures.&lt;/p&gt;
+    &lt;p&gt;Naturally, this piqued my interest: what would it take to implement a basic DE engine in Java? Can we achieve something useful with less than, let’s say, 1,000 lines of code? The idea being not to build a production-ready engine, but to get a better understanding of the problem space and potential solutions for it. You can find the result of this exploration, called Persistasaurus, in this GitHub repository. Coincidentally, this project also serves as a very nice example of how modern Java versions can significantly simplify the life of developers.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Hello Persistasaurus!&lt;/head&gt;
+    &lt;p&gt;Let’s take a look at an example of what you can do with Persistasaurus and then dive into some of the key implementation details. As per the idea of DE, flows are implemented as regular Java code. The entry point of a flow is a method marked with the &lt;code&gt;@Flow&lt;/code&gt; annotation.
+Individual flow steps are methods annotated with &lt;code&gt;@Step&lt;/code&gt;:&lt;/p&gt;
+    &lt;p&gt;Steps are the unit of persistence—their outcomes are recorded, and when resuming a flow after a failure, it will continue from the last successfully run step method. Now, which exact parts of a flow warrant being persisted as a step is on the developer to decide. You don’t want to define steps too granularly, so as to keep the overhead of logging low. In general, flow sections which are costly or time-consuming to run or whose result cannot easily be reproduced, are great candidates for being moved into a step method.&lt;/p&gt;
+    &lt;p&gt;A flow is executed by obtaining a &lt;code&gt;FlowInstance&lt;/code&gt; object and then calling the flow’s main method:&lt;/p&gt;
+    &lt;p&gt;Each flow run is identified by a unique id, allowing to re-execute it after a failure, or to resume it when waiting for an external signal ("human in the loop", more on that below). If the Hello World flow runs to completion, the following will be logged to stdout:&lt;/p&gt;
+    &lt;p&gt;Now let’s assume something goes wrong while executing the third step:&lt;/p&gt;
+    &lt;p&gt;When re-running the flow, using the same UUID as before, it will retry that failed step and resume from there. The first two steps which were already run successfully are not re-executed. Instead, they will be replayed from a persistent execution log, which is based on SQLite, an embedded SQL database:&lt;/p&gt;
+    &lt;p&gt;In the following, let’s take a closer look at some of the implementation choices in Persistasaurus.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Capturing Execution State&lt;/head&gt;
+    &lt;p&gt;At the core of every DE engine there’s some form of persistent durable execution log. You can think of this a bit like the write-ahead log of a database. It captures the intent to execute a given flow step, which makes it possible to retry that step should it fail, using the same parameter values. Once successfully executed, a step’s result will also be recorded in the log, so that it can be replayed from there if needed, without having to actually re-execute the step itself.&lt;/p&gt;
+    &lt;p&gt;DE logs come in two flavours largely speaking; one is in the form of an external state store which is accessed via some sort of SDK. Example frameworks taking this approach include Temporal, Restate, Resonate, and Inngest. The other option is to persist DE state in the local database of a given application or (micro)service. One solution in this category is DBOS, which implements DE on top of Postgres.&lt;/p&gt;
+    &lt;p&gt;To keep things simple, I went with the local database model for Persistasaurus, using SQLite for storing the execution log. But as we’ll see later on, depending on your specific use case, SQLite actually might also be a great choice for a production scenario, for instance when building a self-contained agentic system.&lt;/p&gt;
+    &lt;p&gt;The structure of the execution log table in SQLite is straight-forward. It contains one entry for each durable execution step:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;The UUID of the flow&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;2&lt;/cell&gt;
+        &lt;cell&gt;The sequence number of the step within the flow, in the order of execution&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;3&lt;/cell&gt;
+        &lt;cell&gt;The timestamp of first running this step&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;4&lt;/cell&gt;
+        &lt;cell&gt;The name of the class defining the step method&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;5&lt;/cell&gt;
+        &lt;cell&gt;The name of the step method (currently ignoring overloaded methods for this PoC)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;6&lt;/cell&gt;
+        &lt;cell&gt;For delayed steps, the delay in milli-seconds&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;7&lt;/cell&gt;
+        &lt;cell&gt;The current status of the step&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;8&lt;/cell&gt;
+        &lt;cell&gt;A counter for keeping track of how many times the step has been tried&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;9&lt;/cell&gt;
+        &lt;cell&gt;The serialized form of the step’s input parameters, if any&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;10&lt;/cell&gt;
+        &lt;cell&gt;The serialized form of the step’s result, if any&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;This log table stores all information needed to capture execution intent and persist results. More details on the notion of delays and signals follow further down.&lt;/p&gt;
+    &lt;p&gt;When running a flow, the engine needs to know when a given step gets executed so it can be logged. One common way for doing so is via explicit API calls into the engine, e.g. like so with DBOS Transact:&lt;/p&gt;
+    &lt;p&gt;This works, but tightly couples workflows to the DE engine’s API. For Persistaurus I aimed to avoid this dependency as much as possible. Instead, the idea is to transparently intercept the invocations of all step methods and track them in the execution log, allowing for a very concise flow expression, without any API dependencies:&lt;/p&gt;
+    &lt;p&gt;In order for the DE engine to know when a flow or step method gets invoked, the proxy pattern is being used: a proxy wraps the actually flow object and handles each of its method invocations, updating the state in the execution log before and after passing the call on to the flow itself. Thanks to Java’s dynamic nature, creating such a proxy is relatively easy, requiring just a little bit of bytecode generation. Unsurprisingly, I’m using the ByteBuddy library for this job:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;Create a sub-class proxy for the flow type&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;2&lt;/cell&gt;
+        &lt;cell&gt;Intercept all method invocations on this proxy…&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;3&lt;/cell&gt;
+        &lt;cell&gt;…and delegate them to an &lt;code&gt;Interceptor&lt;/code&gt; object&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;4&lt;/cell&gt;
+        &lt;cell&gt;Load the generated proxy class&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;5&lt;/cell&gt;
+        &lt;cell&gt;Instantiate the flow proxy&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;As an aside, Claude Code does an excellent job in creating code using the ByteBuddy API, which is not always self-explanatory. Now, whenever a method is invoked on the flow proxy, the call is delegated to the &lt;code&gt;Interceptor&lt;/code&gt; class,
+which will record the step in the execution log before invoking the actual flow method.
+I am going to spare you the complete details of the method interceptor implementation
+(you can find it here on GitHub),
+but the high-level logic looks like so:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;Replay completed step if present&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;2&lt;/cell&gt;
+        &lt;cell&gt;Log invocation&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;3&lt;/cell&gt;
+        &lt;cell&gt;Execute the actual step method&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;4&lt;/cell&gt;
+        &lt;cell&gt;Log result&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Replaying completed steps from the log is essential for ensuring deterministic execution. Each step typically runs exactly once, capturing non-deterministic values such as the current time or random numbers while doing so.&lt;/p&gt;
+    &lt;p&gt;There’s an important failure mode, though: if the system crashes after a step has been executed but before the result can be recorded in the log, that step would be repeated when rerunning the flow. Odds for this to happen are pretty small, but whether it is acceptable or not depends on the particular use case. When executing steps with side-effects, such as remote API calls, it may be a good idea to add idempotency keys to the requests, which lets the invoked services detect and ignore any potential duplicate calls.&lt;/p&gt;
+    &lt;p&gt;The actual execution log implementation isn’t that interesting, you can find its source code here. All it does is persist step invocations and their status in the &lt;code&gt;execution_log&lt;/code&gt; SQLite table shown above.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Delayed Executions&lt;/head&gt;
+    &lt;p&gt;At this point, we have a basic Durable Execution engine which can run simple flows as the one above. Next, I explored implementing delayed execution steps. As an example, consider a user onboarding flow, where you might want to send out an email with useful resources a few days after a user has signed up. Using the annotation-based programming model of Persistasaurus, this can be expressed like so:&lt;/p&gt;
+    &lt;p&gt;Naturally, we don’t want to block the initiating thread when delaying a step—for instance, a web application’s request handler. Instead, we need a way to temporarily yield execution of the flow, return control to the caller, and then later on, when the configured delay has passed, resume the flow.&lt;/p&gt;
+    &lt;p&gt;Unlike other programming languages, Java doesn’t support continuations via its public API. So how could we yield control then? One option would be to define a specific exception type, let’s say &lt;code&gt;FlowYieldException&lt;/code&gt;, and raise it from within the method interceptor when encountering a delayed method.
+The call stack would be unwound until some framework-provided exception handler catches that exception and returns control to the code triggering the flow.
+For this to work, it is essential that no user-provided flow or step code catches that exception type.
+Alternatively, one could transform the bytecode of the step method (and all the methods below it in the call stack),
+so that it can return control at given suspension points and later on resume from there,
+similar to how Kotlin’s coroutines are implemented under the hood ("continuation passing style").&lt;/p&gt;
+    &lt;p&gt;Luckily, Java 21 offers a much simpler solution. This version added support for virtual threads (JEP 444), and while you shouldn’t block OS level threads, blocking virtual threads is totally fine. Virtual threads are lightweight user-mode threads managed by the JVM, and an application can have hundreds of thousands, or even millions of them at once. Thus I decided to implement delayed executions in Persistasaurus through virtual threads, sleeping for the given period of time when encountering a delayed method.&lt;/p&gt;
+    &lt;p&gt;To run a flow with a delayed step, trigger it via &lt;code&gt;runAsync()&lt;/code&gt;,
+which immediately returns control to the caller:&lt;/p&gt;
+    &lt;p&gt;When putting a virtual thread running a flow method asleep, it will be unmounted from the underlying OS level carrier thread, freeing its resources. Later on, once the sleep time has passed, the virtual thread will be remounted onto a carrier thread and continue the flow. When rerunning non-finished flows with a delayed execution step, Persistasaurus will only sleep for the remainder of the configured delay, which might be zero if enough time has passed since the original run of the flow.&lt;/p&gt;
+    &lt;p&gt;So in fact, you could think of virtual threads as a form of continuations; and indeed, if you look closely at the stacktrace of a virtual thread, you’ll see that the frame at the very bottom is the &lt;code&gt;enter()&lt;/code&gt; method of a JDK-internal class &lt;code&gt;Continuation&lt;/code&gt;.
+Interestingly, this class was even part of the public Java API in early preview versions of virtual threads,
+but it got made private later on.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Human Interaction&lt;/head&gt;
+    &lt;p&gt;As the last step of my exploration I was curious how flows with "human in the loop"-steps could be implemented: steps where externally provided input or data is required in order for a flow to continue. Sticking to the sign-up flow example, this could be an email by the user, so as to confirm their identity (double opt-in). As much as possible, I tried to stick to the idea of using plain method calls for expressing the flow logic, but I couldn’t get around making flows invoke a Persistasaurus-specific method, &lt;code&gt;await()&lt;/code&gt;, for signalling that a step requires external input:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;Await the invocation of the given step method&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;When the method interceptor encounters a step method invoked from within an &lt;code&gt;await()&lt;/code&gt; block,
+it doesn’t go on to actually execute right away.
+Instead, the flow will await continuation until the step method gets triggered.
+This is why it doesn’t matter which parameter values are passed to that step within the flow definition.
+You could pass &lt;code&gt;null&lt;/code&gt;, or, as a convention, the &lt;code&gt;any()&lt;/code&gt; placeholder method.&lt;/p&gt;
+    &lt;p&gt;In order to provide the input to a waiting step and continue the flow, call the step method via &lt;code&gt;resume()&lt;/code&gt;, for instance like so, in a request handler method of a Spring Boot web application:&lt;/p&gt;
+    &lt;p&gt;The flow will then continue from that step, using the given parameter value(s) as its input. For this to work, we need a way for the engine to know whether a given step method gets invoked from within &lt;code&gt;resume()&lt;/code&gt; and thus actually should be executed,
+or, whether it gets invoked from within &lt;code&gt;await()&lt;/code&gt; and hence should be suspended.&lt;/p&gt;
+    &lt;p&gt;Seasoned framework developers might immediately think of using thread-local variables for this purpose, but as of Java 25, this can be solved much more elegantly and safely using so-called scoped values, as defined in JEP 506. To quote that JEP, scoped values&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;enable a method to share immutable data both with its callees within a thread, and with child threads. Scoped values are easier to reason about than thread-local variables. They also have lower space and time costs&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Scoped values are typically defined as as a static field like so:&lt;/p&gt;
+    &lt;p&gt;To set the scoped value and run some unit of code with that value, call &lt;code&gt;ScopedValue::where()&lt;/code&gt;:&lt;/p&gt;
+    &lt;p&gt;Unlike thread-local variables, this ensures the scoped value is cleared when leaving the scope. Then, further down in the call stack, within the method handler, the scoped value can be consumed:&lt;/p&gt;
+    &lt;p&gt;In order to yield control when waiting for external input and to resume when that input has been provided, a &lt;code&gt;ReentrantLock&lt;/code&gt; with a wait condition is used.
+Similar to the &lt;code&gt;sleep()&lt;/code&gt; call used for fixed delay steps above,
+a virtual thread will be unmounted from its carrier when waiting for a condition.&lt;/p&gt;
+    &lt;p&gt;When accidentally trying to access a scoped value which isn’t actually set, an exception will be raised, addressing another issue you’d commonly encounter with thread-local variables. This might not seem like a huge deal, but it’s great to see how the Java platform continues to evolve and improves things like this.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Managing State&lt;/head&gt;
+    &lt;p&gt;Let’s dive a bit deeper into managing state in a durable execution engine. For the example DE implementation developed for this blog post, I went with SQLite primarily for the sake of simplicity. Now, would you use SQLite, as an embedded database, also in an actual production-ready implementation? The answer is going to depend on your specific use case. If, for instance, you are building a self-contained AI agent and you want to use DE for making sure LLM invocations are not repeated when the agent crashes, an embedded database such as SQLite would make for a great store for persisting execution state. Each agent could have its own database, thus avoiding any concurrent writes, which can pose a bottleneck due to SQLite’s single-writer design.&lt;/p&gt;
+    &lt;p&gt;On the other hand, if you’re building a system with a high number of parallel requests by different users, such as a typical microservice, a client/server database such as Postgres or MySQL would be a better fit. If that system already maintains state in a database (as most services do), then re-using that same database to store execution state provides a critical advantage: Updates to the application’s data and its execution state can happen atomically in a single database transaction, providing atomicity guarantees. This solution is implemented by the DBOS engine, on top of Postgres, for instance.&lt;/p&gt;
+    &lt;p&gt;Another category of DE engines which include systems such as Temporal and Restate, utilizes a separate server component with its own dedicated store for persisting execution state. This approach can be very useful to implement flows spanning across a set of multiple services (sometimes referred to as Sagas). By keeping track of the overall execution state in one central place, they essentially avoid the need for cross-system transactions.&lt;/p&gt;
+    &lt;p&gt;Another advantage of this approach is that the actual application doesn’t have to keep running while waiting for delayed execution steps, making it a great fit for systems implemented in the form of scale-to-zero serverless designs (Function-as-a-Service, Knative, etc.). The downside of this centralized design is the potentially closer coupling of the participating services, as they all need to converge on a specific DE engine, on one specific version of that engine, etc. Also HA and fault tolerance must be a priority in order to avoid the creation of a single point of failure between all the orchestrated services.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Wrapping Up&lt;/head&gt;
+    &lt;p&gt;At its heart, the idea of Durable Execution is not a complex one: Potentially long-running workflows are organized into individual steps whose execution status and result is persisted in a durable form. That way, flows become resumable after failures, while skipping any steps already executed successfully. You could think of it as a persistent implementation of the memoization pattern, or a persistent form of continuations.&lt;/p&gt;
+    &lt;p&gt;As demonstrated in this post and the accompanying source code, it doesn’t take too much work to create a functioning PoC for a DE engine. Of course, it’s still quite a way to go from there to a system you’d actually want to put into production. At the persistence level, you’d have to address aspects such as (horizontal) scalability, fault tolerance and HA. The engine should support things such as retrying failing steps with exponential back-off, parallel execution of workflow steps, throttling flow executions, compensation steps for implementing Sagas, and more. You’d also want to have a UI for managing flows, analyzing, restarting, and debugging them. Finally, you should also have a strategy for evolving flow definitions and the state they persist, in particular when dealing with long-running flows which may take days, weeks, or months to complete.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=45992316</guid><pubDate>Thu, 20 Nov 2025 13:26:08 +0000</pubDate></item><item><title>Homeschooling hits record numbers</title><link>https://reason.com/2025/11/19/homeschooling-hits-record-numbers/</link><description>&lt;doc fingerprint="2c38d07f980997d6"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Homeschooling Hits Record Numbers&lt;/head&gt;
     &lt;head rend="h2"&gt;Last academic year, DIY education grew at nearly three times the average rate it did during the COVID-19 pandemic, according to new research.&lt;/head&gt;
@@ -2016,334 +2186,7 @@ struct MeshDrawCommand {
     &lt;p&gt;Overall, I’m quite satisfied with what I managed to accomplish. Learning Vulkan was quite difficult, but it wasn’t as hard as I imagined. It taught me a lot about graphics programming and modern APIs and now I have a strong foundation to build my games with.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46010329</guid><pubDate>Fri, 21 Nov 2025 23:28:40 +0000</pubDate></item><item><title>Sharper MRI scans may be on horizon thanks to new physics-based model</title><link>https://news.rice.edu/news/2025/sharper-mri-scans-may-be-horizon-thanks-new-physics-based-model</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46010806</guid><pubDate>Sat, 22 Nov 2025 00:30:26 +0000</pubDate></item><item><title>Infinibay LXD Container</title><link>https://github.com/Infinibay/lxd</link><description>&lt;doc fingerprint="aa196b300fad3ba9"&gt;
-  &lt;main&gt;
-    &lt;p&gt;LXD-based containerization for the Infinibay VDI management platform.&lt;/p&gt;
-    &lt;p&gt;✅ Production Ready - Automated provisioning with intelligent orchestration and multi-distro support&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;INSTALL.md - ⭐ Complete installation and deployment guide&lt;/item&gt;
-      &lt;item&gt;Project Root: ../&lt;/item&gt;
-      &lt;item&gt;Installer Reference: ../installer/&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;LXD provides native support for KVM/libvirt, making it ideal for running VMs inside containers without privileged mode or complex workarounds.&lt;/p&gt;
-    &lt;p&gt;Key advantages:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;✅ Native KVM device access - no &lt;code&gt;--privileged&lt;/code&gt;mode needed&lt;/item&gt;
-      &lt;item&gt;✅ Full systemd support inside containers&lt;/item&gt;
-      &lt;item&gt;✅ Designed for nested virtualization&lt;/item&gt;
-      &lt;item&gt;✅ YAML-based configuration (lxd-compose)&lt;/item&gt;
-      &lt;item&gt;✅ Better security isolation for VM workloads&lt;/item&gt;
-      &lt;item&gt;✅ Minimal performance overhead (~5%)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Infinibay's LXD deployment supports multiple Linux distributions with automatic package manager detection:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Debian/Ubuntu - Uses &lt;code&gt;apt-get&lt;/code&gt;(auto-detected)&lt;/item&gt;
-      &lt;item&gt;RHEL/CentOS/Fedora/Rocky/AlmaLinux - Uses &lt;code&gt;dnf&lt;/code&gt;or&lt;code&gt;yum&lt;/code&gt;(auto-detected)&lt;/item&gt;
-      &lt;item&gt;openSUSE/SLES - Uses &lt;code&gt;zypper&lt;/code&gt;(auto-detected)&lt;/item&gt;
-      &lt;item&gt;Arch/Manjaro/EndeavourOS - Uses &lt;code&gt;pacman&lt;/code&gt;(auto-detected)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;The setup script automatically detects your distribution and uses the appropriate package manager. LXD installation path (snap vs native package) is also auto-detected.&lt;/p&gt;
-    &lt;p&gt;This directory contains LXD-based containerization for Infinibay using lxd-compose.&lt;/p&gt;
-    &lt;p&gt;Structure:&lt;/p&gt;
-    &lt;code&gt;lxd/
-├── run.sh                         # Main management script ⭐
-├── .lxd-compose.yml               # Main lxd-compose config
-├── envs/
-│   └── infinibay.yml              # Infinibay project definition
-├── profiles/
-│   └── templates/                 # LXD profile templates
-├── values.yml.example             # Configuration template
-├── setup.sh                       # Automated installation
-├── INSTALL.md                     # Complete guide
-└── README.md                      # This file
-&lt;/code&gt;
-    &lt;p&gt;Note: lxd-compose uses a different structure than docker-compose:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Main config: &lt;code&gt;.lxd-compose.yml&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Projects: &lt;code&gt;envs/*.yml&lt;/code&gt;files&lt;/item&gt;
-      &lt;item&gt;Commands: &lt;code&gt;apply infinibay&lt;/code&gt;,&lt;code&gt;destroy infinibay&lt;/code&gt;,&lt;code&gt;stop infinibay&lt;/code&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;The deployment creates 4 LXD containers:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;infinibay-postgres - PostgreSQL database&lt;/item&gt;
-      &lt;item&gt;infinibay-redis - Redis cache&lt;/item&gt;
-      &lt;item&gt;infinibay-backend - Node.js API + libvirt-node + infiniservice + KVM access&lt;/item&gt;
-      &lt;item&gt;infinibay-frontend - Next.js web interface&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;code&gt;# 1. Clone repository and navigate to lxd directory
-cd infinibay/lxd
-
-# 2. Run setup (installs LXD, lxd-compose, detects package manager)
-sudo ./setup.sh
-
-# 3. IMPORTANT: Activate lxd group (REQUIRED!)
-newgrp lxd
-# This activates the group in your current session
-# You need to do this after setup.sh adds you to the lxd group
-
-# 4. Configure environment variables
-# Option A: Edit the auto-generated .env (RECOMMENDED)
-nano .env
-# setup.sh already created .env with secure auto-generated passwords
-# IMPORTANT: Change ADMIN_PASSWORD from auto-generated to your own!
-
-# Option B: If you prefer to start from .env.example before setup.sh
-# cp .env.example .env &amp;amp;&amp;amp; nano .env
-# Then run setup.sh, which will detect and preserve your .env
-
-# 5. Deploy and start Infinibay (smart default - does everything!)
-./run.sh
-# This one command:
-# - Creates containers if they don't exist
-# - Starts containers if they're stopped
-# - Provisions if not already done (installs PostgreSQL, Redis, Node.js, Rust, libvirt)
-# - Shows access URLs when ready
-# Takes 5-10 minutes on first run
-
-# 6. Access Infinibay
-# URLs will be displayed after ./run.sh completes
-# Frontend: http://&amp;lt;frontend-ip&amp;gt;:3000
-# Backend API: http://&amp;lt;backend-ip&amp;gt;:4000&lt;/code&gt;
-    &lt;p&gt;What happens:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;setup.sh&lt;/code&gt;- Installs LXD, lxd-compose, detects your distro and package manager, auto-detects LXD path, generates&lt;code&gt;.env&lt;/code&gt;with secure passwords&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;newgrp lxd&lt;/code&gt;-&lt;g-emoji&gt;⚠️&lt;/g-emoji&gt;REQUIRED - Activates lxd group permissions&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;.env configuration&lt;/code&gt;-&lt;g-emoji&gt;⚠️&lt;/g-emoji&gt;IMPORTANT - Review and change ADMIN_PASSWORD (auto-generated passwords should be personalized!)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;./run.sh&lt;/code&gt;- Intelligent orchestration: creates containers, provisions software, starts everything&lt;list rend="ul"&gt;&lt;item&gt;Checks if environment exists → creates if not&lt;/item&gt;&lt;item&gt;Checks if containers are running → starts if stopped&lt;/item&gt;&lt;item&gt;Checks if provisioned → provisions if not (tracked via LXD metadata)&lt;/item&gt;&lt;item&gt;Skips already-completed steps automatically&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
-      &lt;item&gt;Containers have shared &lt;code&gt;/opt/infinibay&lt;/code&gt;directory (your code)&lt;/item&gt;
-      &lt;item&gt;Data persists in &lt;code&gt;/data&lt;/code&gt;directories even if containers are destroyed&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;After running &lt;code&gt;setup.sh&lt;/code&gt;, you may need to activate the &lt;code&gt;lxd&lt;/code&gt; group:&lt;/p&gt;
-    &lt;p&gt;Option 1 (Quick - current session only):&lt;/p&gt;
-    &lt;code&gt;newgrp lxd&lt;/code&gt;
-    &lt;p&gt;Option 2 (Permanent - requires re-login):&lt;/p&gt;
-    &lt;code&gt;logout
-# Then login again&lt;/code&gt;
-    &lt;p&gt;How to check if you're in the group:&lt;/p&gt;
-    &lt;code&gt;groups | grep lxd
-# Should show 'lxd' in the output&lt;/code&gt;
-    &lt;code&gt;# One command does everything - creates, provisions, and starts
-./run.sh              # Smart default - handles everything automatically
-
-# Fresh start - destroy and recreate everything
-./run.sh redo         # or: ./run.sh rd
-
-# Quick status check
-./run.sh status       # or: ./run.sh s&lt;/code&gt;
-    &lt;code&gt;# Smart default workflow (recommended)
-./run.sh              # Does everything: create → provision → start
-
-# Manual step-by-step (if you prefer explicit control)
-./run.sh apply        # Shortcuts: a, ap - Create containers
-./run.sh provision    # Shortcuts: p, pr - Install software
-
-# Container management
-./run.sh status       # Shortcuts: s, st - Check status
-./run.sh destroy      # Shortcuts: d, de - Remove containers
-./run.sh redo         # Shortcut: rd - Destroy and recreate (fresh start)
-./run.sh restart      # Shortcuts: r, re - Legacy alias for redo
-
-# Execute commands in containers
-./run.sh exec backend bash      # Shortcuts: e, ex
-./run.sh exec postgres psql -U infinibay
-./run.sh exec frontend npm run dev
-
-# Follow container logs
-./run.sh logs backend           # Shortcuts: l, lo
-./run.sh logs postgres
-
-# Update profiles only (after modifying templates)
-./run.sh setup-profiles         # Shortcut: sp
-
-# Show help with all shortcuts
-./run.sh help&lt;/code&gt;
-    &lt;p&gt;Complete shortcut reference:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;Command&lt;/cell&gt;
-        &lt;cell role="head"&gt;Shortcuts&lt;/cell&gt;
-        &lt;cell role="head"&gt;Description&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;apply&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;a&lt;/code&gt;, &lt;code&gt;ap&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;Create and start containers&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;provision&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;p&lt;/code&gt;, &lt;code&gt;pr&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;Install software in containers&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;redo&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;rd&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Destroy and recreate everything&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;destroy&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;d&lt;/code&gt;, &lt;code&gt;de&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;Stop and remove all containers&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;restart&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;r&lt;/code&gt;, &lt;code&gt;re&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;Legacy alias for redo&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;status&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;s&lt;/code&gt;, &lt;code&gt;st&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;Show container status&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;setup-profiles&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;sp&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Update LXD profiles only&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;exec&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;e&lt;/code&gt;, &lt;code&gt;ex&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;Execute command in container&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;logs&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;l&lt;/code&gt;, &lt;code&gt;lo&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;Follow container logs&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;code&gt;# View container status
-sg lxd -c "lxc list"
-
-# Execute commands
-sg lxd -c "lxc exec infinibay-backend -- bash"
-
-# Create snapshot
-sg lxd -c "lxc snapshot infinibay-backend backup-$(date +%Y%m%d)"
-
-# List snapshots
-lxc info infinibay-backend&lt;/code&gt;
-    &lt;p&gt;Implemented and Working:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;✅ Creates 4 Ubuntu containers with resource limits&lt;/item&gt;
-      &lt;item&gt;✅ Mounts shared &lt;code&gt;/opt/infinibay&lt;/code&gt;directory (your code)&lt;/item&gt;
-      &lt;item&gt;✅ Persistent &lt;code&gt;/data&lt;/code&gt;directories for each service&lt;/item&gt;
-      &lt;item&gt;✅ Automated provisioning scripts for all containers&lt;/item&gt;
-      &lt;item&gt;✅ PostgreSQL installation and configuration&lt;/item&gt;
-      &lt;item&gt;✅ Redis installation and configuration&lt;/item&gt;
-      &lt;item&gt;✅ Node.js 20.x LTS + npm&lt;/item&gt;
-      &lt;item&gt;✅ Rust toolchain (for libvirt-node native modules)&lt;/item&gt;
-      &lt;item&gt;✅ libvirt + KVM with /dev/kvm device access&lt;/item&gt;
-      &lt;item&gt;✅ Systemd services ready for backend/frontend&lt;/item&gt;
-      &lt;item&gt;✅ Network connectivity between containers&lt;/item&gt;
-      &lt;item&gt;✅ Universal package manager support (apt/dnf/zypper/pacman)&lt;/item&gt;
-      &lt;item&gt;✅ Automatic LXD path detection (snap vs native)&lt;/item&gt;
-      &lt;item&gt;✅ Smart default orchestration with state tracking&lt;/item&gt;
-      &lt;item&gt;✅ Provisioning state persistence via LXD metadata&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Still Manual:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;⏳ npm install in backend/frontend&lt;/item&gt;
-      &lt;item&gt;⏳ Database migrations&lt;/item&gt;
-      &lt;item&gt;⏳ Starting Infinibay services&lt;/item&gt;
-      &lt;item&gt;⏳ Application configuration&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;After provisioning, you need to:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Install npm dependencies in backend/frontend&lt;/item&gt;
-      &lt;item&gt;Run database migrations&lt;/item&gt;
-      &lt;item&gt;Configure and start Infinibay services&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;See INSTALL.md for detailed instructions.&lt;/p&gt;
-    &lt;code&gt;# Make sure you specify the project name
-lxd-compose apply infinibay  # ✓ Correct
-lxd-compose apply             # ✗ Wrong&lt;/code&gt;
-    &lt;code&gt;# You need to be in the lxd group
-newgrp lxd
-# Or logout/login&lt;/code&gt;
-    &lt;code&gt;# Check if you're in lxd group
-groups | grep lxd
-
-# If not, the setup script should have added you
-# Just run:
-newgrp lxd&lt;/code&gt;
-    &lt;code&gt;# Check individual container status
-./run.sh status
-
-# Use redo to start fresh (destroys and recreates everything)
-./run.sh redo&lt;/code&gt;
-    &lt;code&gt;# Option 1: Use redo command (destroys and recreates everything)
-./run.sh redo
-
-# Option 2: Manually clear provisioning state for specific container
-lxc config unset infinibay-backend user.provisioned
-lxc config unset infinibay-frontend user.provisioned
-lxc config unset infinibay-postgres user.provisioned
-lxc config unset infinibay-redis user.provisioned
-# Then run: ./run.sh&lt;/code&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;Aspect&lt;/cell&gt;
-        &lt;cell role="head"&gt;LXD (Current)&lt;/cell&gt;
-        &lt;cell role="head"&gt;Native Installer&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Status&lt;/cell&gt;
-        &lt;cell&gt;🚧 In Development&lt;/cell&gt;
-        &lt;cell&gt;✅ Production Ready&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Provisioning&lt;/cell&gt;
-        &lt;cell&gt;Manual for now&lt;/cell&gt;
-        &lt;cell&gt;✅ Fully automated&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Isolation&lt;/cell&gt;
-        &lt;cell&gt;✅ Full container isolation&lt;/cell&gt;
-        &lt;cell&gt;❌ System-wide&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Rollback&lt;/cell&gt;
-        &lt;cell&gt;✅ Snapshots&lt;/cell&gt;
-        &lt;cell&gt;❌ Manual&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Complexity&lt;/cell&gt;
-        &lt;cell&gt;Medium&lt;/cell&gt;
-        &lt;cell&gt;Low&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Recommendation: Use the native installer for production deployments until LXD provisioning is complete.&lt;/p&gt;
-    &lt;p&gt;See INSTALL.md for development workflows.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;LXD Documentation&lt;/item&gt;
-      &lt;item&gt;lxd-compose Documentation&lt;/item&gt;
-      &lt;item&gt;Infinibay Installer - Recommended for production&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Last Updated: 2025-11-21 Status: Production Ready&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46011351</guid><pubDate>Sat, 22 Nov 2025 01:54:45 +0000</pubDate></item><item><title>Moss Survives 9 Months in Space Vacuum</title><link>https://scienceclock.com/moss-survives-9-months-in-space-vacuum/</link><description>&lt;doc fingerprint="3f08d17b68b59460"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46010329</guid><pubDate>Fri, 21 Nov 2025 23:28:40 +0000</pubDate></item><item><title>Sharper MRI scans may be on horizon thanks to new physics-based model</title><link>https://news.rice.edu/news/2025/sharper-mri-scans-may-be-horizon-thanks-new-physics-based-model</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46010806</guid><pubDate>Sat, 22 Nov 2025 00:30:26 +0000</pubDate></item><item><title>Moss Survives 9 Months in Space Vacuum</title><link>https://scienceclock.com/moss-survives-9-months-in-space-vacuum/</link><description>&lt;doc fingerprint="3f08d17b68b59460"&gt;
   &lt;main&gt;
     &lt;p&gt;Mosses are already known for coping with harsh radiation, dehydration, and long freezes. Now scientists have pushed them even further by exposing their spore capsules to open space for nine months, and most of them survived.&lt;/p&gt;
     &lt;p&gt;The team worked with spreading earthmoss (Physcomitrium patens), a small moss species used widely as a plant model by researchers. Its spore-containing capsules were mounted on the outside of the International Space Station (ISS), where they experienced direct solar radiation, vacuum conditions, and sharp temperature swings during each orbit.&lt;/p&gt;
