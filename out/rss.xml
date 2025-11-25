@@ -1,24 +1,931 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Tue, 25 Nov 2025 05:40:59 +0000</lastBuildDate><item><title>Advice for crime analyst to break into data science</title><link>https://andrewpwheeler.com/2025/11/21/advice-for-crime-analyst-to-break-into-data-science/</link><description>&lt;doc fingerprint="7e9699d6092783bc"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Tue, 25 Nov 2025 06:17:35 +0000</lastBuildDate><item><title>A million ways to die from a data race in Go</title><link>https://gaultier.github.io/blog/a_million_ways_to_data_race_in_go.html</link><description>&lt;doc fingerprint="54705b3b3ea05890"&gt;
+  &lt;main&gt;&lt;p&gt;Published on 2025-11-21&lt;/p&gt;&lt;p&gt;I have been writing production applications in Go for a few years now. I like some aspects of Go. One aspect I do not like is how easy it is to create data races in Go.&lt;/p&gt;&lt;p&gt;Go is often touted for its ease to write highly concurrent programs. However, it is also mind-boggling how many ways Go happily gives us developers to shoot ourselves in the foot.&lt;/p&gt;&lt;p&gt;Over the years I have encountered and fixed many interesting kinds of data races in Go. If that interests you, I have written about Go concurrency in the past and about some existing footguns, without them being necessarily 'Go data races':&lt;/p&gt;&lt;p&gt;So what is a 'Go data race'? Quite simply, it is Go code that does not conform to the Go memory model. Importantly, Go defines in its memory model what a Go compiler MUST do and MAY do when faced with a non-conforming program exhibiting data races. Not everything is allowed, quite the contrary in fact. Data races in Go are not benign either: their effects can range from 'no symptoms' to 'arbitrary memory corruption'.&lt;/p&gt;&lt;p&gt;Quoting the Go memory model:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;This means that races on multiword data structures can lead to inconsistent values not corresponding to a single write. When the values depend on the consistency of internal (pointer, length) or (pointer, type) pairs, as can be the case for interface values, maps, slices, and strings in most Go implementations, such races can in turn lead to arbitrary memory corruption.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;With this out of the way, let's take a tour of real data races in Go code that I have encountered and fixed. At the end I will emit some recommendations to (try to) avoid them.&lt;/p&gt;&lt;p&gt;I also recommend reading the paper A Study of Real-World Data Races in Golang. This article humbly hopes to be a spiritual companion to it. Some items here are also present in this paper, and some are new.&lt;/p&gt;&lt;p&gt;In the code I will often use &lt;code&gt;errgroup.WaitGroup&lt;/code&gt; or &lt;code&gt;sync.WaitGroup&lt;/code&gt; because they act as a fork-join pattern, shortening the code. The exact same can be done with 'raw' Go channels and goroutines. This also serves to show that using higher-level concepts does not magically protect against all data races.&lt;/p&gt;&lt;p&gt;This one is very common in Go and also very easy to fall into. Here is a simplified reproducer:&lt;/p&gt;&lt;code&gt;package main
+
+import (
+	"context"
+
+	"golang.org/x/sync/errgroup"
+)
+
+func Foo() error { return nil }
+func Bar() error { return nil }
+func Baz() error { return nil }
+
+func Run(ctx context.Context) error {
+	err := Foo()
+	if err != nil {
+		return err
+	}
+
+	wg, ctx := errgroup.WithContext(ctx)
+	wg.Go(func() error {
+		err = Baz()
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	wg.Go(func() error {
+		err = Bar()
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	return wg.Wait()
+}
+
+func main() {
+	println(Run(context.Background()))
+}
+&lt;/code&gt;&lt;p&gt;The issue might not be immediately visible.&lt;/p&gt;&lt;p&gt;The problem is that the &lt;code&gt;err&lt;/code&gt; outer variable is implicitly captured by the closures running each in a separate goroutine. They then mutate &lt;code&gt;err&lt;/code&gt; concurrently. What they meant to do is instead use a variable local to the closure and return that instead. There is conceptually no need to share any data; this is purely accidental.&lt;/p&gt;&lt;p&gt;The fix is simple, I'll show two variants in the same diff: define a local variable, or use a named return value.&lt;/p&gt;&lt;code&gt;diff --git a/cmd-sg/main.go b/cmd-sg/main.go
+index 7eabdbc..4349157 100644
+--- a/cmd-sg/main.go
++++ b/cmd-sg/main.go
+@@ -18,14 +18,14 @@ func Run(ctx context.Context) error {
+ 
+ 	wg, ctx := errgroup.WithContext(ctx)
+ 	wg.Go(func() error {
+-		err = Baz()
++		err := Baz()
+ 		if err != nil {
+ 			return err
+ 		}
+ 
+ 		return nil
+ 	})
+-	wg.Go(func() error {
++	wg.Go(func() (err error) {
+ 		err = Bar()
+ 		if err != nil {
+ 			return err
+
+&lt;/code&gt;&lt;p&gt;It is unfortunate that a one character difference is all we need to fall into this trap. I feel for the original developer who wrote this code without realizing the implicit capture. As mentioned in a previous article where this silent behavior bit me, we can use the build flag &lt;code&gt;-gcflags='-d closure=1'&lt;/code&gt; to make the Go compiler print which variables are being captured by the closure:&lt;/p&gt;&lt;code&gt;$ go build -gcflags='-d closure=1' 
+./main.go:20:8: heap closure, captured vars = [err]
+./main.go:28:8: heap closure, captured vars = [err]
+&lt;/code&gt;&lt;p&gt;But this is not realistic to do that in a big codebase and inspect each closure. It's useful if you know that a given closure might suffer from this problem.&lt;/p&gt;&lt;p&gt;The Go docs state about &lt;code&gt;http.Client&lt;/code&gt;:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;[...] Clients should be reused instead of created as needed. Clients are safe for concurrent use by multiple goroutines.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;So imagine my surprise when the Go race detector flagged a race tied to &lt;code&gt;http.Client&lt;/code&gt;. The code looked like this:&lt;/p&gt;&lt;code&gt;package main
+
+import (
+	"context"
+	"net/http"
+
+	"golang.org/x/sync/errgroup"
+)
+
+func Run(ctx context.Context) error {
+	client := http.Client{}
+
+	wg, ctx := errgroup.WithContext(ctx)
+	wg.Go(func() error {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if req.Host == "google.com" {
+				return nil
+			} else {
+				return http.ErrUseLastResponse
+			}
+		}
+		_, err := client.Get("http://google.com")
+		return err
+	})
+	wg.Go(func() error {
+		client.CheckRedirect = nil
+		_, err := client.Get("http://amazon.com")
+		return err
+	})
+
+	return wg.Wait()
+}
+
+func main() {
+	println(Run(context.Background()))
+}
+&lt;/code&gt;&lt;p&gt;The program makes two concurrent HTTP requests to two different URLs. For the first one, the code restricts redirects (I invented the exact logic for that, no need to look too much into it, the real code has complex logic here). For the second one, no redirect checks are performed, by setting &lt;code&gt;CheckRedirect&lt;/code&gt; to nil. This code is idiomatic and follows the recommendations from the documentation:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;CheckRedirect specifies the policy for handling redirects. If CheckRedirect is not nil, the client calls it before following an HTTP redirect. If CheckRedirect is nil, the Client uses its default policy [...].&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;The problem is: the &lt;code&gt;CheckRedirect&lt;/code&gt; field is modified concurrently without any synchronization which is a data race.&lt;/p&gt;&lt;p&gt;This code also suffers from an I/O race: depending on the network speed and response time for both URLs, the redirects might or might be checked, since the callback might get overwritten from the other goroutine, right when the HTTP client would call it.&lt;/p&gt;&lt;p&gt;Alternatively, the &lt;code&gt;http.Client&lt;/code&gt; could end up calling a &lt;code&gt;nil&lt;/code&gt; callback if the callback was set when the &lt;code&gt;http.Client&lt;/code&gt; checked whether it was nil or not, but before &lt;code&gt;http.Client&lt;/code&gt; had the chance to call it, the other goroutine set it to &lt;code&gt;nil&lt;/code&gt;. Boom, &lt;code&gt;nil&lt;/code&gt; dereference.&lt;/p&gt;&lt;p&gt;Here, the simplest fix is to use two different HTTP clients:&lt;/p&gt;&lt;code&gt;diff --git a/cmd-sg/main.go b/cmd-sg/main.go
+index 351ecc0..8abee1c 100644
+--- a/cmd-sg/main.go
++++ b/cmd-sg/main.go
+@@ -8,10 +8,10 @@ import (
+ )
+ 
+ func Run(ctx context.Context) error {
+-	client := http.Client{}
+ 
+ 	wg, ctx := errgroup.WithContext(ctx)
+ 	wg.Go(func() error {
++		client := http.Client{}
+ 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+ 			if req.Host == "google.com" {
+ 				return nil
+@@ -23,6 +23,7 @@ func Run(ctx context.Context) error {
+ 		return err
+ 	})
+ 	wg.Go(func() error {
++		client := http.Client{}
+ 		client.CheckRedirect = nil
+ 		_, err := client.Get("http://amazon.com")
+ 		return err
+
+&lt;/code&gt;&lt;p&gt;This may affect performance negatively since some resources will not be shared anymore.&lt;/p&gt;&lt;p&gt;Additionally, in some situations, this is not so easy because &lt;code&gt;http.Client&lt;/code&gt; does not offer a &lt;code&gt;Clone()&lt;/code&gt; method (a recurring issue in Go as we'll see). For example, a Go test may start a &lt;code&gt;httptest.Server&lt;/code&gt; and then call &lt;code&gt;.Client()&lt;/code&gt; on this server to obtain a preconfigured HTTP client for this server. Then, there is no easy way to duplicate this client to use it from two different tests running in parallel.&lt;/p&gt;&lt;p&gt;Again here, I would not blame the original developer. In my view, the docs for &lt;code&gt;http.Client&lt;/code&gt; are misleading and should mention that not every single operation is concurrency safe. Perhaps with the wording: 'once a http.Client is constructed, performing a HTTP request is concurrency safe, provided that the http.Client fields are not modified concurrently'. Which is less catchy than 'Clients are safe for concurrent use', period.&lt;/p&gt;&lt;p&gt;The next data race is one that baffled me for a bit, because the code was using a mutex properly and I could not fathom why a race would be possible.&lt;/p&gt;&lt;p&gt;Here's a minimal reproducer:&lt;/p&gt;&lt;code&gt;package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"sync"
+)
+
+type Plans map[string]int
+
+type PricingInfo struct {
+	plans Plans
+}
+
+var pricingInfo = PricingInfo{plans: Plans{"cheap plan": 1, "expensive plan": 5}}
+
+type PricingService struct {
+	info    PricingInfo
+	infoMtx sync.Mutex
+}
+
+func NewPricingService() *PricingService {
+	return &amp;amp;PricingService{info: pricingInfo, infoMtx: sync.Mutex{}}
+}
+
+func AddPricing(w http.ResponseWriter, r *http.Request) {
+	pricingService := NewPricingService()
+
+	pricingService.infoMtx.Lock()
+	defer pricingService.infoMtx.Unlock()
+
+	pricingService.info.plans["middle plan"] = 3
+
+	encoder := json.NewEncoder(w)
+	encoder.Encode(pricingService.info)
+}
+
+func GetPricing(w http.ResponseWriter, r *http.Request) {
+	pricingService := NewPricingService()
+
+	pricingService.infoMtx.Lock()
+	defer pricingService.infoMtx.Unlock()
+
+	encoder := json.NewEncoder(w)
+	encoder.Encode(pricingService.info)
+}
+
+func main() {
+	http.HandleFunc("POST /add-pricing", AddPricing)
+	http.HandleFunc("GET /pricing", GetPricing)
+	http.ListenAndServe(":12345", nil)
+}
+&lt;/code&gt;&lt;p&gt;A global mutable map of pricing information is guarded by a mutex. One HTTP endpoint reads the map, another adds an item to it. Pretty simple I would say. The locking is done correctly.&lt;/p&gt;&lt;p&gt;Yet the map suffers from a data race. Here is a reproducer:&lt;/p&gt;&lt;code&gt;package main
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestMain(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /add-pricing", AddPricing)
+	mux.HandleFunc("GET /pricing", GetPricing)
+
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	t.Run("get pricing", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := server.Client().Get(server.URL + "/pricing")
+		if err != nil {
+			panic(err)
+		}
+	})
+
+	for range 5 {
+		t.Run("add pricing", func(t *testing.T) {
+			t.Parallel()
+
+			_, err := server.Client().Post(server.URL+"/add-pricing", "application/json", nil)
+			if err != nil {
+				panic(err)
+			}
+		})
+	}
+}
+&lt;/code&gt;&lt;p&gt;The reason why is because the data, and the mutex guarding it, do not have the same 'lifetime'. The &lt;code&gt;pricingInfo&lt;/code&gt; map is global and exists from the start of the program to the end. But the mutex &lt;code&gt;infoMtx&lt;/code&gt; exists only for the duration of the HTTP handler (and thus HTTP request). We effectively have 1 map and N mutexes, none of them shared between HTTP handlers. So HTTP handlers cannot synchronize access to the map.&lt;/p&gt;&lt;p&gt;The intent of the code was (I think) to do a deep clone of the pricing information at the beginning of the HTTP handler in &lt;code&gt;NewPricingService&lt;/code&gt;. Unfortunately, Go does a shallow copy of structures and thus each &lt;code&gt;PricingService&lt;/code&gt; instance ends up sharing the same underlying &lt;code&gt;plans&lt;/code&gt; map, which is this global map. It could be that for a long time, it worked because the &lt;code&gt;PricingInfo&lt;/code&gt; struct did not yet contain the map (in the real code it contains a lot of &lt;code&gt;int&lt;/code&gt;s and &lt;code&gt;string&lt;/code&gt;s which are value types and will be copied correctly by a shallow copy), and the map was only added later.&lt;/p&gt;&lt;p&gt;This data race is akin to copying a mutex by value when passing it to a function, which then locks it. This does no synchronization at all since a copy of the mutex is being locked - no mutex is shared between concurrent units.&lt;/p&gt;&lt;p&gt;In any event, the fix is to align the lifetime of the data and the mutex:&lt;/p&gt;&lt;p&gt;I went with the second approach in the real code because it seemed to be the original intent:&lt;/p&gt;&lt;code&gt;diff --git a/cmd-sg/main.go b/cmd-sg/main.go
+index fb59f5c..c7a7a94 100644
+--- a/cmd-sg/main.go
++++ b/cmd-sg/main.go
+@@ -2,6 +2,7 @@ package main
+ 
+ import (
+ 	"encoding/json"
++	"maps"
+ 	"net/http"
+ 	"sync"
+ )
+@@ -19,8 +20,15 @@ type PricingService struct {
+ 	infoMtx sync.Mutex
+ }
+ 
++func ClonePricing(pricingInfo PricingInfo) PricingInfo {
++	cloned := PricingInfo{plans: make(Plans, len(pricingInfo.plans))}
++	maps.Copy(cloned.plans, pricingInfo.plans)
++
++	return cloned
++}
++
+ func NewPricingService() *PricingService {
+-	return &amp;amp;PricingService{info: pricingInfo, infoMtx: sync.Mutex{}}
++	return &amp;amp;PricingService{info: ClonePricing(pricingInfo), infoMtx: sync.Mutex{}}
+ }
+ 
+ func AddPricing(w http.ResponseWriter, r *http.Request) {
+&lt;/code&gt;&lt;p&gt;It's annoying to have to implement this manually and especially to have to check every single nested field to determine if it's a value type or a reference type (the former will behave correctly with a shallow copy, the latter needs a custom deep copy implementation). I miss the &lt;code&gt;derive(Clone)&lt;/code&gt; annotation in Rust. This is something that the compiler can (and should) do better than me.&lt;/p&gt;&lt;p&gt;Furthermore, as mentioned in the previous section, some types from the standard library or third-party libraries do not implement a deep &lt;code&gt;Clone()&lt;/code&gt; function and contain private fields which prevent us from implementing that ourselves.&lt;/p&gt;&lt;p&gt;I think Rust's API for a mutex is better because a Rust mutex wraps the data it protects and thus it is harder to have uncorrelated lifetimes for the data and the mutex.&lt;/p&gt;&lt;p&gt;Go's mutex API likely could not have been implemented this way since it would have required generics which did not exist at the time. But as of today: I think it could.&lt;/p&gt;&lt;p&gt;Nonetheless, the Go compiler has no way to detect accidental shallow copying, whereas Rust's compiler has the concepts of &lt;code&gt;Copy&lt;/code&gt; and &lt;code&gt;Clone&lt;/code&gt; - so that issue remains in Go, and is not a simple API mistake in the standard library we can fix.&lt;/p&gt;&lt;p&gt;I encountered many cases of concurrently modifying a &lt;code&gt;map&lt;/code&gt;, &lt;code&gt;slice&lt;/code&gt;, etc without any synchronization. That's your run of the mill data race and they are typically fixed by 'slapping a mutex on it' or using a concurrency safe data structure such as &lt;code&gt;sync.Map&lt;/code&gt;.&lt;/p&gt;&lt;p&gt;I will thus share here a more interesting one where it is not as straightforward.&lt;/p&gt;&lt;p&gt;This time, the code is convoluted but what it does is relatively simple:&lt;/p&gt;&lt;code&gt;package main
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/ory/dockertest/v3"
+	"github.com/ory/dockertest/v3/docker"
+	"golang.org/x/sync/errgroup"
+)
+func GetSigningSecretFromStripeContainer() string {
+	dp, err := dockertest.NewPool("")
+	if err != nil {
+		panic(err)
+	}
+
+	forwarder, err := dp.RunWithOptions(&amp;amp;dockertest.RunOptions{
+		Repository: "stripe/stripe-cli",
+		Tag:        "v1.19.1",
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	output := &amp;amp;bytes.Buffer{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var signingSecret string
+	eg := errgroup.Group{}
+	eg.Go(func() error {
+		defer cancel()
+
+		for {
+			ln, err := output.ReadString('\n')
+			if err == io.EOF {
+				&amp;lt;-time.After(100 * time.Millisecond)
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if strings.Contains(ln, "Ready!") {
+				ln = ln[strings.Index(ln, "whsec_"):]
+				signingSecret = ln[:strings.Index(ln, " ")]
+				return nil
+			}
+		}
+	})
+
+	dp.Client.Logs(docker.LogsOptions{
+		Context:      ctx,
+		Stderr:       true,
+		Follow:       true,
+		RawTerminal:  true,
+		Container:    forwarder.Container.ID,
+		OutputStream: output,
+	})
+
+	eg.Wait()
+
+	return signingSecret
+}
+
+func main() {
+	println(GetSigningSecretFromStripeContainer())
+}
+&lt;/code&gt;&lt;p&gt;So, the issue may be clear from the description but here it is spelled out: one goroutine writes to a (growing) byte buffer, another one reads from it, and there is no synchronization: that's a clear data race.&lt;/p&gt;&lt;p&gt;What is interesting here is that we have to pass an &lt;code&gt;io.Writer&lt;/code&gt; for the &lt;code&gt;OutputStream&lt;/code&gt; to the library, and this library will write to the writer we passed. We cannot insert a mutex lock anywhere around the write site, since we do not control the library and there no hooks (e.g. pre/post write callbacks) to do so.&lt;/p&gt;&lt;p&gt;We implement our own writer that does the synchronization with a mutex:&lt;/p&gt;&lt;code&gt;type SyncWriter struct {
+	Writer io.Writer
+	Mtx    *sync.Mutex
+}
+
+func NewSyncWriter(w io.Writer, mtx *sync.Mutex) io.Writer {
+	return &amp;amp;SyncWriter{Writer: w, Mtx: mtx}
+}
+
+func (w *SyncWriter) Write(p []byte) (n int, err error) {
+	w.Mtx.Lock()
+	defer w.Mtx.Unlock()
+
+	written, err := w.Writer.Write(p)
+
+	return written, err
+}
+&lt;/code&gt;&lt;p&gt;We pass it as is to the third-party library, and when we want to read the byte buffer, we lock the mutex first:&lt;/p&gt;&lt;code&gt;diff --git a/cmd-sg/main.go b/cmd-sg/main.go
+index 5529d90..42571b9 100644
+--- a/cmd-sg/main.go
++++ b/cmd-sg/main.go
+@@ -5,6 +5,7 @@ import (
+ 	"context"
+ 	"io"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/ory/dockertest/v3"
+@@ -12,6 +13,24 @@ import (
+ 	"golang.org/x/sync/errgroup"
+ )
+ 
++type SyncWriter struct {
++	Writer io.Writer
++	Mtx    *sync.Mutex
++}
++
++func NewSyncWriter(w io.Writer, mtx *sync.Mutex) io.Writer {
++	return &amp;amp;SyncWriter{Writer: w, Mtx: mtx}
++}
++
++func (w *SyncWriter) Write(p []byte) (n int, err error) {
++	w.Mtx.Lock()
++	defer w.Mtx.Unlock()
++
++	written, err := w.Writer.Write(p)
++
++	return written, err
++}
++
+ func GetSigningSecretFromStripeContainer() string {
+ 	dp, err := dockertest.NewPool("")
+ 	if err != nil {
+@@ -27,6 +46,8 @@ func GetSigningSecretFromStripeContainer() string {
+ 	}
+ 
+ 	output := &amp;amp;bytes.Buffer{}
++	outputMtx := sync.Mutex{}
++	writer := NewSyncWriter(output, &amp;amp;outputMtx)
+ 
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	defer cancel()
+@@ -37,7 +58,9 @@ func GetSigningSecretFromStripeContainer() string {
+ 		defer cancel()
+ 
+ 		for {
++			outputMtx.Lock()
+ 			ln, err := output.ReadString('\n')
++			outputMtx.Unlock()
+ 			if err == io.EOF {
+ 				&amp;lt;-time.After(100 * time.Millisecond)
+ 				continue
+@@ -59,7 +82,7 @@ func GetSigningSecretFromStripeContainer() string {
+ 		Follow:       true,
+ 		RawTerminal:  true,
+ 		Container:    forwarder.Container.ID,
+-		OutputStream: output,
++		OutputStream: writer,
+ 	})
+ 
+ 	eg.Wait()
+&lt;/code&gt;&lt;p&gt;Most types in the Go standard library (or third-party libraries for that matter) are not concurrency safe and synchronization is typically on you. I still often see questions on the internet about that, so assume it is not until the documentation states otherwise.&lt;/p&gt;&lt;p&gt;It would also be nice if more types have a 'sync' version, e.g. &lt;code&gt;SyncWriter&lt;/code&gt;, &lt;code&gt;SyncReader&lt;/code&gt;, etc.&lt;/p&gt;&lt;p&gt;The Go race detector is great but will not detect all data races. Data races will cause you pain and suffering, be it flaky tests, weird production errors, or in the worst case memory corruption.&lt;/p&gt;&lt;p&gt;Due to how easy it is to spawn goroutines without a care in the world (and also to run tests in parallel), it will happen to you. It's not a question of if, just when, how bad, and how many days/weeks it will cost you to find them and fix them.&lt;/p&gt;&lt;p&gt;If you are not running your test suite with the race detector enabled, you have numerous data races in your code. That's just a fact.&lt;/p&gt;&lt;p&gt;Go the language and the Go linter ecosystem do not have nearly enough answers to this problem. Some language features make it way too easy to trigger data races, for example implicit capture of outer variables in closures.&lt;/p&gt;&lt;p&gt;The best option left to Go developers is to try to reach 100% test coverage of their code and run the tests with the race detector on.&lt;/p&gt;&lt;p&gt;We should be able to do better in 2025. Just like with memory safety, when even expert developers regularly produce data races, it's the fault of the language/tooling/APIs/etc. It is not enough to blame humans and demand they just 'do better'.&lt;/p&gt;&lt;p&gt;Ideas for the Go language:&lt;/p&gt;&lt;code&gt;const&lt;/code&gt; in more places. If something is constant, there cannot be data races with it.&lt;code&gt;Clone()&lt;/code&gt; function in the compiler for every type (like Rust's &lt;code&gt;derive(Clone)&lt;/code&gt;). Maybe it's opt-in or opt-out, not sure. Or perhaps it's a built-in like &lt;code&gt;make&lt;/code&gt;.&lt;code&gt;freeze()&lt;/code&gt; functionality like JavaScript's &lt;code&gt;Object.freeze()&lt;/code&gt; to prevent an object from being mutated.&lt;code&gt;Mutex&lt;/code&gt; by taking inspiration from other languages. This has been done successfully in the past with &lt;code&gt;WaitGroup&lt;/code&gt; compared to using raw goroutines and channels.&lt;p&gt;Ideas for Go programs:&lt;/p&gt;&lt;code&gt;string&lt;/code&gt; type in Go is immutable.&lt;quote&gt;&lt;p&gt;If you enjoy what you're reading, you want to support me, and can afford it: Support me. That allows me to write more cool articles!&lt;/p&gt;&lt;p&gt;This blog is open-source! If you find a problem, please open a Github issue. The content of this blog as well as the code snippets are under the BSD-3 License which I also usually use for all my personal projects. It's basically free for every use but you have to mention me as the original author.&lt;/p&gt;&lt;/quote&gt;&lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46015095</guid><pubDate>Sat, 22 Nov 2025 14:33:57 +0000</pubDate></item><item><title>Migrating to Bazel symbolic macros</title><link>https://www.tweag.io/blog/2025-11-20-migrating-bazel-symbolic-macros/</link><description>&lt;doc fingerprint="3ac19a125de6912f"&gt;
   &lt;main&gt;
-    &lt;p&gt;I recently received a question about a crime analyst looking to break into data science. Figured it would be a good topic for my advice in a blog post. I have written many resources over the years targeting recent PhDs, but the advice for crime analysts is not all that different. You need to pick up some programming, and likely some more advanced tech skills.&lt;/p&gt;
-    &lt;p&gt;For background, the individual had SQL + Excel skills (which many analysts may just have Excel). Vast majority of analyst roles, you should be quite adept at SQL. But just SQL is not sufficient for even an entry level data science role.&lt;/p&gt;
-    &lt;p&gt;For entry data science, you will need to demonstrate competency in at least one programming language. The majority of positions will want you to have python skills. (I wrote an entry level python book exactly for someone in your position.)&lt;/p&gt;
-    &lt;p&gt;You likely will also need to demonstrate competency in some machine learning or using large language models for data science roles. It used to be Andrew Ng’s courses were the best recommendation (I see he has a spin off DeepLearningAI now). So that is second hand though, I have not personally taken them. LLMs are more popular now, so prioritizing learning how to call those APIs, build RAG systems, prompt engineering I think is going to make you slightly more marketable than traditional machine learning.&lt;/p&gt;
-    &lt;p&gt;I have personally never hired anyone in a data science role without a masters. That said, I would not have a problem if you had a good portfolio. (Nice website, Github contributions, etc.)&lt;/p&gt;
-    &lt;p&gt;You should likely start just looking and applying to “analyst” roles now. Don’t worry about if they ask for programming you do not have experience in, just apply. Many roles the posting is clearly wrong or totally unrealistic expectations.&lt;/p&gt;
-    &lt;p&gt;Larger companies, analyst roles can have a better career ladder, so you may just decide to stay in that role. If not, can continue additional learning opportunities to pursue a data science career.&lt;/p&gt;
-    &lt;p&gt;Remote is more difficult than in person, but I would start by identifying companies that are crime analysis adjacent (Lexis Nexis, ESRI, Axon) and start applying to current open analyst positions.&lt;/p&gt;
-    &lt;p&gt;For additional resources I have written over the years:&lt;/p&gt;
+    &lt;p&gt;In Bazel, there are two types of macros: legacy macros and symbolic macros, that were introduced in Bazel 8. Symbolic macros are recommended for code clarity, where possible. They include enhancements like typed arguments and the ability to define and limit the visibility of the targets they create.&lt;/p&gt;
+    &lt;p&gt;This post is intended for experienced Bazel engineers or those tasked with modernizing the build metadata of their codebases. The following discussion assumes a solid working knowledge of Bazel’s macro system and build file conventions. If you are looking to migrate legacy macros or deepen your understanding of symbolic macros, you’ll find practical guidance and nuanced pitfalls addressed here.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What are symbolic macros?&lt;/head&gt;
+    &lt;p&gt;Macros instantiate rules by acting as templates that generate targets. As such, they are expanded in the loading phase, when Bazel definitions and &lt;code&gt;BUILD&lt;/code&gt; files are loaded and evaluated.
+This is in contrast with build rules that are run later in the analysis phase.
+In older Bazel versions, macros were defined exclusively as Starlark functions
+(the form that is now called “legacy macros”).
+Symbolic macros are an improvement on that idea;
+they allow defining a set of attributes similar to those of build rules.&lt;/p&gt;
+    &lt;p&gt;In a &lt;code&gt;BUILD&lt;/code&gt; file, you invoke a symbolic macro by supplying attribute values as arguments.
+Because Bazel is explicitly aware of symbolic macros and their function in the build process,
+they can be considered “first-class macros”.
+See the Symbolic macros design document
+to learn more about the rationale.
+Symbolic macros also intend to support lazy evaluation,
+a feature that is currently being considered for a future Bazel release.
+When that functionality is implemented,
+Bazel would defer evaluating a macro until
+the targets defined by that macro are actually requested.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Conventions and restrictions&lt;/head&gt;
+    &lt;p&gt;There is already good documentation that explains how to write symbolic macros. In this section, we are going to take a look at some practical examples of the restrictions that apply to their implementation, which you can learn more about in the Restrictions docs page.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Naming&lt;/head&gt;
+    &lt;p&gt;Any targets created by a symbolic macro must either match the macro’s name parameter exactly or begin with that name followed by a &lt;code&gt;_&lt;/code&gt; (preferred), &lt;code&gt;.&lt;/code&gt;, or &lt;code&gt;-&lt;/code&gt;.
+This is different from legacy macros which don’t have naming constraints.&lt;/p&gt;
+    &lt;p&gt;This symbolic macro&lt;/p&gt;
+    &lt;code&gt;# defs.bzl
+def _simple_macro_impl(name):
+    native.genrule(
+        name = "genrule" + name,
+        outs = [name + "_out.data"],
+        srcs = ["//:file.json"],
+    )
+
+# BUILD.bazel
+simple_macro(name = "tool")&lt;/code&gt;
+    &lt;p&gt;would fail when evaluated:&lt;/p&gt;
+    &lt;code&gt;$ bazel cquery //...
+ERROR: in genrule rule //src:genruletool: Target //src:genruletool declared in symbolic macro 'tool'
+violates macro naming rules and cannot be built.&lt;/code&gt;
+    &lt;p&gt;This means &lt;code&gt;simple_macro(name = "tool")&lt;/code&gt; may only produce files or targets named &lt;code&gt;tool&lt;/code&gt; or starting with &lt;code&gt;tool_&lt;/code&gt;,
+&lt;code&gt;tool.&lt;/code&gt;, or &lt;code&gt;tool-&lt;/code&gt;.
+In this particular macro, &lt;code&gt;tool_genrule&lt;/code&gt; would work.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Access to undeclared resources&lt;/head&gt;
+    &lt;p&gt;Symbolic macros must follow Bazel’s standard visibility rules: they cannot directly access source files unless those files are passed in as arguments or are made public by their parent package. This is different from legacy macros, whose implementations were effectively inlined into the &lt;code&gt;BUILD&lt;/code&gt; file where they were called.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Attributes&lt;/head&gt;
+    &lt;head rend="h3"&gt;Positional arguments&lt;/head&gt;
+    &lt;p&gt;In legacy macro invocations, you could have passed the attribute values as positional arguments. For instance, these are perfectly valid legacy macro calls:&lt;/p&gt;
+    &lt;code&gt;# defs.bzl
+def special_test_legacy(name, tag = "", **kwargs):
+    kwargs["name"] = name
+    kwargs["tags"] = [tag] if tag else []
+    cc_test(**kwargs)
+
+
+# BUILD.bazel
+special_test_legacy("no-tag")
+special_test_legacy("with-tag", "manual")&lt;/code&gt;
+    &lt;p&gt;With the macro’s name and tags collected as expected:&lt;/p&gt;
+    &lt;code&gt;$ bazel cquery //test/package:no-tag --output=build
+cc_test(
+  name = "no-tag",
+  tags = [],
+  ...
+)
+
+$ bazel cquery //test/package:with-tag --output=build
+cc_test(
+  name = "with-tag",
+  tags = ["manual"],
+  ...
+)&lt;/code&gt;
+    &lt;p&gt;You can control how arguments are passed to functions by using an asterisk (&lt;code&gt;*&lt;/code&gt;)
+in the parameter list of a legacy macro, as per the Starlark language specs.
+If you are a seasoned Python developer (Starlark’s syntax is heavily inspired by Python), you might have already guessed
+that this asterisk separates positional arguments from keyword-only arguments:&lt;/p&gt;
+    &lt;code&gt;# defs.bzl
+def special_test_legacy(name, *, tag = "", **kwargs):
+    kwargs["name"] = name
+    kwargs["tags"] = [tag] if tag else []
+    cc_test(**kwargs)
+
+# BUILD.bazel
+special_test_legacy("no-tag")  # okay
+special_test_legacy("with-tag", tag="manual") # okay
+# Error: special_test_legacy() accepts no more than 1 positional argument but got 2
+special_test_legacy("with-tag", "manual")&lt;/code&gt;
+    &lt;p&gt;Positional arguments are not supported in symbolic macros as attributes must either be declared in the &lt;code&gt;attrs&lt;/code&gt; dictionary
+(which would make it automatically a keyword argument)
+or be inherited in which case it should also be provided by name.&lt;/p&gt;
+    &lt;p&gt;Arguably, avoiding positional arguments in macros altogether is helpful because it eliminates subtle bugs caused by incorrect order of parameters passed and makes them easier to read and easier to process by tooling such as &lt;code&gt;buildozer&lt;/code&gt;.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Default values&lt;/head&gt;
+    &lt;p&gt;Legacy macros accepted default values for their parameters which made it possible to skip passing certain arguments:&lt;/p&gt;
+    &lt;code&gt;# defs.bzl
+def special_test_legacy(name, *, purpose = "dev", **kwargs):
+    kwargs["name"] = name
+    kwargs["tags"] = [purpose]
+    cc_test(**kwargs)
+
+# BUILD.bazel
+special_test_legacy("dev-test")
+special_test_legacy("prod-test", purpose="prod")&lt;/code&gt;
+    &lt;p&gt;With symbolic macros, the default values are declared in the &lt;code&gt;attrs&lt;/code&gt; dictionary instead:&lt;/p&gt;
+    &lt;code&gt;# defs.bzl
+def _special_test_impl(name, purpose = "dev", **kwargs):
+    kwargs["tags"] = [purpose]
+    cc_test(
+        name = name,
+        **kwargs
+    )
+
+special_test = macro(
+    inherit_attrs = native.cc_test,
+    attrs = {
+        "purpose": attr.string(configurable = False, default = "staging"),
+        "copts": None,
+    },
+    implementation = _special_test_impl,
+)
+
+# BUILD.bazel
+special_test(
+    name = "my-special-test-prod",
+    srcs = ["test.cc"],
+    purpose = "prod",
+)
+
+special_test(
+    name = "my-special-test-dev",
+    srcs = ["test.cc"],
+)&lt;/code&gt;
+    &lt;p&gt;Let’s see what kind of tags are going to be set for these &lt;code&gt;cc_test&lt;/code&gt; targets:&lt;/p&gt;
+    &lt;code&gt;$ bazel cquery //test/package:my-special-test-prod --output=build
+cc_test(
+  name = "my-special-test-prod",
+  tags = ["prod"],
+  ...
+)
+
+$ bazel cquery //test/package:my-special-test-dev --output=build
+cc_test(
+  name = "my-special-test-dev",
+  tags = ["staging"],
+  ...
+)&lt;/code&gt;
+    &lt;p&gt;Notice how the default &lt;code&gt;dev&lt;/code&gt; value declared in the macro implementation was never used.
+This is because the default values defined for parameters in the macro’s function are going to be ignored,
+so it’s best to remove them to avoid any confusion.&lt;/p&gt;
+    &lt;p&gt;Also, all the inherited attributes have a default value of &lt;code&gt;None&lt;/code&gt;,
+so make sure to refactor your macro logic accordingly.
+Be careful when processing the keyword arguments to avoid
+subtle bugs such as checking whether a user has passed &lt;code&gt;[]&lt;/code&gt; in a keyword argument
+merely by doing &lt;code&gt;if not kwargs["attr-name"]&lt;/code&gt;
+as &lt;code&gt;None&lt;/code&gt; would also be evaluated to &lt;code&gt;False&lt;/code&gt; in this context.&lt;/p&gt;
+    &lt;p&gt;This might be potentially confusing as the default value for many common attributes is not &lt;code&gt;None&lt;/code&gt;.
+Take a look at the &lt;code&gt;target_compatible_with&lt;/code&gt; attribute
+which normally has the default value &lt;code&gt;[]&lt;/code&gt; when used in a rule,
+but when used in a macro, would still by default be set to &lt;code&gt;None&lt;/code&gt;.
+Using &lt;code&gt;bazel cquery //:target --output=build&lt;/code&gt;
+with some &lt;code&gt;print&lt;/code&gt; calls in your &lt;code&gt;.bzl&lt;/code&gt; files can help when refactoring.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Inheritance&lt;/head&gt;
+    &lt;p&gt;Macros are frequently designed to wrap a rule (or another macro), and the macro’s author typically aims to pass most of the wrapped symbol’s attributes using &lt;code&gt;**kwargs&lt;/code&gt; directly to the macro’s primary target
+or the main inner macro without modification.&lt;/p&gt;
+    &lt;p&gt;To enable this behavior, a macro can inherit attributes from a rule or another macro by providing the rule or macro symbol to the &lt;code&gt;inherit_attrs&lt;/code&gt; parameter of &lt;code&gt;macro()&lt;/code&gt;.
+Note that when &lt;code&gt;inherit_attrs&lt;/code&gt; is set, the implementation function must have a &lt;code&gt;**kwargs&lt;/code&gt; parameter.
+This makes it possible to avoid listing every attribute that the macro may accept,
+and it is also possible to disable certain attributes that you don’t want macro callers to provide.
+For instance, let’s say you don’t want &lt;code&gt;copts&lt;/code&gt; to be defined in macros that wrap &lt;code&gt;cc_test&lt;/code&gt;
+because you want to manage them internally within the macro body instead:&lt;/p&gt;
+    &lt;code&gt;# BUILD.bazel
+special_test(
+    name = "my-special-test",
+    srcs = ["test.cc"],
+    copts = ["-std=c++22"],
+)&lt;/code&gt;
+    &lt;p&gt;This can be done by setting the attributes you don’t want to inherit to &lt;code&gt;None&lt;/code&gt;.&lt;/p&gt;
+    &lt;code&gt;# defs.bzl
+special_test = macro(
+    inherit_attrs = native.cc_test,
+    attrs = { "copts": None },
+    implementation = _special_test_impl,
+)&lt;/code&gt;
+    &lt;p&gt;Now the macro caller will see that &lt;code&gt;copts&lt;/code&gt; is not possible to declare when calling the macro:&lt;/p&gt;
+    &lt;code&gt;$ bazel query //test/package:my-special-test
+        File "defs.bzl", line 19, column 1, in special_test
+                special_test = macro(
+Error: no such attribute 'copts' in 'special_test' macro&lt;/code&gt;
+    &lt;p&gt;Keep in mind that all inherited attributes are going to be included in the &lt;code&gt;kwargs&lt;/code&gt; parameter
+with the default value of &lt;code&gt;None&lt;/code&gt; unless specified otherwise.
+This means you have to be extra careful in the macro implementation function if you refactor a legacy macro:
+you can no longer merely check for the presence of a key in the &lt;code&gt;kwargs&lt;/code&gt; dictionary.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Mutation&lt;/head&gt;
+    &lt;p&gt;In symbolic macros, you will not be able to mutate the arguments passed to the macro implementation function.&lt;/p&gt;
+    &lt;code&gt;# defs.bzl
+def _simple_macro_impl(name, visibility, env):
+    print(type(env), env)
+    env["some"] = "more"
+
+simple_macro = macro(
+    attrs = {
+        "env": attr.string_dict(configurable = False)
+    },
+    implementation = _simple_macro_impl
+)
+
+# BUILD.bazel
+simple_macro(name = "tool", env = {"state": "active"})&lt;/code&gt;
+    &lt;p&gt;Let’s check how this would get evaluated:&lt;/p&gt;
+    &lt;code&gt;$ bazel cquery //...
+DEBUG: defs.bzl:36:10: dict {"state": "active"}
+        File "defs.bzl", line 37, column 17, in _simple_macro_impl
+                env["some"] = "more"
+Error: trying to mutate a frozen dict value&lt;/code&gt;
+    &lt;p&gt;This, however, is no different to legacy macros where you could not modify mutable objects in place either. In situations like this, creating a new dict with &lt;code&gt;env = dict(env)&lt;/code&gt; would be of help.&lt;/p&gt;
+    &lt;p&gt;In legacy macros you can still modify objects in place when they are inside the &lt;code&gt;kwargs&lt;/code&gt;,
+but this arguably leads to code that is harder to reason about
+and invites subtle bugs that are a nightmare to troubleshoot in a large codebase.
+See the Mutability in Starlark section to learn more.&lt;/p&gt;
+    &lt;p&gt;This is still possible in legacy macros:&lt;/p&gt;
+    &lt;code&gt;# defs.bzl
+def special_test_legacy(name, **kwargs):
+    kwargs["name"] = name
+    kwargs["env"]["some"] = "more"
+    cc_test(**kwargs)
+
+# BUILD.bazel
+special_test_legacy("small-test", env = {"state": "active"})&lt;/code&gt;
+    &lt;p&gt;Let’s see how the updated environment variables were set for the &lt;code&gt;cc_test&lt;/code&gt; target created in the legacy macro:&lt;/p&gt;
+    &lt;code&gt;$ bazel cquery //test/package:small-test --output=build
+...
+cc_test(
+  name = "small-test",
+  ...
+  env = {"state": "active", "some": "more"},
+)&lt;/code&gt;
+    &lt;p&gt;This is no longer allowed in symbolic macros:&lt;/p&gt;
+    &lt;code&gt;# defs.bzl
+def _simple_macro_impl(name, visibility, **kwargs):
+    print(type(kwargs["env"]), kwargs["env"])
+    kwargs["env"]["some"] = "more"&lt;/code&gt;
+    &lt;p&gt;It would fail to evaluate:&lt;/p&gt;
+    &lt;code&gt;$ bazel cquery //...
+
+DEBUG: defs.bzl:35:10: dict {"state": "active"}
+        File "defs.bzl", line 36, column 27, in _simple_macro_impl
+                kwargs["env"]["some"] = "more"
+Error: trying to mutate a frozen dict value&lt;/code&gt;
+    &lt;head rend="h2"&gt;Configuration&lt;/head&gt;
+    &lt;p&gt;Symbolic macros, just like legacy macros, support configurable attributes, commonly known as &lt;code&gt;select()&lt;/code&gt;, a Bazel feature that lets users determine the values of build rule (or macro)
+attributes at the command line.&lt;/p&gt;
+    &lt;p&gt;Here’s an example symbolic macro with the &lt;code&gt;select&lt;/code&gt; toggle:&lt;/p&gt;
+    &lt;code&gt;# defs.bzl
+def _special_test_impl(name, **kwargs):
+    cc_test(
+        name = name,
+        **kwargs
+    )
+special_test = macro(
+    inherit_attrs = native.cc_test,
+    attrs = {},
+    implementation = _special_test_impl,
+)
+
+# BUILD.bazel
+config_setting(
+    name = "linking-static",
+    define_values = {"static-testing": "true"},
+)
+
+config_setting(
+    name = "linking-dynamic",
+    define_values = {"static-testing": "false"},
+)
+
+special_test(
+    name = "my-special-test",
+    srcs = ["test.cc"],
+    linkstatic = select({
+        ":linking-static": True,
+        ":linking-dynamic": False,
+        "//conditions:default": False,
+    }),
+)&lt;/code&gt;
+    &lt;p&gt;Let’s see how this expands in the &lt;code&gt;BUILD&lt;/code&gt; file:&lt;/p&gt;
+    &lt;code&gt;$ bazel query //test/package:my-special-test --output=build
+cc_test(
+  name = "my-special-test",
+  ...(omitted for brevity)...
+  linkstatic = select({
+    "//test/package:linking-static": True,
+    "//test/package:linking-dynamic": False,
+    "//conditions:default": False
+  }),
+)&lt;/code&gt;
+    &lt;p&gt;The &lt;code&gt;query&lt;/code&gt; command does show that the macro was expanded into a &lt;code&gt;cc_test&lt;/code&gt; target,
+but it does not show what the &lt;code&gt;select()&lt;/code&gt; is resolved to.
+For this, we would need to use the &lt;code&gt;cquery&lt;/code&gt; (configurable query)
+which is a variant of &lt;code&gt;query&lt;/code&gt; that runs after &lt;code&gt;select()&lt;/code&gt;s have been evaluated.&lt;/p&gt;
+    &lt;code&gt;$ bazel cquery //test/package:my-special-test --output=build
+cc_test(
+  name = "my-special-test",
+  ...(omitted for brevity)...
+  linkstatic = False,
+)&lt;/code&gt;
+    &lt;p&gt;Let’s configure the test to be statically linked:&lt;/p&gt;
+    &lt;code&gt;$ bazel cquery //test/package:my-special-test --output=build --define="static-testing=true"
+cc_test(
+  name = "my-special-test",
+  ...(omitted for brevity)...
+  linkstatic = True,
+)&lt;/code&gt;
+    &lt;p&gt;Each attribute in the &lt;code&gt;macro&lt;/code&gt; function explicitly declares whether it tolerates &lt;code&gt;select()&lt;/code&gt; values,
+in other words, whether it is configurable.
+For common attributes, consult the Typical attributes defined by most build rules
+to see which attributes can be configured.
+Most attributes are configurable, meaning that their values may change
+when the target is built in different ways;
+however, there are a handful which are not.
+For example, you cannot assign a &lt;code&gt;*_test&lt;/code&gt; target to be flaky using a &lt;code&gt;select()&lt;/code&gt;
+(e.g., to mark a test as flaky only on &lt;code&gt;aarch64&lt;/code&gt; devices).&lt;/p&gt;
+    &lt;p&gt;Unless specifically declared, all attributes in symbolic macros are configurable (if they support this) which means they will be wrapped in a &lt;code&gt;select()&lt;/code&gt; (that simply maps &lt;code&gt;//conditions:default&lt;/code&gt; to the single value),
+and you might need to adjust the code of the legacy macro you migrate.
+For instance, this legacy code used to append some dependencies with the &lt;code&gt;.append()&lt;/code&gt; list method,
+but this might break:&lt;/p&gt;
+    &lt;code&gt;# defs.bzl
+def _simple_macro_impl(name, visibility, **kwargs):
+    print(kwargs["deps"])
+    kwargs["deps"].append("//:commons")
+    cc_test(**kwargs)
+
+simple_macro = macro(
+    attrs = {
+        "deps": attr.label_list(),
+    },
+    implementation = _simple_macro_impl,
+)
+
+# BUILD.bazel
+simple_macro(name = "simple-test", deps = ["//:helpers"])&lt;/code&gt;
+    &lt;p&gt;Let’s evaluate the macro:&lt;/p&gt;
+    &lt;code&gt;$ bazel cquery //...
+DEBUG: defs.bzl:35:10: select({"//conditions:default": [Label("//:helpers")]})
+        File "defs.bzl", line 36, column 19, in _simple_macro_impl
+                kwargs["deps"].append("//:commons")
+Error: 'select' value has no field or method 'append'&lt;/code&gt;
+    &lt;p&gt;Keep in mind that &lt;code&gt;select&lt;/code&gt; is an opaque object with limited interactivity.
+It does, however, support modification in place, so that you can extend it,
+e.g., with &lt;code&gt;kwargs["deps"] += ["//:commons"]&lt;/code&gt;:&lt;/p&gt;
+    &lt;code&gt;$ bazel cquery //test/package:simple-test --output=build
+...
+cc_test(
+  name = "simple-test",
+  generator_name = "simple-test",
+  ...
+  deps = ["//:commons", "//:helpers", "@rules_cc//:link_extra_lib"],
+)&lt;/code&gt;
+    &lt;p&gt;Be extra vigilant when dealing with attributes of &lt;code&gt;bool&lt;/code&gt; type that are configurable
+because the return type of &lt;code&gt;select&lt;/code&gt; converts silently in truthy contexts to &lt;code&gt;True&lt;/code&gt;.
+This can lead to some code being legitimate, but not doing what you intended.
+See Why does select() always return true? to learn more.&lt;/p&gt;
+    &lt;p&gt;When refactoring, you might need to make an attribute configurable, however, it may stop working using the existing macro implementation. For example, imagine you need to pass different files as input to your macro depending on the configuration specified at runtime:&lt;/p&gt;
+    &lt;code&gt;# defs.bzl
+def _deployment_impl(name, visibility, filepath):
+    print(filepath)
+    # implementation
+
+simple_macro = macro(
+    attrs = {
+        "filepath": attr.string(),
+    },
+    implementation = _deployment_impl,
+)
+
+# BUILD.bazel
+deployment(
+    name = "deploy",
+    filepath = select({
+        "//conditions:default": "deploy/config/dev.ini",
+        "//:production": "deploy/config/production.ini",
+    }),
+)&lt;/code&gt;
+    &lt;p&gt;In rules, &lt;code&gt;select()&lt;/code&gt; objects are resolved to their actual values,
+but in macros, &lt;code&gt;select()&lt;/code&gt; creates a special object of type &lt;code&gt;select&lt;/code&gt;
+that isn’t evaluated until the analysis phase,
+which is why you won’t be able to get actual values out of it.&lt;/p&gt;
+    &lt;code&gt;$ bazel cquery //:deploy
+...
+select({
+    Label("//conditions:default"): "deploy/config/dev.ini",
+    Label("//:production"): "deploy/config/production.ini"
+    })
+...&lt;/code&gt;
+    &lt;p&gt;In some cases, such as when you need to have the &lt;code&gt;select&lt;/code&gt;ed value available in the macro function,
+you can have the &lt;code&gt;select&lt;/code&gt; object resolved before it’s passed to the macro.
+This can be done with the help of an &lt;code&gt;alias&lt;/code&gt; target, and the label of a target can be turned into a filepath
+using the special &lt;code&gt;location&lt;/code&gt; variable:&lt;/p&gt;
+    &lt;code&gt;# defs.bzl
+def _deployment_impl(name, visibility, filepath):
+    print(type(filepath), filepath)
+    native.genrule(
+        name = name + "_gen",
+        srcs = [filepath],
+        outs = ["config.out"],
+        cmd = "echo '$(location {})' &amp;gt; $@".format(filepath)
+    )
+
+deployment = macro(
+    attrs = {
+        "filepath": attr.label(configurable = False),
+    },
+    implementation = _deployment_impl,
+)
+
+# BUILD.bazel
+alias(
+    name = "configpath",
+    actual = select({
+        "//conditions:default": "deploy/config/dev.ini",
+        "//:production": "deploy/config/production.ini",
+    }),
+    visibility = ["//visibility:public"],
+)
+
+deployment(
+    name = "deploy",
+    filepath = ":configpath",
+)&lt;/code&gt;
+    &lt;p&gt;You can confirm the right file is chosen when passing different configuration flags before building the target:&lt;/p&gt;
+    &lt;code&gt;$ bazel cquery //tests:configpath --output=build
+INFO: Analyzed target //tests:configpath (0 packages loaded, 1 target configured).
+...
+alias(
+  name = "configpath",
+  visibility = ["//visibility:public"],
+  actual = "//tests:deploy/config/dev.ini",
+)
+...
+
+$ bazel build //tests:deploy_gen &amp;amp;&amp;amp; cat bazel-bin/tests/config.out
+...
+DEBUG: defs.bzl:29:10: Label //tests:configpath
+...
+tests/deploy/config/dev.ini&lt;/code&gt;
+    &lt;head rend="h2"&gt;Querying macros&lt;/head&gt;
+    &lt;p&gt;Since macros are evaluated when &lt;code&gt;BUILD&lt;/code&gt; files are queried,
+you cannot use Bazel itself to query “raw” &lt;code&gt;BUILD&lt;/code&gt; files.
+Identifying definitions of legacy macros is quite difficult,
+as they resemble Starlark functions, but instantiate targets.
+Using &lt;code&gt;bazel cquery&lt;/code&gt; with the &lt;code&gt;--output=starlark&lt;/code&gt;
+might help printing the properties of targets to see
+if they have been instantiated from macros.&lt;/p&gt;
+    &lt;p&gt;When using &lt;code&gt;--output=build&lt;/code&gt;, you can also inspect some of the properties:&lt;/p&gt;
     &lt;list rend="ul"&gt;
-      &lt;item&gt;alt ac newsletter, not running anymore but has most of my advice on those webpages&lt;/item&gt;
-      &lt;item&gt;blog post on different types of tech jobs, approximate salaries&lt;/item&gt;
-      &lt;item&gt;resume advice&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;generator_name&lt;/code&gt;(the name attribute of the macro)&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;generator_function&lt;/code&gt;(which function generated the rules)&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;generator_location&lt;/code&gt;(where the macro was invoked)&lt;/item&gt;
     &lt;/list&gt;
-    &lt;p&gt;The alt-ac newsletter has various programming and job search tips. THe 2023 blog post goes through different positions (if you want, it may be easier to break into project management than data science, you have a good background to get senior analyst positions though), and the 2025 blog post goes over how to have a portfolio of work.&lt;/p&gt;
+    &lt;p&gt;This information with some heuristics might help you to identify the macros. Once you have identified the macro name, you can run &lt;code&gt;bazel query --output=build 'attr(generator_function, simple_macro, //...)'&lt;/code&gt;
+to find all targets that are generated by a particular macro.
+Finding symbolic macros, in contrast, is trivial
+as you would simply need to grep for &lt;code&gt;macro()&lt;/code&gt; function calls in &lt;code&gt;.bzl&lt;/code&gt; files.&lt;/p&gt;
+    &lt;p&gt;To query unprocessed &lt;code&gt;BUILD&lt;/code&gt; files, you might want to use buildozer
+which is a tool that lets you query the contents of &lt;code&gt;BUILD&lt;/code&gt; files using a static parser.
+The tool will come in handy for various use cases when refactoring, such as migrating the macros.
+Because both legacy and symbolic macros follow the same &lt;code&gt;BUILD&lt;/code&gt; file syntax,
+&lt;code&gt;buildozer&lt;/code&gt; can be used to query build metadata for either type.&lt;/p&gt;
+    &lt;p&gt;Let’s write some queries for these macro invocations:&lt;/p&gt;
+    &lt;code&gt;# BUILD.bazel
+perftest(
+  name = "apis",
+  srcs = ["//:srcA", "//:srcB"],
+  env = {"type": "performance"},
+)
+
+perftest(
+  name = "backend",
+  srcs = ["//:srcC", "//:srcD"],
+  env = {"type": "performance"},
+)&lt;/code&gt;
+    &lt;p&gt;Print all macro invocations (raw) across the whole workspace:&lt;/p&gt;
+    &lt;code&gt;$ buildozer 'print rule' "//...:%perftest"
+
+perftest(
+    name = "apis",
+    srcs = [
+        "//:srcA",
+        "//:srcB",
+    ],
+    env = {"type": "performance"},
+)
+
+perftest(
+    name = "backend",
+    srcs = [
+        "//:srcC",
+        "//:srcD",
+    ],
+    env = {"type": "performance"},
+)&lt;/code&gt;
+    &lt;p&gt;Print attribute’s values for all macro invocations:&lt;/p&gt;
+    &lt;code&gt;$ buildozer 'print label srcs' "//...:%perftest"
+//test/package:apis [//:srcA //:srcB]
+//test/package:backend [//:srcC //:srcD]&lt;/code&gt;
+    &lt;p&gt;Print path to files where macros are invoked:&lt;/p&gt;
+    &lt;code&gt;$ buildozer 'print path' "//...:%perftest" | xargs realpath --relative-to "$PWD" | sort | uniq
+test/package/BUILD.bazel&lt;/code&gt;
+    &lt;p&gt;The &lt;code&gt;path&lt;/code&gt; can be combined with an attribute, e.g., print &lt;code&gt;path&lt;/code&gt; and the &lt;code&gt;srcs&lt;/code&gt; to make reviewing easier:&lt;/p&gt;
+    &lt;code&gt;$ buildozer 'print path srcs' "//...:%perftest"
+/home/user/code/project/test/package/BUILD.bazel [//:srcA //:srcB]
+/home/user/code/project/test/package/BUILD.bazel [//:srcC //:srcD]&lt;/code&gt;
+    &lt;p&gt;Remove an attribute from a macro invocation (e.g., &lt;code&gt;env&lt;/code&gt; will be set up in the macro implementation function):&lt;/p&gt;
+    &lt;code&gt;$ buildozer 'remove env' "//...:%perftest"
+fixed /home/user/code/project/test/package/BUILD.bazel&lt;/code&gt;
+    &lt;p&gt;You might also want to check that no macro invocation passes an attribute that is not supposed to be passed. In the command output, the &lt;code&gt;missing&lt;/code&gt; means the attribute doesn’t exist;
+these lines can of course be ignored with &lt;code&gt;grep -v missing&lt;/code&gt;:&lt;/p&gt;
+    &lt;code&gt;$ buildozer -quiet 'print path env' "//...:%perftest" 2&amp;gt;/dev/null
+/home/user/code/project/test/package/BUILD.bazel {"type": "performance"}
+/home/user/code/project/test/package/BUILD.bazel (missing)&lt;/code&gt;
+    &lt;p&gt;We hope that these practical suggestions and examples will assist you in your efforts to modernize the use of macros throughout your codebase. Remember that you can compose legacy and symbolic macros, which may be useful during the transition. Also, legacy macros can still be used and are to remain supported in Bazel for the foreseeable future. Some organizations may even choose not to migrate at all, particularly if they rely on the current behavior of the legacy macros heavily.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Behind the scenes&lt;/head&gt;
+    &lt;p&gt;Alexey is a build systems software engineer who cares about code quality, engineering productivity, and developer experience.&lt;/p&gt;
+    &lt;p&gt;If you enjoyed this article, you might be interested in joining the Tweag team.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46016104</guid><pubDate>Sat, 22 Nov 2025 16:53:06 +0000</pubDate></item><item><title>Three Years from GPT-3 to Gemini 3</title><link>https://www.oneusefulthing.org/p/three-years-from-gpt-3-to-gemini</link><description>&lt;doc fingerprint="3d53915f1bb40691"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46015467</guid><pubDate>Sat, 22 Nov 2025 15:26:44 +0000</pubDate></item><item><title>Three Years from GPT-3 to Gemini 3</title><link>https://www.oneusefulthing.org/p/three-years-from-gpt-3-to-gemini</link><description>&lt;doc fingerprint="3d53915f1bb40691"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Three Years from GPT-3 to Gemini 3&lt;/head&gt;
     &lt;head rend="h3"&gt;From chatbots to agents&lt;/head&gt;
@@ -49,7 +956,146 @@
     &lt;p&gt;Obligatory warning: Giving an AI agent access to your computer can be risky if you don’t know what you are doing. They can move or delete files without asking you and can potentially present a security risk as well by exposing your documents to others. I suspect many of these problems will be addressed as these tools are adapted to non-coders, but, for now, be very careful.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46019898</guid><pubDate>Sun, 23 Nov 2025 01:25:17 +0000</pubDate></item><item><title>What OpenAI did when ChatGPT users lost touch with reality</title><link>https://www.nytimes.com/2025/11/23/technology/openai-chatgpt-users-risks.html</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46030799</guid><pubDate>Mon, 24 Nov 2025 05:58:08 +0000</pubDate></item><item><title>Build a Compiler in Five Projects</title><link>https://kmicinski.com/functional-programming/2025/11/23/build-a-language/</link><description>&lt;doc fingerprint="4d007891504bb690"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46019898</guid><pubDate>Sun, 23 Nov 2025 01:25:17 +0000</pubDate></item><item><title>Bytes before FLOPS: your algorithm is (mostly) fine, your data isn't</title><link>https://www.bitsdraumar.is/bytes-before-flops/</link><description>&lt;doc fingerprint="e658d830bce5191b"&gt;
+  &lt;main&gt;
+    &lt;p&gt;on&lt;/p&gt;
+    &lt;head rend="h1"&gt;Bytes before FLOPS: your algorithm is (mostly) fine, your data isn't&lt;/head&gt;
+    &lt;p&gt;A small, but deep dive into performance and data-oriented optimization.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Foreword&lt;/head&gt;
+    &lt;p&gt;So, earlier this year I did a presentation at a cool(get it?) little Norwegian company called Airthings.&lt;/p&gt;
+    &lt;p&gt;It was a two-parter. First part was how the compilation pipeline works - from ASCII to assembly, greatly simplified of course. It was from an old presentation I did many years ago. The second part is the interesting. It's about performance and what are some of the low-hanging fruits that you can pick off to speed up stuff as much as possible.&lt;/p&gt;
+    &lt;p&gt;Now, that part actually takes a while, but in short it's basically a distillation of my experience working on compilers, assembly and writing vectorized code. The gist of it is - data.&lt;/p&gt;
+    &lt;p&gt;It occurred to me that a small summary would make a good blog post. There's plenty of material on data-oriented design and performance, but this might be a nice overview.&lt;/p&gt;
+    &lt;p&gt;I'll style it as a written representation of how I approach optimization.&lt;/p&gt;
+    &lt;p&gt;When I approach an optimization effort, first thing I do is I try to visualize the data, where each bit is going from and to, what operations are being done, what's the difference between the initial and final state, can we get there with fewer or simpler steps?&lt;/p&gt;
+    &lt;p&gt;If the data is coming in in a suboptimal form, transform it.&lt;lb/&gt; There is no algorithm in the world that will save you from inefficiently coded information.&lt;/p&gt;
+    &lt;p&gt;Usually the steps, in my experience, go like this:&lt;/p&gt;
+    &lt;head rend="h2"&gt;1. Profile&lt;/head&gt;
+    &lt;p&gt;Before anything else, profile.&lt;/p&gt;
+    &lt;p&gt;Sometimes you can intuit where the bottleneck is, but most of the time, you would be surprised at the real place the algorithm falls apart. Sometimes it won't be a single bottleneck, maybe it'll be spread out over multiple places (worst case scenario being the flat profile where program time is roughly evenly distributed).&lt;/p&gt;
+    &lt;p&gt;A lot of it depends on not only understanding low-level programming but the domain that you're working with.&lt;lb/&gt; There's only so much you can optimize without enough information on what that specific algorithm/code/subsystem is supposed to be doing, rather than what it is actually (slowly) doing.&lt;/p&gt;
+    &lt;p&gt;Also, once the lowest-hanging fruit has been picked, we're not talking just function, but instruction-level profiling as well where, depending on the machine, you can be frontend-bound, backend-bound, memory-bound... a whole new world opens up.&lt;lb/&gt; See VTune metrics and analysis guides, lots of useful stuff in there.&lt;/p&gt;
+    &lt;head rend="h2"&gt;2. Specialize the algorithm&lt;/head&gt;
+    &lt;p&gt;This step is not directly related to data, but changing data often requires changing the algorithm. Not only do we need to change access patterns and the shape of the data, but often a different algorithm more suited to the new form of data we're processing.&lt;/p&gt;
+    &lt;p&gt;Regardless, this is a crucial part as this is where you identify one of the most important parts of optimization - "do less". Usually when we implement algorithms, we just try to make them work, aka. the "make it work-&amp;gt;make it fast-&amp;gt;make it beautiful" paradigm. In the process of development we change the data, the algorithm, the code goes through many iterations, a lot is left on the table.&lt;/p&gt;
+    &lt;p&gt;Specializing an algorithm means taking away the genericity and only leaving in the parts that are relevant to the data being processed. If it means specializing the data, then that's fair game as well, garbage in/garbage out. As part of development we tend to use existing algorithms, whether it is from a standard library or an external one, or even just different module in the program.&lt;/p&gt;
+    &lt;p&gt;These existing algorithms are by definition not bespoke and don't take into account the data or the manipulation done on it. In many cases you can rewrite them to suit your use-case, in others you can simply use a more specific algorithm, e.g. &lt;code&gt;radixsort&lt;/code&gt; instead of &lt;code&gt;quicksort&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;People are often afraid of peeking into the libraries, thinking it's magic. It's not, just look at the code, learn what's being used and adapt it to your own case.&lt;/p&gt;
+    &lt;p&gt;The specific example given in the presentation was specializing a generic image downscaling algorithm to specifically handle integer-based, 32bit argb images, which was used to great effect. Sped up the implementation as well as allowed for further optimizations.&lt;/p&gt;
+    &lt;p&gt;Small and (very) trivial example would be something like this:&lt;/p&gt;
+    &lt;code&gt;// we're trying to parse a validated, 2-digit, positive integer
+
+// the generic way (atoi)
+// overhead: function call, loop setup, branch prediction, locale checks.
+int val = atoi(ptr);
+
+// the specialized way
+// overhead: none really, just a few instructions that the CPU can blaze through
+int val = (ptr[0] - '0') * 10 + (ptr[1] - '0');
+&lt;/code&gt;
+    &lt;head rend="h2"&gt;3. Make it cache friendly&lt;/head&gt;
+    &lt;p&gt;This is where the meat of the matter is. Think about the data writes and reads, both on temporal and spatial axes. Every load and store needs to be accounted for and studied. Is it needed, where does it write, when should it write, are there any similarly pointed writes/reads? Similarly for reads, consider not just the location in the code, but the memory location it concerns.&lt;/p&gt;
+    &lt;p&gt;To put it plainly, try to access data that's either close to data you've already accessed or data that you've recently accessed.&lt;/p&gt;
+    &lt;p&gt;If your algorithm is just accessing a part of your data, e.g. you have an array of structs and you're only accessing the first 8 bytes of a 128 byte struct, you're wasting a lot of cpu. Separate out the relevant data and process it independently. The relevant data stays hot in cache and you reap the benefits.&lt;/p&gt;
+    &lt;p&gt;One nice trick is if you're writing to a location that you know you won't access soon, you can use streaming non-temporal writes/stores (&lt;code&gt;_mm_stream_XX&lt;/code&gt; intrinsics in x86).
+Using them allows the CPU to bypass the data caches and speed up the whole process. Useful for constricted memory bandwidth as well.&lt;/p&gt;
+    &lt;p&gt;Once you've done all that (or ideally before, premature optimization is not a thing here in this blog. Improperly granulated optimization on the other hand, is), you can see what the actual values will be for each piece of data and compress the types if possible. Saves space, you can keep more data in cache and thus speed up the whole thing.&lt;/p&gt;
+    &lt;p&gt;Structure padding can also be a significant factor. Take a look at this example, generated by a very useful tool called &lt;code&gt;pahole&lt;/code&gt;.&lt;/p&gt;
+    &lt;code&gt;struct bad_order {
+	char                       c;                    /*     0     1 */
+
+	/* XXX 7 bytes hole, try to pack */
+
+	double                     d;                    /*     8     8 */
+	int                        i;                    /*    16     4 */
+
+	/* size: 24, cachelines: 1, members: 3 */
+	/* sum members: 13, holes: 1, sum holes: 7 */
+	/* padding: 4 */
+	/* last cacheline: 24 bytes */
+};
+&lt;/code&gt;
+    &lt;code&gt;struct good_order {
+	double                     d;                    /*     0     8 */
+	int                        i;                    /*     8     4 */
+	char                       c;                    /*    12     1 */
+
+	/* size: 16, cachelines: 1, members: 3 */
+	/* padding: 3 */
+	/* last cacheline: 16 bytes */
+};
+&lt;/code&gt;
+    &lt;p&gt;As seen above, even though &lt;code&gt;bad_order&lt;/code&gt; has the same members as &lt;code&gt;good_order&lt;/code&gt;, it is 8 bytes larger simply due to the ordering of members.&lt;lb/&gt; In practice, on x86-64, this means that you can fit 4 &lt;code&gt;good_order&lt;/code&gt; structs in a 64bit cache line, whereas you can fit only 2 &lt;code&gt;bad_order&lt;/code&gt; structs (with one spilling over).&lt;lb/&gt; Which is a bit bonkers if you think about it, simply reordering a few lines in an editor can take off a good chunk of a runtime (depending on the algorithm of course).&lt;/p&gt;
+    &lt;p&gt;You can use &lt;code&gt;__attribute__((packed))&lt;/code&gt; instead of manually reordering members, but I'd only use it for protocol/storage use as unaligned members can cause issues on some architectures, so just one more thing to keep in mind.&lt;/p&gt;
+    &lt;p&gt;Finally, if you're in a loop where you know exactly which next addresses you're going to access (provided it's not a simple strided memory access pattern), you can use software prefetching instructions (&lt;code&gt;__builtin_prefetch&lt;/code&gt; intrinsic in x86). But again, unless it's a highly unpredictable (for the pretty good hardware prefetchers of the modern CPUs), you should just trust the CPU.&lt;/p&gt;
+    &lt;head rend="h2"&gt;4. Make it SIMD&lt;/head&gt;
+    &lt;p&gt;Vectorizing an algorithm can in some simpler cases come as a result of the step above, as the result is usually a serial processing of data, which is highly amenable to vectorization (and parallelization). In that case, simply grouping the data in 8/16/32 wide groups and using vector instructions to process them can be enough.&lt;lb/&gt; In those cases, what can also happen as well is autovectorization, where the compiler will happily recognize that a loop vectorizable and do the whole process for you.&lt;/p&gt;
+    &lt;p&gt;In other cases, you have to take a good hard look at what your algorithm is doing, separate out independent streams of data processing, rearrange the data to fit the vectorized version so it's laid out nicely and contiguously for the SIMD instructions to speed through, and try to vectorize the whole loop(s). If you have some complex data movement going on, it can be a challenge to shuffle and permute all the bytes around, but a fun challenge nonetheless.&lt;/p&gt;
+    &lt;p&gt;One thing to be aware of is that not all instruction sets are available on all CPUs microarchitectures (looking at you Intel with AVX512) and thus code that you write can just segfault on some machines. To avoid it, just simply branch based on the CPU feature set with a common fallback.&lt;/p&gt;
+    &lt;p&gt;For autovectorization, you can use function multiversioning which automatically does all that for you. It makes multiple copies of a function for each target and branches on each call, very nifty.&lt;lb/&gt; Example:&lt;/p&gt;
+    &lt;code&gt;__attribute__((target_clones("avx512f", "avx2", "default")))
+void process_data(float* data, int count) {
+    for (int i = 0; i &amp;lt; count; ++i) {
+        data[i] = data[i] * 0.5f;
+    }
+}
+&lt;/code&gt;
+    &lt;p&gt;For more information on this (and data-oriented design in general), research SoA(structures of arrays) and AoSoA (arrays of structures of arrays). This could honestly be a whole series of blog posts, so just for the sake of terseness, take a look at the materials section at the bottom for sources.&lt;/p&gt;
+    &lt;head rend="h2"&gt;5. Make it parallel&lt;/head&gt;
+    &lt;p&gt;So now, parallelization at this stage should come at no cost, you've already separated out the data processing in independent streams, parallelizing should be just a matter of using &lt;code&gt;OpenMP&lt;/code&gt; and &lt;code&gt;rayon&lt;/code&gt; in case of C/C++ and Rust. Combined with the above steps, this should easily net you two orders of magnitude worth of speedup.&lt;/p&gt;
+    &lt;p&gt;One thing you should be aware of however, is false sharing.&lt;lb/&gt; In short, if you have multiple threads accessing a single cache line, it'll trigger a memory stall and a load from RAM.&lt;lb/&gt; Ironically, it can be fixed by adding padding, which makes less data fit in the cache, but enables the parallelization to do its thing. Thus a net positive. Small example:&lt;/p&gt;
+    &lt;code&gt;struct packed {
+    std::atomic&amp;lt;int64_t&amp;gt; a;
+    std::atomic&amp;lt;int64_t&amp;gt; b; 
+};
+
+struct padded {
+    std::atomic&amp;lt;int64_t&amp;gt; a;
+    // force "b" onto a new cache line
+    alignas(64) std::atomic&amp;lt;int64_t&amp;gt; b; 
+};
+&lt;/code&gt;
+    &lt;p&gt;In the &lt;code&gt;packed&lt;/code&gt; struct, both members fit in a single cache line and will therefore exhibit false sharing in a multithreaded scenario.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Conclusion&lt;/head&gt;
+    &lt;p&gt;That is more or less it. Note that this list is not applicable in every case (how on earth would you parallelize an interpreter) nor does it have every optimization worth doing (rewriting a subroutine in assembly for example).&lt;/p&gt;
+    &lt;p&gt;It should cover most of it though as, with programming, all we're doing is shuffling data from end to the other with some transformation in between.&lt;/p&gt;
+    &lt;head rend="h2"&gt;How do GC/scripting languages fit in?&lt;/head&gt;
+    &lt;p&gt;Short answer - they don't.&lt;/p&gt;
+    &lt;p&gt;Long answer - it depends. It depends on the language and its support for value types and the ability to control the data layout.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Java has Project Valhalla, which is an unreleased experimental project to add value types to Java.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Go is solid all-around, but writing vectorized code often (ideally) requires writing go assembly.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Python defers any perf-related code to C/C++.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Lua similarly should not be used to implement perf-sensitive parts of a program, which its embeddable nature supports quite naturally.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;C# has an awesome situation in here with its support for value types (ref structs), slices (spans), stack allocation, SIMD intrinsics (including AVX512!). You can even go bare-metal and GC-free with bflat.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Despite the outliers, if you truly have non-IO-bottlenecked, data-intensive code that needs to run as fast as possible, systems languages like C/C++/Rust are your best bet.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Useful tools &amp;amp; material&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;hyperfine - benchmarking&lt;/item&gt;
+      &lt;item&gt;perf - profiling (ETW for windows)&lt;/item&gt;
+      &lt;item&gt;VTune - in-depth profiling&lt;/item&gt;
+      &lt;item&gt;DTrace - profiling, debugging, tracing&lt;/item&gt;
+      &lt;item&gt;Cachegrind - cache tracing&lt;/item&gt;
+      &lt;item&gt;Perfetto - tracing visualization&lt;/item&gt;
+      &lt;item&gt;godbolt.org - a fantastic website where you can see in-detail how you code gets compiled down to assembly (plus analysis and various tools)&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The now legendary intro to data-oriented design: CppCon 2014: Mike Acton "Data-Oriented Design and C++"&lt;/p&gt;
+    &lt;p&gt;Much more about data-oriented design: www.dataorienteddesign.com/dodbook&lt;/p&gt;
+    &lt;p&gt;An in-depth overview of performance analysis and optimization: Performance Analysis and Tuning on Modern CPUs by Denis Bakhvalov&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46024402</guid><pubDate>Sun, 23 Nov 2025 15:47:50 +0000</pubDate></item><item><title>What OpenAI did when ChatGPT users lost touch with reality</title><link>https://www.nytimes.com/2025/11/23/technology/openai-chatgpt-users-risks.html</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46030799</guid><pubDate>Mon, 24 Nov 2025 05:58:08 +0000</pubDate></item><item><title>Build a Compiler in Five Projects</title><link>https://kmicinski.com/functional-programming/2025/11/23/build-a-language/</link><description>&lt;doc fingerprint="4d007891504bb690"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Build a Compiler in Five Projects&lt;/head&gt;
     &lt;p&gt;Class website here: https://kmicinski.com/cis531-f25&lt;/p&gt;
@@ -531,1530 +1577,7 @@ the programs in the &lt;code&gt;test-programs/&lt;/code&gt; directory, using the
     &lt;p&gt;Congratulations on making it to the end of this article! There are other topics I’d love to discuss, such as RAII and design patterns. However, this article is long enough, so I will leave those for you to explore on your own.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46032148</guid><pubDate>Mon, 24 Nov 2025 09:40:32 +0000</pubDate></item><item><title>A fast EDN (Extensible Data Notation) reader written in C11 with SIMD boost</title><link>https://github.com/DotFox/edn.c</link><description>&lt;doc fingerprint="3ad23251e013e918"&gt;
-  &lt;main&gt;
-    &lt;p&gt;A fast, zero-copy EDN (Extensible Data Notation) reader written in C11 with SIMD acceleration.&lt;/p&gt;
-    &lt;p&gt;EDN (Extensible Data Notation) is a data format similar to JSON, but richer and more extensible. Think of it as "JSON with superpowers":&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;JSON-like foundation: Maps &lt;code&gt;{:key value}&lt;/code&gt;, vectors&lt;code&gt;[1 2 3]&lt;/code&gt;, strings, numbers, booleans, null (&lt;code&gt;nil&lt;/code&gt;)&lt;/item&gt;
-      &lt;item&gt;Additional built-in types: Sets &lt;code&gt;#{:a :b}&lt;/code&gt;, keywords&lt;code&gt;:keyword&lt;/code&gt;, symbols&lt;code&gt;my-symbol&lt;/code&gt;, characters&lt;code&gt;\newline&lt;/code&gt;, lists&lt;code&gt;(1 2 3)&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Extensible via tagged literals: &lt;code&gt;#inst "2024-01-01"&lt;/code&gt;,&lt;code&gt;#uuid "..."&lt;/code&gt;—transform data at parse time with custom readers&lt;/item&gt;
-      &lt;item&gt;Human-friendly: Comments, flexible whitespace, designed to be readable and writable by both humans and programs&lt;/item&gt;
-      &lt;item&gt;Language-agnostic: Originally from Clojure, but useful anywhere you need rich, extensible data interchange&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Why EDN over JSON? More expressive types (keywords, symbols, sets), native extensibility through tags (no more &lt;code&gt;{"__type": "Date", "value": "..."}&lt;/code&gt; hacks), and better support for configuration files and data interchange in functional programming environments.&lt;/p&gt;
-    &lt;p&gt;Learn more: Official EDN specification&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;🚀 Fast: SIMD-accelerated parsing with NEON (ARM64), SSE4.2 (x86_64) and SIMD128 (WebAssembly) support&lt;/item&gt;
-      &lt;item&gt;🌐 WebAssembly: Full WASM SIMD128 support for high-performance parsing in browsers and Node.js&lt;/item&gt;
-      &lt;item&gt;💾 Zero-copy: Minimal allocations, references input data where possible&lt;/item&gt;
-      &lt;item&gt;🎯 Simple API: Easy-to-use interface with comprehensive type support&lt;/item&gt;
-      &lt;item&gt;🧹 Memory-safe: Arena allocator for efficient cleanup - single &lt;code&gt;edn_free()&lt;/code&gt;call&lt;/item&gt;
-      &lt;item&gt;🔧 Zero Dependencies: Pure C11 with standard library only&lt;/item&gt;
-      &lt;item&gt;✅ Fully Tested: 340+ tests across 24 test suites&lt;/item&gt;
-      &lt;item&gt;📖 UTF-8 Native: All string inputs and outputs are UTF-8 encoded&lt;/item&gt;
-      &lt;item&gt;🏷️ Tagged Literals: Extensible data types with custom reader support&lt;/item&gt;
-      &lt;item&gt;🗺️ Map Namespace Syntax: Clojure-compatible &lt;code&gt;#:ns{...}&lt;/code&gt;syntax (optional, disabled by default)&lt;/item&gt;
-      &lt;item&gt;🔤 Extended Characters: &lt;code&gt;\formfeed&lt;/code&gt;,&lt;code&gt;\backspace&lt;/code&gt;, and octal&lt;code&gt;\oNNN&lt;/code&gt;literals (optional, disabled by default)&lt;/item&gt;
-      &lt;item&gt;📝 Metadata: Clojure-style metadata &lt;code&gt;^{...}&lt;/code&gt;syntax (optional, disabled by default)&lt;/item&gt;
-      &lt;item&gt;📄 Text Blocks: Java-style multi-line text blocks &lt;code&gt;"""\n...\n"""&lt;/code&gt;(experimental, disabled by default)&lt;/item&gt;
-      &lt;item&gt;🔢 Ratio Numbers: Clojure-compatible ratio literals &lt;code&gt;22/7&lt;/code&gt;(optional, disabled by default)&lt;/item&gt;
-      &lt;item&gt;🔣 Extended Integers: Hex (&lt;code&gt;0xFF&lt;/code&gt;), octal (&lt;code&gt;0777&lt;/code&gt;), binary (&lt;code&gt;2r1010&lt;/code&gt;), and arbitrary radix (&lt;code&gt;36rZZ&lt;/code&gt;) formats (optional, disabled by default)&lt;/item&gt;
-      &lt;item&gt;🔢 Underscore in Numeric Literals: Visual grouping with underscores &lt;code&gt;1_000_000&lt;/code&gt;,&lt;code&gt;3.14_15_92&lt;/code&gt;,&lt;code&gt;0xDE_AD_BE_EF&lt;/code&gt;(optional, disabled by default)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Installation&lt;/item&gt;
-      &lt;item&gt;Quick Start&lt;/item&gt;
-      &lt;item&gt;Whitespace and Control Characters&lt;/item&gt;
-      &lt;item&gt;API Reference&lt;/item&gt;
-      &lt;item&gt;Examples&lt;/item&gt;
-      &lt;item&gt;Building&lt;/item&gt;
-      &lt;item&gt;Performance&lt;/item&gt;
-      &lt;item&gt;Contributing&lt;/item&gt;
-      &lt;item&gt;License&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;C11 compatible compiler (GCC 4.9+, Clang 3.1+, MSVC 2015+)&lt;/item&gt;
-      &lt;item&gt;Make (Unix/macOS) or CMake (Windows/cross-platform)&lt;/item&gt;
-      &lt;item&gt;Supported platforms: &lt;list rend="ul"&gt;&lt;item&gt;macOS (Apple Silicon M1/M2/M3, Intel) - NEON/SSE4.2 SIMD&lt;/item&gt;&lt;item&gt;Linux (ARM64, x86_64) - NEON/SSE4.2 SIMD&lt;/item&gt;&lt;item&gt;Windows (x86_64, ARM64) - NEON/SSE4.2 SIMD via MSVC/MinGW/Clang&lt;/item&gt;&lt;item&gt;WebAssembly - SIMD128 support for browsers and Node.js&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Unix/macOS/Linux:&lt;/p&gt;
-    &lt;code&gt;# Clone the repository
-git clone https://github.com/DotFox/edn.c.git
-cd edn.c
-
-# Build static library (libedn.a)
-make
-
-# Run tests to verify build
-make test&lt;/code&gt;
-    &lt;p&gt;Windows:&lt;/p&gt;
-    &lt;code&gt;# Clone the repository
-git clone https://github.com/DotFox/edn.c.git
-cd edn.c
-
-# Build with CMake (works with MSVC, MinGW, Clang)
-.\build.bat
-
-# Or use PowerShell script
-.\build.ps1 -Test&lt;/code&gt;
-    &lt;p&gt;See docs/WINDOWS.md for detailed Windows build instructions.&lt;/p&gt;
-    &lt;p&gt;Option 1: Link static library&lt;/p&gt;
-    &lt;code&gt;# Compile your code
-gcc -o myapp myapp.c -I/path/to/edn.c/include -L/path/to/edn.c -ledn
-
-# Or add to your Makefile
-CFLAGS += -I/path/to/edn.c/include
-LDFLAGS += -L/path/to/edn.c -ledn&lt;/code&gt;
-    &lt;p&gt;Option 2: Include source directly&lt;/p&gt;
-    &lt;p&gt;Copy &lt;code&gt;include/edn.h&lt;/code&gt; and all files from &lt;code&gt;src/&lt;/code&gt; into your project and compile them together.&lt;/p&gt;
-    &lt;code&gt;#include "edn.h"
-#include &amp;lt;stdio.h&amp;gt;
-
-int main(void) {
-    const char *input = "{:name \"Alice\" :age 30 :languages [:clojure :rust]}";
-    
-    // Read EDN string
-    edn_result_t result = edn_read(input, 0);
-    
-    if (result.error != EDN_OK) {
-        fprintf(stderr, "Parse error at line %zu, column %zu: %s\n",
-                result.error_line, result.error_column, result.error_message);
-        return 1;
-    }
-    
-    // Access the parsed map
-    edn_value_t *map = result.value;
-    printf("Parsed map with %zu entries\n", edn_map_count(map));
-    
-    // Look up a value by key
-    edn_result_t key_result = edn_read(":name", 0);
-    edn_value_t *name_value = edn_map_lookup(map, key_result.value);
-    
-    if (name_value != NULL &amp;amp;&amp;amp; edn_type(name_value) == EDN_TYPE_STRING) {
-        size_t len;
-        const char *name = edn_string_get(name_value, &amp;amp;len);
-        printf("Name: %.*s\n", (int)len, name);
-    }
-    
-    // Clean up - frees all allocated memory
-    edn_free(key_result.value);
-    edn_free(map);
-    
-    return 0;
-}&lt;/code&gt;
-    &lt;p&gt;Output:&lt;/p&gt;
-    &lt;code&gt;Parsed map with 3 entries
-Name: Alice
-&lt;/code&gt;
-    &lt;p&gt;EDN.C follows Clojure's exact behavior for whitespace and control character handling:&lt;/p&gt;
-    &lt;p&gt;The following characters act as whitespace delimiters (separate tokens):&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="4"&gt;
-        &lt;cell role="head"&gt;Character&lt;/cell&gt;
-        &lt;cell role="head"&gt;Hex&lt;/cell&gt;
-        &lt;cell role="head"&gt;Name&lt;/cell&gt;
-        &lt;cell role="head"&gt;Common Use&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell/&gt;
-        &lt;cell&gt;0x20&lt;/cell&gt;
-        &lt;cell&gt;Space&lt;/cell&gt;
-        &lt;cell&gt;Standard spacing&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;\t&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;0x09&lt;/cell&gt;
-        &lt;cell&gt;Tab&lt;/cell&gt;
-        &lt;cell&gt;Indentation&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;\n&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;0x0A&lt;/cell&gt;
-        &lt;cell&gt;Line Feed (LF)&lt;/cell&gt;
-        &lt;cell&gt;Unix line ending&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;\r&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;0x0D&lt;/cell&gt;
-        &lt;cell&gt;Carriage Return (CR)&lt;/cell&gt;
-        &lt;cell&gt;Windows line ending&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;\f&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;0x0C&lt;/cell&gt;
-        &lt;cell&gt;Form Feed&lt;/cell&gt;
-        &lt;cell&gt;Page break&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;\v&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;0x0B&lt;/cell&gt;
-        &lt;cell&gt;Vertical Tab&lt;/cell&gt;
-        &lt;cell&gt;Vertical spacing&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;,&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;0x2C&lt;/cell&gt;
-        &lt;cell&gt;Comma&lt;/cell&gt;
-        &lt;cell&gt;Optional separator&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;FS&lt;/cell&gt;
-        &lt;cell&gt;0x1C&lt;/cell&gt;
-        &lt;cell&gt;File Separator&lt;/cell&gt;
-        &lt;cell&gt;Data separation&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;GS&lt;/cell&gt;
-        &lt;cell&gt;0x1D&lt;/cell&gt;
-        &lt;cell&gt;Group Separator&lt;/cell&gt;
-        &lt;cell&gt;Data separation&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;RS&lt;/cell&gt;
-        &lt;cell&gt;0x1E&lt;/cell&gt;
-        &lt;cell&gt;Record Separator&lt;/cell&gt;
-        &lt;cell&gt;Data separation&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;US&lt;/cell&gt;
-        &lt;cell&gt;0x1F&lt;/cell&gt;
-        &lt;cell&gt;Unit Separator&lt;/cell&gt;
-        &lt;cell&gt;Data separation&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Examples:&lt;/p&gt;
-    &lt;code&gt;// All of these parse as vectors with 3 elements:
-edn_read("[1 2 3]", 0);          // spaces
-edn_read("[1,2,3]", 0);          // commas
-edn_read("[1\t2\n3]", 0);        // tabs and newlines
-edn_read("[1\f2\x1C3]", 0);      // formfeed and file separator&lt;/code&gt;
-    &lt;p&gt;Control characters &lt;code&gt;0x00-0x1F&lt;/code&gt; (except whitespace delimiters) are valid in identifiers (symbols and keywords):&lt;/p&gt;
-    &lt;p&gt;Valid identifier characters:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;0x00&lt;/code&gt;-&lt;code&gt;0x08&lt;/code&gt;: NUL, SOH, STX, ETX, EOT, ENQ, ACK, BEL, Backspace&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;0x0E&lt;/code&gt;-&lt;code&gt;0x1B&lt;/code&gt;: Shift Out through Escape&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Examples:&lt;/p&gt;
-    &lt;code&gt;// Backspace in symbol - valid!
-edn_result_t r = edn_read("[\bfoo]", 0);  // 1-element vector
-edn_vector_count(r.value);  // Returns 1
-edn_free(r.value);
-
-// Control characters in middle of identifier
-const char input[] = {'[', 'f', 'o', 'o', 0x08, 'b', 'a', 'r', ']', 0};
-r = edn_read(input, sizeof(input) - 1);
-edn_vector_count(r.value);  // Returns 1 (symbol: "foo\bbar")
-edn_free(r.value);
-
-// Versus whitespace - separates into 2 elements
-edn_result_t r2 = edn_read("[foo\tbar]", 0);  // Tab is whitespace
-edn_vector_count(r2.value);  // Returns 2 (symbols: "foo" and "bar")
-edn_free(r2.value);&lt;/code&gt;
-    &lt;p&gt;Note on null bytes (&lt;code&gt;0x00&lt;/code&gt;): When using string literals with &lt;code&gt;strlen()&lt;/code&gt;, null bytes will truncate the string. Always pass explicit length for data containing null bytes:&lt;/p&gt;
-    &lt;code&gt;const char data[] = {'[', 'a', 0x00, 'b', ']', 0};
-edn_result_t r = edn_read(data, 5);  // Pass exact length: 5 bytes (excluding terminator)&lt;/code&gt;
-    &lt;p&gt;Read EDN from a UTF-8 string.&lt;/p&gt;
-    &lt;code&gt;edn_result_t edn_read(const char *input, size_t length);&lt;/code&gt;
-    &lt;p&gt;Parameters:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;input&lt;/code&gt;: UTF-8 encoded string containing EDN data (must remain valid for zero-copy strings)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;length&lt;/code&gt;: Length of input in bytes, or&lt;code&gt;0&lt;/code&gt;to use&lt;code&gt;strlen(input)&lt;/code&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Returns: &lt;code&gt;edn_result_t&lt;/code&gt; containing:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;value&lt;/code&gt;: Parsed EDN value (NULL on error)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;error&lt;/code&gt;: Error code (&lt;code&gt;EDN_OK&lt;/code&gt;on success)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;error_line&lt;/code&gt;,&lt;code&gt;error_column&lt;/code&gt;: Error location (1-indexed)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;error_message&lt;/code&gt;: Human-readable error description&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Important: The returned value must be freed with &lt;code&gt;edn_free()&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;Free an EDN value and all associated memory.&lt;/p&gt;
-    &lt;code&gt;void edn_free(edn_value_t *value);&lt;/code&gt;
-    &lt;p&gt;Parameters:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;value&lt;/code&gt;: Value to free (may be NULL)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Note: This frees the entire value tree. Do not call &lt;code&gt;free()&lt;/code&gt; on individual values.&lt;/p&gt;
-    &lt;p&gt;Get the type of an EDN value.&lt;/p&gt;
-    &lt;code&gt;edn_type_t edn_type(const edn_value_t *value);&lt;/code&gt;
-    &lt;p&gt;Returns: One of:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;
-        &lt;code&gt;EDN_TYPE_NIL&lt;/code&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;code&gt;EDN_TYPE_BOOL&lt;/code&gt;
-      &lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;EDN_TYPE_INT&lt;/code&gt;(int64_t)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;EDN_TYPE_BIGINT&lt;/code&gt;(arbitrary precision integer)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;EDN_TYPE_FLOAT&lt;/code&gt;(double)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;EDN_TYPE_BIGDEC&lt;/code&gt;(exact precision decimal)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;EDN_TYPE_RATIO&lt;/code&gt;(rational number, requires&lt;code&gt;RATIO=1&lt;/code&gt;build flag)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;EDN_TYPE_CHARACTER&lt;/code&gt;(Unicode codepoint)&lt;/item&gt;
-      &lt;item&gt;
-        &lt;code&gt;EDN_TYPE_STRING&lt;/code&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;code&gt;EDN_TYPE_SYMBOL&lt;/code&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;code&gt;EDN_TYPE_KEYWORD&lt;/code&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;code&gt;EDN_TYPE_LIST&lt;/code&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;code&gt;EDN_TYPE_VECTOR&lt;/code&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;code&gt;EDN_TYPE_MAP&lt;/code&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;code&gt;EDN_TYPE_SET&lt;/code&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;code&gt;EDN_TYPE_TAGGED&lt;/code&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;code&gt;typedef enum {
-    EDN_OK = 0,                    // Success
-    EDN_ERROR_INVALID_SYNTAX,      // Syntax error
-    EDN_ERROR_UNEXPECTED_EOF,      // Unexpected end of input
-    EDN_ERROR_OUT_OF_MEMORY,       // Allocation failure
-    EDN_ERROR_INVALID_UTF8,        // Invalid UTF-8 sequence
-    EDN_ERROR_INVALID_NUMBER,      // Malformed number
-    EDN_ERROR_INVALID_STRING,      // Malformed string
-    EDN_ERROR_INVALID_ESCAPE,      // Invalid escape sequence
-    EDN_ERROR_UNMATCHED_DELIMITER, // Mismatched brackets
-    EDN_ERROR_UNKNOWN_TAG,         // Unregistered tag (with ERROR mode)
-    EDN_ERROR_DUPLICATE_KEY,       // Map has duplicate keys
-    EDN_ERROR_DUPLICATE_ELEMENT    // Set has duplicate elements
-} edn_error_t;&lt;/code&gt;
-    &lt;code&gt;const char *edn_string_get(const edn_value_t *value, size_t *length);&lt;/code&gt;
-    &lt;p&gt;Get UTF-8 string data. Returns NULL if value is not a string.&lt;/p&gt;
-    &lt;p&gt;Lazy decoding: For strings without escapes, returns a pointer into the original input (zero-copy). For strings with escapes (&lt;code&gt;\n&lt;/code&gt;, &lt;code&gt;\t&lt;/code&gt;, &lt;code&gt;\"&lt;/code&gt;, etc.), decodes and caches the result on first call.&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read("\"Hello, world!\"", 0);
-size_t len;
-const char *str = edn_string_get(r.value, &amp;amp;len);
-printf("%.*s\n", (int)len, str);
-edn_free(r.value);&lt;/code&gt;
-    &lt;code&gt;bool edn_is_nil(const edn_value_t *value);&lt;/code&gt;
-    &lt;p&gt;Check if value is nil. Returns &lt;code&gt;true&lt;/code&gt; if value is &lt;code&gt;EDN_TYPE_NIL&lt;/code&gt;, &lt;code&gt;false&lt;/code&gt; otherwise.&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read("nil", 0);
-if (edn_is_nil(r.value)) {
-    printf("Value is nil\n");
-}
-edn_free(r.value);&lt;/code&gt;
-    &lt;code&gt;bool edn_bool_get(const edn_value_t *value, bool *out);&lt;/code&gt;
-    &lt;p&gt;Get boolean value. Returns &lt;code&gt;true&lt;/code&gt; if value is &lt;code&gt;EDN_TYPE_BOOL&lt;/code&gt;, &lt;code&gt;false&lt;/code&gt; otherwise.&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read("true", 0);
-bool val;
-if (edn_bool_get(r.value, &amp;amp;val)) {
-    printf("Boolean: %s\n", val ? "true" : "false");
-}
-edn_free(r.value);&lt;/code&gt;
-    &lt;code&gt;bool edn_int64_get(const edn_value_t *value, int64_t *out);&lt;/code&gt;
-    &lt;p&gt;Get int64_t value. Returns &lt;code&gt;true&lt;/code&gt; if value is &lt;code&gt;EDN_TYPE_INT&lt;/code&gt;, &lt;code&gt;false&lt;/code&gt; otherwise.&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read("42", 0);
-int64_t num;
-if (edn_int64_get(r.value, &amp;amp;num)) {
-    printf("Number: %lld\n", (long long)num);
-}
-edn_free(r.value);&lt;/code&gt;
-    &lt;code&gt;const char *edn_bigint_get(const edn_value_t *value, size_t *length,
-                           bool *negative, uint8_t *radix);&lt;/code&gt;
-    &lt;p&gt;Get big integer digit string for use with external libraries (GMP, OpenSSL BIGNUM, etc.).&lt;/p&gt;
-    &lt;p&gt;Parameters:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;value&lt;/code&gt;: EDN big integer value&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;length&lt;/code&gt;: Output for digit string length (may be NULL)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;negative&lt;/code&gt;: Output for sign flag (may be NULL)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;radix&lt;/code&gt;: Output for number base: 10, 16, 8, or 2 (may be NULL)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Returns: Digit string, or NULL if not a big integer.&lt;/p&gt;
-    &lt;p&gt;Clojure Compatibility: The &lt;code&gt;N&lt;/code&gt; suffix forces BigInt for base-10 integers.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;42N&lt;/code&gt;→ BigInt "42" (forced BigInt even though it fits in int64)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;999999999999999999999999999&lt;/code&gt;→ BigInt (overflow detection)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;0xDEADBEEFN&lt;/code&gt;→ Long (N is hex digit, not suffix)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;// BigInt from overflow
-edn_result_t r = edn_read("999999999999999999999999999", 0);
-size_t len;
-bool neg;
-uint8_t radix;
-const char *digits = edn_bigint_get(r.value, &amp;amp;len, &amp;amp;neg, &amp;amp;radix);
-if (digits) {
-    printf("%s%.*s (base %d)\n", neg ? "-" : "", (int)len, digits, radix);
-}
-edn_free(r.value);
-
-// BigInt with N suffix
-edn_result_t r2 = edn_read("42N", 0);
-digits = edn_bigint_get(r2.value, &amp;amp;len, &amp;amp;neg, &amp;amp;radix);
-// digits = "42", len = 2, use with GMP: mpz_set_str(bigint, digits, radix)
-edn_free(r2.value);&lt;/code&gt;
-    &lt;code&gt;bool edn_double_get(const edn_value_t *value, double *out);&lt;/code&gt;
-    &lt;p&gt;Get double value. Returns &lt;code&gt;true&lt;/code&gt; if value is &lt;code&gt;EDN_TYPE_FLOAT&lt;/code&gt;, &lt;code&gt;false&lt;/code&gt; otherwise.&lt;/p&gt;
-    &lt;code&gt;bool edn_number_as_double(const edn_value_t *value, double *out);&lt;/code&gt;
-    &lt;p&gt;Convert any numeric type (INT, BIGINT, FLOAT, BIGDEC) to double. May lose precision for large numbers.&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read("3.14159", 0);
-double num;
-if (edn_double_get(r.value, &amp;amp;num)) {
-    printf("Pi: %.5f\n", num);
-}
-edn_free(r.value);&lt;/code&gt;
-    &lt;code&gt;const char *edn_bigdec_get(const edn_value_t *value, size_t *length, bool *negative);&lt;/code&gt;
-    &lt;p&gt;Get big decimal string for use with external libraries (Java BigDecimal, Python Decimal, etc.).&lt;/p&gt;
-    &lt;p&gt;Parameters:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;value&lt;/code&gt;: EDN big decimal value&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;length&lt;/code&gt;: Output for string length (may be NULL)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;negative&lt;/code&gt;: Output for sign flag (may be NULL)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Returns: Decimal string, or NULL if not a big decimal.&lt;/p&gt;
-    &lt;p&gt;Clojure Compatibility: The &lt;code&gt;M&lt;/code&gt; suffix forces exact precision decimal representation.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;42M&lt;/code&gt;→ BigDecimal "42" (integer with M suffix)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;3.14M&lt;/code&gt;→ BigDecimal "3.14"&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;1.5e10M&lt;/code&gt;→ BigDecimal "1.5e10"&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;// BigDecimal from float
-edn_result_t r1 = edn_read("3.14159265358979323846M", 0);
-size_t len;
-bool neg;
-const char *decimal = edn_bigdec_get(r1.value, &amp;amp;len, &amp;amp;neg);
-if (decimal) {
-    printf("%s%.*s\n", neg ? "-" : "", (int)len, decimal);
-    // Use with: Java BigDecimal(decimal), Python Decimal(decimal), etc.
-}
-edn_free(r1.value);
-
-// BigDecimal from integer with M suffix
-edn_result_t r2 = edn_read("42M", 0);
-decimal = edn_bigdec_get(r2.value, &amp;amp;len, &amp;amp;neg);
-// decimal = "42", application can convert to BigDecimal
-edn_free(r2.value);&lt;/code&gt;
-    &lt;code&gt;bool edn_ratio_get(const edn_value_t *value, int64_t *numerator, int64_t *denominator);&lt;/code&gt;
-    &lt;p&gt;Get ratio numerator and denominator. Returns &lt;code&gt;true&lt;/code&gt; if value is &lt;code&gt;EDN_TYPE_RATIO&lt;/code&gt;, &lt;code&gt;false&lt;/code&gt; otherwise.&lt;/p&gt;
-    &lt;p&gt;Parameters:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;value&lt;/code&gt;: EDN ratio value&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;numerator&lt;/code&gt;: Output for numerator (may be NULL)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;denominator&lt;/code&gt;: Output for denominator (may be NULL)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Returns: &lt;code&gt;true&lt;/code&gt; if value is a ratio, &lt;code&gt;false&lt;/code&gt; otherwise.&lt;/p&gt;
-    &lt;p&gt;Clojure Compatibility: Ratios represent exact rational numbers as numerator/denominator pairs.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;22/7&lt;/code&gt;→ Ratio with numerator=22, denominator=7&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;-3/4&lt;/code&gt;→ Ratio with numerator=-3, denominator=4 (negative numerator)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;1/2&lt;/code&gt;→ Ratio with numerator=1, denominator=2&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;3/6&lt;/code&gt;→ Automatically reduced to ratio 1/2&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;10/5&lt;/code&gt;→ Automatically reduced to integer 2 (ratios with denominator 1 become integers)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;0/5&lt;/code&gt;→ Returns integer 0 (zero numerator always becomes integer 0)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;0777/3&lt;/code&gt;→ Returns 777/2&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;0777/0777&lt;/code&gt;→ Returns 1&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Automatic Reduction: Ratios are automatically reduced to lowest terms using the Binary GCD algorithm (Stein's algorithm):&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;6/9&lt;/code&gt;→ Reduced to&lt;code&gt;2/3&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;100/25&lt;/code&gt;→ Reduced to&lt;code&gt;4/1&lt;/code&gt;→ Returns as integer&lt;code&gt;4&lt;/code&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Restrictions:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Only decimal (base-10) integers supported for both numerator and denominator&lt;/item&gt;
-      &lt;item&gt;Octal (base-8) integers supported keeping compatibility with Clojure where it is incorrectly interpreted as decimal integers with leading zeros.&lt;/item&gt;
-      &lt;item&gt;Both numerator and denominator must fit in &lt;code&gt;int64_t&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Denominator must be positive (negative denominators are rejected)&lt;/item&gt;
-      &lt;item&gt;Denominator cannot be zero&lt;/item&gt;
-      &lt;item&gt;No whitespace allowed around &lt;code&gt;/&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Hex and binary notations not supported for ratios&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;// Parse ratio
-edn_result_t r = edn_read("22/7", 0);
-
-if (r.error == EDN_OK &amp;amp;&amp;amp; edn_type(r.value) == EDN_TYPE_RATIO) {
-    int64_t num, den;
-    edn_ratio_get(r.value, &amp;amp;num, &amp;amp;den);
-    printf("Ratio: %lld/%lld\n", (long long)num, (long long)den);
-    // Output: Ratio: 22/7
-
-    // Convert to double for approximation
-    double approx;
-    edn_number_as_double(r.value, &amp;amp;approx);
-    printf("Approximation: %.10f\n", approx);
-    // Output: Approximation: 3.1428571429
-}
-
-edn_free(r.value);
-
-// Automatic reduction
-edn_result_t r2 = edn_read("3/6", 0);
-int64_t num2, den2;
-edn_ratio_get(r2.value, &amp;amp;num2, &amp;amp;den2);
-// num2 = 1, den2 = 2 (reduced from 3/6)
-edn_free(r2.value);
-
-// Reduction to integer
-edn_result_t r3 = edn_read("10/5", 0);
-assert(edn_type(r3.value) == EDN_TYPE_INT);
-int64_t int_val;
-edn_int64_get(r3.value, &amp;amp;int_val);
-// int_val = 2 (10/5 reduced to 2/1, returned as integer)
-edn_free(r3.value);
-
-// Negative ratios
-edn_result_t r4 = edn_read("-3/4", 0);
-int64_t num4, den4;
-edn_ratio_get(r4.value, &amp;amp;num4, &amp;amp;den4);
-// num4 = -3, den4 = 4 (numerator is negative, denominator is positive)
-edn_free(r4.value);
-
-// Error: zero denominator
-edn_result_t r5 = edn_read("5/0", 0);
-// r5.error == EDN_ERROR_INVALID_NUMBER
-// r5.error_message == "Ratio denominator cannot be zero"
-
-// Error: negative denominator (denominators must be positive)
-edn_result_t r6 = edn_read("3/-4", 0);
-// r6.error == EDN_ERROR_INVALID_NUMBER
-// r6.error_message == "Ratio denominator must be positive"
-
-// Error: hex not supported
-edn_result_t r7 = edn_read("0x10/2", 0);
-// Parses 0x10 as int, not as ratio&lt;/code&gt;
-    &lt;p&gt;Build Configuration:&lt;/p&gt;
-    &lt;p&gt;This feature is disabled by default. To enable it:&lt;/p&gt;
-    &lt;p&gt;Make:&lt;/p&gt;
-    &lt;code&gt;make RATIO=1&lt;/code&gt;
-    &lt;p&gt;CMake:&lt;/p&gt;
-    &lt;code&gt;cmake -DEDN_ENABLE_RATIO=ON ..
-make&lt;/code&gt;
-    &lt;p&gt;When disabled (default):&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;EDN_TYPE_RATIO&lt;/code&gt;enum value is not available&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;edn_ratio_get()&lt;/code&gt;function is not available&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Note: Ratios are a Clojure language feature, not part of the official EDN specification. They're provided here for compatibility with Clojure's clojure.edn parser.&lt;/p&gt;
-    &lt;p&gt;See &lt;code&gt;test/test_numbers.c&lt;/code&gt; for comprehensive ratio test examples.&lt;/p&gt;
-    &lt;p&gt;EDN.C supports Clojure-style special integer formats for hexadecimal, octal, binary, and arbitrary radix numbers. These are disabled by default as they are not part of the base EDN specification.&lt;/p&gt;
-    &lt;p&gt;Supported formats:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Hexadecimal: &lt;code&gt;0xFF&lt;/code&gt;,&lt;code&gt;0x2A&lt;/code&gt;,&lt;code&gt;-0x10&lt;/code&gt;(base-16, prefix&lt;code&gt;0x&lt;/code&gt;or&lt;code&gt;0X&lt;/code&gt;)&lt;/item&gt;
-      &lt;item&gt;Octal: &lt;code&gt;0777&lt;/code&gt;,&lt;code&gt;052&lt;/code&gt;,&lt;code&gt;-0123&lt;/code&gt;(base-8, leading zero followed by&lt;code&gt;0-7&lt;/code&gt;)&lt;/item&gt;
-      &lt;item&gt;Binary: &lt;code&gt;2r1010&lt;/code&gt;,&lt;code&gt;-2r1111&lt;/code&gt;(base-2, radix notation)&lt;/item&gt;
-      &lt;item&gt;Arbitrary radix: &lt;code&gt;8r77&lt;/code&gt;,&lt;code&gt;16rFF&lt;/code&gt;,&lt;code&gt;36rZZ&lt;/code&gt;(bases 2-36, radix notation&lt;code&gt;NrDDDD&lt;/code&gt;)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Examples:&lt;/p&gt;
-    &lt;code&gt;// Hexadecimal
-edn_result_t r1 = edn_read("0xFF", 0);
-int64_t val1;
-edn_int64_get(r1.value, &amp;amp;val1);
-// val1 = 255
-edn_free(r1.value);
-
-// Octal
-edn_result_t r2 = edn_read("0777", 0);
-int64_t val2;
-edn_int64_get(r2.value, &amp;amp;val2);
-// val2 = 511 (7*64 + 7*8 + 7)
-edn_free(r2.value);
-
-// Binary (radix notation)
-edn_result_t r3 = edn_read("2r1010", 0);
-int64_t val3;
-edn_int64_get(r3.value, &amp;amp;val3);
-// val3 = 10
-edn_free(r3.value);
-
-// Base-36 (radix notation)
-edn_result_t r4 = edn_read("36rZZ", 0);
-int64_t val4;
-edn_int64_get(r4.value, &amp;amp;val4);
-// val4 = 1295 (35*36 + 35)
-edn_free(r4.value);
-
-// Negative hex
-edn_result_t r5 = edn_read("-0x10", 0);
-int64_t val5;
-edn_int64_get(r5.value, &amp;amp;val5);
-// val5 = -16
-edn_free(r5.value);&lt;/code&gt;
-    &lt;p&gt;Radix notation: &lt;code&gt;NrDDDD&lt;/code&gt; where:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;N&lt;/code&gt;is the radix (base) from 2 to 36&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;r&lt;/code&gt;is the radix separator&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;DDDD&lt;/code&gt;are the digits (0-9, A-Z, case-insensitive for bases &amp;gt; 10)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Build Configuration:&lt;/p&gt;
-    &lt;p&gt;This feature is disabled by default. To enable it:&lt;/p&gt;
-    &lt;p&gt;Make:&lt;/p&gt;
-    &lt;code&gt;make EXTENDED_INTEGERS=1&lt;/code&gt;
-    &lt;p&gt;CMake:&lt;/p&gt;
-    &lt;code&gt;cmake -DEDN_ENABLE_EXTENDED_INTEGERS=ON ..
-make&lt;/code&gt;
-    &lt;p&gt;When disabled (default):&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Hexadecimal (&lt;code&gt;0xFF&lt;/code&gt;), binary (&lt;code&gt;2r1010&lt;/code&gt;), and radix notation (&lt;code&gt;36rZZ&lt;/code&gt;) will fail to parse&lt;/item&gt;
-      &lt;item&gt;Leading zeros are forbidden: Numbers like &lt;code&gt;01&lt;/code&gt;,&lt;code&gt;0123&lt;/code&gt;,&lt;code&gt;0777&lt;/code&gt;are rejected (per EDN spec)&lt;/item&gt;
-      &lt;item&gt;Only &lt;code&gt;0&lt;/code&gt;itself, or&lt;code&gt;0.5&lt;/code&gt;,&lt;code&gt;0e10&lt;/code&gt;(floats starting with zero) are allowed&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Note: Extended integer formats are a Clojure language feature, not part of the official EDN specification. They're provided here for compatibility with Clojure's reader.&lt;/p&gt;
-    &lt;p&gt;See &lt;code&gt;test/test_numbers.c&lt;/code&gt; for comprehensive extended integer format test examples.&lt;/p&gt;
-    &lt;p&gt;EDN.C supports underscores as visual separators in numeric literals for improved readability. This feature is disabled by default as it's not part of the base EDN specification.&lt;/p&gt;
-    &lt;p&gt;Supported number types:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Integers: &lt;code&gt;1_000&lt;/code&gt;,&lt;code&gt;1_000_000&lt;/code&gt;,&lt;code&gt;4____2&lt;/code&gt;→&lt;code&gt;1000&lt;/code&gt;,&lt;code&gt;1000000&lt;/code&gt;,&lt;code&gt;42&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Floats: &lt;code&gt;3.14_15_92&lt;/code&gt;,&lt;code&gt;1_234.56_78&lt;/code&gt;→&lt;code&gt;3.141592&lt;/code&gt;,&lt;code&gt;1234.5678&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Scientific notation: &lt;code&gt;1_500e10&lt;/code&gt;,&lt;code&gt;1.5e1_0&lt;/code&gt;,&lt;code&gt;1_5.2_5e1_0&lt;/code&gt;→&lt;code&gt;1500e10&lt;/code&gt;,&lt;code&gt;1.5e10&lt;/code&gt;,&lt;code&gt;15.25e10&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;BigInt: &lt;code&gt;1_234_567_890_123_456_789N&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;BigDecimal: &lt;code&gt;1_234.56_78M&lt;/code&gt;,&lt;code&gt;1_5.2_5e1_0M&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Hexadecimal (with &lt;code&gt;EXTENDED_INTEGERS=1&lt;/code&gt;):&lt;code&gt;0xDE_AD_BE_EF&lt;/code&gt;→&lt;code&gt;0xDEADBEEF&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Octal (with &lt;code&gt;EXTENDED_INTEGERS=1&lt;/code&gt;):&lt;code&gt;07_77&lt;/code&gt;→&lt;code&gt;0777&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Binary (with &lt;code&gt;EXTENDED_INTEGERS=1&lt;/code&gt;):&lt;code&gt;2r1010_1010&lt;/code&gt;→&lt;code&gt;170&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Radix notation (with &lt;code&gt;EXTENDED_INTEGERS=1&lt;/code&gt;):&lt;code&gt;36rZ_Z&lt;/code&gt;→&lt;code&gt;1295&lt;/code&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Rules:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Underscores are only allowed between digits (not at start, end, or adjacent to special characters)&lt;/item&gt;
-      &lt;item&gt;Multiple consecutive underscores are allowed: &lt;code&gt;4____2&lt;/code&gt;is valid&lt;/item&gt;
-      &lt;item&gt;Not allowed adjacent to decimal point: &lt;code&gt;123_.5&lt;/code&gt;or&lt;code&gt;123._5&lt;/code&gt;are invalid&lt;/item&gt;
-      &lt;item&gt;Not allowed before/after exponent marker: &lt;code&gt;123_e10&lt;/code&gt;or&lt;code&gt;123e_10&lt;/code&gt;are invalid&lt;/item&gt;
-      &lt;item&gt;Not allowed before suffix: &lt;code&gt;123_N&lt;/code&gt;or&lt;code&gt;123.45_M&lt;/code&gt;are invalid&lt;/item&gt;
-      &lt;item&gt;Works with negative numbers: &lt;code&gt;-1_234&lt;/code&gt;→&lt;code&gt;-1234&lt;/code&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Examples:&lt;/p&gt;
-    &lt;code&gt;// Credit card number formatting
-edn_result_t r1 = edn_read("1234_5678_9012_3456", 0);
-int64_t val1;
-edn_int64_get(r1.value, &amp;amp;val1);
-// val1 = 1234567890123456
-edn_free(r1.value);
-
-// Pi with digit grouping
-edn_result_t r2 = edn_read("3.14_15_92_65_35_89_79", 0);
-double val2;
-edn_double_get(r2.value, &amp;amp;val2);
-// val2 = 3.141592653589793
-edn_free(r2.value);
-
-// Hex bytes (requires EXTENDED_INTEGERS=1)
-edn_result_t r3 = edn_read("0xFF_EC_DE_5E", 0);
-int64_t val3;
-edn_int64_get(r3.value, &amp;amp;val3);
-// val3 = 0xFFECDE5E
-edn_free(r3.value);
-
-// Large numbers with thousands separators
-edn_result_t r4 = edn_read("1_000_000", 0);
-int64_t val4;
-edn_int64_get(r4.value, &amp;amp;val4);
-// val4 = 1000000
-edn_free(r4.value);
-
-// In collections
-edn_result_t r5 = edn_read("[1_000 2_000 3_000]", 0);
-// Three integers: 1000, 2000, 3000
-edn_free(r5.value);&lt;/code&gt;
-    &lt;p&gt;Invalid examples:&lt;/p&gt;
-    &lt;code&gt;// Underscore at start - parses as symbol
-edn_read("_123", 0);  // Symbol, not number
-
-// Underscore at end
-edn_read("123_", 0);  // Error: EDN_ERROR_INVALID_NUMBER
-
-// Adjacent to decimal point
-edn_read("123_.5", 0);   // Error: EDN_ERROR_INVALID_NUMBER
-edn_read("123._5", 0);   // Error: EDN_ERROR_INVALID_NUMBER
-
-// Before/after exponent marker
-edn_read("123_e10", 0);  // Error: EDN_ERROR_INVALID_NUMBER
-edn_read("123e_10", 0);  // Error: EDN_ERROR_INVALID_NUMBER
-
-// Before suffix
-edn_read("123_N", 0);    // Error: EDN_ERROR_INVALID_NUMBER
-edn_read("123.45_M", 0); // Error: EDN_ERROR_INVALID_NUMBER&lt;/code&gt;
-    &lt;p&gt;Build Configuration:&lt;/p&gt;
-    &lt;p&gt;This feature is disabled by default. To enable it:&lt;/p&gt;
-    &lt;p&gt;Make:&lt;/p&gt;
-    &lt;code&gt;make UNDERSCORE_IN_NUMERIC=1&lt;/code&gt;
-    &lt;p&gt;CMake:&lt;/p&gt;
-    &lt;code&gt;cmake -DEDN_ENABLE_UNDERSCORE_IN_NUMERIC=ON ..
-make&lt;/code&gt;
-    &lt;p&gt;Combined with other features:&lt;/p&gt;
-    &lt;code&gt;# Enable underscores with extended integers and ratios
-make UNDERSCORE_IN_NUMERIC=1 EXTENDED_INTEGERS=1 RATIO=1&lt;/code&gt;
-    &lt;p&gt;When disabled (default):&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Numbers with underscores will fail to parse&lt;/item&gt;
-      &lt;item&gt;The scanner will stop at the first underscore, treating it as an invalid number&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Note: Underscores in numeric literals are a common feature in modern programming languages (Java, Rust, Python 3.6+, etc.) but are not part of the official EDN specification. This feature is provided for convenience and readability.&lt;/p&gt;
-    &lt;p&gt;See &lt;code&gt;test/test_underscore_numeric.c&lt;/code&gt; for comprehensive test examples.&lt;/p&gt;
-    &lt;code&gt;bool edn_character_get(const edn_value_t *value, uint32_t *out);&lt;/code&gt;
-    &lt;p&gt;Get Unicode codepoint. Returns &lt;code&gt;true&lt;/code&gt; if value is &lt;code&gt;EDN_TYPE_CHARACTER&lt;/code&gt;, &lt;code&gt;false&lt;/code&gt; otherwise.&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;// Named characters: \newline, \tab, \space, \return
-edn_result_t r1 = edn_read("\\newline", 0);
-uint32_t cp1;
-edn_character_get(r1.value, &amp;amp;cp1);  // cp1 = 0x0A
-
-// Unicode: \uXXXX or literal character
-edn_result_t r2 = edn_read("\\u03B1", 0);  // Greek alpha
-uint32_t cp2;
-edn_character_get(r2.value, &amp;amp;cp2);  // cp2 = 0x03B1
-
-edn_free(r1.value);
-edn_free(r2.value);&lt;/code&gt;
-    &lt;p&gt;Convenience functions for type checking:&lt;/p&gt;
-    &lt;code&gt;bool edn_is_nil(const edn_value_t *value);
-bool edn_is_string(const edn_value_t *value);
-bool edn_is_number(const edn_value_t *value);
-bool edn_is_integer(const edn_value_t *value);
-bool edn_is_collection(const edn_value_t *value);&lt;/code&gt;
-    &lt;p&gt;Type predicate details:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;edn_is_nil()&lt;/code&gt;- Returns&lt;code&gt;true&lt;/code&gt;for&lt;code&gt;EDN_TYPE_NIL&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;edn_is_string()&lt;/code&gt;- Returns&lt;code&gt;true&lt;/code&gt;for&lt;code&gt;EDN_TYPE_STRING&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;edn_is_number()&lt;/code&gt;- Returns&lt;code&gt;true&lt;/code&gt;for any numeric type (INT, BIGINT, FLOAT, BIGDEC, RATIO)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;edn_is_integer()&lt;/code&gt;- Returns&lt;code&gt;true&lt;/code&gt;for integer types (INT, BIGINT)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;edn_is_collection()&lt;/code&gt;- Returns&lt;code&gt;true&lt;/code&gt;for collections (LIST, VECTOR, MAP, SET)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read("[42 \"hello\" [1 2] {:a 1}]", 0);
-
-if (edn_is_collection(r.value)) {
-    for (size_t i = 0; i &amp;lt; edn_vector_count(r.value); i++) {
-        edn_value_t* elem = edn_vector_get(r.value, i);
-
-        if (edn_is_number(elem)) {
-            printf("Found number\n");
-        } else if (edn_is_string(elem)) {
-            printf("Found string\n");
-        } else if (edn_is_collection(elem)) {
-            printf("Found nested collection\n");
-        }
-    }
-}
-
-edn_free(r.value);&lt;/code&gt;
-    &lt;code&gt;bool edn_string_equals(const edn_value_t *value, const char *str);&lt;/code&gt;
-    &lt;p&gt;Compare EDN string with C string for equality. Returns &lt;code&gt;true&lt;/code&gt; if equal, &lt;code&gt;false&lt;/code&gt; otherwise.&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read("{:status \"active\"}", 0);
-edn_value_t* status = edn_map_get_keyword(r.value, "status");
-
-if (edn_string_equals(status, "active")) {
-    printf("Status is active\n");
-}
-
-edn_free(r.value);&lt;/code&gt;
-    &lt;code&gt;bool edn_symbol_get(const edn_value_t *value,
-                    const char **namespace, size_t *ns_length,
-                    const char **name, size_t *name_length);&lt;/code&gt;
-    &lt;p&gt;Get symbol components. Returns &lt;code&gt;true&lt;/code&gt; if value is &lt;code&gt;EDN_TYPE_SYMBOL&lt;/code&gt;, &lt;code&gt;false&lt;/code&gt; otherwise.&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;// Simple symbol
-edn_result_t r1 = edn_read("foo", 0);
-const char *name;
-size_t name_len;
-edn_symbol_get(r1.value, NULL, NULL, &amp;amp;name, &amp;amp;name_len);
-printf("Symbol: %.*s\n", (int)name_len, name);
-
-// Namespaced symbol
-edn_result_t r2 = edn_read("clojure.core/map", 0);
-const char *ns, *n;
-size_t ns_len, n_len;
-edn_symbol_get(r2.value, &amp;amp;ns, &amp;amp;ns_len, &amp;amp;n, &amp;amp;n_len);
-printf("Symbol: %.*s/%.*s\n", (int)ns_len, ns, (int)n_len, n);
-
-edn_free(r1.value);
-edn_free(r2.value);&lt;/code&gt;
-    &lt;code&gt;bool edn_keyword_get(const edn_value_t *value,
-                     const char **namespace, size_t *ns_length,
-                     const char **name, size_t *name_length);&lt;/code&gt;
-    &lt;p&gt;Get keyword components. Returns &lt;code&gt;true&lt;/code&gt; if value is &lt;code&gt;EDN_TYPE_KEYWORD&lt;/code&gt;, &lt;code&gt;false&lt;/code&gt; otherwise.&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read(":name", 0);
-const char *name;
-size_t name_len;
-edn_keyword_get(r.value, NULL, NULL, &amp;amp;name, &amp;amp;name_len);
-printf("Keyword: :%.*s\n", (int)name_len, name);
-edn_free(r.value);&lt;/code&gt;
-    &lt;p&gt;Ordered sequences: &lt;code&gt;(1 2 3)&lt;/code&gt;&lt;/p&gt;
-    &lt;code&gt;size_t edn_list_count(const edn_value_t *value);
-edn_value_t *edn_list_get(const edn_value_t *value, size_t index);&lt;/code&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read("(1 2 3)", 0);
-size_t count = edn_list_count(r.value);
-
-for (size_t i = 0; i &amp;lt; count; i++) {
-    edn_value_t *elem = edn_list_get(r.value, i);
-    int64_t num;
-    if (edn_int64_get(elem, &amp;amp;num)) {
-        printf("%lld ", (long long)num);
-    }
-}
-printf("\n");
-edn_free(r.value);&lt;/code&gt;
-    &lt;p&gt;Indexed sequences: &lt;code&gt;[1 2 3]&lt;/code&gt;&lt;/p&gt;
-    &lt;code&gt;size_t edn_vector_count(const edn_value_t *value);
-edn_value_t *edn_vector_get(const edn_value_t *value, size_t index);&lt;/code&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read("[\"a\" \"b\" \"c\"]", 0);
-size_t count = edn_vector_count(r.value);
-
-for (size_t i = 0; i &amp;lt; count; i++) {
-    edn_value_t *elem = edn_vector_get(r.value, i);
-    size_t len;
-    const char *str = edn_string_get(elem, &amp;amp;len);
-    printf("[%zu] = %.*s\n", i, (int)len, str);
-}
-edn_free(r.value);&lt;/code&gt;
-    &lt;p&gt;Unique elements: &lt;code&gt;#{:a :b :c}&lt;/code&gt;&lt;/p&gt;
-    &lt;code&gt;size_t edn_set_count(const edn_value_t *value);
-edn_value_t *edn_set_get(const edn_value_t *value, size_t index);
-bool edn_set_contains(const edn_value_t *value, const edn_value_t *element);&lt;/code&gt;
-    &lt;p&gt;Note: Sets reject duplicate elements during parsing. Iteration order is implementation-defined.&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read("#{:a :b :c}", 0);
-printf("Set has %zu elements\n", edn_set_count(r.value));
-
-edn_result_t key = edn_read(":a", 0);
-if (edn_set_contains(r.value, key.value)) {
-    printf(":a is in set\n");
-}
-
-edn_free(key.value);
-edn_free(r.value);&lt;/code&gt;
-    &lt;p&gt;Key-value pairs: &lt;code&gt;{:foo 1 :bar 2}&lt;/code&gt;&lt;/p&gt;
-    &lt;code&gt;size_t edn_map_count(const edn_value_t *value);
-edn_value_t *edn_map_get_key(const edn_value_t *value, size_t index);
-edn_value_t *edn_map_get_value(const edn_value_t *value, size_t index);
-edn_value_t *edn_map_lookup(const edn_value_t *value, const edn_value_t *key);
-bool edn_map_contains_key(const edn_value_t *value, const edn_value_t *key);&lt;/code&gt;
-    &lt;p&gt;Note: Maps reject duplicate keys during parsing. Iteration order is implementation-defined.&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read("{:name \"Alice\" :age 30}", 0);
-
-// Iterate over all entries
-size_t count = edn_map_count(r.value);
-for (size_t i = 0; i &amp;lt; count; i++) {
-    edn_value_t *key = edn_map_get_key(r.value, i);
-    edn_value_t *val = edn_map_get_value(r.value, i);
-    
-    const char *key_name;
-    size_t key_len;
-    edn_keyword_get(key, NULL, NULL, &amp;amp;key_name, &amp;amp;key_len);
-    printf(":%.*s =&amp;gt; ", (int)key_len, key_name);
-    
-    if (edn_type(val) == EDN_TYPE_STRING) {
-        size_t val_len;
-        const char *str = edn_string_get(val, &amp;amp;val_len);
-        printf("\"%.*s\"\n", (int)val_len, str);
-    } else if (edn_type(val) == EDN_TYPE_INT) {
-        int64_t num;
-        edn_int64_get(val, &amp;amp;num);
-        printf("%lld\n", (long long)num);
-    }
-}
-
-// Lookup by key
-edn_result_t key = edn_read(":name", 0);
-edn_value_t *name = edn_map_lookup(r.value, key.value);
-if (name != NULL) {
-    size_t len;
-    const char *str = edn_string_get(name, &amp;amp;len);
-    printf("Name: %.*s\n", (int)len, str);
-}
-
-edn_free(key.value);
-edn_free(r.value);&lt;/code&gt;
-    &lt;p&gt;Map Convenience Functions:&lt;/p&gt;
-    &lt;code&gt;edn_value_t *edn_map_get_keyword(const edn_value_t *map, const char *keyword);
-edn_value_t *edn_map_get_namespaced_keyword(const edn_value_t *map, const char *namespace, const char *name);
-edn_value_t *edn_map_get_string_key(const edn_value_t *map, const char *key);&lt;/code&gt;
-    &lt;p&gt;Convenience wrappers that simplify common map lookup patterns by creating the key internally.&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read("{:name \"Alice\" :family/name \"Black\" :age 30 \"config\" true}", 0);
-
-// Keyword lookup
-edn_value_t* name = edn_map_get_keyword(r.value, "name");
-if (name &amp;amp;&amp;amp; edn_is_string(name)) {
-    // name is "Alice"
-}
-
-edn_value_t* name = edn_map_get_namespaced_keyword(r.value, "family", "name");
-if (name &amp;amp;&amp;amp; edn_is_string(name)) {
-    // name is "Black"
-}
-
-// String key lookup
-edn_value_t* config = edn_map_get_string_key(r.value, "config");
-if (config) {
-    bool val;
-    edn_bool_get(config, &amp;amp;val);  // val is true
-}
-
-edn_free(r.value);&lt;/code&gt;
-    &lt;p&gt;Tagged literals provide extensibility: &lt;code&gt;#tag value&lt;/code&gt;&lt;/p&gt;
-    &lt;code&gt;bool edn_tagged_get(const edn_value_t *value,
-                    const char **tag, size_t *tag_length,
-                    edn_value_t **tagged_value);&lt;/code&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t r = edn_read("#inst \"2024-01-01T00:00:00Z\"", 0);
-
-const char *tag;
-size_t tag_len;
-edn_value_t *wrapped;
-
-if (edn_tagged_get(r.value, &amp;amp;tag, &amp;amp;tag_len, &amp;amp;wrapped)) {
-    printf("Tag: %.*s\n", (int)tag_len, tag);
-    
-    size_t str_len;
-    const char *str = edn_string_get(wrapped, &amp;amp;str_len);
-    printf("Value: %.*s\n", (int)str_len, str);
-}
-
-edn_free(r.value);&lt;/code&gt;
-    &lt;p&gt;Transform tagged literals during parsing with custom reader functions.&lt;/p&gt;
-    &lt;code&gt;// Create and destroy registry
-edn_reader_registry_t *edn_reader_registry_create(void);
-void edn_reader_registry_destroy(edn_reader_registry_t *registry);
-
-// Register/unregister readers
-bool edn_reader_register(edn_reader_registry_t *registry,
-                         const char *tag, edn_reader_fn reader);
-void edn_reader_unregister(edn_reader_registry_t *registry, const char *tag);
-edn_reader_fn edn_reader_lookup(const edn_reader_registry_t *registry,
-                                const char *tag);&lt;/code&gt;
-    &lt;code&gt;typedef edn_value_t *(*edn_reader_fn)(edn_value_t *value,
-                                      edn_arena_t *arena,
-                                      const char **error_message);&lt;/code&gt;
-    &lt;p&gt;A reader function receives the wrapped value and transforms it into a new representation. On error, set &lt;code&gt;error_message&lt;/code&gt; to a static string and return NULL.&lt;/p&gt;
-    &lt;code&gt;typedef struct {
-    edn_reader_registry_t *reader_registry;  // Optional reader registry
-    edn_value_t *eof_value;                  // Optional value to return on EOF
-    edn_default_reader_mode_t default_reader_mode;
-} edn_parse_options_t;
-
-edn_result_t edn_read_with_options(const char *input, size_t length,
-                                    const edn_parse_options_t *options);&lt;/code&gt;
-    &lt;p&gt;Parse options fields:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;reader_registry&lt;/code&gt;: Optional reader registry for tagged literal transformations&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;eof_value&lt;/code&gt;: Optional value to return when EOF is encountered instead of an error&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;default_reader_mode&lt;/code&gt;: Behavior for unregistered tags (see below)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Default reader modes:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;EDN_DEFAULT_READER_PASSTHROUGH&lt;/code&gt;: Return&lt;code&gt;EDN_TYPE_TAGGED&lt;/code&gt;for unregistered tags (default)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;EDN_DEFAULT_READER_UNWRAP&lt;/code&gt;: Discard tag, return wrapped value&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;EDN_DEFAULT_READER_ERROR&lt;/code&gt;: Fail with&lt;code&gt;EDN_ERROR_UNKNOWN_TAG&lt;/code&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;EOF Value Handling:&lt;/p&gt;
-    &lt;p&gt;By default, when the parser encounters end-of-file (empty input, whitespace-only input, or after &lt;code&gt;#_&lt;/code&gt; discard), it returns &lt;code&gt;EDN_ERROR_UNEXPECTED_EOF&lt;/code&gt;. You can customize this behavior by providing an &lt;code&gt;eof_value&lt;/code&gt; in the parse options:&lt;/p&gt;
-    &lt;code&gt;// First, create an EOF sentinel value
-edn_result_t eof_sentinel = edn_read(":eof", 0);
-
-// Configure parse options with EOF value
-edn_parse_options_t options = {
-    .reader_registry = NULL,
-    .eof_value = eof_sentinel.value,
-    .default_reader_mode = EDN_DEFAULT_READER_PASSTHROUGH
-};
-
-// Parse input that results in EOF
-edn_result_t result = edn_read_with_options("   ", 3, &amp;amp;options);
-
-// Instead of EDN_ERROR_UNEXPECTED_EOF, returns EDN_OK with eof_value
-if (result.error == EDN_OK) {
-    // result.value == eof_sentinel.value
-    const char* name;
-    edn_keyword_get(result.value, NULL, NULL, &amp;amp;name, NULL);
-    // name == "eof"
-}
-
-// Clean up
-edn_free(eof_sentinel.value);&lt;/code&gt;
-    &lt;code&gt;#include "edn.h"
-#include "../src/edn_internal.h"  // For edn_arena_alloc
-
-// Reader that uppercases keywords
-static edn_value_t *upper_reader(edn_value_t *value, edn_arena_t *arena,
-                                 const char **error_message) {
-    if (edn_type(value) != EDN_TYPE_KEYWORD) {
-        *error_message = "#upper requires keyword";
-        return NULL;
-    }
-
-    const char *name;
-    size_t name_len;
-    edn_keyword_get(value, NULL, NULL, &amp;amp;name, &amp;amp;name_len);
-
-    // Allocate uppercase name in arena
-    char *upper = (char *)edn_arena_alloc(arena, name_len + 1);
-    if (!upper) {
-        *error_message = "Out of memory";
-        return NULL;
-    }
-
-    for (size_t i = 0; i &amp;lt; name_len; i++) {
-        char c = name[i];
-        upper[i] = (c &amp;gt;= 'a' &amp;amp;&amp;amp; c &amp;lt;= 'z') ? (c - 32) : c;
-    }
-    upper[name_len] = '\0';
-
-    // Create new keyword value
-    edn_value_t *result = edn_arena_alloc_value(arena);
-    if (!result) {
-        *error_message = "Out of memory";
-        return NULL;
-    }
-
-    result-&amp;gt;type = EDN_TYPE_KEYWORD;
-    result-&amp;gt;as.keyword.name = upper;
-    result-&amp;gt;as.keyword.name_length = name_len;
-    result-&amp;gt;as.keyword.namespace = NULL;
-    result-&amp;gt;as.keyword.ns_length = 0;
-    result-&amp;gt;arena = arena;
-
-    return result;
-}
-
-int main(void) {
-    // Create registry and register reader
-    edn_reader_registry_t *registry = edn_reader_registry_create();
-    edn_reader_register(registry, "upper", upper_reader);
-
-    // Parse with custom reader
-    edn_parse_options_t opts = {
-        .reader_registry = registry,
-        .default_reader_mode = EDN_DEFAULT_READER_PASSTHROUGH
-    };
-
-    edn_result_t r = edn_read_with_options("#upper :hello", 0, &amp;amp;opts);
-    if (r.error == EDN_OK) {
-        const char *name;
-        size_t len;
-        edn_keyword_get(r.value, NULL, NULL, &amp;amp;name, &amp;amp;len);
-        printf(":%.*s\n", (int)len, name);  // Output: :HELLO
-    }
-
-    edn_free(r.value);
-    edn_reader_registry_destroy(registry);
-    return 0;
-}&lt;/code&gt;
-    &lt;p&gt;See &lt;code&gt;examples/reader.c&lt;/code&gt; for more complete examples including timestamp conversion, vector extraction, and namespaced tags.&lt;/p&gt;
-    &lt;p&gt;EDN.C supports Clojure's map namespace syntax extension, which allows you to specify a namespace that gets automatically applied to all non-namespaced keyword keys in a map.&lt;/p&gt;
-    &lt;p&gt;Syntax: &lt;code&gt;#:namespace{:key1 val1 :key2 val2}&lt;/code&gt;&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t result = edn_read("#:person{:name \"Alice\" :age 30}", 0);
-// Equivalent to: {:person/name "Alice" :person/age 30}
-
-if (result.error == EDN_OK) {
-    edn_value_t* map = result.value;
-    
-    // Keys are automatically namespaced
-    edn_value_t* key1 = edn_map_get_key(map, 0);
-    const char *ns, *name;
-    size_t ns_len, name_len;
-    edn_keyword_get(key1, &amp;amp;ns, &amp;amp;ns_len, &amp;amp;name, &amp;amp;name_len);
-    
-    printf(":%.*s/%.*s\n", (int)ns_len, ns, (int)name_len, name);
-    // Output: :person/name
-    
-    edn_free(map);
-}&lt;/code&gt;
-    &lt;p&gt;Rules:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Both keyword and symbol keys without an existing namespace are transformed&lt;/item&gt;
-      &lt;item&gt;Keys with existing namespaces are preserved: &lt;code&gt;#:foo{:x 1 :bar/y 2}&lt;/code&gt;→&lt;code&gt;{:foo/x 1 :bar/y 2}&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Symbol keys are also namespaced: &lt;code&gt;#:foo{x 1 y 2}&lt;/code&gt;→&lt;code&gt;{foo/x 1 foo/y 2}&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Mixed keys work correctly: &lt;code&gt;#:foo{x 1 :y 2}&lt;/code&gt;→&lt;code&gt;{foo/x 1 :foo/y 2}&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Non-keyword/non-symbol keys are not transformed: &lt;code&gt;#:foo{"x" 1 :y 2}&lt;/code&gt;→&lt;code&gt;{"x" 1 :foo/y 2}&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;The namespace keyword cannot itself have a namespace&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Build Configuration:&lt;/p&gt;
-    &lt;p&gt;This feature is disabled by default. To enable it:&lt;/p&gt;
-    &lt;code&gt;make MAP_NAMESPACE_SYNTAX=1&lt;/code&gt;
-    &lt;p&gt;When disabled (default), &lt;code&gt;#:foo{...}&lt;/code&gt; will fail to parse.&lt;/p&gt;
-    &lt;p&gt;See &lt;code&gt;examples/example_namespaced_map.c&lt;/code&gt; for more details.&lt;/p&gt;
-    &lt;p&gt;EDN.C supports optional extended character literal features that are disabled by default for strict EDN compliance.&lt;/p&gt;
-    &lt;p&gt;Extended named characters:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;\formfeed&lt;/code&gt;- Form feed control character (U+000C)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;\backspace&lt;/code&gt;- Backspace control character (U+0008)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Octal escape sequences (Clojure-compatible):&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;\oN&lt;/code&gt;- Where N is 1-3 octal digits (0-7)&lt;/item&gt;
-      &lt;item&gt;If &lt;code&gt;\o&lt;/code&gt;is followed by any digit, attempts octal parsing&lt;/item&gt;
-      &lt;item&gt;Digits 8 or 9 cause "Invalid octal escape sequence in character literal" error&lt;/item&gt;
-      &lt;item&gt;Examples: &lt;list rend="ul"&gt;&lt;item&gt;&lt;code&gt;\o7&lt;/code&gt;- Bell character (U+0007)&lt;/item&gt;&lt;item&gt;&lt;code&gt;\o12&lt;/code&gt;- Line feed (U+000A)&lt;/item&gt;&lt;item&gt;&lt;code&gt;\o101&lt;/code&gt;- Uppercase 'A' (U+0041)&lt;/item&gt;&lt;item&gt;&lt;code&gt;\o377&lt;/code&gt;- Maximum value (U+00FF / 255)&lt;/item&gt;&lt;item&gt;&lt;code&gt;\o&lt;/code&gt;alone - Parses as character 'o'&lt;/item&gt;&lt;item&gt;&lt;code&gt;\o8&lt;/code&gt;- Error: Invalid octal character&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;edn_result_t result = edn_read("\\formfeed", 0);
-if (result.error == EDN_OK) {
-    uint32_t codepoint;
-    edn_character_get(result.value, &amp;amp;codepoint);
-    printf("U+%04X\n", codepoint);  // Output: U+000C
-    edn_free(result.value);
-}
-
-// Octal escapes
-result = edn_read("[\\o101 \\o102 \\o103]", 0);
-// Parses as vector ['A', 'B', 'C']&lt;/code&gt;
-    &lt;p&gt;Build Configuration:&lt;/p&gt;
-    &lt;p&gt;This feature is disabled by default. To enable it:&lt;/p&gt;
-    &lt;p&gt;Make:&lt;/p&gt;
-    &lt;code&gt;make EXTENDED_CHARACTERS=1&lt;/code&gt;
-    &lt;p&gt;CMake:&lt;/p&gt;
-    &lt;code&gt;cmake -DEDN_ENABLE_EXTENDED_CHARACTERS=ON ..
-make&lt;/code&gt;
-    &lt;p&gt;When disabled (default):&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;\formfeed&lt;/code&gt;and&lt;code&gt;\backspace&lt;/code&gt;will fail to parse&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;\oNNN&lt;/code&gt;will fail to parse&lt;/item&gt;
-      &lt;item&gt;Standard character literals still work: &lt;code&gt;\newline&lt;/code&gt;,&lt;code&gt;\tab&lt;/code&gt;,&lt;code&gt;\space&lt;/code&gt;,&lt;code&gt;\return&lt;/code&gt;,&lt;code&gt;\uXXXX&lt;/code&gt;, etc.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;See &lt;code&gt;examples/example_extended_characters.c&lt;/code&gt; for more details.&lt;/p&gt;
-    &lt;p&gt;EDN.C supports Clojure-style metadata syntax, which allows attaching metadata maps to values.&lt;/p&gt;
-    &lt;p&gt;Syntax variants:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Map metadata: &lt;code&gt;^{:key val} form&lt;/code&gt;- metadata is the map itself&lt;/item&gt;
-      &lt;item&gt;Keyword shorthand: &lt;code&gt;^:keyword form&lt;/code&gt;- expands to&lt;code&gt;{:keyword true}&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;String tag: &lt;code&gt;^"string" form&lt;/code&gt;- expands to&lt;code&gt;{:tag "string"}&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Symbol tag: &lt;code&gt;^symbol form&lt;/code&gt;- expands to&lt;code&gt;{:tag symbol}&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Vector param-tags: &lt;code&gt;^[type1 type2] form&lt;/code&gt;- expands to&lt;code&gt;{:param-tags [type1 type2]}&lt;/code&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Chaining: Multiple metadata can be chained: &lt;code&gt;^meta1 ^meta2 form&lt;/code&gt; - metadata maps are merged from right to left.&lt;/p&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;#include "edn.h"
-#include &amp;lt;stdio.h&amp;gt;
-
-int main(void) {
-    // Parse with keyword shorthand
-    edn_result_t result = edn_read("^:private my-var", 0);
-
-    if (result.error == EDN_OK) {
-        // Check if value has metadata
-        if (edn_value_has_meta(result.value)) {
-            edn_value_t* meta = edn_value_meta(result.value);
-
-            // Metadata is always a map
-            printf("Metadata entries: %zu\n", edn_map_count(meta));
-
-            // Look up specific metadata key
-            edn_result_t key = edn_read(":private", 0);
-            edn_value_t* val = edn_map_lookup(meta, key.value);
-            // val will be boolean true
-
-            edn_free(key.value);
-        }
-
-        edn_free(result.value);
-    }
-
-    return 0;
-}&lt;/code&gt;
-    &lt;p&gt;More examples:&lt;/p&gt;
-    &lt;code&gt;// Map metadata
-edn_read("^{:doc \"A function\" :test true} my-fn", 0);
-
-// String tag
-edn_read("^\"String\" [1 2 3]", 0);
-// Expands to: ^{:tag "String"} [1 2 3]
-
-// Symbol tag
-edn_read("^Vector [1 2 3]", 0);
-// Expands to: ^{:tag Vector} [1 2 3]
-
-// Vector param-tags
-edn_read("^[String long _] my-fn", 0);
-// Expands to: ^{:param-tags [String long _]} my-fn
-
-// Chained metadata
-edn_read("^:private ^:dynamic ^{:doc \"My var\"} x", 0);
-// All metadata merged into one map&lt;/code&gt;
-    &lt;p&gt;Supported value types:&lt;/p&gt;
-    &lt;p&gt;Metadata can only be attached to:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Collections: lists, vectors, maps, sets&lt;/item&gt;
-      &lt;item&gt;Tagged literals&lt;/item&gt;
-      &lt;item&gt;Symbols&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Note: Metadata cannot be attached to scalar values (nil, booleans, numbers, strings, keywords).&lt;/p&gt;
-    &lt;p&gt;API:&lt;/p&gt;
-    &lt;code&gt;// Check if value has metadata
-bool edn_value_has_meta(const edn_value_t* value);
-
-// Get metadata map (returns NULL if no metadata)
-edn_value_t* edn_value_meta(const edn_value_t* value);&lt;/code&gt;
-    &lt;p&gt;Build Configuration:&lt;/p&gt;
-    &lt;p&gt;This feature is disabled by default. To enable it:&lt;/p&gt;
-    &lt;p&gt;Make:&lt;/p&gt;
-    &lt;code&gt;make METADATA=1&lt;/code&gt;
-    &lt;p&gt;CMake:&lt;/p&gt;
-    &lt;code&gt;cmake -DEDN_ENABLE_METADATA=ON ..
-make&lt;/code&gt;
-    &lt;p&gt;When disabled (default):&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;^&lt;/code&gt;is treated as a valid character in identifiers (symbols/keywords)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;^test&lt;/code&gt;parses as a symbol named "^test"&lt;/item&gt;
-      &lt;item&gt;Metadata API functions are not available&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Note: Metadata is a Clojure language feature, not part of the official EDN specification. It's provided here for compatibility with Clojure's reader.&lt;/p&gt;
-    &lt;p&gt;See &lt;code&gt;examples/example_metadata.c&lt;/code&gt; for more details.&lt;/p&gt;
-    &lt;p&gt;Experimental feature that adds Java-style multi-line text blocks with automatic indentation stripping to EDN. Requires &lt;code&gt;EDN_ENABLE_TEXT_BLOCKS&lt;/code&gt; compilation flag (disabled by default).&lt;/p&gt;
-    &lt;p&gt;Text blocks start with three double quotes followed by a newline (&lt;code&gt;"""\n&lt;/code&gt;) and end with three double quotes (&lt;code&gt;"""&lt;/code&gt;):&lt;/p&gt;
-    &lt;code&gt;{:query """
-    SELECT *
-      FROM users
-    WHERE age &amp;gt; 21
-    """}&lt;/code&gt;
-    &lt;p&gt;Features:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Automatic indentation stripping (common leading whitespace removed)&lt;/item&gt;
-      &lt;item&gt;Closing &lt;code&gt;"""&lt;/code&gt;position determines base indentation level&lt;/item&gt;
-      &lt;item&gt;Closing on own line adds trailing newline, on same line doesn't&lt;/item&gt;
-      &lt;item&gt;Trailing whitespace automatically removed from each line&lt;/item&gt;
-      &lt;item&gt;Minimal escaping: only &lt;code&gt;\"""&lt;/code&gt;to include literal triple quotes&lt;/item&gt;
-      &lt;item&gt;Returns standard EDN string (no special type needed)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;#include "edn.h"
-#include &amp;lt;stdio.h&amp;gt;
-
-int main(void) {
-    const char* input =
-        "{:sql \"\"\"\n"
-        "       SELECT * FROM users\n"
-        "       WHERE age &amp;gt; 21\n"
-        "       ORDER BY name\n"
-        "       \"\"\""}";
-
-    edn_result_t result = edn_read(input, 0);
-
-    if (result.error == EDN_OK) {
-        edn_result_t key = edn_read(":sql", 0);
-        edn_value_t* val = edn_map_lookup(result.value, key.value);
-
-        // Text block returns a regular string with indentation stripped
-        size_t len;
-        const char* sql = edn_string_get(val, &amp;amp;len);
-        printf("%s\n", sql);
-        // Output:
-        // SELECT * FROM users
-        // WHERE age &amp;gt; 21
-        // ORDER BY name
-
-        edn_free(key.value);
-        edn_free(result.value);
-    }
-
-    return 0;
-}&lt;/code&gt;
-    &lt;p&gt;Indentation Rules (Java JEP 378):&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Find minimum indentation across all non-blank lines&lt;/item&gt;
-      &lt;item&gt;Closing &lt;code&gt;"""&lt;/code&gt;position also determines indentation&lt;/item&gt;
-      &lt;item&gt;Strip that amount from each line&lt;/item&gt;
-      &lt;item&gt;If closing &lt;code&gt;"""&lt;/code&gt;is on its own line, add trailing&lt;code&gt;\n&lt;/code&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;code&gt;{:foo """
-        line1
-       line2
-      line3
-      """}&lt;/code&gt;
-    &lt;p&gt;Result: &lt;code&gt;{:foo "  line1\n line2\nline3\n"}&lt;/code&gt; (min indent 6, trailing newline added)&lt;/p&gt;
-    &lt;code&gt;{:foo """
-        line1
-       line2
-      line3"""}&lt;/code&gt;
-    &lt;p&gt;Result: &lt;code&gt;{:foo "  line1\n line2\nline3"}&lt;/code&gt; (min indent 6, no trailing newline)&lt;/p&gt;
-    &lt;p&gt;Build Configuration:&lt;/p&gt;
-    &lt;p&gt;This feature is disabled by default. To enable it:&lt;/p&gt;
-    &lt;p&gt;Make:&lt;/p&gt;
-    &lt;code&gt;make TEXT_BLOCKS=1&lt;/code&gt;
-    &lt;p&gt;CMake:&lt;/p&gt;
-    &lt;code&gt;cmake -DEDN_ENABLE_TEXT_BLOCKS=ON ..
-make&lt;/code&gt;
-    &lt;p&gt;When disabled (default):&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;"""\n&lt;/code&gt;pattern is parsed as a regular string&lt;/item&gt;
-      &lt;item&gt;No automatic indentation processing&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Note: Text blocks are an experimental feature and not part of the official EDN specification.&lt;/p&gt;
-    &lt;p&gt;See &lt;code&gt;examples/example_text_block.c&lt;/code&gt; for more examples.&lt;/p&gt;
-    &lt;p&gt;EDN.C includes an interactive terminal viewer for exploring EDN data:&lt;/p&gt;
-    &lt;code&gt;# Build the TUI
-make tui
-
-# Explore data interactively
-./examples/edn_tui data.edn
-
-# Use arrow keys to navigate, Enter/Space to expand/collapse, q to quit&lt;/code&gt;
-    &lt;p&gt;EDN.C includes a command-line tool for parsing and pretty-printing EDN files:&lt;/p&gt;
-    &lt;code&gt;# Build the CLI
-make cli
-
-# Parse and pretty-print a file
-./examples/edn_cli data.edn
-
-# Or from stdin
-echo '{:name "Alice" :age 30}' | ./examples/edn_cli&lt;/code&gt;
-    &lt;code&gt;#include "edn.h"
-#include &amp;lt;stdio.h&amp;gt;
-#include &amp;lt;string.h&amp;gt;
-
-void print_value(edn_value_t *val, int indent) {
-    for (int i = 0; i &amp;lt; indent; i++) printf("  ");
-    
-    switch (edn_type(val)) {
-        case EDN_TYPE_NIL:
-            printf("nil\n");
-            break;
-        case EDN_TYPE_BOOL:
-            // Note: Use internal API or add edn_bool_get() to public API
-            printf("bool\n");
-            break;
-        case EDN_TYPE_INT: {
-            int64_t num;
-            edn_int64_get(val, &amp;amp;num);
-            printf("%lld\n", (long long)num);
-            break;
-        }
-        case EDN_TYPE_FLOAT: {
-            double num;
-            edn_double_get(val, &amp;amp;num);
-            printf("%g\n", num);
-            break;
-        }
-        case EDN_TYPE_STRING: {
-            size_t len;
-            const char *str = edn_string_get(val, &amp;amp;len);
-            printf("\"%.*s\"\n", (int)len, str);
-            break;
-        }
-        case EDN_TYPE_KEYWORD: {
-            const char *name;
-            size_t len;
-            edn_keyword_get(val, NULL, NULL, &amp;amp;name, &amp;amp;len);
-            printf(":%.*s\n", (int)len, name);
-            break;
-        }
-        case EDN_TYPE_VECTOR: {
-            printf("[\n");
-            size_t count = edn_vector_count(val);
-            for (size_t i = 0; i &amp;lt; count; i++) {
-                print_value(edn_vector_get(val, i), indent + 1);
-            }
-            for (int i = 0; i &amp;lt; indent; i++) printf("  ");
-            printf("]\n");
-            break;
-        }
-        case EDN_TYPE_MAP: {
-            printf("{\n");
-            size_t count = edn_map_count(val);
-            for (size_t i = 0; i &amp;lt; count; i++) {
-                print_value(edn_map_get_key(val, i), indent + 1);
-                print_value(edn_map_get_value(val, i), indent + 1);
-            }
-            for (int i = 0; i &amp;lt; indent; i++) printf("  ");
-            printf("}\n");
-            break;
-        }
-        default:
-            printf("&amp;lt;other type&amp;gt;\n");
-    }
-}
-
-int main(void) {
-    const char *edn = 
-        "{:users [{:name \"Alice\" :age 30}\n"
-        "         {:name \"Bob\" :age 25}]\n"
-        " :status :active}";
-    
-    edn_result_t result = edn_read(edn, 0);
-    
-    if (result.error != EDN_OK) {
-        fprintf(stderr, "Error at %zu:%zu - %s\n",
-                result.error_line, result.error_column, result.error_message);
-        return 1;
-    }
-    
-    printf("Parsed EDN structure:\n");
-    print_value(result.value, 0);
-    
-    edn_free(result.value);
-    return 0;
-}&lt;/code&gt;
-    &lt;p&gt;More examples available in the &lt;code&gt;examples/&lt;/code&gt; directory.&lt;/p&gt;
-    &lt;code&gt;# Build library (libedn.a)
-make
-
-# Build and run all tests
-make test
-
-# Build and run single test
-make test/test_numbers
-./test/test_numbers
-
-# Build with debug symbols and sanitizers (ASAN/UBSAN)
-make DEBUG=1
-
-# Run benchmarks
-make bench          # Quick benchmark
-make bench-all      # All benchmarks
-
-# Clean build artifacts
-make clean
-
-# Show build configuration
-make info&lt;/code&gt;
-    &lt;p&gt;EDN.C fully supports Windows with MSVC, MinGW, and Clang. Choose your preferred method:&lt;/p&gt;
-    &lt;p&gt;Quick Start (CMake - Recommended):&lt;/p&gt;
-    &lt;code&gt;# Using the provided build script
-.\build.bat
-
-# Or with PowerShell
-.\build.ps1 -Test&lt;/code&gt;
-    &lt;p&gt;Manual CMake Build:&lt;/p&gt;
-    &lt;code&gt;mkdir build
-cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --config Release
-ctest -C Release&lt;/code&gt;
-    &lt;p&gt;Visual Studio:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Open &lt;code&gt;CMakeLists.txt&lt;/code&gt;in Visual Studio 2019+&lt;/item&gt;
-      &lt;item&gt;Build → Build All (Ctrl+Shift+B)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;For detailed Windows build instructions, see docs/WINDOWS.md.&lt;/p&gt;
-    &lt;p&gt;Standard options:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;DEBUG=1&lt;/code&gt;- Enable debug symbols, ASAN, and UBSAN&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;SANITIZE=1&lt;/code&gt;- Enable sanitizers without full debug build&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;OPTIMIZE=0&lt;/code&gt;- Disable optimizations&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;VERBOSE=1&lt;/code&gt;- Show full compiler commands&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Optional EDN features (disabled by default):&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;MAP_NAMESPACE_SYNTAX=1&lt;/code&gt;- Enable&lt;code&gt;#:ns{...}&lt;/code&gt;map namespace syntax&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;EXTENDED_CHARACTERS=1&lt;/code&gt;- Enable&lt;code&gt;\formfeed&lt;/code&gt;,&lt;code&gt;\backspace&lt;/code&gt;,&lt;code&gt;\oNNN&lt;/code&gt;octal escapes&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;METADATA=1&lt;/code&gt;- Enable Clojure-style metadata&lt;code&gt;^{...}&lt;/code&gt;syntax&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;TEXT_BLOCKS=1&lt;/code&gt;- Enable Java-style text blocks&lt;code&gt;"""\n...\n"""&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;RATIO=1&lt;/code&gt;- Enable ratio numbers&lt;code&gt;22/7&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;EXTENDED_INTEGERS=1&lt;/code&gt;- Enable hex (&lt;code&gt;0xFF&lt;/code&gt;), octal (&lt;code&gt;0777&lt;/code&gt;), binary (&lt;code&gt;2r1010&lt;/code&gt;), and radix (&lt;code&gt;36rZZ&lt;/code&gt;) formats&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;UNDERSCORE_IN_NUMERIC=1&lt;/code&gt;- Enable underscores in numeric literals&lt;code&gt;1_000_000&lt;/code&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;# Build with metadata and ratio support
-make METADATA=1 RATIO=1&lt;/code&gt;
-    &lt;code&gt;# Auto-format all C files (run before committing!)
-make format
-
-# Check if formatting is needed without modifying
-make format-check&lt;/code&gt;
-    &lt;code&gt;# Generate compile_commands.json for LSP (requires bear or compiledb)
-make compile-commands&lt;/code&gt;
-    &lt;p&gt;EDN.C is designed for high performance with several optimizations:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;SIMD acceleration: Vectorized whitespace scanning, comment skipping, and identifier parsing&lt;/item&gt;
-      &lt;item&gt;Zero-copy strings: String values without escapes point directly into input buffer&lt;/item&gt;
-      &lt;item&gt;Lazy decoding: Escape sequences decoded only when accessed via &lt;code&gt;edn_string_get()&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Arena allocation: Single bulk allocation and deallocation eliminates malloc overhead&lt;/item&gt;
-      &lt;item&gt;Efficient collections: Maps and sets use sorted arrays with binary search&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Typical performance on Apple M1 (from microbenchmarks):&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Whitespace skipping: 1-5 ns per operation&lt;/item&gt;
-      &lt;item&gt;Number parsing: 10-30 ns per number&lt;/item&gt;
-      &lt;item&gt;String parsing: 15-50 ns per string&lt;/item&gt;
-      &lt;item&gt;Identifier parsing: 10-25 ns per symbol/keyword&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;See &lt;code&gt;bench/&lt;/code&gt; directory for detailed benchmarking tools and results.&lt;/p&gt;
-    &lt;p&gt;Current version: 1.0.0 (Release Candidate)&lt;/p&gt;
-    &lt;p&gt;✅ Complete features:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Full EDN specification support&lt;/item&gt;
-      &lt;item&gt;All scalar types (nil, bool, int, bigint, float, character, string, symbol, keyword)&lt;/item&gt;
-      &lt;item&gt;All collection types (lists, vectors, maps, sets)&lt;/item&gt;
-      &lt;item&gt;Tagged literals with custom reader support&lt;/item&gt;
-      &lt;item&gt;Discard forms &lt;code&gt;#_&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Comments (&lt;code&gt;;&lt;/code&gt;line comments)&lt;/item&gt;
-      &lt;item&gt;Duplicate detection for maps/sets&lt;/item&gt;
-      &lt;item&gt;Deep structural equality&lt;/item&gt;
-      &lt;item&gt;SIMD optimization for ARM64 (NEON) and x86_64 (SSE4.2)&lt;/item&gt;
-      &lt;item&gt;Cross-platform support (Unix, macOS, Linux, Windows)&lt;/item&gt;
-      &lt;item&gt;Optional Clojure extensions (disabled by default): &lt;list rend="ul"&gt;&lt;item&gt;Map namespace syntax &lt;code&gt;#:ns{...}&lt;/code&gt;&lt;/item&gt;&lt;item&gt;Extended character literals (&lt;code&gt;\formfeed&lt;/code&gt;,&lt;code&gt;\backspace&lt;/code&gt;,&lt;code&gt;\oNNN&lt;/code&gt;)&lt;/item&gt;&lt;item&gt;Metadata &lt;code&gt;^{...}&lt;/code&gt;syntax&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
-      &lt;item&gt;Map namespace syntax &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;✅ Testing:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;340+ tests across 24 test suites&lt;/item&gt;
-      &lt;item&gt;Memory safety verified with ASAN/UBSAN&lt;/item&gt;
-      &lt;item&gt;Edge case coverage (empty collections, deeply nested structures, Unicode, etc.)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;📋 Roadmap:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Performance profiling and further optimization&lt;/item&gt;
-      &lt;item&gt;Extended documentation and tutorials&lt;/item&gt;
-      &lt;item&gt;Streaming/Incremental parsing&lt;/item&gt;
-      &lt;item&gt;Additional SIMD Platform Support: &lt;list rend="ul"&gt;&lt;item&gt;32-bit x86 (i386/i686) &lt;code&gt;__i386__, _M_IX86. mostly the same as x86-64&lt;/code&gt;&lt;/item&gt;&lt;item&gt;32-bit ARM (ARMv7) &lt;code&gt;__arm__, _M_ARM. mostly the same as ARM64 NEON&lt;/code&gt;&lt;/item&gt;&lt;item&gt;RISC-V Vector Extension (RVV) &lt;code&gt;__riscv, __riscv_vector. uses &amp;lt;riscv_vector.h&amp;gt;&lt;/code&gt;&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
-      &lt;item&gt;32-bit x86 (i386/i686) &lt;/item&gt;
-      &lt;item&gt;Extra features: &lt;list rend="ul"&gt;&lt;item&gt;float trailing dot ("1." =&amp;gt; 1.0, "1.M" =&amp;gt; 1.0M)&lt;/item&gt;&lt;item&gt;octal escape (""\176"" =&amp;gt; "~")&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Contributions are welcome! Please:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Run &lt;code&gt;make format&lt;/code&gt;before committing (auto-formats with clang-format)&lt;/item&gt;
-      &lt;item&gt;Ensure all tests pass with &lt;code&gt;make test&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Add tests for new features&lt;/item&gt;
-      &lt;item&gt;Follow the existing code style (K&amp;amp;R, 4 spaces, C11, see &lt;code&gt;.clang-format&lt;/code&gt;)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;docs/DESIGN.md - Architecture and design philosophy&lt;/item&gt;
-      &lt;item&gt;docs/READER_DESIGN.md - Custom reader implementation&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;MIT License&lt;/p&gt;
-    &lt;p&gt;Copyright (c) 2025 [Kirill Chernyshov]&lt;/p&gt;
-    &lt;p&gt;Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:&lt;/p&gt;
-    &lt;p&gt;The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.&lt;/p&gt;
-    &lt;p&gt;THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;EDN specification: https://github.com/edn-format/edn&lt;/item&gt;
-      &lt;item&gt;Inspired by Clojure's EDN implementation&lt;/item&gt;
-      &lt;item&gt;Benchmark files from fast-edn&lt;/item&gt;
-      &lt;item&gt;SWAR (SIMD Within A Register) digit parsing technique from simdjson&lt;/item&gt;
-      &lt;item&gt;Fast double parsing using Clinger's algorithm (William D. Clinger, 1990) - "How to Read Floating Point Numbers Accurately"&lt;/item&gt;
-      &lt;item&gt;SIMD optimization patterns from high-performance JSON parsers (simdjson, yyjson)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Questions or issues? Please open an issue on GitHub or consult the documentation in the &lt;code&gt;docs/&lt;/code&gt; directory.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46032230</guid><pubDate>Mon, 24 Nov 2025 09:51:45 +0000</pubDate></item><item><title>Shai-Hulud Returns: Over 300 NPM Packages Infected</title><link>https://helixguard.ai/blog/malicious-sha1hulud-2025-11-24</link><guid isPermaLink="false">https://news.ycombinator.com/item?id=46032539</guid><pubDate>Mon, 24 Nov 2025 10:40:22 +0000</pubDate></item><item><title>Chrome Jpegxl Issue Reopened</title><link>https://issues.chromium.org/issues/40168998</link><description>&lt;doc fingerprint="732bc1ae2d485202"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46032148</guid><pubDate>Mon, 24 Nov 2025 09:40:32 +0000</pubDate></item><item><title>Shai-Hulud Returns: Over 300 NPM Packages Infected</title><link>https://helixguard.ai/blog/malicious-sha1hulud-2025-11-24</link><guid isPermaLink="false">https://news.ycombinator.com/item?id=46032539</guid><pubDate>Mon, 24 Nov 2025 10:40:22 +0000</pubDate></item><item><title>Chrome Jpegxl Issue Reopened</title><link>https://issues.chromium.org/issues/40168998</link><description>&lt;doc fingerprint="732bc1ae2d485202"&gt;
   &lt;main&gt;
     &lt;p&gt;Sign in&lt;/p&gt;
   &lt;/main&gt;
@@ -2101,44 +1624,7 @@ make compile-commands&lt;/code&gt;
     &lt;p&gt;More&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46036908</guid><pubDate>Mon, 24 Nov 2025 17:52:43 +0000</pubDate></item><item><title>Mind-reading devices can now predict preconscious thoughts</title><link>https://www.nature.com/articles/d41586-025-03714-0</link><description>&lt;doc fingerprint="bc2ac354b92b09e0"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Thank you for visiting nature.com. You are using a browser version with limited support for CSS. To obtain the best experience, we recommend you use a more up to date browser (or turn off compatibility mode in Internet Explorer). In the meantime, to ensure continued support, we are displaying the site without styles and JavaScript.&lt;/p&gt;
-    &lt;p&gt;Before a car crash in 2008 left her paralysed from the neck down, Nancy Smith enjoyed playing the piano. Years later, Smith started making music again, thanks to an implant that recorded and analysed her brain activity. When she imagined playing an on-screen keyboard, her brain–computer interface (BCI) translated her thoughts into keystrokes — and simple melodies, such as ‘Twinkle, Twinkle, Little Star’, rang out1.&lt;/p&gt;
-    &lt;p&gt;But there was a twist. For Smith, it seemed as if the piano played itself. “It felt like the keys just automatically hit themselves without me thinking about it,” she said at the time. “It just seemed like it knew the tune, and it just did it on its own.”&lt;/p&gt;
-    &lt;p&gt;Smith’s BCI system, implanted as part of a clinical trial, trained on her brain signals as she imagined playing the keyboard. That learning enabled the system to detect her intention to play hundreds of milliseconds before she consciously attempted to do so, says trial leader Richard Andersen, a neuroscientist at the California Institute of Technology in Pasadena.&lt;/p&gt;
-    &lt;p&gt;Smith is one of roughly 90 people who, over the past two decades, have had BCIs implanted to control assistive technologies, such as computers, robotic arms or synthetic voice generators. These volunteers — paralysed by spinal-cord injuries, strokes or neuromuscular disorders, such as motor neuron disease (amyotrophic lateral sclerosis) — have demonstrated how command signals for the body’s muscles, recorded from the brain’s motor cortex as people imagine moving, can be decoded into commands for connected devices.&lt;/p&gt;
-    &lt;p&gt;But Smith, who died of cancer in 2023, was among the first volunteers to have an extra interface implanted in her posterior parietal cortex, a brain region associated with reasoning, attention and planning. Andersen and his team think that by also capturing users’ intentions and pre-motor planning, such ‘dual-implant’ BCIs will improve the performance of prosthetic devices.&lt;/p&gt;
-    &lt;p&gt;Andersen’s research also illustrates the potential of BCIs that access areas outside the motor cortex. “The surprise was that when we go into the posterior parietal, we can get signals that are mixed together from a large number of areas,” says Andersen. “There’s a wide variety of things that we can decode.”&lt;/p&gt;
-    &lt;p&gt;The ability of these devices to access aspects of a person’s innermost life, including preconscious thought, raises the stakes on concerns about how to keep neural data private. It also poses ethical questions about how neurotechnologies might shape people’s thoughts and actions — especially when paired with artificial intelligence.&lt;/p&gt;
-    &lt;p&gt;Meanwhile, AI is enhancing the capabilities of wearable consumer products that record signals from outside the brain. Ethicists worry that, left unregulated, these devices could give technology companies access to new and more precise data about people’s internal reactions to online and other content.&lt;/p&gt;
-    &lt;p&gt;Ethicists and BCI developers are now asking how previously inaccessible information should be handled and used. “Whole-brain interfacing is going to be the future,” says Tom Oxley, chief executive of Synchron, a BCI company in New York City. He predicts that the desire to treat psychiatric conditions and other brain disorders will lead to more brain regions being explored. Along the way, he says, AI will continue to improve decoding capabilities and change how these systems serve their users. “It leads you to the final question: how do we make that safe?”&lt;/p&gt;
-    &lt;p&gt;Consumer concerns&lt;/p&gt;
-    &lt;p&gt;Consumer neurotech products capture less-sophisticated data than implanted BCIs do. Unlike implanted BCIs, which rely on the firings of specific collections of neurons, most consumer products rely on electroencephalography (EEG). This measures ripples of electrical activity that arise from the averaged firing of huge neuronal populations and are detectable on the scalp. Rather than being created to capture the best recording possible, consumer devices are designed to be stylish (such as in sleek headbands) or unobtrusive (with electrodes hidden inside headphones or headsets for augmented or virtual reality).&lt;/p&gt;
-    &lt;p&gt;Still, EEG can reveal overall brain states, such as alertness, focus, tiredness and anxiety levels. Companies already offer headsets and software that give customers real-time scores relating to these states, with the intention of helping them to improve their sports performance, meditate more effectively or become more productive, for example.&lt;/p&gt;
-    &lt;p&gt;AI has helped to turn noisy signals from suboptimal recording systems into reliable data, explains Ramses Alcaide, chief executive of Neurable, a neurotech company in Boston, Massachusetts, that specializes in EEG signal processing and sells a headphone-based headset for this purpose. “We’ve made it so that EEG doesn’t suck as much as it used to,” Alcaide says. “Now, it can be used in real-life environments, essentially.”&lt;/p&gt;
-    &lt;p&gt;And there is widespread anticipation that AI will allow further aspects of users’ mental processes to be decoded. For example, Marcello Ienca, a neuroethicist at the Technical University of Munich in Germany, says that EEG can detect small voltage changes in the brain that occur within hundreds of milliseconds of a person perceiving a stimulus. Such signals could reveal how their attention and decision-making relate to that specific stimulus.&lt;/p&gt;
-    &lt;p&gt;Although accurate user numbers are hard to gather, many thousands of enthusiasts are already using neurotech headsets. And ethicists say that a big tech company could suddenly catapult the devices to widespread use. Apple, for example, patented a design for EEG sensors for future use in its Airpods wireless earphones in 2023.&lt;/p&gt;
-    &lt;p&gt;Yet unlike BCIs aimed at the clinic, which are governed by medical regulations and privacy protections, the consumer BCI space has little legal oversight, says David Lyreskog, an ethicist at the University of Oxford, UK. “There’s a wild west when it comes to the regulatory standards,” he says.&lt;/p&gt;
-    &lt;p&gt;In 2018, Ienca and his colleagues found that most consumer BCIs don’t use secure data-sharing channels or implement state-of-the-art privacy technologies2. “I believe that has not changed,” Ienca says. What’s more, a 2024 analysis3 of the data policies of 30 consumer neurotech companies by the Neurorights Foundation, a non-profit organization in New York City, showed that nearly all had complete control over the data users provided. That means most firms can use the information as they please, including selling it.&lt;/p&gt;
-    &lt;p&gt;Responding to such concerns, the government of Chile and the legislators of four US states have passed laws that give direct recordings of any form of nerve activity protected status. But Ienca and Nita Farahany, an ethicist at Duke University in Durham, North Carolina, fear that such laws are insufficient because they focus on the raw data and not on the inferences that companies can make by combining neural information with parallel streams of digital data. Inferences about a person’s mental health, say, or their political allegiances could still be sold to third parties and used to discriminate against or manipulate a person.&lt;/p&gt;
-    &lt;p&gt;“The data economy, in my view, is already quite privacy-violating and cognitive- liberty-violating,” Ienca says. Adding neural data, he says, “is like giving steroids to the existing data economy”.&lt;/p&gt;
-    &lt;p&gt;Several key international bodies, including the United Nations cultural organization UNESCO and the Organisation for Economic Co-operation and Development, have issued guidelines on these issues. Furthermore, in September, three US senators introduced an act that would require the Federal Trade Commission to review how data from neurotechnology should be protected.&lt;/p&gt;
-    &lt;p&gt;Heading to the clinic&lt;/p&gt;
-    &lt;p&gt;While their development advances at pace, so far no implanted BCI has been approved for general clinical use. Synchron’s device is closest to the clinic. This relatively simple BCI allows users to select on-screen options by imagining moving their foot. Because it is inserted into a blood vessel on the surface of the motor cortex, it doesn’t require neurosurgery. It has proved safe, robust and effective in initial trials4, and Oxley says Synchron is discussing a pivotal trial with the US Food and Drug Administration that could lead to clinical approval.&lt;/p&gt;
-    &lt;p&gt;Elon Musk’s neurotech firm Neuralink in Fremont, California, has surgically implanted its more complex device in the motor cortices of at least 13 volunteers who are using it to play computer games, for example, and control robotic hands. Company representatives say that more than 10,000 people have joined waiting lists for its clinical trials.&lt;/p&gt;
-    &lt;p&gt;At least five more BCI companies have tested their devices in humans for the first time over the past two years, making short-term recordings (on timescales ranging from minutes to weeks) in people undergoing neurosurgical procedures. Researchers in the field say the first approvals are likely to be for devices in the motor cortex that restore independence to people who have severe paralysis — including BCIs that enable speech through synthetic voice technology.&lt;/p&gt;
-    &lt;p&gt;As for what’s next, Farahany says that moving beyond the motor cortex is a widespread goal among BCI developers. “All of them hope to go back further in time in the brain,” she says, “and to get to that subconscious precursor to thought.”&lt;/p&gt;
-    &lt;p&gt;Last year, Andersen’s group published a proof-of-concept study5 in which internal dialogue was decoded from the parietal cortex of two participants, albeit with an extremely limited vocabulary. The team has also recorded from the parietal cortex while a BCI user played the card game blackjack (pontoon)6. Certain neurons responded to the face values of cards, whereas others tracked the cumulative total of a player’s hand. Some even became active when the player decided whether to stick with their current hand or take another card.&lt;/p&gt;
-    &lt;p&gt;Both Oxley and Matt Angle, chief executive of BCI company Paradromics, based in Austin, Texas, agree that BCIs in brain regions other than the motor cortex might one day help to diagnose and treat psychiatric conditions. Maryam Shanechi, an engineer and computer scientist at the University of Southern California in Los Angeles, is working towards this goal — in part by aiming to identify and monitor neural signatures of psychiatric diseases and their symptoms7.&lt;/p&gt;
-    &lt;p&gt;BCIs could potentially track such symptoms in a person, deliver stimulation that adjusts neural activity and quantify how the brain responds to that stimulation or other interventions. “That feedback is important, because you want to precisely tailor the therapy to that individual’s own needs,” Shanechi says.&lt;/p&gt;
-    &lt;p&gt;Shanechi does not yet know whether the neural correlates of psychiatric symptoms will be trackable across many brain regions or whether they will require recording from specific brain areas. Either way, a central aspect of her work is building foundation models of brain activity. Such models, constructed by training AI algorithms on thousands of hours of neural data from numerous people, would in theory be generalizable across individuals’ brains.&lt;/p&gt;
-    &lt;p&gt;Enjoying our latest content? Log in or create an account to continue&lt;/p&gt;
-    &lt;p&gt;Access the most recent journalism from Nature's award-winning team&lt;/p&gt;
-    &lt;p&gt;Explore the latest features &amp;amp; opinion covering groundbreaking research&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46037267</guid><pubDate>Mon, 24 Nov 2025 18:26:09 +0000</pubDate></item><item><title>The Bitter Lesson of LLM Extensions</title><link>https://www.sawyerhood.com/blog/llm-extension</link><description>&lt;doc fingerprint="d546845b0b9b86be"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46036908</guid><pubDate>Mon, 24 Nov 2025 17:52:43 +0000</pubDate></item><item><title>The Bitter Lesson of LLM Extensions</title><link>https://www.sawyerhood.com/blog/llm-extension</link><description>&lt;doc fingerprint="d546845b0b9b86be"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;The Bitter Lesson of LLM Extensions&lt;/head&gt;
     &lt;p&gt;Three years ago, “using an LLM” meant pasting a wall of text into a chat box and hoping for something useful back. Today, we point agents at our codebases, our browsers, and let them go off and act on our behalf. A key question that has been brewing under the surface during this time has been: how do we let end users actually customize these systems?&lt;/p&gt;
@@ -2248,7 +1734,7 @@ To test local web applications, write native Python Playwright scripts.
   &lt;main&gt;
     &lt;p&gt;Affiliate links on Android Authority may earn us a commission. Learn more.&lt;/p&gt;
     &lt;head rend="h1"&gt;Google's new 'Aluminium OS' project brings Android to PC: Here's what we know&lt;/head&gt;
-    &lt;p&gt;11 hours ago&lt;/p&gt;
+    &lt;p&gt;12 hours ago&lt;/p&gt;
     &lt;p&gt;The Android operating system is incredibly versatile. Beyond smartphones, it officially powers tablets, watches, TVs, cars, and XR headsets. However, it has virtually no presence on traditional PCs, where Google instead relies on ChromeOS. Despite Google’s efforts to challenge the dominance of Windows and macOS, ChromeOS remains a distant third. To close this gap, the company is unifying ChromeOS and Android into a single desktop platform, codenamed ‘Aluminium OS.’ Here’s what we know so far.&lt;/p&gt;
     &lt;head rend="h2"&gt;Android on PCs: The story so far&lt;/head&gt;
     &lt;p&gt;One year ago, Android Authority exclusively revealed Google’s plan to rally behind Android as its unified desktop OS. Our source indicated that this shift aims to create products that better compete with the iPad while making more effective use of development resources. In July, a Google executive confirmed part of our reporting, revealing that the company intends to merge ChromeOS and Android into a single platform. Finally, at Qualcomm’s Snapdragon Summit in September, Google officially announced it is bringing Android to the PC market. The company stated it is collaborating with Qualcomm to build a new platform that converges mobile and desktop computing, leveraging recent advancements in AI.&lt;/p&gt;
