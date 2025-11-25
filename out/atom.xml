@@ -1,931 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-11-25T06:17:35.454690+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46015095</id><title>A million ways to die from a data race in Go</title><updated>2025-11-25T06:17:41.012216+00:00</updated><content>&lt;doc fingerprint="54705b3b3ea05890"&gt;
-  &lt;main&gt;&lt;p&gt;Published on 2025-11-21&lt;/p&gt;&lt;p&gt;I have been writing production applications in Go for a few years now. I like some aspects of Go. One aspect I do not like is how easy it is to create data races in Go.&lt;/p&gt;&lt;p&gt;Go is often touted for its ease to write highly concurrent programs. However, it is also mind-boggling how many ways Go happily gives us developers to shoot ourselves in the foot.&lt;/p&gt;&lt;p&gt;Over the years I have encountered and fixed many interesting kinds of data races in Go. If that interests you, I have written about Go concurrency in the past and about some existing footguns, without them being necessarily 'Go data races':&lt;/p&gt;&lt;p&gt;So what is a 'Go data race'? Quite simply, it is Go code that does not conform to the Go memory model. Importantly, Go defines in its memory model what a Go compiler MUST do and MAY do when faced with a non-conforming program exhibiting data races. Not everything is allowed, quite the contrary in fact. Data races in Go are not benign either: their effects can range from 'no symptoms' to 'arbitrary memory corruption'.&lt;/p&gt;&lt;p&gt;Quoting the Go memory model:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;This means that races on multiword data structures can lead to inconsistent values not corresponding to a single write. When the values depend on the consistency of internal (pointer, length) or (pointer, type) pairs, as can be the case for interface values, maps, slices, and strings in most Go implementations, such races can in turn lead to arbitrary memory corruption.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;With this out of the way, let's take a tour of real data races in Go code that I have encountered and fixed. At the end I will emit some recommendations to (try to) avoid them.&lt;/p&gt;&lt;p&gt;I also recommend reading the paper A Study of Real-World Data Races in Golang. This article humbly hopes to be a spiritual companion to it. Some items here are also present in this paper, and some are new.&lt;/p&gt;&lt;p&gt;In the code I will often use &lt;code&gt;errgroup.WaitGroup&lt;/code&gt; or &lt;code&gt;sync.WaitGroup&lt;/code&gt; because they act as a fork-join pattern, shortening the code. The exact same can be done with 'raw' Go channels and goroutines. This also serves to show that using higher-level concepts does not magically protect against all data races.&lt;/p&gt;&lt;p&gt;This one is very common in Go and also very easy to fall into. Here is a simplified reproducer:&lt;/p&gt;&lt;code&gt;package main
-
-import (
-	"context"
-
-	"golang.org/x/sync/errgroup"
-)
-
-func Foo() error { return nil }
-func Bar() error { return nil }
-func Baz() error { return nil }
-
-func Run(ctx context.Context) error {
-	err := Foo()
-	if err != nil {
-		return err
-	}
-
-	wg, ctx := errgroup.WithContext(ctx)
-	wg.Go(func() error {
-		err = Baz()
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-	wg.Go(func() error {
-		err = Bar()
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-
-	return wg.Wait()
-}
-
-func main() {
-	println(Run(context.Background()))
-}
-&lt;/code&gt;&lt;p&gt;The issue might not be immediately visible.&lt;/p&gt;&lt;p&gt;The problem is that the &lt;code&gt;err&lt;/code&gt; outer variable is implicitly captured by the closures running each in a separate goroutine. They then mutate &lt;code&gt;err&lt;/code&gt; concurrently. What they meant to do is instead use a variable local to the closure and return that instead. There is conceptually no need to share any data; this is purely accidental.&lt;/p&gt;&lt;p&gt;The fix is simple, I'll show two variants in the same diff: define a local variable, or use a named return value.&lt;/p&gt;&lt;code&gt;diff --git a/cmd-sg/main.go b/cmd-sg/main.go
-index 7eabdbc..4349157 100644
---- a/cmd-sg/main.go
-+++ b/cmd-sg/main.go
-@@ -18,14 +18,14 @@ func Run(ctx context.Context) error {
- 
- 	wg, ctx := errgroup.WithContext(ctx)
- 	wg.Go(func() error {
--		err = Baz()
-+		err := Baz()
- 		if err != nil {
- 			return err
- 		}
- 
- 		return nil
- 	})
--	wg.Go(func() error {
-+	wg.Go(func() (err error) {
- 		err = Bar()
- 		if err != nil {
- 			return err
-
-&lt;/code&gt;&lt;p&gt;It is unfortunate that a one character difference is all we need to fall into this trap. I feel for the original developer who wrote this code without realizing the implicit capture. As mentioned in a previous article where this silent behavior bit me, we can use the build flag &lt;code&gt;-gcflags='-d closure=1'&lt;/code&gt; to make the Go compiler print which variables are being captured by the closure:&lt;/p&gt;&lt;code&gt;$ go build -gcflags='-d closure=1' 
-./main.go:20:8: heap closure, captured vars = [err]
-./main.go:28:8: heap closure, captured vars = [err]
-&lt;/code&gt;&lt;p&gt;But this is not realistic to do that in a big codebase and inspect each closure. It's useful if you know that a given closure might suffer from this problem.&lt;/p&gt;&lt;p&gt;The Go docs state about &lt;code&gt;http.Client&lt;/code&gt;:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;[...] Clients should be reused instead of created as needed. Clients are safe for concurrent use by multiple goroutines.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;So imagine my surprise when the Go race detector flagged a race tied to &lt;code&gt;http.Client&lt;/code&gt;. The code looked like this:&lt;/p&gt;&lt;code&gt;package main
-
-import (
-	"context"
-	"net/http"
-
-	"golang.org/x/sync/errgroup"
-)
-
-func Run(ctx context.Context) error {
-	client := http.Client{}
-
-	wg, ctx := errgroup.WithContext(ctx)
-	wg.Go(func() error {
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			if req.Host == "google.com" {
-				return nil
-			} else {
-				return http.ErrUseLastResponse
-			}
-		}
-		_, err := client.Get("http://google.com")
-		return err
-	})
-	wg.Go(func() error {
-		client.CheckRedirect = nil
-		_, err := client.Get("http://amazon.com")
-		return err
-	})
-
-	return wg.Wait()
-}
-
-func main() {
-	println(Run(context.Background()))
-}
-&lt;/code&gt;&lt;p&gt;The program makes two concurrent HTTP requests to two different URLs. For the first one, the code restricts redirects (I invented the exact logic for that, no need to look too much into it, the real code has complex logic here). For the second one, no redirect checks are performed, by setting &lt;code&gt;CheckRedirect&lt;/code&gt; to nil. This code is idiomatic and follows the recommendations from the documentation:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;CheckRedirect specifies the policy for handling redirects. If CheckRedirect is not nil, the client calls it before following an HTTP redirect. If CheckRedirect is nil, the Client uses its default policy [...].&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;The problem is: the &lt;code&gt;CheckRedirect&lt;/code&gt; field is modified concurrently without any synchronization which is a data race.&lt;/p&gt;&lt;p&gt;This code also suffers from an I/O race: depending on the network speed and response time for both URLs, the redirects might or might be checked, since the callback might get overwritten from the other goroutine, right when the HTTP client would call it.&lt;/p&gt;&lt;p&gt;Alternatively, the &lt;code&gt;http.Client&lt;/code&gt; could end up calling a &lt;code&gt;nil&lt;/code&gt; callback if the callback was set when the &lt;code&gt;http.Client&lt;/code&gt; checked whether it was nil or not, but before &lt;code&gt;http.Client&lt;/code&gt; had the chance to call it, the other goroutine set it to &lt;code&gt;nil&lt;/code&gt;. Boom, &lt;code&gt;nil&lt;/code&gt; dereference.&lt;/p&gt;&lt;p&gt;Here, the simplest fix is to use two different HTTP clients:&lt;/p&gt;&lt;code&gt;diff --git a/cmd-sg/main.go b/cmd-sg/main.go
-index 351ecc0..8abee1c 100644
---- a/cmd-sg/main.go
-+++ b/cmd-sg/main.go
-@@ -8,10 +8,10 @@ import (
- )
- 
- func Run(ctx context.Context) error {
--	client := http.Client{}
- 
- 	wg, ctx := errgroup.WithContext(ctx)
- 	wg.Go(func() error {
-+		client := http.Client{}
- 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
- 			if req.Host == "google.com" {
- 				return nil
-@@ -23,6 +23,7 @@ func Run(ctx context.Context) error {
- 		return err
- 	})
- 	wg.Go(func() error {
-+		client := http.Client{}
- 		client.CheckRedirect = nil
- 		_, err := client.Get("http://amazon.com")
- 		return err
-
-&lt;/code&gt;&lt;p&gt;This may affect performance negatively since some resources will not be shared anymore.&lt;/p&gt;&lt;p&gt;Additionally, in some situations, this is not so easy because &lt;code&gt;http.Client&lt;/code&gt; does not offer a &lt;code&gt;Clone()&lt;/code&gt; method (a recurring issue in Go as we'll see). For example, a Go test may start a &lt;code&gt;httptest.Server&lt;/code&gt; and then call &lt;code&gt;.Client()&lt;/code&gt; on this server to obtain a preconfigured HTTP client for this server. Then, there is no easy way to duplicate this client to use it from two different tests running in parallel.&lt;/p&gt;&lt;p&gt;Again here, I would not blame the original developer. In my view, the docs for &lt;code&gt;http.Client&lt;/code&gt; are misleading and should mention that not every single operation is concurrency safe. Perhaps with the wording: 'once a http.Client is constructed, performing a HTTP request is concurrency safe, provided that the http.Client fields are not modified concurrently'. Which is less catchy than 'Clients are safe for concurrent use', period.&lt;/p&gt;&lt;p&gt;The next data race is one that baffled me for a bit, because the code was using a mutex properly and I could not fathom why a race would be possible.&lt;/p&gt;&lt;p&gt;Here's a minimal reproducer:&lt;/p&gt;&lt;code&gt;package main
-
-import (
-	"encoding/json"
-	"net/http"
-	"sync"
-)
-
-type Plans map[string]int
-
-type PricingInfo struct {
-	plans Plans
-}
-
-var pricingInfo = PricingInfo{plans: Plans{"cheap plan": 1, "expensive plan": 5}}
-
-type PricingService struct {
-	info    PricingInfo
-	infoMtx sync.Mutex
-}
-
-func NewPricingService() *PricingService {
-	return &amp;amp;PricingService{info: pricingInfo, infoMtx: sync.Mutex{}}
-}
-
-func AddPricing(w http.ResponseWriter, r *http.Request) {
-	pricingService := NewPricingService()
-
-	pricingService.infoMtx.Lock()
-	defer pricingService.infoMtx.Unlock()
-
-	pricingService.info.plans["middle plan"] = 3
-
-	encoder := json.NewEncoder(w)
-	encoder.Encode(pricingService.info)
-}
-
-func GetPricing(w http.ResponseWriter, r *http.Request) {
-	pricingService := NewPricingService()
-
-	pricingService.infoMtx.Lock()
-	defer pricingService.infoMtx.Unlock()
-
-	encoder := json.NewEncoder(w)
-	encoder.Encode(pricingService.info)
-}
-
-func main() {
-	http.HandleFunc("POST /add-pricing", AddPricing)
-	http.HandleFunc("GET /pricing", GetPricing)
-	http.ListenAndServe(":12345", nil)
-}
-&lt;/code&gt;&lt;p&gt;A global mutable map of pricing information is guarded by a mutex. One HTTP endpoint reads the map, another adds an item to it. Pretty simple I would say. The locking is done correctly.&lt;/p&gt;&lt;p&gt;Yet the map suffers from a data race. Here is a reproducer:&lt;/p&gt;&lt;code&gt;package main
-
-import (
-	"net/http"
-	"net/http/httptest"
-	"testing"
-)
-
-func TestMain(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /add-pricing", AddPricing)
-	mux.HandleFunc("GET /pricing", GetPricing)
-
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-
-	t.Run("get pricing", func(t *testing.T) {
-		t.Parallel()
-
-		_, err := server.Client().Get(server.URL + "/pricing")
-		if err != nil {
-			panic(err)
-		}
-	})
-
-	for range 5 {
-		t.Run("add pricing", func(t *testing.T) {
-			t.Parallel()
-
-			_, err := server.Client().Post(server.URL+"/add-pricing", "application/json", nil)
-			if err != nil {
-				panic(err)
-			}
-		})
-	}
-}
-&lt;/code&gt;&lt;p&gt;The reason why is because the data, and the mutex guarding it, do not have the same 'lifetime'. The &lt;code&gt;pricingInfo&lt;/code&gt; map is global and exists from the start of the program to the end. But the mutex &lt;code&gt;infoMtx&lt;/code&gt; exists only for the duration of the HTTP handler (and thus HTTP request). We effectively have 1 map and N mutexes, none of them shared between HTTP handlers. So HTTP handlers cannot synchronize access to the map.&lt;/p&gt;&lt;p&gt;The intent of the code was (I think) to do a deep clone of the pricing information at the beginning of the HTTP handler in &lt;code&gt;NewPricingService&lt;/code&gt;. Unfortunately, Go does a shallow copy of structures and thus each &lt;code&gt;PricingService&lt;/code&gt; instance ends up sharing the same underlying &lt;code&gt;plans&lt;/code&gt; map, which is this global map. It could be that for a long time, it worked because the &lt;code&gt;PricingInfo&lt;/code&gt; struct did not yet contain the map (in the real code it contains a lot of &lt;code&gt;int&lt;/code&gt;s and &lt;code&gt;string&lt;/code&gt;s which are value types and will be copied correctly by a shallow copy), and the map was only added later.&lt;/p&gt;&lt;p&gt;This data race is akin to copying a mutex by value when passing it to a function, which then locks it. This does no synchronization at all since a copy of the mutex is being locked - no mutex is shared between concurrent units.&lt;/p&gt;&lt;p&gt;In any event, the fix is to align the lifetime of the data and the mutex:&lt;/p&gt;&lt;p&gt;I went with the second approach in the real code because it seemed to be the original intent:&lt;/p&gt;&lt;code&gt;diff --git a/cmd-sg/main.go b/cmd-sg/main.go
-index fb59f5c..c7a7a94 100644
---- a/cmd-sg/main.go
-+++ b/cmd-sg/main.go
-@@ -2,6 +2,7 @@ package main
- 
- import (
- 	"encoding/json"
-+	"maps"
- 	"net/http"
- 	"sync"
- )
-@@ -19,8 +20,15 @@ type PricingService struct {
- 	infoMtx sync.Mutex
- }
- 
-+func ClonePricing(pricingInfo PricingInfo) PricingInfo {
-+	cloned := PricingInfo{plans: make(Plans, len(pricingInfo.plans))}
-+	maps.Copy(cloned.plans, pricingInfo.plans)
-+
-+	return cloned
-+}
-+
- func NewPricingService() *PricingService {
--	return &amp;amp;PricingService{info: pricingInfo, infoMtx: sync.Mutex{}}
-+	return &amp;amp;PricingService{info: ClonePricing(pricingInfo), infoMtx: sync.Mutex{}}
- }
- 
- func AddPricing(w http.ResponseWriter, r *http.Request) {
-&lt;/code&gt;&lt;p&gt;It's annoying to have to implement this manually and especially to have to check every single nested field to determine if it's a value type or a reference type (the former will behave correctly with a shallow copy, the latter needs a custom deep copy implementation). I miss the &lt;code&gt;derive(Clone)&lt;/code&gt; annotation in Rust. This is something that the compiler can (and should) do better than me.&lt;/p&gt;&lt;p&gt;Furthermore, as mentioned in the previous section, some types from the standard library or third-party libraries do not implement a deep &lt;code&gt;Clone()&lt;/code&gt; function and contain private fields which prevent us from implementing that ourselves.&lt;/p&gt;&lt;p&gt;I think Rust's API for a mutex is better because a Rust mutex wraps the data it protects and thus it is harder to have uncorrelated lifetimes for the data and the mutex.&lt;/p&gt;&lt;p&gt;Go's mutex API likely could not have been implemented this way since it would have required generics which did not exist at the time. But as of today: I think it could.&lt;/p&gt;&lt;p&gt;Nonetheless, the Go compiler has no way to detect accidental shallow copying, whereas Rust's compiler has the concepts of &lt;code&gt;Copy&lt;/code&gt; and &lt;code&gt;Clone&lt;/code&gt; - so that issue remains in Go, and is not a simple API mistake in the standard library we can fix.&lt;/p&gt;&lt;p&gt;I encountered many cases of concurrently modifying a &lt;code&gt;map&lt;/code&gt;, &lt;code&gt;slice&lt;/code&gt;, etc without any synchronization. That's your run of the mill data race and they are typically fixed by 'slapping a mutex on it' or using a concurrency safe data structure such as &lt;code&gt;sync.Map&lt;/code&gt;.&lt;/p&gt;&lt;p&gt;I will thus share here a more interesting one where it is not as straightforward.&lt;/p&gt;&lt;p&gt;This time, the code is convoluted but what it does is relatively simple:&lt;/p&gt;&lt;code&gt;package main
-
-import (
-	"bytes"
-	"context"
-	"io"
-	"strings"
-	"time"
-
-	"github.com/ory/dockertest/v3"
-	"github.com/ory/dockertest/v3/docker"
-	"golang.org/x/sync/errgroup"
-)
-func GetSigningSecretFromStripeContainer() string {
-	dp, err := dockertest.NewPool("")
-	if err != nil {
-		panic(err)
-	}
-
-	forwarder, err := dp.RunWithOptions(&amp;amp;dockertest.RunOptions{
-		Repository: "stripe/stripe-cli",
-		Tag:        "v1.19.1",
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	output := &amp;amp;bytes.Buffer{}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var signingSecret string
-	eg := errgroup.Group{}
-	eg.Go(func() error {
-		defer cancel()
-
-		for {
-			ln, err := output.ReadString('\n')
-			if err == io.EOF {
-				&amp;lt;-time.After(100 * time.Millisecond)
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			if strings.Contains(ln, "Ready!") {
-				ln = ln[strings.Index(ln, "whsec_"):]
-				signingSecret = ln[:strings.Index(ln, " ")]
-				return nil
-			}
-		}
-	})
-
-	dp.Client.Logs(docker.LogsOptions{
-		Context:      ctx,
-		Stderr:       true,
-		Follow:       true,
-		RawTerminal:  true,
-		Container:    forwarder.Container.ID,
-		OutputStream: output,
-	})
-
-	eg.Wait()
-
-	return signingSecret
-}
-
-func main() {
-	println(GetSigningSecretFromStripeContainer())
-}
-&lt;/code&gt;&lt;p&gt;So, the issue may be clear from the description but here it is spelled out: one goroutine writes to a (growing) byte buffer, another one reads from it, and there is no synchronization: that's a clear data race.&lt;/p&gt;&lt;p&gt;What is interesting here is that we have to pass an &lt;code&gt;io.Writer&lt;/code&gt; for the &lt;code&gt;OutputStream&lt;/code&gt; to the library, and this library will write to the writer we passed. We cannot insert a mutex lock anywhere around the write site, since we do not control the library and there no hooks (e.g. pre/post write callbacks) to do so.&lt;/p&gt;&lt;p&gt;We implement our own writer that does the synchronization with a mutex:&lt;/p&gt;&lt;code&gt;type SyncWriter struct {
-	Writer io.Writer
-	Mtx    *sync.Mutex
-}
-
-func NewSyncWriter(w io.Writer, mtx *sync.Mutex) io.Writer {
-	return &amp;amp;SyncWriter{Writer: w, Mtx: mtx}
-}
-
-func (w *SyncWriter) Write(p []byte) (n int, err error) {
-	w.Mtx.Lock()
-	defer w.Mtx.Unlock()
-
-	written, err := w.Writer.Write(p)
-
-	return written, err
-}
-&lt;/code&gt;&lt;p&gt;We pass it as is to the third-party library, and when we want to read the byte buffer, we lock the mutex first:&lt;/p&gt;&lt;code&gt;diff --git a/cmd-sg/main.go b/cmd-sg/main.go
-index 5529d90..42571b9 100644
---- a/cmd-sg/main.go
-+++ b/cmd-sg/main.go
-@@ -5,6 +5,7 @@ import (
- 	"context"
- 	"io"
- 	"strings"
-+	"sync"
- 	"time"
- 
- 	"github.com/ory/dockertest/v3"
-@@ -12,6 +13,24 @@ import (
- 	"golang.org/x/sync/errgroup"
- )
- 
-+type SyncWriter struct {
-+	Writer io.Writer
-+	Mtx    *sync.Mutex
-+}
-+
-+func NewSyncWriter(w io.Writer, mtx *sync.Mutex) io.Writer {
-+	return &amp;amp;SyncWriter{Writer: w, Mtx: mtx}
-+}
-+
-+func (w *SyncWriter) Write(p []byte) (n int, err error) {
-+	w.Mtx.Lock()
-+	defer w.Mtx.Unlock()
-+
-+	written, err := w.Writer.Write(p)
-+
-+	return written, err
-+}
-+
- func GetSigningSecretFromStripeContainer() string {
- 	dp, err := dockertest.NewPool("")
- 	if err != nil {
-@@ -27,6 +46,8 @@ func GetSigningSecretFromStripeContainer() string {
- 	}
- 
- 	output := &amp;amp;bytes.Buffer{}
-+	outputMtx := sync.Mutex{}
-+	writer := NewSyncWriter(output, &amp;amp;outputMtx)
- 
- 	ctx, cancel := context.WithCancel(context.Background())
- 	defer cancel()
-@@ -37,7 +58,9 @@ func GetSigningSecretFromStripeContainer() string {
- 		defer cancel()
- 
- 		for {
-+			outputMtx.Lock()
- 			ln, err := output.ReadString('\n')
-+			outputMtx.Unlock()
- 			if err == io.EOF {
- 				&amp;lt;-time.After(100 * time.Millisecond)
- 				continue
-@@ -59,7 +82,7 @@ func GetSigningSecretFromStripeContainer() string {
- 		Follow:       true,
- 		RawTerminal:  true,
- 		Container:    forwarder.Container.ID,
--		OutputStream: output,
-+		OutputStream: writer,
- 	})
- 
- 	eg.Wait()
-&lt;/code&gt;&lt;p&gt;Most types in the Go standard library (or third-party libraries for that matter) are not concurrency safe and synchronization is typically on you. I still often see questions on the internet about that, so assume it is not until the documentation states otherwise.&lt;/p&gt;&lt;p&gt;It would also be nice if more types have a 'sync' version, e.g. &lt;code&gt;SyncWriter&lt;/code&gt;, &lt;code&gt;SyncReader&lt;/code&gt;, etc.&lt;/p&gt;&lt;p&gt;The Go race detector is great but will not detect all data races. Data races will cause you pain and suffering, be it flaky tests, weird production errors, or in the worst case memory corruption.&lt;/p&gt;&lt;p&gt;Due to how easy it is to spawn goroutines without a care in the world (and also to run tests in parallel), it will happen to you. It's not a question of if, just when, how bad, and how many days/weeks it will cost you to find them and fix them.&lt;/p&gt;&lt;p&gt;If you are not running your test suite with the race detector enabled, you have numerous data races in your code. That's just a fact.&lt;/p&gt;&lt;p&gt;Go the language and the Go linter ecosystem do not have nearly enough answers to this problem. Some language features make it way too easy to trigger data races, for example implicit capture of outer variables in closures.&lt;/p&gt;&lt;p&gt;The best option left to Go developers is to try to reach 100% test coverage of their code and run the tests with the race detector on.&lt;/p&gt;&lt;p&gt;We should be able to do better in 2025. Just like with memory safety, when even expert developers regularly produce data races, it's the fault of the language/tooling/APIs/etc. It is not enough to blame humans and demand they just 'do better'.&lt;/p&gt;&lt;p&gt;Ideas for the Go language:&lt;/p&gt;&lt;code&gt;const&lt;/code&gt; in more places. If something is constant, there cannot be data races with it.&lt;code&gt;Clone()&lt;/code&gt; function in the compiler for every type (like Rust's &lt;code&gt;derive(Clone)&lt;/code&gt;). Maybe it's opt-in or opt-out, not sure. Or perhaps it's a built-in like &lt;code&gt;make&lt;/code&gt;.&lt;code&gt;freeze()&lt;/code&gt; functionality like JavaScript's &lt;code&gt;Object.freeze()&lt;/code&gt; to prevent an object from being mutated.&lt;code&gt;Mutex&lt;/code&gt; by taking inspiration from other languages. This has been done successfully in the past with &lt;code&gt;WaitGroup&lt;/code&gt; compared to using raw goroutines and channels.&lt;p&gt;Ideas for Go programs:&lt;/p&gt;&lt;code&gt;string&lt;/code&gt; type in Go is immutable.&lt;quote&gt;&lt;p&gt;If you enjoy what you're reading, you want to support me, and can afford it: Support me. That allows me to write more cool articles!&lt;/p&gt;&lt;p&gt;This blog is open-source! If you find a problem, please open a Github issue. The content of this blog as well as the code snippets are under the BSD-3 License which I also usually use for all my personal projects. It's basically free for every use but you have to mention me as the original author.&lt;/p&gt;&lt;/quote&gt;&lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://gaultier.github.io/blog/a_million_ways_to_data_race_in_go.html"/><published>2025-11-22T14:33:57+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46015467</id><title>Migrating to Bazel symbolic macros</title><updated>2025-11-25T06:17:40.822263+00:00</updated><content>&lt;doc fingerprint="3ac19a125de6912f"&gt;
-  &lt;main&gt;
-    &lt;p&gt;In Bazel, there are two types of macros: legacy macros and symbolic macros, that were introduced in Bazel 8. Symbolic macros are recommended for code clarity, where possible. They include enhancements like typed arguments and the ability to define and limit the visibility of the targets they create.&lt;/p&gt;
-    &lt;p&gt;This post is intended for experienced Bazel engineers or those tasked with modernizing the build metadata of their codebases. The following discussion assumes a solid working knowledge of Bazel’s macro system and build file conventions. If you are looking to migrate legacy macros or deepen your understanding of symbolic macros, you’ll find practical guidance and nuanced pitfalls addressed here.&lt;/p&gt;
-    &lt;head rend="h2"&gt;What are symbolic macros?&lt;/head&gt;
-    &lt;p&gt;Macros instantiate rules by acting as templates that generate targets. As such, they are expanded in the loading phase, when Bazel definitions and &lt;code&gt;BUILD&lt;/code&gt; files are loaded and evaluated.
-This is in contrast with build rules that are run later in the analysis phase.
-In older Bazel versions, macros were defined exclusively as Starlark functions
-(the form that is now called “legacy macros”).
-Symbolic macros are an improvement on that idea;
-they allow defining a set of attributes similar to those of build rules.&lt;/p&gt;
-    &lt;p&gt;In a &lt;code&gt;BUILD&lt;/code&gt; file, you invoke a symbolic macro by supplying attribute values as arguments.
-Because Bazel is explicitly aware of symbolic macros and their function in the build process,
-they can be considered “first-class macros”.
-See the Symbolic macros design document
-to learn more about the rationale.
-Symbolic macros also intend to support lazy evaluation,
-a feature that is currently being considered for a future Bazel release.
-When that functionality is implemented,
-Bazel would defer evaluating a macro until
-the targets defined by that macro are actually requested.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Conventions and restrictions&lt;/head&gt;
-    &lt;p&gt;There is already good documentation that explains how to write symbolic macros. In this section, we are going to take a look at some practical examples of the restrictions that apply to their implementation, which you can learn more about in the Restrictions docs page.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Naming&lt;/head&gt;
-    &lt;p&gt;Any targets created by a symbolic macro must either match the macro’s name parameter exactly or begin with that name followed by a &lt;code&gt;_&lt;/code&gt; (preferred), &lt;code&gt;.&lt;/code&gt;, or &lt;code&gt;-&lt;/code&gt;.
-This is different from legacy macros which don’t have naming constraints.&lt;/p&gt;
-    &lt;p&gt;This symbolic macro&lt;/p&gt;
-    &lt;code&gt;# defs.bzl
-def _simple_macro_impl(name):
-    native.genrule(
-        name = "genrule" + name,
-        outs = [name + "_out.data"],
-        srcs = ["//:file.json"],
-    )
-
-# BUILD.bazel
-simple_macro(name = "tool")&lt;/code&gt;
-    &lt;p&gt;would fail when evaluated:&lt;/p&gt;
-    &lt;code&gt;$ bazel cquery //...
-ERROR: in genrule rule //src:genruletool: Target //src:genruletool declared in symbolic macro 'tool'
-violates macro naming rules and cannot be built.&lt;/code&gt;
-    &lt;p&gt;This means &lt;code&gt;simple_macro(name = "tool")&lt;/code&gt; may only produce files or targets named &lt;code&gt;tool&lt;/code&gt; or starting with &lt;code&gt;tool_&lt;/code&gt;,
-&lt;code&gt;tool.&lt;/code&gt;, or &lt;code&gt;tool-&lt;/code&gt;.
-In this particular macro, &lt;code&gt;tool_genrule&lt;/code&gt; would work.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Access to undeclared resources&lt;/head&gt;
-    &lt;p&gt;Symbolic macros must follow Bazel’s standard visibility rules: they cannot directly access source files unless those files are passed in as arguments or are made public by their parent package. This is different from legacy macros, whose implementations were effectively inlined into the &lt;code&gt;BUILD&lt;/code&gt; file where they were called.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Attributes&lt;/head&gt;
-    &lt;head rend="h3"&gt;Positional arguments&lt;/head&gt;
-    &lt;p&gt;In legacy macro invocations, you could have passed the attribute values as positional arguments. For instance, these are perfectly valid legacy macro calls:&lt;/p&gt;
-    &lt;code&gt;# defs.bzl
-def special_test_legacy(name, tag = "", **kwargs):
-    kwargs["name"] = name
-    kwargs["tags"] = [tag] if tag else []
-    cc_test(**kwargs)
-
-
-# BUILD.bazel
-special_test_legacy("no-tag")
-special_test_legacy("with-tag", "manual")&lt;/code&gt;
-    &lt;p&gt;With the macro’s name and tags collected as expected:&lt;/p&gt;
-    &lt;code&gt;$ bazel cquery //test/package:no-tag --output=build
-cc_test(
-  name = "no-tag",
-  tags = [],
-  ...
-)
-
-$ bazel cquery //test/package:with-tag --output=build
-cc_test(
-  name = "with-tag",
-  tags = ["manual"],
-  ...
-)&lt;/code&gt;
-    &lt;p&gt;You can control how arguments are passed to functions by using an asterisk (&lt;code&gt;*&lt;/code&gt;)
-in the parameter list of a legacy macro, as per the Starlark language specs.
-If you are a seasoned Python developer (Starlark’s syntax is heavily inspired by Python), you might have already guessed
-that this asterisk separates positional arguments from keyword-only arguments:&lt;/p&gt;
-    &lt;code&gt;# defs.bzl
-def special_test_legacy(name, *, tag = "", **kwargs):
-    kwargs["name"] = name
-    kwargs["tags"] = [tag] if tag else []
-    cc_test(**kwargs)
-
-# BUILD.bazel
-special_test_legacy("no-tag")  # okay
-special_test_legacy("with-tag", tag="manual") # okay
-# Error: special_test_legacy() accepts no more than 1 positional argument but got 2
-special_test_legacy("with-tag", "manual")&lt;/code&gt;
-    &lt;p&gt;Positional arguments are not supported in symbolic macros as attributes must either be declared in the &lt;code&gt;attrs&lt;/code&gt; dictionary
-(which would make it automatically a keyword argument)
-or be inherited in which case it should also be provided by name.&lt;/p&gt;
-    &lt;p&gt;Arguably, avoiding positional arguments in macros altogether is helpful because it eliminates subtle bugs caused by incorrect order of parameters passed and makes them easier to read and easier to process by tooling such as &lt;code&gt;buildozer&lt;/code&gt;.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Default values&lt;/head&gt;
-    &lt;p&gt;Legacy macros accepted default values for their parameters which made it possible to skip passing certain arguments:&lt;/p&gt;
-    &lt;code&gt;# defs.bzl
-def special_test_legacy(name, *, purpose = "dev", **kwargs):
-    kwargs["name"] = name
-    kwargs["tags"] = [purpose]
-    cc_test(**kwargs)
-
-# BUILD.bazel
-special_test_legacy("dev-test")
-special_test_legacy("prod-test", purpose="prod")&lt;/code&gt;
-    &lt;p&gt;With symbolic macros, the default values are declared in the &lt;code&gt;attrs&lt;/code&gt; dictionary instead:&lt;/p&gt;
-    &lt;code&gt;# defs.bzl
-def _special_test_impl(name, purpose = "dev", **kwargs):
-    kwargs["tags"] = [purpose]
-    cc_test(
-        name = name,
-        **kwargs
-    )
-
-special_test = macro(
-    inherit_attrs = native.cc_test,
-    attrs = {
-        "purpose": attr.string(configurable = False, default = "staging"),
-        "copts": None,
-    },
-    implementation = _special_test_impl,
-)
-
-# BUILD.bazel
-special_test(
-    name = "my-special-test-prod",
-    srcs = ["test.cc"],
-    purpose = "prod",
-)
-
-special_test(
-    name = "my-special-test-dev",
-    srcs = ["test.cc"],
-)&lt;/code&gt;
-    &lt;p&gt;Let’s see what kind of tags are going to be set for these &lt;code&gt;cc_test&lt;/code&gt; targets:&lt;/p&gt;
-    &lt;code&gt;$ bazel cquery //test/package:my-special-test-prod --output=build
-cc_test(
-  name = "my-special-test-prod",
-  tags = ["prod"],
-  ...
-)
-
-$ bazel cquery //test/package:my-special-test-dev --output=build
-cc_test(
-  name = "my-special-test-dev",
-  tags = ["staging"],
-  ...
-)&lt;/code&gt;
-    &lt;p&gt;Notice how the default &lt;code&gt;dev&lt;/code&gt; value declared in the macro implementation was never used.
-This is because the default values defined for parameters in the macro’s function are going to be ignored,
-so it’s best to remove them to avoid any confusion.&lt;/p&gt;
-    &lt;p&gt;Also, all the inherited attributes have a default value of &lt;code&gt;None&lt;/code&gt;,
-so make sure to refactor your macro logic accordingly.
-Be careful when processing the keyword arguments to avoid
-subtle bugs such as checking whether a user has passed &lt;code&gt;[]&lt;/code&gt; in a keyword argument
-merely by doing &lt;code&gt;if not kwargs["attr-name"]&lt;/code&gt;
-as &lt;code&gt;None&lt;/code&gt; would also be evaluated to &lt;code&gt;False&lt;/code&gt; in this context.&lt;/p&gt;
-    &lt;p&gt;This might be potentially confusing as the default value for many common attributes is not &lt;code&gt;None&lt;/code&gt;.
-Take a look at the &lt;code&gt;target_compatible_with&lt;/code&gt; attribute
-which normally has the default value &lt;code&gt;[]&lt;/code&gt; when used in a rule,
-but when used in a macro, would still by default be set to &lt;code&gt;None&lt;/code&gt;.
-Using &lt;code&gt;bazel cquery //:target --output=build&lt;/code&gt;
-with some &lt;code&gt;print&lt;/code&gt; calls in your &lt;code&gt;.bzl&lt;/code&gt; files can help when refactoring.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Inheritance&lt;/head&gt;
-    &lt;p&gt;Macros are frequently designed to wrap a rule (or another macro), and the macro’s author typically aims to pass most of the wrapped symbol’s attributes using &lt;code&gt;**kwargs&lt;/code&gt; directly to the macro’s primary target
-or the main inner macro without modification.&lt;/p&gt;
-    &lt;p&gt;To enable this behavior, a macro can inherit attributes from a rule or another macro by providing the rule or macro symbol to the &lt;code&gt;inherit_attrs&lt;/code&gt; parameter of &lt;code&gt;macro()&lt;/code&gt;.
-Note that when &lt;code&gt;inherit_attrs&lt;/code&gt; is set, the implementation function must have a &lt;code&gt;**kwargs&lt;/code&gt; parameter.
-This makes it possible to avoid listing every attribute that the macro may accept,
-and it is also possible to disable certain attributes that you don’t want macro callers to provide.
-For instance, let’s say you don’t want &lt;code&gt;copts&lt;/code&gt; to be defined in macros that wrap &lt;code&gt;cc_test&lt;/code&gt;
-because you want to manage them internally within the macro body instead:&lt;/p&gt;
-    &lt;code&gt;# BUILD.bazel
-special_test(
-    name = "my-special-test",
-    srcs = ["test.cc"],
-    copts = ["-std=c++22"],
-)&lt;/code&gt;
-    &lt;p&gt;This can be done by setting the attributes you don’t want to inherit to &lt;code&gt;None&lt;/code&gt;.&lt;/p&gt;
-    &lt;code&gt;# defs.bzl
-special_test = macro(
-    inherit_attrs = native.cc_test,
-    attrs = { "copts": None },
-    implementation = _special_test_impl,
-)&lt;/code&gt;
-    &lt;p&gt;Now the macro caller will see that &lt;code&gt;copts&lt;/code&gt; is not possible to declare when calling the macro:&lt;/p&gt;
-    &lt;code&gt;$ bazel query //test/package:my-special-test
-        File "defs.bzl", line 19, column 1, in special_test
-                special_test = macro(
-Error: no such attribute 'copts' in 'special_test' macro&lt;/code&gt;
-    &lt;p&gt;Keep in mind that all inherited attributes are going to be included in the &lt;code&gt;kwargs&lt;/code&gt; parameter
-with the default value of &lt;code&gt;None&lt;/code&gt; unless specified otherwise.
-This means you have to be extra careful in the macro implementation function if you refactor a legacy macro:
-you can no longer merely check for the presence of a key in the &lt;code&gt;kwargs&lt;/code&gt; dictionary.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Mutation&lt;/head&gt;
-    &lt;p&gt;In symbolic macros, you will not be able to mutate the arguments passed to the macro implementation function.&lt;/p&gt;
-    &lt;code&gt;# defs.bzl
-def _simple_macro_impl(name, visibility, env):
-    print(type(env), env)
-    env["some"] = "more"
-
-simple_macro = macro(
-    attrs = {
-        "env": attr.string_dict(configurable = False)
-    },
-    implementation = _simple_macro_impl
-)
-
-# BUILD.bazel
-simple_macro(name = "tool", env = {"state": "active"})&lt;/code&gt;
-    &lt;p&gt;Let’s check how this would get evaluated:&lt;/p&gt;
-    &lt;code&gt;$ bazel cquery //...
-DEBUG: defs.bzl:36:10: dict {"state": "active"}
-        File "defs.bzl", line 37, column 17, in _simple_macro_impl
-                env["some"] = "more"
-Error: trying to mutate a frozen dict value&lt;/code&gt;
-    &lt;p&gt;This, however, is no different to legacy macros where you could not modify mutable objects in place either. In situations like this, creating a new dict with &lt;code&gt;env = dict(env)&lt;/code&gt; would be of help.&lt;/p&gt;
-    &lt;p&gt;In legacy macros you can still modify objects in place when they are inside the &lt;code&gt;kwargs&lt;/code&gt;,
-but this arguably leads to code that is harder to reason about
-and invites subtle bugs that are a nightmare to troubleshoot in a large codebase.
-See the Mutability in Starlark section to learn more.&lt;/p&gt;
-    &lt;p&gt;This is still possible in legacy macros:&lt;/p&gt;
-    &lt;code&gt;# defs.bzl
-def special_test_legacy(name, **kwargs):
-    kwargs["name"] = name
-    kwargs["env"]["some"] = "more"
-    cc_test(**kwargs)
-
-# BUILD.bazel
-special_test_legacy("small-test", env = {"state": "active"})&lt;/code&gt;
-    &lt;p&gt;Let’s see how the updated environment variables were set for the &lt;code&gt;cc_test&lt;/code&gt; target created in the legacy macro:&lt;/p&gt;
-    &lt;code&gt;$ bazel cquery //test/package:small-test --output=build
-...
-cc_test(
-  name = "small-test",
-  ...
-  env = {"state": "active", "some": "more"},
-)&lt;/code&gt;
-    &lt;p&gt;This is no longer allowed in symbolic macros:&lt;/p&gt;
-    &lt;code&gt;# defs.bzl
-def _simple_macro_impl(name, visibility, **kwargs):
-    print(type(kwargs["env"]), kwargs["env"])
-    kwargs["env"]["some"] = "more"&lt;/code&gt;
-    &lt;p&gt;It would fail to evaluate:&lt;/p&gt;
-    &lt;code&gt;$ bazel cquery //...
-
-DEBUG: defs.bzl:35:10: dict {"state": "active"}
-        File "defs.bzl", line 36, column 27, in _simple_macro_impl
-                kwargs["env"]["some"] = "more"
-Error: trying to mutate a frozen dict value&lt;/code&gt;
-    &lt;head rend="h2"&gt;Configuration&lt;/head&gt;
-    &lt;p&gt;Symbolic macros, just like legacy macros, support configurable attributes, commonly known as &lt;code&gt;select()&lt;/code&gt;, a Bazel feature that lets users determine the values of build rule (or macro)
-attributes at the command line.&lt;/p&gt;
-    &lt;p&gt;Here’s an example symbolic macro with the &lt;code&gt;select&lt;/code&gt; toggle:&lt;/p&gt;
-    &lt;code&gt;# defs.bzl
-def _special_test_impl(name, **kwargs):
-    cc_test(
-        name = name,
-        **kwargs
-    )
-special_test = macro(
-    inherit_attrs = native.cc_test,
-    attrs = {},
-    implementation = _special_test_impl,
-)
-
-# BUILD.bazel
-config_setting(
-    name = "linking-static",
-    define_values = {"static-testing": "true"},
-)
-
-config_setting(
-    name = "linking-dynamic",
-    define_values = {"static-testing": "false"},
-)
-
-special_test(
-    name = "my-special-test",
-    srcs = ["test.cc"],
-    linkstatic = select({
-        ":linking-static": True,
-        ":linking-dynamic": False,
-        "//conditions:default": False,
-    }),
-)&lt;/code&gt;
-    &lt;p&gt;Let’s see how this expands in the &lt;code&gt;BUILD&lt;/code&gt; file:&lt;/p&gt;
-    &lt;code&gt;$ bazel query //test/package:my-special-test --output=build
-cc_test(
-  name = "my-special-test",
-  ...(omitted for brevity)...
-  linkstatic = select({
-    "//test/package:linking-static": True,
-    "//test/package:linking-dynamic": False,
-    "//conditions:default": False
-  }),
-)&lt;/code&gt;
-    &lt;p&gt;The &lt;code&gt;query&lt;/code&gt; command does show that the macro was expanded into a &lt;code&gt;cc_test&lt;/code&gt; target,
-but it does not show what the &lt;code&gt;select()&lt;/code&gt; is resolved to.
-For this, we would need to use the &lt;code&gt;cquery&lt;/code&gt; (configurable query)
-which is a variant of &lt;code&gt;query&lt;/code&gt; that runs after &lt;code&gt;select()&lt;/code&gt;s have been evaluated.&lt;/p&gt;
-    &lt;code&gt;$ bazel cquery //test/package:my-special-test --output=build
-cc_test(
-  name = "my-special-test",
-  ...(omitted for brevity)...
-  linkstatic = False,
-)&lt;/code&gt;
-    &lt;p&gt;Let’s configure the test to be statically linked:&lt;/p&gt;
-    &lt;code&gt;$ bazel cquery //test/package:my-special-test --output=build --define="static-testing=true"
-cc_test(
-  name = "my-special-test",
-  ...(omitted for brevity)...
-  linkstatic = True,
-)&lt;/code&gt;
-    &lt;p&gt;Each attribute in the &lt;code&gt;macro&lt;/code&gt; function explicitly declares whether it tolerates &lt;code&gt;select()&lt;/code&gt; values,
-in other words, whether it is configurable.
-For common attributes, consult the Typical attributes defined by most build rules
-to see which attributes can be configured.
-Most attributes are configurable, meaning that their values may change
-when the target is built in different ways;
-however, there are a handful which are not.
-For example, you cannot assign a &lt;code&gt;*_test&lt;/code&gt; target to be flaky using a &lt;code&gt;select()&lt;/code&gt;
-(e.g., to mark a test as flaky only on &lt;code&gt;aarch64&lt;/code&gt; devices).&lt;/p&gt;
-    &lt;p&gt;Unless specifically declared, all attributes in symbolic macros are configurable (if they support this) which means they will be wrapped in a &lt;code&gt;select()&lt;/code&gt; (that simply maps &lt;code&gt;//conditions:default&lt;/code&gt; to the single value),
-and you might need to adjust the code of the legacy macro you migrate.
-For instance, this legacy code used to append some dependencies with the &lt;code&gt;.append()&lt;/code&gt; list method,
-but this might break:&lt;/p&gt;
-    &lt;code&gt;# defs.bzl
-def _simple_macro_impl(name, visibility, **kwargs):
-    print(kwargs["deps"])
-    kwargs["deps"].append("//:commons")
-    cc_test(**kwargs)
-
-simple_macro = macro(
-    attrs = {
-        "deps": attr.label_list(),
-    },
-    implementation = _simple_macro_impl,
-)
-
-# BUILD.bazel
-simple_macro(name = "simple-test", deps = ["//:helpers"])&lt;/code&gt;
-    &lt;p&gt;Let’s evaluate the macro:&lt;/p&gt;
-    &lt;code&gt;$ bazel cquery //...
-DEBUG: defs.bzl:35:10: select({"//conditions:default": [Label("//:helpers")]})
-        File "defs.bzl", line 36, column 19, in _simple_macro_impl
-                kwargs["deps"].append("//:commons")
-Error: 'select' value has no field or method 'append'&lt;/code&gt;
-    &lt;p&gt;Keep in mind that &lt;code&gt;select&lt;/code&gt; is an opaque object with limited interactivity.
-It does, however, support modification in place, so that you can extend it,
-e.g., with &lt;code&gt;kwargs["deps"] += ["//:commons"]&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;$ bazel cquery //test/package:simple-test --output=build
-...
-cc_test(
-  name = "simple-test",
-  generator_name = "simple-test",
-  ...
-  deps = ["//:commons", "//:helpers", "@rules_cc//:link_extra_lib"],
-)&lt;/code&gt;
-    &lt;p&gt;Be extra vigilant when dealing with attributes of &lt;code&gt;bool&lt;/code&gt; type that are configurable
-because the return type of &lt;code&gt;select&lt;/code&gt; converts silently in truthy contexts to &lt;code&gt;True&lt;/code&gt;.
-This can lead to some code being legitimate, but not doing what you intended.
-See Why does select() always return true? to learn more.&lt;/p&gt;
-    &lt;p&gt;When refactoring, you might need to make an attribute configurable, however, it may stop working using the existing macro implementation. For example, imagine you need to pass different files as input to your macro depending on the configuration specified at runtime:&lt;/p&gt;
-    &lt;code&gt;# defs.bzl
-def _deployment_impl(name, visibility, filepath):
-    print(filepath)
-    # implementation
-
-simple_macro = macro(
-    attrs = {
-        "filepath": attr.string(),
-    },
-    implementation = _deployment_impl,
-)
-
-# BUILD.bazel
-deployment(
-    name = "deploy",
-    filepath = select({
-        "//conditions:default": "deploy/config/dev.ini",
-        "//:production": "deploy/config/production.ini",
-    }),
-)&lt;/code&gt;
-    &lt;p&gt;In rules, &lt;code&gt;select()&lt;/code&gt; objects are resolved to their actual values,
-but in macros, &lt;code&gt;select()&lt;/code&gt; creates a special object of type &lt;code&gt;select&lt;/code&gt;
-that isn’t evaluated until the analysis phase,
-which is why you won’t be able to get actual values out of it.&lt;/p&gt;
-    &lt;code&gt;$ bazel cquery //:deploy
-...
-select({
-    Label("//conditions:default"): "deploy/config/dev.ini",
-    Label("//:production"): "deploy/config/production.ini"
-    })
-...&lt;/code&gt;
-    &lt;p&gt;In some cases, such as when you need to have the &lt;code&gt;select&lt;/code&gt;ed value available in the macro function,
-you can have the &lt;code&gt;select&lt;/code&gt; object resolved before it’s passed to the macro.
-This can be done with the help of an &lt;code&gt;alias&lt;/code&gt; target, and the label of a target can be turned into a filepath
-using the special &lt;code&gt;location&lt;/code&gt; variable:&lt;/p&gt;
-    &lt;code&gt;# defs.bzl
-def _deployment_impl(name, visibility, filepath):
-    print(type(filepath), filepath)
-    native.genrule(
-        name = name + "_gen",
-        srcs = [filepath],
-        outs = ["config.out"],
-        cmd = "echo '$(location {})' &amp;gt; $@".format(filepath)
-    )
-
-deployment = macro(
-    attrs = {
-        "filepath": attr.label(configurable = False),
-    },
-    implementation = _deployment_impl,
-)
-
-# BUILD.bazel
-alias(
-    name = "configpath",
-    actual = select({
-        "//conditions:default": "deploy/config/dev.ini",
-        "//:production": "deploy/config/production.ini",
-    }),
-    visibility = ["//visibility:public"],
-)
-
-deployment(
-    name = "deploy",
-    filepath = ":configpath",
-)&lt;/code&gt;
-    &lt;p&gt;You can confirm the right file is chosen when passing different configuration flags before building the target:&lt;/p&gt;
-    &lt;code&gt;$ bazel cquery //tests:configpath --output=build
-INFO: Analyzed target //tests:configpath (0 packages loaded, 1 target configured).
-...
-alias(
-  name = "configpath",
-  visibility = ["//visibility:public"],
-  actual = "//tests:deploy/config/dev.ini",
-)
-...
-
-$ bazel build //tests:deploy_gen &amp;amp;&amp;amp; cat bazel-bin/tests/config.out
-...
-DEBUG: defs.bzl:29:10: Label //tests:configpath
-...
-tests/deploy/config/dev.ini&lt;/code&gt;
-    &lt;head rend="h2"&gt;Querying macros&lt;/head&gt;
-    &lt;p&gt;Since macros are evaluated when &lt;code&gt;BUILD&lt;/code&gt; files are queried,
-you cannot use Bazel itself to query “raw” &lt;code&gt;BUILD&lt;/code&gt; files.
-Identifying definitions of legacy macros is quite difficult,
-as they resemble Starlark functions, but instantiate targets.
-Using &lt;code&gt;bazel cquery&lt;/code&gt; with the &lt;code&gt;--output=starlark&lt;/code&gt;
-might help printing the properties of targets to see
-if they have been instantiated from macros.&lt;/p&gt;
-    &lt;p&gt;When using &lt;code&gt;--output=build&lt;/code&gt;, you can also inspect some of the properties:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;generator_name&lt;/code&gt;(the name attribute of the macro)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;generator_function&lt;/code&gt;(which function generated the rules)&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;generator_location&lt;/code&gt;(where the macro was invoked)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;This information with some heuristics might help you to identify the macros. Once you have identified the macro name, you can run &lt;code&gt;bazel query --output=build 'attr(generator_function, simple_macro, //...)'&lt;/code&gt;
-to find all targets that are generated by a particular macro.
-Finding symbolic macros, in contrast, is trivial
-as you would simply need to grep for &lt;code&gt;macro()&lt;/code&gt; function calls in &lt;code&gt;.bzl&lt;/code&gt; files.&lt;/p&gt;
-    &lt;p&gt;To query unprocessed &lt;code&gt;BUILD&lt;/code&gt; files, you might want to use buildozer
-which is a tool that lets you query the contents of &lt;code&gt;BUILD&lt;/code&gt; files using a static parser.
-The tool will come in handy for various use cases when refactoring, such as migrating the macros.
-Because both legacy and symbolic macros follow the same &lt;code&gt;BUILD&lt;/code&gt; file syntax,
-&lt;code&gt;buildozer&lt;/code&gt; can be used to query build metadata for either type.&lt;/p&gt;
-    &lt;p&gt;Let’s write some queries for these macro invocations:&lt;/p&gt;
-    &lt;code&gt;# BUILD.bazel
-perftest(
-  name = "apis",
-  srcs = ["//:srcA", "//:srcB"],
-  env = {"type": "performance"},
-)
-
-perftest(
-  name = "backend",
-  srcs = ["//:srcC", "//:srcD"],
-  env = {"type": "performance"},
-)&lt;/code&gt;
-    &lt;p&gt;Print all macro invocations (raw) across the whole workspace:&lt;/p&gt;
-    &lt;code&gt;$ buildozer 'print rule' "//...:%perftest"
-
-perftest(
-    name = "apis",
-    srcs = [
-        "//:srcA",
-        "//:srcB",
-    ],
-    env = {"type": "performance"},
-)
-
-perftest(
-    name = "backend",
-    srcs = [
-        "//:srcC",
-        "//:srcD",
-    ],
-    env = {"type": "performance"},
-)&lt;/code&gt;
-    &lt;p&gt;Print attribute’s values for all macro invocations:&lt;/p&gt;
-    &lt;code&gt;$ buildozer 'print label srcs' "//...:%perftest"
-//test/package:apis [//:srcA //:srcB]
-//test/package:backend [//:srcC //:srcD]&lt;/code&gt;
-    &lt;p&gt;Print path to files where macros are invoked:&lt;/p&gt;
-    &lt;code&gt;$ buildozer 'print path' "//...:%perftest" | xargs realpath --relative-to "$PWD" | sort | uniq
-test/package/BUILD.bazel&lt;/code&gt;
-    &lt;p&gt;The &lt;code&gt;path&lt;/code&gt; can be combined with an attribute, e.g., print &lt;code&gt;path&lt;/code&gt; and the &lt;code&gt;srcs&lt;/code&gt; to make reviewing easier:&lt;/p&gt;
-    &lt;code&gt;$ buildozer 'print path srcs' "//...:%perftest"
-/home/user/code/project/test/package/BUILD.bazel [//:srcA //:srcB]
-/home/user/code/project/test/package/BUILD.bazel [//:srcC //:srcD]&lt;/code&gt;
-    &lt;p&gt;Remove an attribute from a macro invocation (e.g., &lt;code&gt;env&lt;/code&gt; will be set up in the macro implementation function):&lt;/p&gt;
-    &lt;code&gt;$ buildozer 'remove env' "//...:%perftest"
-fixed /home/user/code/project/test/package/BUILD.bazel&lt;/code&gt;
-    &lt;p&gt;You might also want to check that no macro invocation passes an attribute that is not supposed to be passed. In the command output, the &lt;code&gt;missing&lt;/code&gt; means the attribute doesn’t exist;
-these lines can of course be ignored with &lt;code&gt;grep -v missing&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;$ buildozer -quiet 'print path env' "//...:%perftest" 2&amp;gt;/dev/null
-/home/user/code/project/test/package/BUILD.bazel {"type": "performance"}
-/home/user/code/project/test/package/BUILD.bazel (missing)&lt;/code&gt;
-    &lt;p&gt;We hope that these practical suggestions and examples will assist you in your efforts to modernize the use of macros throughout your codebase. Remember that you can compose legacy and symbolic macros, which may be useful during the transition. Also, legacy macros can still be used and are to remain supported in Bazel for the foreseeable future. Some organizations may even choose not to migrate at all, particularly if they rely on the current behavior of the legacy macros heavily.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Behind the scenes&lt;/head&gt;
-    &lt;p&gt;Alexey is a build systems software engineer who cares about code quality, engineering productivity, and developer experience.&lt;/p&gt;
-    &lt;p&gt;If you enjoyed this article, you might be interested in joining the Tweag team.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.tweag.io/blog/2025-11-20-migrating-bazel-symbolic-macros/"/><published>2025-11-22T15:26:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46019898</id><title>Three Years from GPT-3 to Gemini 3</title><updated>2025-11-25T06:17:40.620366+00:00</updated><content>&lt;doc fingerprint="3d53915f1bb40691"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-11-25T06:50:52.384972+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46019898</id><title>Three Years from GPT-3 to Gemini 3</title><updated>2025-11-25T06:50:57.965616+00:00</updated><content>&lt;doc fingerprint="3d53915f1bb40691"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Three Years from GPT-3 to Gemini 3&lt;/head&gt;
     &lt;head rend="h3"&gt;From chatbots to agents&lt;/head&gt;
@@ -956,7 +30,7 @@ these lines can of course be ignored with &lt;code&gt;grep -v missing&lt;/code&g
     &lt;p&gt;Obligatory warning: Giving an AI agent access to your computer can be risky if you don’t know what you are doing. They can move or delete files without asking you and can potentially present a security risk as well by exposing your documents to others. I suspect many of these problems will be addressed as these tools are adapted to non-coders, but, for now, be very careful.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.oneusefulthing.org/p/three-years-from-gpt-3-to-gemini"/><published>2025-11-23T01:25:17+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46024402</id><title>Bytes before FLOPS: your algorithm is (mostly) fine, your data isn't</title><updated>2025-11-25T06:17:40.313892+00:00</updated><content>&lt;doc fingerprint="e658d830bce5191b"&gt;
+&lt;/doc&gt;</content><link href="https://www.oneusefulthing.org/p/three-years-from-gpt-3-to-gemini"/><published>2025-11-23T01:25:17+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46024402</id><title>Bytes before FLOPS: your algorithm is (mostly) fine, your data isn't</title><updated>2025-11-25T06:50:57.738557+00:00</updated><content>&lt;doc fingerprint="e658d830bce5191b"&gt;
   &lt;main&gt;
     &lt;p&gt;on&lt;/p&gt;
     &lt;head rend="h1"&gt;Bytes before FLOPS: your algorithm is (mostly) fine, your data isn't&lt;/head&gt;
@@ -1095,7 +169,7 @@ struct padded {
     &lt;p&gt;An in-depth overview of performance analysis and optimization: Performance Analysis and Tuning on Modern CPUs by Denis Bakhvalov&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.bitsdraumar.is/bytes-before-flops/"/><published>2025-11-23T15:47:50+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46030799</id><title>What OpenAI did when ChatGPT users lost touch with reality</title><updated>2025-11-25T06:17:40.083642+00:00</updated><content/><link href="https://www.nytimes.com/2025/11/23/technology/openai-chatgpt-users-risks.html"/><published>2025-11-24T05:58:08+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46031220</id><title>Build a Compiler in Five Projects</title><updated>2025-11-25T06:17:39.979762+00:00</updated><content>&lt;doc fingerprint="4d007891504bb690"&gt;
+&lt;/doc&gt;</content><link href="https://www.bitsdraumar.is/bytes-before-flops/"/><published>2025-11-23T15:47:50+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46030799</id><title>What OpenAI did when ChatGPT users lost touch with reality</title><updated>2025-11-25T06:50:57.586883+00:00</updated><content/><link href="https://www.nytimes.com/2025/11/23/technology/openai-chatgpt-users-risks.html"/><published>2025-11-24T05:58:08+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46031220</id><title>Build a Compiler in Five Projects</title><updated>2025-11-25T06:50:57.378512+00:00</updated><content>&lt;doc fingerprint="4d007891504bb690"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Build a Compiler in Five Projects&lt;/head&gt;
     &lt;p&gt;Class website here: https://kmicinski.com/cis531-f25&lt;/p&gt;
@@ -1425,7 +499,7 @@ the programs in the &lt;code&gt;test-programs/&lt;/code&gt; directory, using the
     &lt;p&gt;Kristopher Micinski – Syracuse, November, 2025&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://kmicinski.com/functional-programming/2025/11/23/build-a-language/"/><published>2025-11-24T07:14:55+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46032148</id><title>Fifty Shades of OOP</title><updated>2025-11-25T06:17:39.596462+00:00</updated><content>&lt;doc fingerprint="7648da12caf69dc0"&gt;
+&lt;/doc&gt;</content><link href="https://kmicinski.com/functional-programming/2025/11/23/build-a-language/"/><published>2025-11-24T07:14:55+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46032148</id><title>Fifty Shades of OOP</title><updated>2025-11-25T06:50:56.990702+00:00</updated><content>&lt;doc fingerprint="7648da12caf69dc0"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Fifty Shades of OOP&lt;/head&gt;
     &lt;p&gt;OOP-bashing seems fashionable nowadays. I decided to write this article after seeing two OOP-related articles on Lobsters in quick succession. I’m not interested in defending or attacking OOP, but I do want to throw in my two cents and offer a more nuanced view.&lt;/p&gt;
@@ -1577,12 +651,12 @@ the programs in the &lt;code&gt;test-programs/&lt;/code&gt; directory, using the
     &lt;p&gt;Congratulations on making it to the end of this article! There are other topics I’d love to discuss, such as RAII and design patterns. However, this article is long enough, so I will leave those for you to explore on your own.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://lesleylai.info/en/fifty_shades_of_oop/"/><published>2025-11-24T09:40:32+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46032539</id><title>Shai-Hulud Returns: Over 300 NPM Packages Infected</title><updated>2025-11-25T06:17:39.249575+00:00</updated><link href="https://helixguard.ai/blog/malicious-sha1hulud-2025-11-24"/><published>2025-11-24T10:40:22+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46033330</id><title>Chrome Jpegxl Issue Reopened</title><updated>2025-11-25T06:17:38.799465+00:00</updated><content>&lt;doc fingerprint="732bc1ae2d485202"&gt;
+&lt;/doc&gt;</content><link href="https://lesleylai.info/en/fifty_shades_of_oop/"/><published>2025-11-24T09:40:32+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46032539</id><title>Shai-Hulud Returns: Over 300 NPM Packages Infected</title><updated>2025-11-25T06:50:56.667483+00:00</updated><link href="https://helixguard.ai/blog/malicious-sha1hulud-2025-11-24"/><published>2025-11-24T10:40:22+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46033330</id><title>Chrome Jpegxl Issue Reopened</title><updated>2025-11-25T06:50:56.382852+00:00</updated><content>&lt;doc fingerprint="732bc1ae2d485202"&gt;
   &lt;main&gt;
     &lt;p&gt;Sign in&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://issues.chromium.org/issues/40168998"/><published>2025-11-24T12:23:02+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46036222</id><title>Corvus Robotics (YC S18): Hiring Head of Mfg/Ops, Next Door to YC Mountain View</title><updated>2025-11-25T06:17:38.459949+00:00</updated><content>&lt;doc fingerprint="9c16a0a6b25e9e2d"&gt;
+&lt;/doc&gt;</content><link href="https://issues.chromium.org/issues/40168998"/><published>2025-11-24T12:23:02+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46036222</id><title>Corvus Robotics (YC S18): Hiring Head of Mfg/Ops, Next Door to YC Mountain View</title><updated>2025-11-25T06:50:56.068194+00:00</updated><content>&lt;doc fingerprint="9c16a0a6b25e9e2d"&gt;
   &lt;main&gt;
     &lt;div&gt;
       &lt;p&gt;Corvus Robotics is scaling the largest autonomous logistics data capture fleet ever built. If you're allergic to leaded solder, actual revenue, spreadsheets, or ambiguity -- this role is not for you. More "cardboard boxes," less "Pelican cases."&lt;/p&gt;
@@ -1594,14 +668,14 @@ the programs in the &lt;code&gt;test-programs/&lt;/code&gt; directory, using the
     &lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://news.ycombinator.com/item?id=46036222"/><published>2025-11-24T17:00:33+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46036878</id><title>Implications of AI to schools</title><updated>2025-11-25T06:17:38.206767+00:00</updated><content>&lt;doc fingerprint="d635f48b34542867"&gt;
+&lt;/doc&gt;</content><link href="https://news.ycombinator.com/item?id=46036222"/><published>2025-11-24T17:00:33+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46036878</id><title>Implications of AI to schools</title><updated>2025-11-25T06:50:55.842567+00:00</updated><content>&lt;doc fingerprint="d635f48b34542867"&gt;
   &lt;main&gt;
     &lt;p&gt;We’ve detected that JavaScript is disabled in this browser. Please enable JavaScript or switch to a supported browser to continue using x.com. You can see a list of supported browsers in our Help Center.&lt;/p&gt;
     &lt;p&gt;Help Center&lt;/p&gt;
     &lt;p&gt;Terms of Service Privacy Policy Cookie Policy Imprint Ads info © 2025 X Corp.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://twitter.com/karpathy/status/1993010584175141038"/><published>2025-11-24T17:51:02+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46036895</id><title>Cool-retro-term: terminal emulator which mimics look and feel of CRTs</title><updated>2025-11-25T06:17:37.767002+00:00</updated><content>&lt;doc fingerprint="afec61b99b81218b"&gt;
+&lt;/doc&gt;</content><link href="https://twitter.com/karpathy/status/1993010584175141038"/><published>2025-11-24T17:51:02+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46036895</id><title>Cool-retro-term: terminal emulator which mimics look and feel of CRTs</title><updated>2025-11-25T06:50:55.433394+00:00</updated><content>&lt;doc fingerprint="afec61b99b81218b"&gt;
   &lt;main&gt;
     &lt;table&gt;
       &lt;row span="3"&gt;
@@ -1619,12 +693,12 @@ the programs in the &lt;code&gt;test-programs/&lt;/code&gt; directory, using the
     &lt;p&gt;Check out the wiki and follow the instructions on how to build it on Linux and macOS.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/Swordfish90/cool-retro-term"/><published>2025-11-24T17:52:01+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46036908</id><title>Show HN: I built an interactive HN Simulator</title><updated>2025-11-25T06:17:37.567701+00:00</updated><content>&lt;doc fingerprint="777ff7b7fede5c03"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/Swordfish90/cool-retro-term"/><published>2025-11-24T17:52:01+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46036908</id><title>Show HN: I built an interactive HN Simulator</title><updated>2025-11-25T06:50:55.198980+00:00</updated><content>&lt;doc fingerprint="777ff7b7fede5c03"&gt;
   &lt;main&gt;
     &lt;p&gt;More&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://news.ysimulator.run/news"/><published>2025-11-24T17:52:43+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46037343</id><title>The Bitter Lesson of LLM Extensions</title><updated>2025-11-25T06:17:37.331171+00:00</updated><content>&lt;doc fingerprint="d546845b0b9b86be"&gt;
+&lt;/doc&gt;</content><link href="https://news.ysimulator.run/news"/><published>2025-11-24T17:52:43+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46037343</id><title>The Bitter Lesson of LLM Extensions</title><updated>2025-11-25T06:50:55.090352+00:00</updated><content>&lt;doc fingerprint="d546845b0b9b86be"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;The Bitter Lesson of LLM Extensions&lt;/head&gt;
     &lt;p&gt;Three years ago, “using an LLM” meant pasting a wall of text into a chat box and hoping for something useful back. Today, we point agents at our codebases, our browsers, and let them go off and act on our behalf. A key question that has been brewing under the surface during this time has been: how do we let end users actually customize these systems?&lt;/p&gt;
@@ -1730,7 +804,7 @@ To test local web applications, write native Python Playwright scripts.
     &lt;p&gt;If I could short MCP, I would, and I expect us to go back to extending our agents with the most accessible programming language: natural language.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.sawyerhood.com/blog/llm-extension"/><published>2025-11-24T18:32:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46037591</id><title>Google's new 'Aluminium OS' project brings Android to PC</title><updated>2025-11-25T06:17:37.165501+00:00</updated><content>&lt;doc fingerprint="3f86a0419b9c75e1"&gt;
+&lt;/doc&gt;</content><link href="https://www.sawyerhood.com/blog/llm-extension"/><published>2025-11-24T18:32:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46037591</id><title>Google's new 'Aluminium OS' project brings Android to PC</title><updated>2025-11-25T06:50:54.962509+00:00</updated><content>&lt;doc fingerprint="3f86a0419b9c75e1"&gt;
   &lt;main&gt;
     &lt;p&gt;Affiliate links on Android Authority may earn us a commission. Learn more.&lt;/p&gt;
     &lt;head rend="h1"&gt;Google's new 'Aluminium OS' project brings Android to PC: Here's what we know&lt;/head&gt;
@@ -1767,7 +841,7 @@ To test local web applications, write native Python Playwright scripts.
     &lt;p&gt;Thank you for being part of our community. Read our Comment Policy before posting.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.androidauthority.com/aluminium-os-android-for-pcs-3619092/"/><published>2025-11-24T18:49:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46037626</id><title>Pebble Watch software is now 100% open source</title><updated>2025-11-25T06:17:36.859271+00:00</updated><content>&lt;doc fingerprint="dc4f4b1117d7e1f1"&gt;
+&lt;/doc&gt;</content><link href="https://www.androidauthority.com/aluminium-os-android-for-pcs-3619092/"/><published>2025-11-24T18:49:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46037626</id><title>Pebble Watch software is now 100% open source</title><updated>2025-11-25T06:50:54.578698+00:00</updated><content>&lt;doc fingerprint="dc4f4b1117d7e1f1"&gt;
   &lt;main&gt;
     &lt;p&gt;Pebble Watch Software Is Now 100% Open Source + Tick Talk #4 - PT2 Demos!&lt;/p&gt;
     &lt;p&gt;[2025-11-24]&lt;/p&gt;
@@ -1807,7 +881,7 @@ To test local web applications, write native Python Playwright scripts.
     &lt;p&gt;The video below opens to the part of the video where I do the demo.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://ericmigi.com/blog/pebble-watch-software-is-now-100percent-open-source"/><published>2025-11-24T18:52:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46037637</id><title>Claude Opus 4.5</title><updated>2025-11-25T06:17:36.657369+00:00</updated><content>&lt;doc fingerprint="5f7d0efe2f9bc06f"&gt;
+&lt;/doc&gt;</content><link href="https://ericmigi.com/blog/pebble-watch-software-is-now-100percent-open-source"/><published>2025-11-24T18:52:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46037637</id><title>Claude Opus 4.5</title><updated>2025-11-25T06:50:54.377503+00:00</updated><content>&lt;doc fingerprint="5f7d0efe2f9bc06f"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;Introducing Claude Opus 4.5&lt;/head&gt;&lt;p&gt;Our newest model, Claude Opus 4.5, is available today. It’s intelligent, efficient, and the best model in the world for coding, agents, and computer use. It’s also meaningfully better at everyday tasks like deep research and working with slides and spreadsheets. Opus 4.5 is a step forward in what AI systems can do, and a preview of larger changes to how work gets done.&lt;/p&gt;&lt;p&gt;Claude Opus 4.5 is state-of-the-art on tests of real-world software engineering:&lt;/p&gt;&lt;p&gt;Opus 4.5 is available today on our apps, our API, and on all three major cloud platforms. If you’re a developer, simply use &lt;code&gt;claude-opus-4-5-20251101&lt;/code&gt; via the Claude API. Pricing is now $5/$25 per million tokens—making Opus-level capabilities accessible to even more users, teams, and enterprises.&lt;/p&gt;&lt;p&gt;Alongside Opus, we’re releasing updates to the Claude Developer Platform, Claude Code, and our consumer apps. There are new tools for longer-running agents and new ways to use Claude in Excel, Chrome, and on desktop. In the Claude apps, lengthy conversations no longer hit a wall. See our product-focused section below for details.&lt;/p&gt;&lt;head rend="h2"&gt;First impressions&lt;/head&gt;&lt;p&gt;As our Anthropic colleagues tested the model before release, we heard remarkably consistent feedback. Testers noted that Claude Opus 4.5 handles ambiguity and reasons about tradeoffs without hand-holding. They told us that, when pointed at a complex, multi-system bug, Opus 4.5 figures out the fix. They said that tasks that were near-impossible for Sonnet 4.5 just a few weeks ago are now within reach. Overall, our testers told us that Opus 4.5 just “gets it.”&lt;/p&gt;&lt;p&gt;Many of our customers with early access have had similar experiences. Here are some examples of what they told us:&lt;/p&gt;&lt;quote&gt;Opus models have always been “the real SOTA” but have been cost prohibitive in the past. Claude Opus 4.5 is now at a price point where it can be your go-to model for most tasks. It’s the clear winner and exhibits the best frontier task planning and tool calling we’ve seen yet.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 delivers high-quality code and excels at powering heavy-duty agentic workflows with GitHub Copilot. Early testing shows it surpasses internal coding benchmarks while cutting token usage in half, and is especially well-suited for tasks like code migration and code refactoring.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 beats Sonnet 4.5 and competition on our internal benchmarks, using fewer tokens to solve the same problems. At scale, that efficiency compounds.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 delivers frontier reasoning within Lovable's chat mode, where users plan and iterate on projects. Its reasoning depth transforms planning—and great planning makes code generation even better.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 excels at long-horizon, autonomous tasks, especially those that require sustained reasoning and multi-step execution. In our evaluations it handled complex workflows with fewer dead-ends. On Terminal Bench it delivered a 15% improvement over Sonnet 4.5, a meaningful gain that becomes especially clear when using Warp’s Planning Mode.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 achieved state-of-the-art results for complex enterprise tasks on our benchmarks, outperforming previous models on multi-step reasoning tasks that combine information retrieval, tool use, and deep analysis.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 delivers measurable gains where it matters most: stronger results on our hardest evaluations and consistent performance through 30-minute autonomous coding sessions.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 represents a breakthrough in self-improving AI agents. For office automation, our agents were able to autonomously refine their own capabilities—achieving peak performance in 4 iterations while other models couldn’t match that quality after 10.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 is a notable improvement over the prior Claude models inside Cursor, with improved pricing and intelligence on difficult coding tasks.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 is yet another example of Anthropic pushing the frontier of general intelligence. It performs exceedingly well across difficult coding tasks, showcasing long-term goal-directed behavior.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 delivered an impressive refactor spanning two codebases and three coordinated agents. It was very thorough, helping develop a robust plan, handling the details and fixing tests. A clear step forward from Sonnet 4.5.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 handles long-horizon coding tasks more efficiently than any model we’ve tested. It achieves higher pass rates on held-out tests while using up to 65% fewer tokens, giving developers real cost control without sacrificing quality.&lt;/quote&gt;&lt;quote&gt;We’ve found that Opus 4.5 excels at interpreting what users actually want, producing shareable content on the first try. Combined with its speed, token efficiency, and surprisingly low cost, it’s the first time we’re making Opus available in Notion Agent.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 excels at long-context storytelling, generating 10-15 page chapters with strong organization and consistency. It's unlocked use cases we couldn't reliably deliver before.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 sets a new standard for Excel automation and financial modeling. Accuracy on our internal evals improved 20%, efficiency rose 15%, and complex tasks that once seemed out of reach became achievable.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 is the only model that nails some of our hardest 3D visualizations. Polished design, tasteful UX, and excellent planning &amp;amp; orchestration - all with more efficient token usage. Tasks that took previous models 2 hours now take thirty minutes.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 catches more issues in code reviews without sacrificing precision. For production code review at scale, that reliability matters.&lt;/quote&gt;&lt;quote&gt;Based on testing with Junie, our coding agent, Claude Opus 4.5 outperforms Sonnet 4.5 across all benchmarks. It requires fewer steps to solve tasks and uses fewer tokens as a result. This indicates that the new model is more precise and follows instructions more effectively — a direction we’re very excited about.&lt;/quote&gt;&lt;quote&gt;The effort parameter is brilliant. Claude Opus 4.5 feels dynamic rather than overthinking, and at lower effort delivers the same quality we need while being dramatically more efficient. That control is exactly what our SQL workflows demand.&lt;/quote&gt;&lt;quote&gt;We’re seeing 50% to 75% reductions in both tool calling errors and build/lint errors with Claude Opus 4.5. It consistently finishes complex tasks in fewer iterations with more reliable execution.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.5 is smooth, with none of the rough edges we've seen from other frontier models. The speed improvements are remarkable.&lt;/quote&gt;&lt;head rend="h2"&gt;Evaluating Claude Opus 4.5&lt;/head&gt;&lt;p&gt;We give prospective performance engineering candidates a notoriously difficult take-home exam. We also test new models on this exam as an internal benchmark. Within our prescribed 2-hour time limit, Claude Opus 4.5 scored higher than any human candidate ever1.&lt;/p&gt;&lt;p&gt;The take-home test is designed to assess technical ability and judgment under time pressure. It doesn’t test for other crucial skills candidates may possess, like collaboration, communication, or the instincts that develop over years. But this result—where an AI model outperforms strong candidates on important technical skills—raises questions about how AI will change engineering as a profession. Our Societal Impacts and Economic Futures research is aimed at understanding these kinds of changes across many fields. We plan to share more results soon.&lt;/p&gt;&lt;p&gt;Software engineering isn’t the only area on which Claude Opus 4.5 has improved. Capabilities are higher across the board—Opus 4.5 has better vision, reasoning, and mathematics skills than its predecessors, and it is state-of-the-art in many domains:2&lt;/p&gt;&lt;p&gt;The model’s capabilities outpace some of the benchmarks we use in our tests. A common benchmark for agentic capabilities is τ2-bench, which measures the performance of agents in real-world, multi-turn tasks. In one scenario, models have to act as an airline service agent helping a distressed customer. The benchmark expects models to refuse a modification to a basic economy booking since the airline doesn’t allow changes to that class of tickets. Instead, Opus 4.5 found an insightful (and legitimate) way to solve the problem: upgrade the cabin first, then modify the flights.&lt;/p&gt;&lt;code&gt;Let me think about what options I have within my policy:
 
 1. Modify flights - Basic economy cannot be modified. This is clear in the policy.
@@ -1824,7 +898,7 @@ So the strategy could be:
 
 This would cost more money, but it’s a legitimate path within the policy!&lt;/code&gt;&lt;p&gt;The benchmark technically scored this as a failure because Claude’s way of helping the customer was unanticipated. But this kind of creative problem solving is exactly what we’ve heard about from our testers and customers—it’s what makes Claude Opus 4.5 feel like a meaningful step forward.&lt;/p&gt;&lt;p&gt;In other contexts, finding clever paths around intended constraints could count as reward hacking—where models “game” rules or objectives in unintended ways. Preventing such misalignment is one of the objectives of our safety testing, discussed in the next section.&lt;/p&gt;&lt;head rend="h2"&gt;A step forward on safety&lt;/head&gt;&lt;p&gt;As we state in our system card, Claude Opus 4.5 is the most robustly aligned model we have released to date and, we suspect, the best-aligned frontier model by any developer. It continues our trend towards safer and more secure models:&lt;/p&gt;&lt;p&gt;Our customers often use Claude for critical tasks. They want to be assured that, in the face of malicious attacks by hackers and cybercriminals, Claude has the training and the “street smarts” to avoid trouble. With Opus 4.5, we’ve made substantial progress in robustness against prompt injection attacks, which smuggle in deceptive instructions to fool the model into harmful behavior. Opus 4.5 is harder to trick with prompt injection than any other frontier model in the industry:&lt;/p&gt;&lt;p&gt;You can find a detailed description of all our capability and safety evaluations in the Claude Opus 4.5 system card.&lt;/p&gt;&lt;head rend="h2"&gt;New on the Claude Developer Platform&lt;/head&gt;&lt;p&gt;As models get smarter, they can solve problems in fewer steps: less backtracking, less redundant exploration, less verbose reasoning. Claude Opus 4.5 uses dramatically fewer tokens than its predecessors to reach similar or better outcomes.&lt;/p&gt;&lt;p&gt;But different tasks call for different tradeoffs. Sometimes developers want a model to keep thinking about a problem; sometimes they want something more nimble. With our new effort parameter on the Claude API, you can decide to minimize time and spend or maximize capability.&lt;/p&gt;&lt;p&gt;Set to a medium effort level, Opus 4.5 matches Sonnet 4.5’s best score on SWE-bench Verified, but uses 76% fewer output tokens. At its highest effort level, Opus 4.5 exceeds Sonnet 4.5 performance by 4.3 percentage points—while using 48% fewer tokens.&lt;/p&gt;&lt;p&gt;With effort control, context compaction, and advanced tool use, Claude Opus 4.5 runs longer, does more, and requires less intervention.&lt;/p&gt;&lt;p&gt;Our context management and memory capabilities can dramatically boost performance on agentic tasks. Opus 4.5 is also very effective at managing a team of subagents, enabling the construction of complex, well-coordinated multi-agent systems. In our testing, the combination of all these techniques boosted Opus 4.5’s performance on a deep research evaluation by almost 15 percentage points4.&lt;/p&gt;&lt;p&gt;We’re making our Developer Platform more composable over time. We want to give you the building blocks to construct exactly what you need, with full control over efficiency, tool use, and context management.&lt;/p&gt;&lt;head rend="h2"&gt;Product updates&lt;/head&gt;&lt;p&gt;Products like Claude Code show what’s possible when the kinds of upgrades we’ve made to the Claude Developer Platform come together. Claude Code gains two upgrades with Opus 4.5. Plan Mode now builds more precise plans and executes more thoroughly—Claude asks clarifying questions upfront, then builds a user-editable plan.md file before executing.&lt;/p&gt;&lt;p&gt;Claude Code is also now available in our desktop app, letting you run multiple local and remote sessions in parallel: perhaps one agent fixes bugs, another researches GitHub, and a third updates docs.&lt;/p&gt;&lt;p&gt;For Claude app users, long conversations no longer hit a wall—Claude automatically summarizes earlier context as needed, so you can keep the chat going. Claude for Chrome, which lets Claude handle tasks across your browser tabs, is now available to all Max users. We announced Claude for Excel in October, and as of today we've expanded beta access to all Max, Team, and Enterprise users. Each of these updates takes advantage of Claude Opus 4.5’s market-leading performance in using computers, spreadsheets, and handling long-running tasks.&lt;/p&gt;&lt;p&gt;For Claude and Claude Code users with access to Opus 4.5, we’ve removed Opus-specific caps. For Max and Team Premium users, we’ve increased overall usage limits, meaning you’ll have roughly the same number of Opus tokens as you previously had with Sonnet. We’re updating usage limits to make sure you’re able to use Opus 4.5 for daily work. These limits are specific to Opus 4.5. As future models surpass it, we expect to update limits as needed.&lt;/p&gt;&lt;head rend="h4"&gt;Footnotes&lt;/head&gt;&lt;p&gt;1: This result was using parallel test-time compute, a method that aggregates multiple “tries” from the model and selects from among them. Without a time limit, the model (used within Claude Code) matched the best-ever human candidate.&lt;/p&gt;&lt;p&gt;2: We improved the hosting environment to reduce infrastructure failures. This change improved Gemini 3 to 56.7% and GPT-5.1 to 48.6% from the values reported by their developers, using the Terminus-2 harness.&lt;/p&gt;&lt;p&gt;3: Note that these evaluations were run on an in-progress upgrade to Petri, our open-source, automated evaluation tool. They were run on an earlier snapshot of Claude Opus 4.5. Evaluations of the final production model show a very similar pattern of results when compared to other Claude models, and are described in detail in the Claude Opus 4.5 system card.&lt;/p&gt;&lt;p&gt;4: A fetch-enabled version of BrowseComp-Plus. Specifically, the improvement was from 70.48% without using the combination of techniques to 85.30% using it.&lt;/p&gt;&lt;p&gt;Methodology&lt;/p&gt;&lt;p&gt;All evals were run with a 64K thinking budget, interleaved scratchpads, 200K context window, default effort (high), default sampling settings (temperature, top_p), and averaged over 5 independent trials. Exceptions: SWE-bench Verified (no thinking budget) and Terminal Bench (128K thinking budget). Please see the Claude Opus 4.5 system card for full details.&lt;/p&gt;&lt;head rend="h2"&gt;Related content&lt;/head&gt;&lt;head rend="h3"&gt;Claude now available in Microsoft Foundry and Microsoft 365 Copilot&lt;/head&gt;Read more&lt;head rend="h3"&gt;Microsoft, NVIDIA, and Anthropic announce strategic partnerships&lt;/head&gt;&lt;p&gt;Microsoft, NVIDIA and Anthropic announced new strategic partnerships. Anthropic is scaling its rapidly-growing Claude AI model on Microsoft Azure, powered by NVIDIA, which will broaden access to Claude and provide Azure enterprise customers with expanded model choice and new capabilities. Anthropic has committed to purchase $30 billion of Azure compute capacity and to contract additional compute capacity up to one gigawatt.&lt;/p&gt;Read more&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.anthropic.com/news/claude-opus-4-5"/><published>2025-11-24T18:53:05+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46038047</id><title>Claude Advanced Tool Use</title><updated>2025-11-25T06:17:36.327993+00:00</updated><content>&lt;doc fingerprint="b34d76d332b7ca8a"&gt;
+&lt;/doc&gt;</content><link href="https://www.anthropic.com/news/claude-opus-4-5"/><published>2025-11-24T18:53:05+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46038047</id><title>Claude Advanced Tool Use</title><updated>2025-11-25T06:50:54.138245+00:00</updated><content>&lt;doc fingerprint="b34d76d332b7ca8a"&gt;
   &lt;main&gt;
     &lt;p&gt;The future of AI agents is one where models work seamlessly across hundreds or thousands of tools. An IDE assistant that integrates git operations, file manipulation, package managers, testing frameworks, and deployment pipelines. An operations coordinator that connects Slack, GitHub, Google Drive, Jira, company databases, and dozens of MCP servers simultaneously.&lt;/p&gt;
     &lt;p&gt;To build effective agents, they need to work with unlimited tool libraries without stuffing every definition into context upfront. Our blog article on using code execution with MCP discussed how tool results and definitions can sometimes consume 50,000+ tokens before an agent reads a request. Agents should discover and load tools on-demand, keeping only what's relevant for the current task.&lt;/p&gt;
@@ -2242,7 +1316,7 @@ Returns:
     &lt;p&gt;Written by Bin Wu, with contributions from Adam Jones, Artur Renault, Henry Tay, Jake Noble, Nathan McCandlish, Noah Picard, Sam Jiang, and the Claude Developer Platform team. This work builds on foundational research by Chris Gorgolewski, Daniel Jiang, Jeremy Fox and Mike Lambert. We also drew inspiration from across the AI ecosystem, including Joel Pobar's LLMVM, Cloudflare's Code Mode and Code Execution as MCP. Special thanks to Andy Schumeister, Hamish Kerr, Keir Bradwell, Matt Bleifer and Molly Vorwerck for their support.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.anthropic.com/engineering/advanced-tool-use"/><published>2025-11-24T19:21:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46038099</id><title>Unpowered SSDs slowly lose data</title><updated>2025-11-25T06:17:36.085741+00:00</updated><content>&lt;doc fingerprint="3653bc3789b28fb8"&gt;
+&lt;/doc&gt;</content><link href="https://www.anthropic.com/engineering/advanced-tool-use"/><published>2025-11-24T19:21:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46038099</id><title>Unpowered SSDs slowly lose data</title><updated>2025-11-25T06:50:53.883829+00:00</updated><content>&lt;doc fingerprint="3653bc3789b28fb8"&gt;
   &lt;main&gt;
     &lt;p&gt;SSDs have all but replaced hard drives when it comes to primary storage. They're orders of magnitude faster, more convenient, and consume less power than mechanical hard drives. That said, if you're also using SSDs for cold storage, expecting the drives lying in your drawer to work perfectly after years, you might want to rethink your strategy. Your reliable SSD could suffer from corrupted or lost data if left unpowered for extended periods. This is why many users don't consider SSDs a reliable long-term storage medium, and prefer using hard drives, magnetic tape, or M-Disc instead.&lt;/p&gt;
     &lt;head rend="h2"&gt;Your SSD data isn't as permanent as you think&lt;/head&gt;
@@ -2262,7 +1336,7 @@ Returns:
     &lt;p&gt;As long as you're using consumer SSDs for primary storage on your PC, it's all well and good. You'll most likely replace your drive long before exhausting its P/E cycles. For long-term storage, however, relying on SSDs is risky, since they can lose data if left without power for years. This data loss can occur anytime from 1 to 3 years of keeping your SSDs unpowered, so using alternate storage media and investing in a backup system should be your priorities.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.xda-developers.com/your-unpowered-ssd-is-slowly-losing-your-data/"/><published>2025-11-24T19:25:25+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46038143</id><title>PS5 now costs less than 64GB of DDR5 memory. RAM jumps to $600 due to shortage</title><updated>2025-11-25T06:17:35.883877+00:00</updated><content>&lt;doc fingerprint="536a48fd8eb6f785"&gt;
+&lt;/doc&gt;</content><link href="https://www.xda-developers.com/your-unpowered-ssd-is-slowly-losing-your-data/"/><published>2025-11-24T19:25:25+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46038143</id><title>PS5 now costs less than 64GB of DDR5 memory. RAM jumps to $600 due to shortage</title><updated>2025-11-25T06:50:53.549769+00:00</updated><content>&lt;doc fingerprint="536a48fd8eb6f785"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;An entire PS5 now costs less than 64GB of DDR5 memory, even after a discount — simple memory kit jumps to $600 due to DRAM shortage, and it's expected to get worse into 2026&lt;/head&gt;
     &lt;p&gt;Thanks to the AI boom devouring the majority of the world's memory and storage supply, end-consumers are now facing increasingly inflated prices for common components. DDR5 RAM, a necessity for building current-gen Intel or AMD systems, has now reached record highs in terms of pricing; a 64 GB kit of G.Skill's Trident Z5 Neo 6000 MT/s RAM is listed at $599.99 on Newegg right now — that's $200 more than a PS5 Slim or a Microsoft Xbox Series S, and just $50 shy off an entire PS5 Pro at the moment.&lt;/p&gt;
@@ -2313,4 +1387,100 @@ Returns:
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.tomshardware.com/pc-components/ddr5/64gb-of-ddr5-memory-now-costs-more-than-an-entire-ps5-even-after-a-discount-trident-z5-neo-kit-jumps-to-usd600-due-to-dram-shortage-and-its-expected-to-get-worse-into-2026"/><published>2025-11-24T19:29:12+00:00</published></entry></feed>
+&lt;/doc&gt;</content><link href="https://www.tomshardware.com/pc-components/ddr5/64gb-of-ddr5-memory-now-costs-more-than-an-entire-ps5-even-after-a-discount-trident-z5-neo-kit-jumps-to-usd600-due-to-dram-shortage-and-its-expected-to-get-worse-into-2026"/><published>2025-11-24T19:29:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46042655</id><title>Windows GUI – Good, Bad and Pretty Ugly (2023)</title><updated>2025-11-25T06:50:53.134812+00:00</updated><content>&lt;doc fingerprint="149ee97fbfa67cd6"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Windows launched way back in 1985, when I was still using a Commodore 64 and PCs were all of four years old–barely out of diapers. The GUI or Graphical User Interface, has changed a lot over the years and I thought it might be fun/horrifying to rank every major version of the Windows GUI, from Windows 1.0 in 1985, to Windows 11 as of 2023.&lt;/p&gt;
+    &lt;p&gt;I’m rating not based on how the system looked at the time (you can do only do so much with CGA/EGA graphics, after all), but how they look now. Is this fair? Probably not, but as always, I make the rules!&lt;/p&gt;
+    &lt;p&gt;The rating system is based on a scale of 1 to 10 Clippys, with 10 being best.&lt;/p&gt;
+    &lt;quote&gt;NOTE: I am skipping over all versions of Windows NT because it follows the look of other versions mentioned below.&lt;/quote&gt;
+    &lt;p&gt;Overall Rankings:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Windows 11&lt;/item&gt;
+      &lt;item&gt;Windows 2000&lt;/item&gt;
+      &lt;item&gt;Windows 95/98/Vista/7&lt;/item&gt;
+      &lt;item&gt;Windows 10&lt;/item&gt;
+      &lt;item&gt;Windows 3.0/3.1/XP&lt;/item&gt;
+      &lt;item&gt;Windows 8.1&lt;/item&gt;
+      &lt;item&gt;Windows 8&lt;/item&gt;
+      &lt;item&gt;Windows 2.0&lt;/item&gt;
+      &lt;item&gt;Windows 1.0&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Windows 1.0 (1985)&lt;lb/&gt;Rating: 1 Clippy&lt;/p&gt;
+    &lt;p&gt;In 1985, Windows ran on top of DOS, had drop-down menus, fixed windows, and CGA graphics. In a way, the extremely limited colour palette actually made it more colourful. Perhaps too colourful. This is pretty ugly all around. If you are a fan of this, you probably wear plaid bow ties unironically.&lt;/p&gt;
+    &lt;p&gt;Windows 2.0 (1987)&lt;lb/&gt;Rating: 2.5 Clippys&lt;/p&gt;
+    &lt;p&gt;This is where Windows goes from hideously ugly to just unattractive. The menu bars and arrows have been refined a little, and now you get resizable windows. It’s like a colour Macintosh, but hit with an ugly stick. And still needs to run on top of DOS.&lt;/p&gt;
+    &lt;p&gt;Windows 3.0 (1990)&lt;lb/&gt;Rating: 6 Clippys&lt;/p&gt;
+    &lt;p&gt;Microsoft makes a big leap with Windows 3, the first version to offer a coherent GUI, with pseudo 3D elements for buttons and scroll bars. Support for VGA graphics also means the cartoony look has gone away, making it look that more professional. It still needs DOS and has that weird File Manager/Program Manager split. Oh, and Minesweeper.&lt;/p&gt;
+    &lt;p&gt;Windows 3.1 (1992)&lt;lb/&gt;Rating 6 Clippys&lt;/p&gt;
+    &lt;p&gt;Windows hits the big time. This is the version where it was clear Windows was the future and DOS was the past. Windows 3.1 actually doesn’t look much different than 3.0, though, so it rates the same.&lt;/p&gt;
+    &lt;p&gt;Windows 95 (1995)&lt;lb/&gt;Rating: 7.5 Clippys&lt;/p&gt;
+    &lt;p&gt;With Windows 95, Microsoft managed to produce a version of its OS that scared Apple so much they ended up bringing Steve Jobs back, along with his own operating system, NeXTSTEP. Windows 95 introduced the taskbar, the Start button (it’s even labelled Start, how quaint!), a proper desktop and a continued refinement with the 3D bevelled look. The GUI is also simplified in some ways, with the title bar widgets all getting moved to the top-right corner. Icons are more detailed and colours are overall more subdued.&lt;/p&gt;
+    &lt;p&gt;While it looks dated to our 2023 eyes, this GUI remains just as clear and functional today as it was 28 (!) years ago.&lt;/p&gt;
+    &lt;p&gt;Windows 98 (1998)&lt;lb/&gt;Rating: 7.5 Clippys&lt;/p&gt;
+    &lt;p&gt;Windows 98 basically looks the same as Windows 95, but Microsoft did add a stylin’ gradient effect to title bars. It’s not enough to change its rating over 95, though. Sorry, MS!&lt;/p&gt;
+    &lt;p&gt;Note: I am skipping Windows Millennium Edition (Me) because while it had changes under the hood, visually it is pretty much Windows 98 Third Edition.&lt;/p&gt;
+    &lt;p&gt;Windows 2000 (2000)&lt;lb/&gt;Rating: 8 Clippys&lt;/p&gt;
+    &lt;p&gt;I admit bias here. First, this is essentially a version of Windows NT, which I said I wouldn’t be rating. Second, it really just brings the 95/98 look to the NT version of Windows. But this was the first version of Windows that tried to bridge the gap between consumer and business versions–and it mostly worked (if you could get it at a discount, like I did at the time). I give it a slight edge because they changed some of the icons, improving them, in my view. It also had a generally more sophisticated veneer–the last version of Windows to really use this approach for many years.&lt;/p&gt;
+    &lt;p&gt;Windows XP (2001)&lt;lb/&gt;Rating: 6 Clippys&lt;/p&gt;
+    &lt;p&gt;Our first regression! Windows XP gave us a pretty wallpaper (probably the most famous OS wallpaper ever) and there’s something I find pleasing about the look of its buttons and most of its icons. The bevelled look, combined with much brighter colours, though, gives the OS a decidedly less serious look. I’m not sure what Microsoft was going for, but I don’t think “cartoony” is what they had in mind. Not a total disaster or anything, but kind of goofy-looking in hindsight.&lt;/p&gt;
+    &lt;p&gt;Windows Vista (2006)&lt;lb/&gt;Rating: 7.5 Clippys&lt;/p&gt;
+    &lt;p&gt;With Vista, Microsoft sought to strip away the bright, simple colours of XP in favour of a glossy 3D sheen. For the most part, I think it works, though transparency does get a bit out of hand at times. I like how the Start button now looks more like a button. Icons are cleaner and more detailed. This is Microsoft saying Windows is all grown up now. Too bad about all the driver issues and steep system requirements.&lt;/p&gt;
+    &lt;p&gt;Windows 7 (2009)&lt;lb/&gt;Rating: 7.5 Clippys &lt;/p&gt;
+    &lt;p&gt;As you can see, Windows 7 is pretty much Vista, but with the transparency toned down. This is welcome, but it’s not enough to change its rating over Vista.&lt;/p&gt;
+    &lt;p&gt;Windows 8 (2012)&lt;lb/&gt;Rating: 5 Clippys&lt;/p&gt;
+    &lt;p&gt;And here we have a major step back. Microsoft somehow thought that in 2012 everyone would be using tablets with swipe gestures, and designed Windows 8’s GUI around this. They also elected to do away with finely-detailed icons in favour of simple, single-colour tiles and widgets. But the tiles could be one of many colours (and sizes), so you ended up with a crazy quilt look (see the screenshot below for a representative example). They got rid of the Start menu and the Start button. This is ugly. If you like Windows 8’s look, you are a bad person. You are the one Steve Jobs was talking about when he said Microsoft had no taste.&lt;/p&gt;
+    &lt;p&gt;Windows 8.1 (2013)&lt;lb/&gt;Rating: 5.5 Clippys&lt;/p&gt;
+    &lt;p&gt;Windows 8.1 made some changes, such as adding back the Start button and including the option to boot to the desktop, but the GUI was mostly the same, and just as ugly.&lt;/p&gt;
+    &lt;p&gt;Windows 10 (2015)&lt;lb/&gt;Rating: 6.5 Clippys&lt;/p&gt;
+    &lt;p&gt;Windows 10’s main mission was to undo Windows 8. It brought back the Start menu, it made the desktop the central part of the UI again, and it tamed some of the tile experience, though the flat look still persisted. This frankenOS approach means it feels like a cross between Windows 7 and 8. It’s not bad, but it’s also clearly the result of yanking the Windows GUI off in a new and unplanned direction.&lt;/p&gt;
+    &lt;p&gt;Windows 11 (2021)&lt;lb/&gt;Rating: 8 Clippys&lt;/p&gt;
+    &lt;p&gt;There are things to critique about Windows 11–its security requirements, the all but mandatory MS account, a push toward oversimplification of the Start menu. But in terms of GUI, this is probably the most refined the OS has been since 2000. It also restores a cohesion to the look of the OS that had been missing since Windows 7 in 2009. Sure, it’s clearly aping macOS in some ways, like the rounded corners on windows, but everything looks very clean. I actually would give this version the nod, aesthetically, over the current version of macOS (Monterey as I write this)–though not by a lot. The biggest knocks are its lack of customization (in some regards), removal of features (the taskbar can no longer be moved to other edges of the screen) and Microsoft’s annoying habit of adding more intrusive bloatware, pop-ups and other distractions. Looks-wise, though, it’s pretty nice!&lt;/p&gt;
+    &lt;p&gt;Overall, the versions I feel Microsoft got right (and iterated on) were:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Windows 3.0&lt;/item&gt;
+      &lt;item&gt;Windows 95&lt;/item&gt;
+      &lt;item&gt;Windows Vista&lt;/item&gt;
+      &lt;item&gt;Windows 11&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The ones that struck out were:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Windows XP&lt;/item&gt;
+      &lt;item&gt;Windows 8&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The early versions (1.0 and 2.0) were hamstrung by the technology at the time, while Windows 10 had to pick up the pieces from Windows 8.&lt;/p&gt;
+    &lt;p&gt;Rumours say Microsoft is working on Windows 12. If so, I wouldn’t expect it to depart visually from Windows 11, but you never know.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://creolened.com/windows-gui-good-bad-and-pretty-ugly-ranked/"/><published>2025-11-25T05:33:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46042928</id><title>Human brains are preconfigured with instructions for understanding the world</title><updated>2025-11-25T06:50:52.704241+00:00</updated><content>&lt;doc fingerprint="230b53ace9f3ddab"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Health&lt;/p&gt;
+    &lt;head rend="h1"&gt;Evidence suggests early developing human brains are preconfigured with instructions for understanding the world&lt;/head&gt;
+    &lt;p&gt;Assistant Professor of Biomolecular Engineering Tal Sharf’s lab used organoids to make fundamental discoveries about human brain development.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Press Contact&lt;/head&gt;
+    &lt;head rend="h2"&gt;Key takeaways&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;New findings suggest the brain has preconfigured, structured activity patterns even before sensory experiences occur.&lt;/item&gt;
+      &lt;item&gt;UC Santa Cruz researchers used brain organoids to study the brain’s earliest electrical activity.&lt;/item&gt;
+      &lt;item&gt;Understanding early brain patterns could have important implications for diagnosing and treating developmental brain disorders.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Humans have long wondered when and how we begin to form thoughts. Are we born with a pre-configured brain, or do thought patterns only begin to emerge in response to our sensory experiences of the world around us? Now, science is getting closer to answering the questions philosophers have pondered for centuries.&lt;/p&gt;
+    &lt;p&gt;Researchers at the University of California, Santa Cruz, are using tiny models of human brain tissue, called organoids, to study the earliest moments of electrical activity in the brain. A new study in Nature Neuroscience finds that the earliest firings of the brain occur in structured patterns without any external experiences, suggesting that the human brain is preconfigured with instructions about how to navigate and interact with the world.&lt;/p&gt;
+    &lt;p&gt;“These cells are clearly interacting with each other and forming circuits that self-assemble before we can experience anything from the outside world,” said Tal Sharf, assistant professor of biomolecular engineering at the Baskin School of Engineering and the study’s senior author. “There’s an operating system that exists, that emerges in a primordial state. In my laboratory, we grow brain organoids to peer into this primordial version of the brain’s operating system and study how the brain builds itself before it’s shaped by sensory experience.”&lt;/p&gt;
+    &lt;p&gt;In improving our fundamental understanding of human brain development, these findings can help researchers better understand neurodevelopmental disorders, and pinpoint the impact of toxins like pesticides and microplastics in the developing brain.&lt;/p&gt;
+    &lt;head rend="h4"&gt;Studying the developing brain&lt;/head&gt;
+    &lt;p&gt;The brain, similar to a computer, runs on electrical signals—the firing of neurons. When these signals begin to fire, and how the human brain develops, are challenging topics for scientists to study, as the early developing human brain is protected within the womb.&lt;/p&gt;
+    &lt;p&gt;Organoids, which are 3D models of tissue grown from human stem cells in the lab, provide a unique window into brain development. The Braingeneers group at UC Santa Cruz, in collaboration with researchers at UC San Francisco and UC Santa Barbara, are pioneering methods to grow these models and take measurements from them to gain insights into brain development and disorders.&lt;/p&gt;
+    &lt;p&gt;Organoids are particularly useful for understanding if the brain develops in response to sensory input—as they exist in the lab setting and not the body—and can be grown ethically in large quantities. In this study, researchers prompted stem cells to form brain tissue, and then measured their electrical activity using specialized microchips, similar to those that run a computer. Sharf’s background in both applied physics, computation, and neurobiology form his expertise in modelling the circuitry of the early brain.&lt;/p&gt;
+    &lt;p&gt;“An organoid system that’s intrinsically decoupled from any sensory input or communication with organs gives you a window into what’s happening with this self-assembly process,” Sharf said. “That self-assembly process is really hard to do with traditional 2D cell culture—you can’t get the cell diversity and the architecture. The cells need to be in intimate contact with each other. We’re trying to control the initial conditions, so we can let biology do its wonderful thing.”&lt;/p&gt;
+    &lt;p&gt;The Sharf lab is developing novel neural interfaces, leveraging expertise in physics, materials science, and electrical engineering. On the right, Koushik Devarajan, an electrical and computer engineering Ph.D. student in the Sharf lab.&lt;/p&gt;
+    &lt;head rend="h4"&gt;Pattern production&lt;/head&gt;
+    &lt;p&gt;The researchers observed the electrical activity of the brain tissue as they self-assembled from stem cells into a tissue that can translate the senses and produce language and conscious thought. They found that within the first few months of development, long before the human brain is capable of receiving and processing complex external sensory information such as vision and hearing, its cells spontaneously began to emit electrical signals characteristic of the patterns that underlie translation of the senses.&lt;/p&gt;
+    &lt;p&gt;Through decades of neuroscience research, the community has discovered that neurons fire in patterns that aren’t just random. Instead, the brain has a “default mode” — a basic underlying structure for firing neurons which then becomes more specific as the brain processes unique signals like a smell or taste. This background mode outlines the possible range of sensory responses the body and brain can produce.&lt;/p&gt;
+    &lt;p&gt;In their observations of single neuron spikes in the self-assembling organoid models, Sharf and colleagues found that these earliest observable patterns have striking similarity with the brain’s default mode. Even without having received any sensory input, they are firing off a complex repertoire of time-based patterns, or sequences, which have the potential to be refined for specific senses, hinting at a genetically encoded blueprint inherent to the neural architecture of the living brain.&lt;/p&gt;
+    &lt;p&gt;“These intrinsically self-organized systems could serve as a basis for constructing a representation of the world around us,” Sharf said. “The fact that we can see them in these early stages suggests that evolution has figured out a way that the central nervous system can construct a map that would allow us to navigate and interact with the world.”&lt;/p&gt;
+    &lt;p&gt;Knowing that these organoids produce the basic structure of the living brain opens up a range of possibilities for better understanding human neurodevelopment, disease, and the effects of toxins in the brain.&lt;/p&gt;
+    &lt;p&gt;“We’re showing that there is a basis for capturing complex dynamics that likely could be signatures of pathological onsets that we could study in human tissue,” Sharf said. “That would allow us to develop therapies, working with clinicians at the preclinical level to potentially develop compounds, drug therapies, and gene editing tools that could be cheaper, more efficient, higher throughput.”&lt;/p&gt;
+    &lt;p&gt;This study included researchers at UC Santa Barbara, Washington University in St. Louis, Johns Hopkins University, the University Medical Center Hamburg-Eppendorf, and ETH Zurich.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://news.ucsc.edu/2025/11/sharf-preconfigured-brain/"/><published>2025-11-25T06:31:31+00:00</published></entry></feed>
