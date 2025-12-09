@@ -1,5 +1,983 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-12-09T14:45:11.069624+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46194337</id><title>Let's put Tailscale on a jailbroken Kindle</title><updated>2025-12-09T14:45:19.366181+00:00</updated><content>&lt;doc fingerprint="77000a1e01fd3fdc"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-12-09T15:12:59.672944+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46193931</id><title>AMD GPU Debugger</title><updated>2025-12-09T15:13:09.090123+00:00</updated><content>&lt;doc fingerprint="ae1ad8512d473b89"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;AMD GPU Debugger&lt;/head&gt;
+    &lt;p&gt;I’ve always wondered why we don’t have a GPU debugger similar to the one used for CPUs. A tool that allows pausing execution and examining the current state. This capability feels essential, especially since the GPU’s concurrent execution model is much harder to reason about. After searching for solutions, I came across rocgdb, a debugger for AMD’s ROCm environment. Unfortunately, its scope is limited to that environment. Still, this shows it’s technically possible. I then found a helpful series of blog posts by Marcell Kiss, detailing how he achieved this, which inspired me to try to recreate the process myself.&lt;/p&gt;
+    &lt;head rend="h1"&gt;Let’s Try To Talk To The GPU Directly&lt;/head&gt;
+    &lt;p&gt;The best place to start learning about this is RADV. By tracing what it does, we can find how to do it. Our goal here is to run the most basic shader &lt;code&gt;nop 0&lt;/code&gt; without using Vulkan, aka RADV in our case.&lt;/p&gt;
+    &lt;p&gt;First of all, we need to open the DRM file to establish a connection with the KMD, using a simple open(“/dev/dri/cardX”), then we find that it’s calling &lt;code&gt;amdgpu_device_initialize&lt;/code&gt;, which is a function defined in &lt;code&gt;libdrm&lt;/code&gt;, which is a library that acts as middleware between user mode drivers(UMD) like &lt;code&gt;RADV&lt;/code&gt; and and kernel mode drivers(KMD) like amdgpu driver, and then when we try to do some actual work we have to create a context which can be achieved by calling &lt;code&gt;amdgpu_cs_ctx_create&lt;/code&gt; from &lt;code&gt;libdrm&lt;/code&gt; again, next up we need to allocate 2 buffers one of them for our code and the other for writing our commands into, we do this by calling a couple of functions, here’s how I do it:&lt;/p&gt;
+    &lt;code&gt;void bo_alloc(amdgpu_t* dev, size_t size, u32 domain, bool uncached, amdgpubo_t* bo) {
+ s32    ret         = -1;
+ u32    alignment   = 0;
+ u32    flags       = 0;
+ size_t actual_size = 0;
+
+ amdgpu_bo_handle bo_handle = NULL;
+ amdgpu_va_handle va_handle = NULL;
+ u64              va_addr   = 0;
+ void*            host_addr = NULL;&lt;/code&gt;
+    &lt;p&gt;Here we’re choosing the domain and assigning flags based on the params, some buffers we will need uncached, as we will see:&lt;/p&gt;
+    &lt;code&gt; if (
+   domain != AMDGPU_GEM_DOMAIN_GWS &amp;amp;&amp;amp; domain != AMDGPU_GEM_DOMAIN_GDS &amp;amp;&amp;amp;
+   domain != AMDGPU_GEM_DOMAIN_OA) {
+  actual_size = (size + 4096 - 1) &amp;amp; 0xFFFFFFFFFFFFF000ULL;
+  alignment   = 4096;
+  flags       = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED | AMDGPU_GEM_CREATE_VRAM_CLEARED |
+          AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
+  flags |=
+    uncached ? (domain == AMDGPU_GEM_DOMAIN_GTT) * AMDGPU_GEM_CREATE_CPU_GTT_USWC : 0;
+ } else {
+  actual_size = size;
+  alignment   = 1;
+  flags       = AMDGPU_GEM_CREATE_NO_CPU_ACCESS;
+ }
+
+ struct amdgpu_bo_alloc_request req = {
+  .alloc_size     = actual_size,
+  .phys_alignment = alignment,
+  .preferred_heap = domain,
+  .flags          = flags,
+ };
+
+ // memory aquired!!
+ ret = amdgpu_bo_alloc(dev-&amp;gt;dev_handle, &amp;amp;req, &amp;amp;bo_handle);
+ HDB_ASSERT(!ret, "can't allocate bo");&lt;/code&gt;
+    &lt;p&gt;Now we have the memory, we need to map it. I opt to map anything that can be CPU-mapped for ease of use. We have to map the memory to both the GPU and the CPU virtual space. The KMD creates the page table when we open the DRM file, as shown here.&lt;/p&gt;
+    &lt;p&gt;So map it to the GPU VM and, if possible, to the CPU VM as well. Here, at this point, there’s a libdrm function that does all of this setup for us and maps the memory, but I found that even when specifying &lt;code&gt;AMDGPU_VM_MTYPE_UC&lt;/code&gt;, it doesn’t always tag the page as uncached, not quite sure if it’s a
+bug in my code or something in &lt;code&gt;libdrm&lt;/code&gt; anyways, the function is &lt;code&gt;amdgpu_bo_va_op&lt;/code&gt;, I opted to do it manually here and issue the IOCTL call myself:&lt;/p&gt;
+    &lt;code&gt; u32 kms_handle = 0;
+ amdgpu_bo_export(bo_handle, amdgpu_bo_handle_type_kms, &amp;amp;kms_handle);
+
+ ret = amdgpu_va_range_alloc(
+   dev-&amp;gt;dev_handle,
+   amdgpu_gpu_va_range_general,
+   actual_size,
+   4096,
+   0,
+   &amp;amp;va_addr,
+   &amp;amp;va_handle,
+   0);
+ HDB_ASSERT(!ret, "can't allocate VA");
+
+ u64 map_flags =
+   AMDGPU_VM_PAGE_EXECUTABLE | AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE;
+ map_flags |= uncached ? AMDGPU_VM_MTYPE_UC | AMDGPU_VM_PAGE_NOALLOC : 0;
+
+ struct drm_amdgpu_gem_va va = {
+  .handle       = kms_handle,
+  .operation    = AMDGPU_VA_OP_MAP,
+  .flags        = map_flags,
+  .va_address   = va_addr,
+  .offset_in_bo = 0,
+  .map_size     = actual_size,
+
+ };
+
+ ret = drm_ioctl_write_read(dev-&amp;gt;drm_fd, DRM_AMDGPU_GEM_VA, &amp;amp;va, sizeof(va));
+ HDB_ASSERT(!ret, "can't map bo in GPU space");
+ // ret = amdgpu_bo_va_op(bo_handle, 0, actual_size, va_addr, map_flags,
+ // AMDGPU_VA_OP_MAP);
+
+ if (flags &amp;amp; AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED) {
+  ret = amdgpu_bo_cpu_map(bo_handle, &amp;amp;host_addr);
+  HDB_ASSERT(!ret, "can't map bo in CPU space");
+
+  // AMDGPU_GEM_CREATE_VRAM_CLEARED doesn't really memset the memory to 0 anyways for
+  // debug I'll just do it manually for now
+  memset(host_addr, 0x0, actual_size);
+ }
+
+ *bo = (amdgpubo_t){
+  .bo_handle = bo_handle,
+  .va_handle = va_handle,
+  .va_addr   = va_addr,
+  .size      = actual_size,
+  .host_addr = host_addr,
+ };
+}&lt;/code&gt;
+    &lt;p&gt;Now we have the context and 2 buffers. Next, fill those buffers and send our commands to the KMD, which will then forward them to the Command Processor (CP) in the GPU for processing.&lt;/p&gt;
+    &lt;p&gt;Let’s compile our code. We can use clang assembler for that, like this:&lt;/p&gt;
+    &lt;code&gt;# https://gitlab.freedesktop.org/martty/radbg-poc/-/blob/master/ll-as.sh
+clang -c -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1100 -o asm.o "$1"
+objdump -h asm.o | grep .text | awk '{print "dd if='asm.o' of='asmc.bin' bs=1 count=$[0x" $3 "] skip=$[0x" $6 "] status=none"}' | bash
+#rm asm.o&lt;/code&gt;
+    &lt;p&gt;The bash script compiles the code, and then we’re only interested in the actual machine code, so we use objdump to figure out the offset and the size of the section and copy it to a new file called asmc.bin, then we can just load the file and write its bytes to the CPU-mapped address of the code buffer.&lt;/p&gt;
+    &lt;p&gt;Next up, filling in the commands. This was extremely confusing for me because it’s not well documented. It was mostly learning how &lt;code&gt;RADV&lt;/code&gt; does things and trying to do similar things. Also, shout-out to the folks on the Graphics Programming Discord server for helping me, especially Picoduck. The commands are encoded in a special format called &lt;code&gt;PM4 Packets&lt;/code&gt;, which has multiple types. We only care about &lt;code&gt;Type 3&lt;/code&gt;: each packet has an opcode and the number of bytes it contains.&lt;/p&gt;
+    &lt;p&gt;The first thing we need to do is program the GPU registers, then dispatch the shader. Some of those registers are &lt;code&gt;rsrc[1-3]&lt;/code&gt;; those registers are responsible for a number of configurations, pgm_[lo/hi], which hold the pointer to the code buffer and &lt;code&gt;num_thread_[x/y/z]&lt;/code&gt;; those are responsible for the number of threads inside a work group. All of those are set using the &lt;code&gt;set shader register&lt;/code&gt; packets, and here is how to encode them:&lt;/p&gt;
+    &lt;p&gt;It’s worth mentioning that we can set multiple registers in 1 packet if they’re consecutive.&lt;/p&gt;
+    &lt;code&gt;void pkt3_set_sh_reg(pkt3_packets_t* packets, u32 reg, u32 value) {
+ HDB_ASSERT(
+   reg &amp;gt;= SI_SH_REG_OFFSET &amp;amp;&amp;amp; reg &amp;lt; SI_SH_REG_END,
+   "can't set register outside sh registers span");
+
+ // packet header
+ da_append(packets, PKT3(PKT3_SET_SH_REG, 1, 0));
+ // offset of the register
+ da_append(packets, (reg - SI_SH_REG_OFFSET) / 4);
+ da_append(packets, value);
+}&lt;/code&gt;
+    &lt;p&gt;Then we append the dispatch command:&lt;/p&gt;
+    &lt;code&gt;// we're going for 1 thread since we want the simplest case here.
+
+da_append(&amp;amp;pkt3_packets, PKT3(PKT3_DISPATCH_DIRECT, 3, 0) | PKT3_SHADER_TYPE_S(1));
+da_append(&amp;amp;pkt3_packets, 1u);
+da_append(&amp;amp;pkt3_packets, 1u);
+da_append(&amp;amp;pkt3_packets, 1u);
+da_append(&amp;amp;pkt3_packets, dispatch_initiator);&lt;/code&gt;
+    &lt;p&gt;Now we want to write those commands into our buffer and send them to the KMD:&lt;/p&gt;
+    &lt;code&gt;void dev_submit(
+  amdgpu_t*         dev,
+  pkt3_packets_t*   packets,
+  amdgpu_bo_handle* buffers,
+  u32               buffers_count,
+  amdgpu_submit_t*  submit
+) {
+ s32        ret = -1;
+ amdgpubo_t ib  = { 0 };
+
+ bo_alloc(dev, pkt3_size(packets), AMDGPU_GEM_DOMAIN_GTT, false, &amp;amp;ib);
+ bo_upload(&amp;amp;ib, packets-&amp;gt;data, pkt3_size(packets));
+
+ amdgpu_bo_handle* bo_handles = // +1 for the indirect buffer
+   (amdgpu_bo_handle*)malloc(sizeof(amdgpu_bo_handle) * (buffers_count + 1));
+
+ bo_handles[0] = ib.bo_handle;
+ for_range(i, 0, buffers_count) {
+  bo_handles[i + 1] = buffers[i];
+ }
+
+ amdgpu_bo_list_handle bo_list = NULL;
+ ret =
+   amdgpu_bo_list_create(dev-&amp;gt;dev_handle, buffers_count + 1, bo_handles, NULL, &amp;amp;bo_list);
+ HDB_ASSERT(!ret, "can't create a bo list");
+ free(bo_handles);
+
+ struct amdgpu_cs_ib_info ib_info = {
+  .flags         = 0,
+  .ib_mc_address = ib.va_addr,
+  .size          = packets-&amp;gt;count,
+ };
+
+ struct amdgpu_cs_request req = {
+  .flags                  = 0,
+  .ip_type                = AMDGPU_HW_IP_COMPUTE,
+  .ip_instance            = 0,
+  .ring                   = 0,
+  .resources              = bo_list,
+  .number_of_dependencies = 0,
+  .dependencies           = NULL,
+  .number_of_ibs          = 1,
+  .ibs                    = &amp;amp;ib_info,
+  .seq_no                 = 0,
+  .fence_info             = { 0 },
+ };
+
+ ret = amdgpu_cs_submit(dev-&amp;gt;ctx_handle, 0, &amp;amp;req, 1);
+ HDB_ASSERT(!ret, "can't submit indirect buffer request");
+
+ *submit = (amdgpu_submit_t){
+    .ib = ib,
+    .bo_list = bo_list,
+    .fence = {
+      .context = dev-&amp;gt;ctx_handle,
+      .ip_type = AMDGPU_HW_IP_COMPUTE,
+      .ip_instance = 0,
+      .ring = 0,
+      .fence = req.seq_no,
+    },
+  };
+}&lt;/code&gt;
+    &lt;p&gt;Here is a good point to make a more complex shader that outputs something. For example, writing 1 to a buffer.&lt;/p&gt;
+    &lt;p&gt;No GPU hangs ?! nothing happened ?! cool, cool, now we have a shader that runs on the GPU, what’s next? Let’s try to hang the GPU by pausing the execution, aka make the GPU trap.&lt;/p&gt;
+    &lt;head rend="h1"&gt;TBA/TMA&lt;/head&gt;
+    &lt;p&gt;The RDNA3’s ISA manual does mention 2 registers, &lt;code&gt;TBA, TMA&lt;/code&gt;; here’s how they describe them respectively:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Holds the pointer to the current trap handler program address. Per-VMID register. Bit [63] indicates if the trap handler is present (1) or not (0) and is not considered part of the address (bit[62] is replicated into address bit[63]). Accessed via S_SENDMSG_RTN.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Temporary register for shader operations. For example, it can hold a pointer to memory used by the trap handler.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;You can configure the GPU to enter the trap handler when encountering certain exceptions listed in the RDNA3 ISA manual.&lt;/p&gt;
+    &lt;p&gt;We know from Marcell Kiss’s blog posts that we need to compile a trap handler, which is a normal shader the GPU switches to when encountering a &lt;code&gt;s_trap&lt;/code&gt;. The TBA register has a special bit that indicates whether the trap handler is enabled.&lt;/p&gt;
+    &lt;p&gt;Since these are privileged registers, we cannot write to them from user space. To bridge this gap for debugging, we can utilize the debugfs interface. Luckily, we have UMR, which uses that debugfs interface, and it’s open source; we copy AMD’s homework here which is great.&lt;/p&gt;
+    &lt;head rend="h1"&gt;AMDGPU Debugfs&lt;/head&gt;
+    &lt;p&gt;The amdgpu KMD has a couple of files in debugfs under &lt;code&gt;/sys/kernel/debug/dri/{PCI address}&lt;/code&gt;; one of them is &lt;code&gt;regs2&lt;/code&gt;, which is an interface to a &lt;code&gt;amdgpu_debugfs_regs2_write&lt;/code&gt; in the kernel that writes to the registers. It works by simply opening the file, seeking the register’s offset, and then writing; it also performs some synchronisation and writes the value correctly. We need to provide more parameters about the register before writing to the file, tho and do that by using an ioctl call. Here are the ioctl arguments:&lt;/p&gt;
+    &lt;code&gt;typedef struct amdgpu_debugfs_regs2_iocdata_v2 {
+ __u32 use_srbm, use_grbm, pg_lock;
+ struct {
+  __u32 se, sh, instance;
+ } grbm;
+ struct {
+  __u32 me, pipe, queue, vmid;
+ } srbm;
+ __u32 xcc_id;
+} regs2_ioc_data_t;&lt;/code&gt;
+    &lt;p&gt;The 2 structs are because there are 2 types of registers, GRBM and SRBM, each of which is banked by different constructs; you can learn more about some of them here in the Linux kernel documentation.&lt;/p&gt;
+    &lt;p&gt;Turns out our registers here are SBRM registers and banked by VMIDs, meaning each VMID has its own TBA and TMA registers. Cool, now we need to figure out the VMID of our process. As far as I understand, VMIDs are a way for the GPU to identify a specific process context, including the page table base address, so the address translation unit can translate a virtual memory address. The context is created when we open the DRM file. They get assigned dynamically at dispatch time, which is a problem for us; we want to write to those registers before dispatch.&lt;/p&gt;
+    &lt;p&gt;We can obtain the VMID of the dispatched process by querying the &lt;code&gt;HW_ID2&lt;/code&gt; register with s_getreg_b32. I do a hack here, by enabling the trap handler in every VMID, and there are 16 of them, the first being special, and used by the KMD and the last 8 allocated to the amdkfd driver. We loop over the remaining VMIDs and write to those registers. This can cause issues to other processes using other VMIDs by enabling trap handlers in them and writing the virtual address of our trap handler, which is only valid within our virtual memory address space. It’s relatively safe tho since most other processes won’t cause a trap1.&lt;/p&gt;
+    &lt;p&gt;Now we can write to TMA and TBA, here’s the code:&lt;/p&gt;
+    &lt;code&gt;void dev_op_reg32(
+  amdgpu_t* dev, gc_11_reg_t reg, regs2_ioc_data_t ioc_data, reg_32_op_t op, u32* value) {
+ s32 ret = 0;
+
+ reg_info_t reg_info     = gc_11_regs_infos[reg];
+ uint64_t   reg_offset   = gc_11_regs_offsets[reg];
+ uint64_t   base_offset  = dev-&amp;gt;gc_regs_base_addr[reg_info.soc_index];
+ uint64_t   total_offset = (reg_offset + base_offset);
+
+ // seems like we're multiplying by 4 here because the registers database in UMRs
+ // source has them in indexes rather than bytes.
+ total_offset *= (reg_info.type == REG_MMIO) ? 4 : 1;
+
+ ret = hdb_ioctl(dev-&amp;gt;regs2_fd, AMDGPU_DEBUGFS_REGS2_IOC_SET_STATE_V2, &amp;amp;ioc_data);
+ HDB_ASSERT(!ret, "Failed to set registers state");
+
+ size_t size = lseek(dev-&amp;gt;regs2_fd, total_offset, SEEK_SET);
+ HDB_ASSERT(size == total_offset, "Failed to seek register address");
+
+ switch (op) {
+ case REG_OP_READ : size = read(dev-&amp;gt;regs2_fd, value, 4); break;
+ case REG_OP_WRITE: size = write(dev-&amp;gt;regs2_fd, value, 4); break;
+ default          : HDB_ASSERT(false, "unsupported op");
+ }
+
+ HDB_ASSERT(size == 4, "Failed to write/read the values to/from the register");
+}&lt;/code&gt;
+    &lt;p&gt;And here’s how we write to &lt;code&gt;TMA&lt;/code&gt; and &lt;code&gt;TBA&lt;/code&gt;:
+If you noticed, I’m using bitfields. I use them because working with them is much easier than macros, and while the byte order is not guaranteed by the C spec, it’s guaranteed by System V ABI, which Linux adheres to.&lt;/p&gt;
+    &lt;code&gt;void dev_setup_trap_handler(amdgpu_t* dev, u64 tba, u64 tma) {
+ reg_sq_shader_tma_lo_t tma_lo = { .raw = (u32)(tma) };
+ reg_sq_shader_tma_hi_t tma_hi = { .raw = (u32)(tma &amp;gt;&amp;gt; 32) };
+
+ reg_sq_shader_tba_lo_t tba_lo = { .raw = (u32)(tba &amp;gt;&amp;gt; 8) };
+ reg_sq_shader_tba_hi_t tba_hi = { .raw = (u32)(tba &amp;gt;&amp;gt; 40) };
+
+ tba_hi.trap_en = 1;
+
+ regs2_ioc_data_t ioc_data = {
+  .use_srbm = 1,
+  .xcc_id   = -1,
+ };
+
+ // NOTE(hadi):
+ // vmid's get assigned when code starts executing before hand we don't know which vmid
+ // will get assigned to our process so we just set all of them
+ for_range(i, 1, 9) {
+  ioc_data.srbm.vmid = i;
+  dev_op_reg32(dev, REG_SQ_SHADER_TBA_LO, ioc_data, REG_OP_WRITE, &amp;amp;tba_lo.raw);
+  dev_op_reg32(dev, REG_SQ_SHADER_TBA_HI, ioc_data, REG_OP_WRITE, &amp;amp;tba_hi.raw);
+
+  dev_op_reg32(dev, REG_SQ_SHADER_TMA_LO, ioc_data, REG_OP_WRITE, &amp;amp;tma_lo.raw);
+  dev_op_reg32(dev, REG_SQ_SHADER_TMA_HI, ioc_data, REG_OP_WRITE, &amp;amp;tma_hi.raw);
+ }
+}&lt;/code&gt;
+    &lt;p&gt;Anyway, now that we can write to those registers, if we enable the trap handler correctly, the GPU should hang when we launch our shader if we added &lt;code&gt;s_trap&lt;/code&gt; instruction to it, or we enabled the &lt;code&gt;TRAP_ON_START&lt;/code&gt; bit in rsrc32 register.&lt;/p&gt;
+    &lt;p&gt;Now, let’s try to write a trap handler.&lt;/p&gt;
+    &lt;head rend="h1"&gt;The Trap Handler&lt;/head&gt;
+    &lt;p&gt;If you wrote a different shader that outputs to a buffer, u can try writing to that shader from the trap handler, which is nice to make sure it’s actually being run.&lt;/p&gt;
+    &lt;p&gt;We need 2 things: our trap handler and some scratch memory to use when needed, which we will store the address of in the TMA register.&lt;/p&gt;
+    &lt;p&gt;The trap handler is just a normal program running in privileged state, meaning we have access to special registers like TTMP[0-15]. When we enter a trap handler, we need to first ensure that the state of the GPU registers is saved, just as the kernel does for CPU processes when context-switching, by saving a copy of the stable registers and the program counter, etc. The problem, tho, is that we don’t have a stable ABI for GPUs, or at least not one I’m aware of, and compilers use all the registers they can, so we need to save everything.&lt;/p&gt;
+    &lt;p&gt;AMD GPUs’ Command Processors (CPs) have context-switching functionality, and the amdkfd driver does implement some context-switching shaders. The problem is they’re not documented, and we have to figure them out from the amdkfd driver source and from other parts of the driver stack that interact with it, which is a pain in the ass. I kinda did a workaround here since I didn’t find luck understanding how it works, and some other reasons I’ll discuss later in the post.&lt;/p&gt;
+    &lt;p&gt;The workaround here is to use only TTMP registers and a combination of specific instructions to copy the values of some registers, allowing us to use more instructions to copy the remaining registers. The main idea is to make use of the &lt;code&gt;global_store_addtid_b32&lt;/code&gt; instruction, which adds the index of the current thread within the wave to the writing address, aka&lt;/p&gt;
+    &lt;p&gt;This allows us to write a unique value per thread using only TTMP registers, which are unique per wave, not per thread3, so we can save the context of a single wave.&lt;/p&gt;
+    &lt;p&gt;The problem is that if we have more than 1 wave, they will overlap, and we will have a race condition.&lt;/p&gt;
+    &lt;p&gt;Here is the code:&lt;/p&gt;
+    &lt;code&gt;start:
+ ;; save the STATUS word into ttmp8
+ s_getreg_b32 ttmp8, hwreg(HW_REG_STATUS)
+
+ ;; save exec into ttmp[2:3]
+ s_mov_b64 ttmp[2:3], exec
+
+ ;; getting the address of our tma buffer
+ s_sendmsg_rtn_b64 ttmp[4:5], sendmsg(MSG_RTN_GET_TMA)
+ s_waitcnt lgkmcnt(0)
+
+ ;; save vcc
+ s_mov_b64 ttmp[6:7], vcc
+
+ ;; enable all threads so they can write their vgpr registers
+ s_mov_b64 exec, -1
+
+ ;; FIXME(hadi): this assumes only 1 wave is running
+ global_store_addtid_b32 v0, ttmp[4:5], offset:TMA_VREG_OFFSET        glc slc dlc
+ global_store_addtid_b32 v1, ttmp[4:5], offset:TMA_VREG_OFFSET + 256  glc slc dlc
+ global_store_addtid_b32 v2, ttmp[4:5], offset:TMA_VREG_OFFSET + 512  glc slc dlc
+ global_store_addtid_b32 v3, ttmp[4:5], offset:TMA_VREG_OFFSET + 768  glc slc dlc
+ global_store_addtid_b32 v4, ttmp[4:5], offset:TMA_VREG_OFFSET + 1024 glc slc dlc
+ global_store_addtid_b32 v5, ttmp[4:5], offset:TMA_VREG_OFFSET + 1280 glc slc dlc
+ global_store_addtid_b32 v6, ttmp[4:5], offset:TMA_VREG_OFFSET + 1536 glc slc dlc
+ s_waitcnt vmcnt(0)
+
+ ;; only first thread is supposed to write sgprs of the wave
+ s_mov_b64 exec, 1
+ v_mov_b32 v1, s0
+ v_mov_b32 v2, s1
+ v_mov_b32 v3, s2
+ v_mov_b32 v4, s3
+ v_mov_b32 v5, s4
+ v_mov_b32 v0, 0
+ global_store_b32 v0, v1, ttmp[4:5], offset:TMA_SREG_OFFSET glc slc dlc
+ global_store_b32 v0, v2, ttmp[4:5], offset:TMA_SREG_OFFSET + 4 glc slc dlc
+ global_store_b32 v0, v3, ttmp[4:5], offset:TMA_SREG_OFFSET + 8 glc slc dlc
+ global_store_b32 v0, v4, ttmp[4:5], offset:TMA_SREG_OFFSET + 12 glc slc dlc
+ global_store_b32 v0, v5, ttmp[4:5], offset:TMA_SREG_OFFSET + 16 glc slc dlc
+ s_waitcnt vmcnt(0)
+
+ ;; enable all threads
+ s_mov_b64 exec, -1&lt;/code&gt;
+    &lt;p&gt;Now that we have those values in memory, we need to tell the CPU: Hey, we got the data, and pause the GPU’s execution until the CPU issues a command. Also, notice we can just modify those from the CPU.&lt;/p&gt;
+    &lt;p&gt;Before we tell the CPU, we need to write some values that might help the CPU. Here are they:&lt;/p&gt;
+    &lt;code&gt; ;; IDs to identify which parts of the hardware we are running on exactly
+ s_getreg_b32 ttmp10, hwreg(HW_REG_HW_ID1)
+ s_getreg_b32 ttmp11, hwreg(HW_REG_HW_ID2)
+ v_mov_b32 v3, ttmp10
+ v_mov_b32 v4, ttmp11
+ global_store_dwordx2 v1, v[3:4], ttmp[4:5], offset:TMA_DATA_OFFSET glc slc dlc
+
+ ;; the original vcc mask
+ v_mov_b32 v3, ttmp6
+ v_mov_b32 v4, ttmp7
+ global_store_dwordx2 v1, v[3:4], ttmp[4:5], offset:2048 glc slc dlc
+ s_waitcnt vmcnt(0)
+
+ ;; the original exec mask
+ v_mov_b32 v3, ttmp2
+ v_mov_b32 v4, ttmp3
+ global_store_dwordx2 v1, v[3:4], ttmp[4:5], offset:2056 glc slc dlc
+ s_waitcnt vmcnt(0)
+
+ ;; the program counter
+ v_mov_b32 v3, ttmp0
+ v_mov_b32 v4, ttmp1
+ v_and_b32 v4, v4, 0xffff
+ global_store_dwordx2 v1, v[3:4], ttmp[4:5], offset:16 glc slc dlc
+
+ s_waitcnt vmcnt(0)&lt;/code&gt;
+    &lt;p&gt;Now the GPU should just wait for the CPU, and here’s the spin code it’s implemented as described by Marcell Kiss here:&lt;/p&gt;
+    &lt;code&gt;SPIN:
+ global_load_dword v1, v2, ttmp[4:5] glc slc dlc
+
+SPIN1:
+ // I found the bit range of 10 to 15 using trial and error in the
+ // isa manual specifies that it's a 6-bit number but the offset 10
+ // is just trial and error
+  s_getreg_b32 ttmp13, hwreg(HW_REG_IB_STS, 10, 15)
+ s_and_b32 ttmp13, ttmp13, ttmp13
+ s_cbranch_scc1 SPIN1
+
+ v_readfirstlane_b32 ttmp13, v1
+ s_and_b32 ttmp13, ttmp13, ttmp13
+ s_cbranch_scc0 SPIN
+
+CLEAR:
+ v_mov_b32 v2, 0
+ v_mov_b32 v1, 0
+ global_store_dword v1, v2, ttmp[4:5] glc slc dlc
+ s_waitcnt vmcnt(0)&lt;/code&gt;
+    &lt;p&gt;The main loop in the CPU is like enable trap handler, then dispatch shader, then wait for the GPU to write some specific value in a specific address to signal all data is there, then examine and display, and tell the GPU all clear, go ahead.&lt;/p&gt;
+    &lt;p&gt;Now that our uncached buffers are in play, we just keep looping and checking whether the GPU has written the register values. When it does, the first thing we do is halt the wave by writing into the &lt;code&gt;SQ_CMD&lt;/code&gt; register to allow us to do whatever with the wave without causing any issues, tho if we halt for too long, the GPU CP will reset the command queue and kill the process, but we can change that behaviour by adjusting lockup_timeout parameter of the amdgpu kernel module:&lt;/p&gt;
+    &lt;code&gt;reg_sq_wave_hw_id1_t hw1 = { .raw = tma[2] };
+reg_sq_wave_hw_id2_t hw2 = { .raw = tma[3] };
+
+reg_sq_cmd_t halt_cmd = {
+ .cmd  = 1,
+ .mode = 1,
+ .data = 1,
+};
+
+regs2_ioc_data_t ioc_data = {
+ .use_srbm = false,
+ .use_grbm = true,
+};
+
+dev_op_reg32(&amp;amp;amdgpu, REG_SQ_CMD, ioc_data, REG_OP_WRITE, &amp;amp;halt_cmd.raw);
+gpu_is_halted = true;&lt;/code&gt;
+    &lt;p&gt;From here on, we can do whatever with the data we have. All the data we need to build a proper debugger. We will come back to what to do with the data in a bit; let’s assume we did what was needed for now.&lt;/p&gt;
+    &lt;p&gt;Now that we’re done with the CPU, we need to write to the first byte in our TMA buffer, since the trap handler checks for that, then resume the wave, and the trap handler should pick it up. We can resume by writing to the &lt;code&gt;SQ_CMD&lt;/code&gt; register again:&lt;/p&gt;
+    &lt;code&gt;halt_cmd.mode = 0;
+dev_op_reg32(&amp;amp;amdgpu, REG_SQ_CMD, ioc_data, REG_OP_WRITE, &amp;amp;halt_cmd.raw);
+gpu_is_halted = false;&lt;/code&gt;
+    &lt;p&gt;Then the GPU should continue. We need to restore everything and return the program counter to the original address. Based on whether it’s a hardware trap or not, the program counter may point to the instruction before or the instruction itself. The ISA manual and Marcell Kiss’s posts explain that well, so refer to them.&lt;/p&gt;
+    &lt;code&gt;RETURN:
+ ;; extract the trap ID from ttmp1
+ s_and_b32 ttmp9, ttmp1, PC_HI_TRAP_ID_MASK
+ s_lshr_b32 ttmp9, ttmp9, PC_HI_TRAP_ID_SHIFT
+
+ ;; if the trapID == 0, then this is a hardware trap,
+ ;; we don't need to fix up the return address
+ s_cmpk_eq_u32 ttmp9, 0
+ s_cbranch_scc1 RETURN_FROM_NON_S_TRAP
+
+ ;; restore PC
+ ;; add 4 to the faulting address, with carry
+ s_add_u32 ttmp0, ttmp0, 4
+ s_addc_u32 ttmp1, ttmp1, 0
+
+RETURN_FROM_NON_S_TRAP:
+ s_load_dwordx4 s[0:3], ttmp[4:5], TMA_SREG_OFFSET glc dlc
+ s_load_dword s4, ttmp[4:5], TMA_SREG_OFFSET + 16 glc dlc
+ s_waitcnt lgkmcnt(0)
+
+ s_mov_b64 exec, -1
+ global_load_addtid_b32 v0, ttmp[4:5], offset:TMA_VREG_OFFSET        glc slc dlc
+ global_load_addtid_b32 v1, ttmp[4:5], offset:TMA_VREG_OFFSET + 256  glc slc dlc
+ global_load_addtid_b32 v2, ttmp[4:5], offset:TMA_VREG_OFFSET + 512  glc slc dlc
+ global_load_addtid_b32 v3, ttmp[4:5], offset:TMA_VREG_OFFSET + 768  glc slc dlc
+ global_load_addtid_b32 v4, ttmp[4:5], offset:TMA_VREG_OFFSET + 1024 glc slc dlc
+ global_load_addtid_b32 v5, ttmp[4:5], offset:TMA_VREG_OFFSET + 1280 glc slc dlc
+ global_load_addtid_b32 v6, ttmp[4:5], offset:TMA_VREG_OFFSET + 1536 glc slc dlc
+ s_waitcnt vmcnt(0)
+
+ ;; mask off non-address high bits from ttmp1
+ s_and_b32 ttmp1, ttmp1, 0xffff
+
+ ;; restore exec
+ s_load_b64 vcc, ttmp[4:5], 2048 glc dlc
+ s_load_b64 ttmp[2:3], ttmp[4:5], 2056 glc dlc
+ s_waitcnt lgkmcnt(0)
+ s_mov_b64 exec, ttmp[2:3]
+
+ ;; restore STATUS.EXECZ, not writable by s_setreg_b32
+ s_and_b64 exec, exec, exec
+
+ ;; restore STATUS.VCCZ, not writable by s_setreg_b32
+ s_and_b64 vcc, vcc, vcc
+
+ ;; restore STATUS.SCC
+ s_setreg_b32 hwreg(HW_REG_STATUS, 0, 1), ttmp8
+
+ s_waitcnt vmcnt(0) lgkmcnt(0) expcnt(0)  ; Full pipeline flush
+ ;; return from trap handler and restore STATUS.PRIV
+ s_rfe_b64 [ttmp0, ttmp1]&lt;/code&gt;
+    &lt;head rend="h1"&gt;SPIR-V&lt;/head&gt;
+    &lt;p&gt;Now we can run compiled code directly, but we don’t want people to compile their code manually, then extract the text section, and give it to us. The plan is to take SPIR-V code, compile it correctly, then run it, or, even better, integrate with RADV and let RADV give us more information to work with.&lt;/p&gt;
+    &lt;p&gt;My main plan was making like fork RADV and then add then make report for us the vulkan calls and then we can have a better view on the GPU work know the buffers/textures it’s using etc, This seems like a lot more work tho so I’ll keep it in mind but not doing that for now unless someone is willing to pay me for that ;).&lt;/p&gt;
+    &lt;p&gt;For now, let’s just use RADV’s compiler &lt;code&gt;ACO&lt;/code&gt;. Luckily, RADV has a &lt;code&gt;null_winsys&lt;/code&gt; mode, aka it will not do actual work or open DRM files, just a fake Vulkan device, which is perfect for our case here, since we care about nothing other than just compiling code. We can enable it by setting the env var &lt;code&gt;RADV_FORCE_FAMILY&lt;/code&gt;, then we just call what we need like this:&lt;/p&gt;
+    &lt;code&gt;int32_t hdb_compile_spirv_to_bin(
+  const void* spirv_binary,
+  size_t size,
+  hdb_shader_stage_t stage,
+  hdb_shader_t* shader
+) {
+ setenv("RADV_FORCE_FAMILY", "navi31", 1);
+ //  setenv("RADV_DEBUG", "nocache,noopt", 1);
+ setenv("ACO_DEBUG", "nocache,noopt", 1);
+
+ VkInstanceCreateInfo i_cinfo = {
+  .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+  .pApplicationInfo =
+    &amp;amp;(VkApplicationInfo){
+      .sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+      .pApplicationName   = "HDB Shader Compiler",
+      .applicationVersion = 1,
+      .pEngineName        = "HDB",
+      .engineVersion      = 1,
+      .apiVersion         = VK_API_VERSION_1_4,
+    },
+ };
+
+ VkInstance vk_instance = {};
+ radv_CreateInstance(&amp;amp;i_cinfo, NULL, &amp;amp;vk_instance);
+
+ struct radv_instance* instance = radv_instance_from_handle(vk_instance);
+ instance-&amp;gt;debug_flags |=
+   RADV_DEBUG_NIR_DEBUG_INFO | RADV_DEBUG_NO_CACHE | RADV_DEBUG_INFO;
+
+ uint32_t         n       = 1;
+ VkPhysicalDevice vk_pdev = {};
+ instance-&amp;gt;vk.dispatch_table.EnumeratePhysicalDevices(vk_instance, &amp;amp;n, &amp;amp;vk_pdev);
+
+ struct radv_physical_device* pdev = radv_physical_device_from_handle(vk_pdev);
+ pdev-&amp;gt;use_llvm                    = false;
+
+ VkDeviceCreateInfo d_cinfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+ VkDevice vk_dev = {};
+ pdev-&amp;gt;vk.dispatch_table.CreateDevice(vk_pdev, &amp;amp;d_cinfo, NULL, &amp;amp;vk_dev);
+
+ struct radv_device* dev = radv_device_from_handle(vk_dev);
+
+ struct radv_shader_stage radv_stage = {
+  .spirv.data = spirv_binary,
+  .spirv.size = size,
+  .entrypoint = "main",
+  .stage      = MESA_SHADER_COMPUTE,
+  .layout = {
+   .push_constant_size = 16,
+  },
+  .key = {
+   .optimisations_disabled = true,
+  },
+ };
+
+ struct radv_shader_binary* cs_bin = NULL;
+ struct radv_shader*        cs_shader =
+   radv_compile_cs(dev, NULL, &amp;amp;radv_stage, true, true, false, true, &amp;amp;cs_bin);
+
+ *shader = (hdb_shader_t){
+  .bin              = cs_shader-&amp;gt;code,
+  .bin_size         = cs_shader-&amp;gt;code_size,
+  .rsrc1            = cs_shader-&amp;gt;config.rsrc1,
+  .rsrc2            = cs_shader-&amp;gt;config.rsrc2,
+  .rsrc3            = cs_shader-&amp;gt;config.rsrc3,
+  .debug_info       = cs_shader-&amp;gt;debug_info,
+  .debug_info_count = cs_shader-&amp;gt;debug_info_count,
+ };
+
+ return 0;
+}&lt;/code&gt;
+    &lt;p&gt;Now that we have a well-structured loop and communication between the GPU and the CPU, we can run SPIR-V binaries to some extent. Let’s see how we can make it an actual debugger.&lt;/p&gt;
+    &lt;head rend="h1"&gt;An Actual Debugger&lt;/head&gt;
+    &lt;p&gt;We talked earlier about CPs natively supporting context-switching, this appears to be compute spcific feature, which prevents from implementing it for other types of shaders, tho, it appears that mesh shaders and raytracing shaders are just compute shaders under the hood, which will allow us to use that functionality. For now debugging one wave feels enough, also we can moify the wave parameters to debug some specific indices.&lt;/p&gt;
+    &lt;p&gt;Here’s some of the features&lt;/p&gt;
+    &lt;head rend="h2"&gt;Breakpoints and Stepping&lt;/head&gt;
+    &lt;p&gt;For stepping, we can use 2 bits: one in &lt;code&gt;RSRC1&lt;/code&gt; and the other in &lt;code&gt;RSRC3&lt;/code&gt;. They’re &lt;code&gt;DEBUG_MODE&lt;/code&gt; and &lt;code&gt;TRAP_ON_START&lt;/code&gt;, respectively. The former enters the trap handler after each instruction, and the latter enters before the first instruction. This means we can automatically enable instruction-level stepping.&lt;/p&gt;
+    &lt;p&gt;Regarding breakpoints, I haven’t implemented them, but they’re rather simple to implement here by us having the base address of the code buffer and knowing the size of each instruction; we can calculate the program counter location ahead and have a list of them available to the GPU, and we can do a binary search on the trap handler.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Source Code Line Mapping&lt;/head&gt;
+    &lt;p&gt;The ACO shader compiler does generate instruction-level source code mapping, which is good enough for our purposes here. By taking the offset4 of the current program counter and indexing into the code buffer, we can retrieve the current instruction and disassemble it, as well as find the source code mapping from the debug info.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Address Watching aka Watchpoints&lt;/head&gt;
+    &lt;p&gt;We can implement this by marking the GPU page as protected. On a GPU fault, we enter the trap handler, check whether it’s within the range of our buffers and textures, and then act accordingly. Also, looking at the registers, we can find these:&lt;/p&gt;
+    &lt;code&gt;typedef union {
+ struct {
+  uint32_t addr: 16;
+ };
+ uint32_t raw;
+} reg_sq_watch0_addr_h_t;
+
+typedef union {
+ struct {
+  uint32_t __reserved_0 : 6;
+  uint32_t addr: 26;
+ };
+ uint32_t raw;
+} reg_sq_watch0_addr_l_t;&lt;/code&gt;
+    &lt;p&gt;which suggests that the hardware already supports this natively, so we don’t even need to do that dance. It needs more investigation on my part, tho, since I didn’t implement this.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Variables Types and Names&lt;/head&gt;
+    &lt;p&gt;This needs some serious plumbing, since we need to make NIR(Mesa’s intermediate representation) optimisation passes propagate debug info correctly. I already started on this here. Then we need to make ACO track variables and store the information.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Vulkan Integration&lt;/head&gt;
+    &lt;p&gt;This requires ditching our simple UMD we made earlier and using RADV, which is what should happen eventually, then we have our custom driver maybe pause on before a specific frame, or get triggered by a key, and then ask before each dispatch if to attach to it or not, or something similar, since we have a full proper Vulkan implementation we already have all the information we would need like buffers, textures, push constants, types, variable names, .. etc, that would be a much better and more pleasant debugger to use.&lt;/p&gt;
+    &lt;p&gt;Finally, here’s some live footage:&lt;/p&gt;
+    &lt;head rend="h1"&gt;Bonus Round&lt;/head&gt;
+    &lt;p&gt;Here is an incomplete user-mode page walking code for gfx11, aka rx7900xtx&lt;/p&gt;
+    &lt;code&gt;typedef struct {
+ u64 valid         : 1;  // 0
+ u64 system        : 1;  // 1
+ u64 coherent      : 1;  // 2
+ u64 __reserved_0  : 3;  // 5
+ u64 pte_base_addr : 42; // 47
+ u64 pa_rsvd       : 4;  // 51
+ u64 __reserved_1  : 2;  // 53
+ u64 mall_reuse    : 2;  // 55
+ u64 tfs_addr      : 1;  // 56
+ u64 __reserved_2  : 1;  // 57
+ u64 frag_size     : 5;  // 62
+ u64 pte           : 1;  // 63
+} pde_t;
+
+typedef struct {
+ u64 valid          : 1; // = pte_entry &amp;amp; 1;
+ u64 system         : 1; // = (pte_entry &amp;gt;&amp;gt; 1) &amp;amp; 1;
+ u64 coherent       : 1; // = (pte_entry &amp;gt;&amp;gt; 2) &amp;amp; 1;
+ u64 tmz            : 1; // = (pte_entry &amp;gt;&amp;gt; 3) &amp;amp; 1;
+ u64 execute        : 1; // = (pte_entry &amp;gt;&amp;gt; 4) &amp;amp; 1;
+ u64 read           : 1; // = (pte_entry &amp;gt;&amp;gt; 5) &amp;amp; 1;
+ u64 write          : 1; // = (pte_entry &amp;gt;&amp;gt; 6) &amp;amp; 1;
+ u64 fragment       : 5; // = (pte_entry &amp;gt;&amp;gt; 7) &amp;amp; 0x1F;
+ u64 page_base_addr : 36;
+ u64 mtype          : 2; // = (pte_entry &amp;gt;&amp;gt; 48) &amp;amp; 3;
+ u64 prt            : 1; // = (pte_entry &amp;gt;&amp;gt; 51) &amp;amp; 1;
+ u64 software       : 2; // = (pte_entry &amp;gt;&amp;gt; 52) &amp;amp; 3;
+ u64 pde            : 1; // = (pte_entry &amp;gt;&amp;gt; 54) &amp;amp; 1;
+ u64 __reserved_0   : 1;
+ u64 further        : 1; // = (pte_entry &amp;gt;&amp;gt; 56) &amp;amp; 1;
+ u64 gcr            : 1; // = (pte_entry &amp;gt;&amp;gt; 57) &amp;amp; 1;
+ u64 llc_noalloc    : 1; // = (pte_entry &amp;gt;&amp;gt; 58) &amp;amp; 1;
+} pte_t;
+
+static inline pde_t decode_pde(u64 pde_raw) {
+ pde_t pde         = *((pde_t*)(&amp;amp;pde_raw));
+ pde.pte_base_addr = (u64)pde.pte_base_addr &amp;lt;&amp;lt; 6;
+ return pde;
+}
+
+static inline pte_t decode_pte(u64 pde_raw) {
+ pte_t pte          = *((pte_t*)(&amp;amp;pde_raw));
+ pte.page_base_addr = (u64)pte.page_base_addr &amp;lt;&amp;lt; 12;
+ return pte;
+}
+
+static inline u64 log2_range_round_up(u64 s, u64 e) {
+ u64 x = e - s - 1;
+ return (x == 0 || x == 1) ? 1 : 64 - __builtin_clzll(x);
+}
+
+void dev_linear_vram(amdgpu_t* dev, u64 phy_addr, size_t size, void* buf) {
+ HDB_ASSERT(!((phy_addr &amp;amp; 3) || (size &amp;amp; 3)), "Must be page aligned address and size");
+
+ size_t offset = lseek(dev-&amp;gt;vram_fd, phy_addr, SEEK_SET);
+ HDB_ASSERT(offset == phy_addr, "Couldn't seek to the requested addr");
+
+ offset = read(dev-&amp;gt;vram_fd, buf, size);
+ HDB_ASSERT(offset == size, "Couldn't read the full requested size");
+}
+
+void dev_decode(amdgpu_t* dev, u32 vmid, u64 va_addr) {
+ reg_gcmc_vm_fb_location_base_t fb_base_reg   = { 0 };
+ reg_gcmc_vm_fb_location_top_t  fb_top_reg    = { 0 };
+ reg_gcmc_vm_fb_offset_t        fb_offset_reg = { 0 };
+
+ regs2_ioc_data_t ioc_data = { 0 };
+ dev_op_reg32(
+   dev, REG_GCMC_VM_FB_LOCATION_BASE, ioc_data, REG_OP_READ, &amp;amp;fb_base_reg.raw);
+ dev_op_reg32(dev, REG_GCMC_VM_FB_LOCATION_TOP, ioc_data, REG_OP_READ, &amp;amp;fb_top_reg.raw);
+ dev_op_reg32(dev, REG_GCMC_VM_FB_OFFSET, ioc_data, REG_OP_READ, &amp;amp;fb_offset_reg.raw);
+
+ u64 fb_offset = (u64)fb_offset_reg.fb_offset;
+
+ // TODO(hadi): add zfb mode support
+ bool zfb = fb_top_reg.fb_top + 1 &amp;lt; fb_base_reg.fb_base;
+ HDB_ASSERT(!zfb, "ZFB mode is not implemented yet!");
+
+ // printf(
+ //   "fb base: 0x%x\nfb_top: 0x%x\nfb_offset: 0x%x\n",
+ //   fb_base_reg.raw,
+ //   fb_top_reg.raw,
+ //   fb_offset_reg.raw);
+
+ gc_11_reg_t pt_start_lo_id = { 0 };
+ gc_11_reg_t pt_start_hi_id = { 0 };
+ gc_11_reg_t pt_end_lo_id   = { 0 };
+ gc_11_reg_t pt_end_hi_id   = { 0 };
+ gc_11_reg_t pt_base_hi_id  = { 0 };
+ gc_11_reg_t pt_base_lo_id  = { 0 };
+ gc_11_reg_t ctx_cntl_id    = { 0 };
+
+ switch (vmid) {
+ case 0:
+  pt_start_lo_id = REG_GCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT0_CNTL;
+  break;
+ case 1:
+  pt_start_lo_id = REG_GCVM_CONTEXT1_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT1_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT1_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT1_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT1_CNTL;
+  break;
+ case 2:
+  pt_start_lo_id = REG_GCVM_CONTEXT2_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT2_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT2_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT2_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT2_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT2_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT2_CNTL;
+  break;
+ case 3:
+  pt_start_lo_id = REG_GCVM_CONTEXT3_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT3_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT3_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT3_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT3_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT3_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT3_CNTL;
+  break;
+ case 4:
+  pt_start_lo_id = REG_GCVM_CONTEXT4_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT4_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT4_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT4_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT4_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT4_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT4_CNTL;
+  break;
+ case 5:
+  pt_start_lo_id = REG_GCVM_CONTEXT5_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT5_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT5_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT5_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT5_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT5_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT5_CNTL;
+  break;
+ case 6:
+  pt_start_lo_id = REG_GCVM_CONTEXT6_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT6_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT6_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT6_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT6_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT6_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT6_CNTL;
+  break;
+ case 7:
+  pt_start_lo_id = REG_GCVM_CONTEXT7_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT7_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT7_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT7_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT7_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT7_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT7_CNTL;
+  break;
+ case 8:
+  pt_start_lo_id = REG_GCVM_CONTEXT8_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT8_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT8_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT8_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT7_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT7_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT7_CNTL;
+  break;
+ case 9:
+  pt_start_lo_id = REG_GCVM_CONTEXT9_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT9_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT9_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT9_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT7_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT7_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT7_CNTL;
+  break;
+ case 10:
+  pt_start_lo_id = REG_GCVM_CONTEXT10_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT10_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT10_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT10_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT10_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT10_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT10_CNTL;
+  break;
+ case 11:
+  pt_start_lo_id = REG_GCVM_CONTEXT11_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT11_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT11_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT11_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT11_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT11_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT11_CNTL;
+  break;
+ case 12:
+  pt_start_lo_id = REG_GCVM_CONTEXT12_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT12_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT12_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT12_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT12_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT12_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT12_CNTL;
+  break;
+ case 13:
+  pt_start_lo_id = REG_GCVM_CONTEXT13_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT13_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT13_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT13_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT13_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT13_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT13_CNTL;
+  break;
+ case 14:
+  pt_start_lo_id = REG_GCVM_CONTEXT14_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT14_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT14_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT14_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT14_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT14_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT14_CNTL;
+  break;
+ case 15:
+  pt_start_lo_id = REG_GCVM_CONTEXT15_PAGE_TABLE_START_ADDR_LO32;
+  pt_start_hi_id = REG_GCVM_CONTEXT15_PAGE_TABLE_START_ADDR_HI32;
+  pt_end_lo_id   = REG_GCVM_CONTEXT15_PAGE_TABLE_END_ADDR_LO32;
+  pt_end_hi_id   = REG_GCVM_CONTEXT15_PAGE_TABLE_END_ADDR_HI32;
+  pt_base_lo_id  = REG_GCVM_CONTEXT15_PAGE_TABLE_BASE_ADDR_LO32;
+  pt_base_hi_id  = REG_GCVM_CONTEXT15_PAGE_TABLE_BASE_ADDR_HI32;
+  ctx_cntl_id    = REG_GCVM_CONTEXT15_CNTL;
+  break;
+ default: HDB_ASSERT(false, "Out of range VMID 0-15 trying to access %u", vmid);
+ }
+
+ // all the types of the contexts are the same so will just use 0 but pass the correct
+ // register enum to the read function
+ reg_gcvm_context0_page_table_start_addr_lo32_t pt_start_lo = { 0 };
+ reg_gcvm_context0_page_table_start_addr_hi32_t pt_start_hi = { 0 };
+ reg_gcvm_context0_page_table_end_addr_lo32_t   pt_end_lo   = { 0 };
+ reg_gcvm_context0_page_table_end_addr_hi32_t   pt_end_hi   = { 0 };
+ reg_gcvm_context0_page_table_base_addr_lo32_t  pt_base_lo  = { 0 };
+ reg_gcvm_context0_page_table_base_addr_hi32_t  pt_base_hi  = { 0 };
+ reg_gcvm_context0_cntl_t                       ctx_cntl    = { 0 };
+
+ dev_op_reg32(dev, pt_start_lo_id, ioc_data, REG_OP_READ, &amp;amp;pt_start_lo.raw);
+ dev_op_reg32(dev, pt_start_hi_id, ioc_data, REG_OP_READ, &amp;amp;pt_start_hi.raw);
+ dev_op_reg32(dev, pt_end_lo_id, ioc_data, REG_OP_READ, &amp;amp;pt_end_lo.raw);
+ dev_op_reg32(dev, pt_end_hi_id, ioc_data, REG_OP_READ, &amp;amp;pt_end_hi.raw);
+ dev_op_reg32(dev, pt_base_lo_id, ioc_data, REG_OP_READ, &amp;amp;pt_base_lo.raw);
+ dev_op_reg32(dev, pt_base_hi_id, ioc_data, REG_OP_READ, &amp;amp;pt_base_hi.raw);
+ dev_op_reg32(dev, ctx_cntl_id, ioc_data, REG_OP_READ, &amp;amp;ctx_cntl.raw);
+
+ u64 pt_start_addr = ((u64)pt_start_lo.raw &amp;lt;&amp;lt; 12) | ((u64)pt_start_hi.raw &amp;lt;&amp;lt; 44);
+ u64 pt_end_addr   = ((u64)pt_end_lo.raw &amp;lt;&amp;lt; 12) | ((u64)pt_end_hi.raw &amp;lt;&amp;lt; 44);
+ u64 pt_base_addr  = ((u64)pt_base_lo.raw &amp;lt;&amp;lt; 0) | ((u64)pt_base_hi.raw &amp;lt;&amp;lt; 32);
+ u32 pt_depth      = ctx_cntl.page_table_depth;
+ u32 ptb_size      = ctx_cntl.page_table_block_size;
+
+ HDB_ASSERT(pt_base_addr != 0xffffffffffffffffull, "Invalid page table base addr");
+
+ printf(
+   "\tPage Table Start: 0x%lx\n\tPage Table End: 0x%lx\n\tPage Table Base: "
+   "0x%lx\n\tPage Table Depth: %u\n\tBlock Size: %u\n",
+   pt_start_addr,
+   pt_end_addr,
+   pt_base_addr,
+   pt_depth,
+   ptb_size);
+
+ // decode base PDB
+ pde_t pde = decode_pde(pt_base_addr);
+ pt_base_addr -= fb_offset * !pde.system; // substract only on vram
+
+ u64 pt_last_byte_addr = pt_end_addr + 0xfff; // 0xfff is 1 page
+ HDB_ASSERT(
+   pt_start_addr &amp;lt;= va_addr || va_addr &amp;lt; pt_last_byte_addr,
+   "Invalid virtual address outside the range of the root page table of this vm");
+
+ va_addr -= pt_start_addr;
+ //
+ // Size of the first PDB depends on the total coverage of the
+ // page table and the PAGE_TABLE_BLOCK_SIZE.
+ // Entire table takes ceil(log2(total_vm_size)) bits
+ // All PDBs except the first one take 9 bits each
+ // The PTB covers at least 2 MiB (21 bits)
+ // And PAGE_TABLE_BLOCK_SIZE is log2(num 2MiB ranges PTB covers)
+ // As such, the formula for the size of the first PDB is:
+ //                       PDB1, PDB0, etc.      PTB covers at least 2 MiB
+ //                                        Block size can make it cover more
+ //   total_vm_bits - (9 * num_middle_pdbs) - (page_table_block_size + 21)
+ //
+ // we need the total range range here not the last byte addr like above
+ u32 total_vaddr_bits = log2_range_round_up(pt_start_addr, pt_end_addr + 0x1000);
+
+ u32 total_pdb_bits = total_vaddr_bits;
+ // substract everything from the va_addr to leave just the pdb bits
+ total_pdb_bits -= 9 * (pt_depth - 1); // middle PDBs each is 9 bits
+ total_pdb_bits -= (ptb_size + 21);    // at least 2mb(21) bits + ptb_size
+
+ // u64 va_mask = (1ull &amp;lt;&amp;lt; total_pdb_bits) - 1;
+ // va_mask &amp;lt;&amp;lt;= (total_vaddr_bits - total_pdb_bits);
+
+ // pde_t pdes[8]  = { 0 };
+ // u32   curr_pde = 0;
+ // u64   pde_addr = 0;
+ // u64  loop_pde = pt_base_addr;
+
+ if (pt_depth == 0) { HDB_ASSERT(false, "DEPTH = 0 is not implemented yet"); }
+
+ pde_t curr_pde    = pde;
+ u64   entry_bits  = 0;
+ s32   curr_depth  = pt_depth;
+ bool  pde0_is_pte = false;
+ // walk all middle PDEs
+ while (curr_depth &amp;gt; 0) {
+  // printf("pde(%u):0x%lx \n", curr_depth, curr_pde.pte_base_addr);
+  u64 next_entry_addr = 0;
+
+  u32 shift_amount = total_vaddr_bits;
+  shift_amount -= total_pdb_bits;
+  // for each pdb shift 9 more
+  shift_amount -= ((pt_depth - curr_depth) * 9);
+
+  // shift address and mask out unused bits
+  u64 next_pde_idx = va_addr &amp;gt;&amp;gt; shift_amount;
+  next_pde_idx &amp;amp;= 0x1ff;
+
+  // if on vram we need to apply this offset
+  if (!curr_pde.system) curr_pde.pte_base_addr -= fb_offset;
+
+  next_entry_addr = curr_pde.pte_base_addr + next_pde_idx * 8;
+  curr_depth--;
+
+  if (!curr_pde.system) {
+   dev_linear_vram(dev, next_entry_addr, 8, &amp;amp;entry_bits);
+   curr_pde = decode_pde(entry_bits);
+   printf(
+     "\tPage Dir Entry(%u):\n\t  Addr:0x%lx\n\t  Base: 0x%lx\n\n\t        ↓\n\n",
+     curr_depth,
+     next_entry_addr,
+     curr_pde.pte_base_addr);
+  } else {
+   HDB_ASSERT(false, "GTT physical memory access is not implemented yet");
+  }
+
+  if (!curr_pde.valid) { break; }
+
+  if (curr_pde.pte) {
+   // PDB0 can act as a pte
+   // also I'm making an assumption here that UMRs code doesn't make
+   // that the the PDB0 as PTE path can't have the further bit set
+   pde0_is_pte = true;
+   break;
+  }
+ }
+
+ if (pde0_is_pte) { HDB_ASSERT(false, "PDE0 as PTE is not implemented yet"); }
+
+ // page_table_block_size is the number of 2MiB regions covered by a PTB
+ // If we set it to 0, then PTB cover 2 MiB
+ // If it's 9 PTB cover 1024 MiB
+ // pde0_block_fragment_size tells us how many 4 KiB regions each PTE covers
+ // If it's 0 PTEs cover 4 KiB
+ // If it's 9 PTEs cover 2 MiB
+ // So the number of PTEs in a PTB is 2^(9+ptbs-pbfs)
+ //
+ // size here is actually the log_2 of the size
+ u32 pte_page_size  = curr_pde.frag_size;
+ u32 ptes_per_ptb   = 9 + ptb_size - pte_page_size;
+ u64 pte_index_mask = (1ul &amp;lt;&amp;lt; ptes_per_ptb) - 1;
+
+ u32 pte_bits_count   = pte_page_size + 12;
+ u64 page_offset_mask = (1ul &amp;lt;&amp;lt; pte_bits_count) - 1; // minimum of 12
+
+ u64 pte_index = (va_addr &amp;gt;&amp;gt; pte_bits_count) &amp;amp; pte_index_mask;
+ u64 pte_addr  = curr_pde.pte_base_addr + pte_index * 8;
+
+ pte_t pte = { 0 };
+ if (!curr_pde.system) {
+  dev_linear_vram(dev, pte_addr, 8, &amp;amp;entry_bits);
+  pte = decode_pte(entry_bits);
+
+  printf("\tPage Table Entry: 0x%lx\n", pte.page_base_addr);
+ } else {
+  HDB_ASSERT(false, "GTT physical memory access is not implemented yet");
+ }
+
+ if (pte.further) { HDB_ASSERT(false, "PTE as PDE walking is not implemented yet"); }
+ if (!pte.system) pte.page_base_addr -= fb_offset;
+
+ u64 offset_in_page = va_addr &amp;amp; page_offset_mask;
+ u64 physical_addr  = pte.page_base_addr + offset_in_page;
+ printf("\tFinal Physical Address: 0x%lx\n", physical_addr);
+}&lt;/code&gt;
+    &lt;head rend="h2"&gt;Footnotes&lt;/head&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Other processes need to have a s_trap instruction or have trap on exception flags set, which is not true for most normal GPU processes. ↩&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Available since RDNA3, if I’m not mistaken. ↩&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;VGPRs are unique per thread, and SGPRs are unique per wave ↩&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;We can get that by subtracting the current program counter from the address of the code buffer. ↩&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://thegeeko.me/blog/amd-gpu-debugging/"/><published>2025-12-08T16:06:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46194337</id><title>Let's put Tailscale on a jailbroken Kindle</title><updated>2025-12-09T15:13:08.864780+00:00</updated><content>&lt;doc fingerprint="77000a1e01fd3fdc"&gt;
   &lt;main&gt;
     &lt;p&gt;“It’s a rite of passage to run Tailscale on weird devices.”&lt;/p&gt;
     &lt;p&gt;So writes Mitanshu Sukhwani on his blog, detailing the steps for getting Tailscale onto a jailbroken Kindle. Getting there, and seeing a kindle entry with a satisfying green dot in your Tailscale admin console, takes some doing. But take the trip, and you’ll end up with an e-reader that can run some neat unofficial apps, and is more open to third-party and DRM-free ebooks. And with a Tailscale connection, it’s easier to connect to files and a command line on your underpowered little Linux slab.&lt;/p&gt;
@@ -54,7 +1032,7 @@
     &lt;p&gt;If you’ve gotten Tailscale to run on weird (or just uncommon) devices, we’d more than love to hear about it. Let us know on Reddit, Discord, Bluesky, Mastodon, or LinkedIn.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://tailscale.com/blog/tailscale-jailbroken-kindle"/><published>2025-12-08T16:34:08+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46194384</id><title>Hunting for North Korean Fiber Optic Cables</title><updated>2025-12-09T14:45:19.241826+00:00</updated><content>&lt;doc fingerprint="2fecda19652117ea"&gt;
+&lt;/doc&gt;</content><link href="https://tailscale.com/blog/tailscale-jailbroken-kindle"/><published>2025-12-08T16:34:08+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46194384</id><title>Hunting for North Korean Fiber Optic Cables</title><updated>2025-12-09T15:13:08.687357+00:00</updated><content>&lt;doc fingerprint="2fecda19652117ea"&gt;
   &lt;main&gt;
     &lt;p&gt;Before we go any further, one thing that I want to make clear is that the word assume is going to be doing some heavy lifting throughout this post. This was a rabbit hole that I recently went down and I probably have more questions than answers, but I still wanted to document what I had found so far. If you have additional information or findings you want to share, as always feel free to reach out: contact@nkinternet.com.&lt;/p&gt;
     &lt;p&gt;It all started with a PowerPoint that I came across a few weeks ago. It was presented by the DPRK to the ICAO on the state of their aviation industry and their ADS-B deployment inside North Korea. However, one slide in particular caught my eye because it showed a fiber optic cable running across the country&lt;/p&gt;
@@ -103,7 +1081,7 @@
     &lt;p&gt;Subscribe to get the latest posts sent to your email.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://nkinternet.com/2025/12/08/hunting-for-north-korean-fiber-optic-cables/"/><published>2025-12-08T16:38:08+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46194828</id><title>Launch HN: Nia (YC S25) – Give better context to coding agents</title><updated>2025-12-09T14:45:19.021503+00:00</updated><content/><link href="https://www.trynia.ai/"/><published>2025-12-08T17:10:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46196105</id><title>Jepsen: NATS 2.12.1</title><updated>2025-12-09T14:45:18.558325+00:00</updated><content>&lt;doc fingerprint="2790905544351bb0"&gt;
+&lt;/doc&gt;</content><link href="https://nkinternet.com/2025/12/08/hunting-for-north-korean-fiber-optic-cables/"/><published>2025-12-08T16:38:08+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46194828</id><title>Launch HN: Nia (YC S25) – Give better context to coding agents</title><updated>2025-12-09T15:13:08.509928+00:00</updated><content/><link href="https://www.trynia.ai/"/><published>2025-12-08T17:10:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46196105</id><title>Jepsen: NATS 2.12.1</title><updated>2025-12-09T15:13:08.047796+00:00</updated><content>&lt;doc fingerprint="2790905544351bb0"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;1 Background&lt;/head&gt;
     &lt;p&gt;NATS is a popular streaming system. Producers publish messages to streams, and consumers subscribe to those streams, fetching messages from them. Regular NATS streams are allowed to drop messages. However, NATS has a subsystem called JetStream, which uses the Raft consensus algorithm to replicate data among nodes. JetStream promises âat least onceâ delivery: messages may be duplicated, but acknowledged messages1 should not be lost.2 Moreover, JetStream streams are totally ordered logs.&lt;/p&gt;
@@ -242,7 +1220,7 @@ jepsen-stream', will cleanup&lt;/code&gt;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://jepsen.io/analyses/nats-2.12.1"/><published>2025-12-08T18:51:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46196228</id><title>Has the cost of building software dropped 90%?</title><updated>2025-12-09T14:45:18.427866+00:00</updated><content>&lt;doc fingerprint="a35880536496fbfd"&gt;
+&lt;/doc&gt;</content><link href="https://jepsen.io/analyses/nats-2.12.1"/><published>2025-12-08T18:51:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46196228</id><title>Has the cost of building software dropped 90%?</title><updated>2025-12-09T15:13:07.766702+00:00</updated><content>&lt;doc fingerprint="a35880536496fbfd"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Has the cost of building software just dropped 90%?&lt;/head&gt;
     &lt;p&gt;I've been building software professionally for nearly 20 years. I've been through a lot of changes - the 'birth' of SaaS, the mass shift towards mobile apps, the outrageous hype around blockchain, and the perennial promise that low-code would make developers obsolete.&lt;/p&gt;
@@ -278,7 +1256,7 @@ jepsen-stream', will cleanup&lt;/code&gt;
     &lt;p&gt;One objection I hear a lot is that LLMs are only good at greenfield projects. I'd push back hard on this. I've spent plenty of time trying to understand 3-year-old+ codebases where everyone who wrote it has left. Agents make this dramatically easier - explaining what the code does, finding the bug(s), suggesting the fix. I'd rather inherit a repo written with an agent and a good engineer in the loop than one written by a questionable quality contractor who left three years ago, with no tests, and a spaghetti mess of classes and methods.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://martinalderson.com/posts/has-the-cost-of-software-just-dropped-90-percent/"/><published>2025-12-08T19:00:48+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46196308</id><title>Trials avoid high risk patients and underestimate drug harms</title><updated>2025-12-09T14:45:18.227572+00:00</updated><content>&lt;doc fingerprint="f9f935b219307f6"&gt;
+&lt;/doc&gt;</content><link href="https://martinalderson.com/posts/has-the-cost-of-software-just-dropped-90-percent/"/><published>2025-12-08T19:00:48+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46196308</id><title>Trials avoid high risk patients and underestimate drug harms</title><updated>2025-12-09T15:13:07.331196+00:00</updated><content>&lt;doc fingerprint="f9f935b219307f6"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Trials Avoid High Risk Patients and Underestimate Drug Harms&lt;/head&gt;
     &lt;p&gt;The FDA does not formally regulate representativeness, but if trials under-enroll vulnerable patients, the resulting evidence may understate harm from drugs. We study the relationship between trial participation and the risk of drug-induced adverse events for cancer medications using data from the Surveillance, Epidemiology, and End Results Program linked to Medicare claims. Initiating treatment with a cancer drug increases the risk of hospitalization due to serious adverse events (SAE) by 2 percentage points per month (a 250% increase). Heterogeneity in SAE treatment effects can be predicted by patient's comorbidities, frailty, and demographic characteristics. Patients at the 90th percentile of the risk distribution experience a 2.5 times greater increase in SAEs after treatment initiation compared to patients at the 10th percentile of the risk distribution yet are 4 times less likely to enroll in trials. The predicted SAE treatment effects for the drug's target population are 15% larger than the predicted SAE treatment effects for trial enrollees, corresponding to 1 additional induced SAE hospitalization for every 25 patients per year of treatment. We formalize conditions under which regulating representativeness of SAE risk will lead to more externally valid trials, and we discuss how our results could inform regulatory requirements.&lt;/p&gt;
@@ -287,7 +1265,7 @@ jepsen-stream', will cleanup&lt;/code&gt;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.nber.org/papers/w34534"/><published>2025-12-08T19:07:59+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46196688</id><title>Icons in Menus Everywhere – Send Help</title><updated>2025-12-09T14:45:18.154981+00:00</updated><content>&lt;doc fingerprint="422090131970f19e"&gt;
+&lt;/doc&gt;</content><link href="https://www.nber.org/papers/w34534"/><published>2025-12-08T19:07:59+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46196688</id><title>Icons in Menus Everywhere – Send Help</title><updated>2025-12-09T15:13:07.134376+00:00</updated><content>&lt;doc fingerprint="422090131970f19e"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Icons in Menus Everywhere — Send Help&lt;/head&gt;
     &lt;p&gt;I complained about this on the socials, but I didn’t get it all out of my system. So now I write a blog post.&lt;/p&gt;
@@ -337,7 +1315,7 @@ jepsen-stream', will cleanup&lt;/code&gt;
     &lt;p&gt;Send help.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://blog.jim-nielsen.com/2025/icons-in-menus/"/><published>2025-12-08T19:44:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46198430</id><title>Show HN: I built a system for active note-taking in regular meetings like 1-1s</title><updated>2025-12-09T14:45:17.921845+00:00</updated><link href="https://withdocket.com"/><published>2025-12-08T22:21:26+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46199411</id><title>Kroger acknowledges that its bet on robotics went too far</title><updated>2025-12-09T14:45:17.543714+00:00</updated><content>&lt;doc fingerprint="24a7c19bfeaa83a7"&gt;
+&lt;/doc&gt;</content><link href="https://blog.jim-nielsen.com/2025/icons-in-menus/"/><published>2025-12-08T19:44:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46198430</id><title>Show HN: I built a system for active note-taking in regular meetings like 1-1s</title><updated>2025-12-09T15:13:06.822378+00:00</updated><link href="https://withdocket.com"/><published>2025-12-08T22:21:26+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46199411</id><title>Kroger acknowledges that its bet on robotics went too far</title><updated>2025-12-09T15:13:06.367292+00:00</updated><content>&lt;doc fingerprint="24a7c19bfeaa83a7"&gt;
   &lt;main&gt;
     &lt;p&gt;Kroger’s announcement on Tuesday that it will shutter three of its robotic e-commerce fulfillment facilities represents a sharp turnabout for the grocery company, which until recently had expressed confidence in its ability to leverage automation to run a profitable online grocery business.&lt;/p&gt;
     &lt;p&gt;Less than a year ago, Kroger said it planned to expand the fleet of high-tech fulfillment centers it has been developing in partnership with U.K.-based warehouse automation company Ocado. And in mid-2024, Kroger revealed that it would install new technology from Ocado to improve the efficiency of the warehouses.&lt;/p&gt;
@@ -357,7 +1335,7 @@ jepsen-stream', will cleanup&lt;/code&gt;
     &lt;p&gt;Kroger’s decision to reduce its commitment to automation also poses a significant setback to Ocado, which has positioned its relationship with Kroger as a key endorsement of its warehouse automation technology. Shares in the U.K.-based robotics company have fallen dramatically and are now back to their level 15 years ago, when the company went public.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.grocerydive.com/news/kroger-ocado-close-automated-fulfillment-centers-robotics-grocery-ecommerce/805931/"/><published>2025-12-08T23:53:52+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46199530</id><title>Manual: Spaces</title><updated>2025-12-09T14:45:15.163608+00:00</updated><content>&lt;doc fingerprint="d7a8147305c8adb9"&gt;
+&lt;/doc&gt;</content><link href="https://www.grocerydive.com/news/kroger-ocado-close-automated-fulfillment-centers-robotics-grocery-ecommerce/805931/"/><published>2025-12-08T23:53:52+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46199530</id><title>Manual: Spaces</title><updated>2025-12-09T15:13:04.454481+00:00</updated><content>&lt;doc fingerprint="d7a8147305c8adb9"&gt;
   &lt;main&gt;
     &lt;p&gt;Space (whitespace) is a whole group of glyphs, one of the most important and frequently-used. Any computer user knows space as the widest key on their keyboard, however the notion itself is much bigger and comprises multiple important typographic terms and ideas.&lt;/p&gt;
     &lt;p&gt;Space in general is a blank unprinted area, a counterform that separates letters, words, lines etc. In typography, there are several types of spaces: sinkage (space on a page above a textblock), indent (space before the paragraph), leading (vertical space), word spacing, and letter spacing. In this article, we will primarily focus on word spacing, i.e. the space as a glyph.&lt;/p&gt;
@@ -498,10 +1476,10 @@ jepsen-stream', will cleanup&lt;/code&gt;
     &lt;p&gt;Pyotr Kolomnin, A Concise Account of Typography &lt;lb/&gt; Alexandra Korolkova, Living Typography &lt;lb/&gt; M. I. Schelkunov, History, Technique, Art of Printing &lt;lb/&gt; Alexei Yozhikov, (Nearly) Everything You Need To Know About Whitespace (habr.com) &lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://type.today/en/journal/spaces"/><published>2025-12-09T00:07:42+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46199623</id><title>The universal weight subspace hypothesis</title><updated>2025-12-09T14:45:15.034567+00:00</updated><content>&lt;doc fingerprint="3c1d2c0bdef3808e"&gt;
+&lt;/doc&gt;</content><link href="https://type.today/en/journal/spaces"/><published>2025-12-09T00:07:42+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46199623</id><title>The universal weight subspace hypothesis</title><updated>2025-12-09T15:13:04.289844+00:00</updated><content>&lt;doc fingerprint="3c1d2c0bdef3808e"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;Computer Science &amp;gt; Machine Learning&lt;/head&gt;&lt;p&gt; [Submitted on 4 Dec 2025 (v1), last revised 6 Dec 2025 (this version, v2)]&lt;/p&gt;&lt;head rend="h1"&gt;Title:The Universal Weight Subspace Hypothesis&lt;/head&gt;View PDF HTML (experimental)&lt;quote&gt;Abstract:We show that deep neural networks trained across diverse tasks exhibit remarkably similar low-dimensional parametric subspaces. We provide the first large-scale empirical evidence that demonstrates that neural networks systematically converge to shared spectral subspaces regardless of initialization, task, or domain. Through mode-wise spectral analysis of over 1100 models - including 500 Mistral-7B LoRAs, 500 Vision Transformers, and 50 LLaMA-8B models - we identify universal subspaces capturing majority variance in just a few principal directions. By applying spectral decomposition techniques to the weight matrices of various architectures trained on a wide range of tasks and datasets, we identify sparse, joint subspaces that are consistently exploited, within shared architectures across diverse tasks and datasets. Our findings offer new insights into the intrinsic organization of information within deep networks and raise important questions about the possibility of discovering these universal subspaces without the need for extensive data and computational resources. Furthermore, this inherent structure has significant implications for model reusability, multi-task learning, model merging, and the development of training and inference-efficient algorithms, potentially reducing the carbon footprint of large-scale neural models.&lt;/quote&gt;&lt;head rend="h2"&gt;Submission history&lt;/head&gt;From: Prakhar Kaushik [view email]&lt;p&gt;[v1] Thu, 4 Dec 2025 18:59:58 UTC (14,316 KB)&lt;/p&gt;&lt;p&gt;[v2] Sat, 6 Dec 2025 04:42:07 UTC (14,321 KB)&lt;/p&gt;&lt;p&gt; Current browse context: &lt;/p&gt;&lt;p&gt;cs.LG&lt;/p&gt;&lt;head rend="h3"&gt;References &amp;amp; Citations&lt;/head&gt;&lt;p&gt; export BibTeX citation Loading... &lt;/p&gt;&lt;head rend="h1"&gt;Bibliographic and Citation Tools&lt;/head&gt;&lt;p&gt; Bibliographic Explorer (What is the Explorer?) &lt;/p&gt;&lt;p&gt; Connected Papers (What is Connected Papers?) &lt;/p&gt;&lt;p&gt; Litmaps (What is Litmaps?) &lt;/p&gt;&lt;p&gt; scite Smart Citations (What are Smart Citations?) &lt;/p&gt;&lt;head rend="h1"&gt;Code, Data and Media Associated with this Article&lt;/head&gt;&lt;p&gt; alphaXiv (What is alphaXiv?) &lt;/p&gt;&lt;p&gt; CatalyzeX Code Finder for Papers (What is CatalyzeX?) &lt;/p&gt;&lt;p&gt; DagsHub (What is DagsHub?) &lt;/p&gt;&lt;p&gt; Gotit.pub (What is GotitPub?) &lt;/p&gt;&lt;p&gt; Hugging Face (What is Huggingface?) &lt;/p&gt;&lt;p&gt; Papers with Code (What is Papers with Code?) &lt;/p&gt;&lt;p&gt; ScienceCast (What is ScienceCast?) &lt;/p&gt;&lt;head rend="h1"&gt;Demos&lt;/head&gt;&lt;head rend="h1"&gt;Recommenders and Search Tools&lt;/head&gt;&lt;p&gt; Influence Flower (What are Influence Flowers?) &lt;/p&gt;&lt;p&gt; CORE Recommender (What is CORE?) &lt;/p&gt;&lt;p&gt; IArxiv Recommender (What is IArxiv?) &lt;/p&gt;&lt;head rend="h1"&gt;arXivLabs: experimental projects with community collaborators&lt;/head&gt;&lt;p&gt;arXivLabs is a framework that allows collaborators to develop and share new arXiv features directly on our website.&lt;/p&gt;&lt;p&gt;Both individuals and organizations that work with arXivLabs have embraced and accepted our values of openness, community, excellence, and user data privacy. arXiv is committed to these values and only works with partners that adhere to them.&lt;/p&gt;&lt;p&gt;Have an idea for a project that will add value for arXiv's community? Learn more about arXivLabs.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://arxiv.org/abs/2512.05117"/><published>2025-12-09T00:16:46+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46199723</id><title>Horses: AI progress is steady. Human equivalence is sudden</title><updated>2025-12-09T14:45:14.918518+00:00</updated><content>&lt;doc fingerprint="5b9e92572bb22e27"&gt;
+&lt;/doc&gt;</content><link href="https://arxiv.org/abs/2512.05117"/><published>2025-12-09T00:16:46+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46199723</id><title>Horses: AI progress is steady. Human equivalence is sudden</title><updated>2025-12-09T15:13:04.119870+00:00</updated><content>&lt;doc fingerprint="5b9e92572bb22e27"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Horses&lt;/head&gt;
     &lt;p&gt;So after all these hours talking about AI, in these last five minutes I am going to talk about: horses.&lt;/p&gt;
@@ -541,7 +1519,7 @@ jepsen-stream', will cleanup&lt;/code&gt;
     &lt;p&gt;All opinions are my own and not those of my employer.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://andyljones.com/posts/horses.html"/><published>2025-12-09T00:26:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46202921</id><title>30 Year Anniversary of WarCraft II: Tides of Darkness</title><updated>2025-12-09T14:45:13.865220+00:00</updated><content>&lt;doc fingerprint="be435c9aabb33e50"&gt;
+&lt;/doc&gt;</content><link href="https://andyljones.com/posts/horses.html"/><published>2025-12-09T00:26:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46202921</id><title>30 Year Anniversary of WarCraft II: Tides of Darkness</title><updated>2025-12-09T15:13:02.895021+00:00</updated><content>&lt;doc fingerprint="be435c9aabb33e50"&gt;
   &lt;main&gt;
     &lt;p&gt;It has now been 30 years since WarCraft II: Tides of Darkness was released. After the great response to Warcraft: Orcs and Humans, released in November 1994, Blizzard began working on Warcraft II: Tides of Darkness. Development stared in the first months of 1995, and the game was released in North America and Australia on December 9, 1995.&lt;/p&gt;
     &lt;p&gt;While WarCraft: Orcs and Humans had laid the foundations of the series — arguably even for the RTS genre at a whole — it was really WarCraft II that took things to new heights. More units could be selected at once, the player could right-click to issue commands, naval and aerial combat was introduced, and buildings and units could be upgraded. The graphics were more vivid and visually appealing, and features like the Fog of War was introduced, where you could only see in the vicinity of your own units — unlike in the first game, where you could indefinitely see any area you had previously visited, you now had to continuously scout the map.&lt;/p&gt;
@@ -565,7 +1543,7 @@ jepsen-stream', will cleanup&lt;/code&gt;
     &lt;p&gt;A second strong memory came a few months later, at my friend Erik's house, on his Intel 486 PC. He was experimenting with the WarCraft II map editor, which I hadn't known existed, and I was blown away. I simply could not believe that Blizzard would ship such a tool with the game; to me, it meant that people could essentially create their own games by designing entirely new scenarios. It is quite possible that my fascination with modding was born in that very moment. We probably went outside to play shortly afterward, which I found incredibly lame — we had at our disposal the most powerful tool I could imagine, so why were we not inside using it?&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.jorsys.org/archive/december_2025.html#newsitem_2025-12-09T07:42:19Z"/><published>2025-12-09T09:13:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46203138</id><title>The Joy of Playing Grandia, on Sega Saturn</title><updated>2025-12-09T14:45:13.192970+00:00</updated><content>&lt;doc fingerprint="b78dd71e0a31439d"&gt;
+&lt;/doc&gt;</content><link href="https://www.jorsys.org/archive/december_2025.html#newsitem_2025-12-09T07:42:19Z"/><published>2025-12-09T09:13:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46203138</id><title>The Joy of Playing Grandia, on Sega Saturn</title><updated>2025-12-09T15:13:02.285226+00:00</updated><content>&lt;doc fingerprint="b78dd71e0a31439d"&gt;
   &lt;main&gt;
     &lt;head rend="h2"&gt;The Renaissance Period&lt;/head&gt;
     &lt;p&gt;We are living through a Saturn renaissance. Buckets of titles previously locked away in Japan are seeing new audiences, thanks to the herculean efforts of small but dedicated teams of enthusiast translators, removing the veil of Japanese illiteracy from before our tired eyes. Interestingly, the majority of efforts are being directed at the games with the biggest scripts, and no other genre was as impacted by the language barrier as the text-heavy, story-driven RPG. Over a dozen quality titles are now playable in English. The Saturn is, once again, ascendant…&lt;/p&gt;
@@ -653,7 +1631,7 @@ jepsen-stream', will cleanup&lt;/code&gt;
     &lt;p&gt;Sometimes, we get a chance to say our goodbyes before they depart us, and this is something Justin and Feena were able to share with Sue. With tears in her eyes, even as she bade farewell, she wished for Justin to follow his dreams and complete his long quest to find Angelou. It’s this that ties all of these sentiments together, for me. We all get older. We all leave our childhood behind us and begin to lead our adult lives in earnest. Our carefree days of questing and playing our days away, confident that in the end, everything will be all right, are replaced by planning, worrying, pressure, stress, failure, and other harsh realities of life. Here, Sue reminds us of the importance of not forgetting our dreams. We may not have the time or the energy that we did then, but whatever the obstacles, we must always go boldly in the direction of our dreams, hand-in-hand with those who love us, for we, too, will one day exit the adventure. In our final moments, what sweeter satisfaction could there be than to warmly smile at those who walked with us, and to look back on our journey with pride.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.segasaturnshiro.com/2025/11/27/the-joy-of-playing-grandia-on-sega-saturn/"/><published>2025-12-09T09:48:55+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46203499</id><title>ZX Spectrum Next on the Internet: Xberry Pi ESP01 and Pi Zero Upgrades</title><updated>2025-12-09T14:45:13.053967+00:00</updated><content>&lt;doc fingerprint="e1ce3412480c97fa"&gt;
+&lt;/doc&gt;</content><link href="https://www.segasaturnshiro.com/2025/11/27/the-joy-of-playing-grandia-on-sega-saturn/"/><published>2025-12-09T09:48:55+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46203499</id><title>ZX Spectrum Next on the Internet: Xberry Pi ESP01 and Pi Zero Upgrades</title><updated>2025-12-09T15:13:01.941728+00:00</updated><content>&lt;doc fingerprint="e1ce3412480c97fa"&gt;
   &lt;main&gt;
     &lt;p&gt;I’m enjoying my Xberry Pi ZX Spectrum Next, but I have to say the ‘simple’ upgrade of getting it onto Wifi via the cheap and cheerful ESP 8266 was not fun.&lt;/p&gt;
     &lt;p&gt;While I had every intention of setting up my Speccy keyboard on the board’s matrix connector, I need to wait for a socket of the correct pitch. It turns out the Xberry Pi needs 0.2mm spacing and I have none in my parts box. Instead I figured do the other main upgrades, namely add a Pi Zero “accelerator” and the Wifi upgrade.&lt;/p&gt;
@@ -701,7 +1679,7 @@ send('AT+GMR')
     &lt;p&gt;Seems life might have been easier if a Pi Zero W was used instead of a Pi and an ESP8266, or even an ESP32, but perhaps there is a good reason they went with the little old ESP01.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://retrogamecoders.com/zx-spectrum-next-on-the-internet-xberry-pi-esp01-and-pi-zero-upgrades/"/><published>2025-12-09T10:52:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46203581</id><title>Show HN: AlgoDrill – Interactive drills to stop forgetting LeetCode patterns</title><updated>2025-12-09T14:45:12.725824+00:00</updated><link href="https://algodrill.io"/><published>2025-12-09T11:09:06+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46203611</id><title>Brent's Encapsulated C Programming Rules (2020)</title><updated>2025-12-09T14:45:12.557798+00:00</updated><content>&lt;doc fingerprint="a6789b19a8451298"&gt;
+&lt;/doc&gt;</content><link href="https://retrogamecoders.com/zx-spectrum-next-on-the-internet-xberry-pi-esp01-and-pi-zero-upgrades/"/><published>2025-12-09T10:52:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46203581</id><title>Show HN: AlgoDrill – Interactive drills to stop forgetting LeetCode patterns</title><updated>2025-12-09T15:13:01.637422+00:00</updated><link href="https://algodrill.io"/><published>2025-12-09T11:09:06+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46203611</id><title>Brent's Encapsulated C Programming Rules (2020)</title><updated>2025-12-09T15:13:01.386081+00:00</updated><content>&lt;doc fingerprint="a6789b19a8451298"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Brent's Encapsulated C Programming Rules&lt;/head&gt;
     &lt;p&gt;Below are some rules that I have developed over a long period of time writing fully encapsulated C programs. C is my favorite language and I love the freedom and exploration it allows me. I also love that it is so close to Assembly and I love writing assembly for much of the same reasons!&lt;/p&gt;
@@ -982,136 +1960,7 @@ struct Good {
     &lt;p&gt;There are inevitably more things I’ve forgotten about, but I’ve written this all in one sitting so this is good enough for now until I can update!&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://retroscience.net/brents-c-programming-rules.html"/><published>2025-12-09T11:16:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46203948</id><title>Why frozen test fixtures are a problem on large projects and how to avoid them</title><updated>2025-12-09T14:45:12.323514+00:00</updated><content>&lt;doc fingerprint="ce9078142f77b675"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Why frozen test fixtures are a problem on large projects and how to avoid them&lt;/head&gt;
-    &lt;quote&gt;&lt;p&gt;Tests grow to thousands&lt;/p&gt;&lt;lb/&gt;All make their claim on fixtures&lt;lb/&gt;Frozen by demands&lt;/quote&gt;
-    &lt;p&gt;An ancient Japanese Haiku about a common problem with software test fixtures&lt;/p&gt;
-    &lt;head rend="h2"&gt;Act 1: The problem, frozen fixtures&lt;/head&gt;
-    &lt;p&gt;Fixtures have a lot going for them: super fast, clearly structured, reusable across tests …&lt;/p&gt;
-    &lt;p&gt;That last one is also the source of a common problem in large test suites. Every time you change fixtures you risk falsely breaking some tests. Meaning: the test fails even though the feature it tests still works. This is because every test makes assumptions about the fixtures. This is necessarily part of the test setup, even if it is not explicit in the test code. If the code breaks those assumptions the test itself will no longer work. The more tests there are, the more likely you are to falsely break some of them when you change fixtures.&lt;/p&gt;
-    &lt;p&gt;This is why sufficiently complex data model fixtures tend to become frozen after a certain number of tests. If you aren’t careful, when you get to 1000s of tests, making any change to fixtures can break 10s or even 100s of unrelated tests. It becomes really hard to fix them so you try to avoid directly modifying the fixtures at all. You start to work around it (more on that below) and they stop changing. Hence, frozen fixtures.&lt;/p&gt;
-    &lt;p&gt;Thankfully, there are ways to write tests to minimise this effect but it requires discipline.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Act 2: The bad solutions&lt;/head&gt;
-    &lt;p&gt;First, let me go over 2 approaches I’ve seen on projects and why I think they’re bad:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;If current fixtures can’t be reused, create new ones. This is especially prominent in multi-tenant applications: create a brand new tenant in fixtures just for the new tests you’re adding. This is a road of ever increasing fixture size. It becomes really hard to understand which fixtures are for which tests and the testing database starts to become larger and larger. Reviewing existing fixtures for reuse becomes harder. It becomes easier to just add new fixtures for the next test which makes the problem worse.&lt;/item&gt;
-      &lt;item&gt;Use code inside the test to modify the fixture records just for this test. It seems obvious: let’s just modify the DB to match the state we need for the test. Congratulations! You’ve started to re-discover factories, except you’re doing it ad-hoc. If you start going down that road, consider using both fixtures and factories. I’m not being sarcastic, this combination can work really well.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h2"&gt;Act 3: The right solution&lt;/head&gt;
-    &lt;p&gt;First, recognise that every test is written to test a specific property of the code. It should be red if the property breaks and green if satisfied. Diverging from it in any direction is bad, in different ways:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;A test that passes while the property breaks gives us false confidence. That’s obviously bad because we could ship a bug.&lt;/item&gt;
-      &lt;item&gt;However, a test that breaks while the property holds distracts us with false information. That’s also bad because it is wasting our precious development time and reducing our confidence in our test suite.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;To put it zenly1 : a test should test only that which it is meant to test, no more and no less.&lt;/p&gt;
-    &lt;p&gt;A great solution to remedy frozen fixtures is turning this principle to 112.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Test only what you want to test&lt;/head&gt;
-    &lt;p&gt;This means getting into the habit of asking yourself what a specific test actually tries to test. Then, write the test code to directly test exactly that property. This is not trivial but it becomes effortless with practice. Writing good tests is a skill that needs practice like any other programming skill.&lt;/p&gt;
-    &lt;p&gt;I know that this still sounds abstract so here are 2 very concrete examples.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Example 1: Testing collection content&lt;/head&gt;
-    &lt;p&gt;Testing collections is especially problematic because it has to involve multiple records. This means you’re probably using fixture records that are also used in many other tests. Either that or your fixtures list is crazy long.&lt;/p&gt;
-    &lt;p&gt;Let’s say you are testing a scope on a model. You might be tempted to write something like:&lt;/p&gt;
-    &lt;code&gt;
-      &lt;table&gt;
-        &lt;tr&gt;
-          &lt;td&gt;
-            &lt;quote&gt;1 2 3 &lt;/quote&gt;
-          &lt;/td&gt;
-          &lt;td&gt;
-            &lt;quote&gt;test "active scope returns active projects" do assert_equal [projects(:active1), projects(:active2)], Project.active end &lt;/quote&gt;
-          &lt;/td&gt;
-        &lt;/tr&gt;
-      &lt;/table&gt;
-    &lt;/code&gt;
-    &lt;p&gt;This test has just made it impossible to introduce another active project without breaking it, even if the scope was not actually broken. Add a new variant of an active project for an unrelated test and now you have to also update this test.&lt;/p&gt;
-    &lt;p&gt;Instead, try this:&lt;/p&gt;
-    &lt;code&gt;
-      &lt;table&gt;
-        &lt;tr&gt;
-          &lt;td&gt;
-            &lt;quote&gt;1 2 3 4 5 6 7 &lt;/quote&gt;
-          &lt;/td&gt;
-          &lt;td&gt;
-            &lt;quote&gt;test "active scope returns active projects" do active_projects = Project.active assert_includes active_projects, projects(:active1) assert_includes active_projects, projects(:active2) refute_includes active_projects, projects(:inactive) end &lt;/quote&gt;
-          &lt;/td&gt;
-        &lt;/tr&gt;
-      &lt;/table&gt;
-    &lt;/code&gt;
-    &lt;p&gt;The test will now:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Fail if the scope no longer includes active projects.&lt;/item&gt;
-      &lt;item&gt;Fail if the scope now includes inactive projects.&lt;/item&gt;
-      &lt;item&gt;Not be affected when new projects are added to fixtures.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;This last one is key. By slightly rewriting the test, we’ve avoided freezing fixtures.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Example 2: Testing collection order&lt;/head&gt;
-    &lt;p&gt;A related example is checking that a returned collection is in the correct order.&lt;/p&gt;
-    &lt;p&gt;You might be tempted to do something like this:&lt;/p&gt;
-    &lt;code&gt;
-      &lt;table&gt;
-        &lt;tr&gt;
-          &lt;td&gt;
-            &lt;quote&gt;1 2 3 &lt;/quote&gt;
-          &lt;/td&gt;
-          &lt;td&gt;
-            &lt;quote&gt;test "ordered sorts by project name" do assert_equal Project.ordered, [projects(:aardvark), projects(:active1), projects(:inactive)] end &lt;/quote&gt;
-          &lt;/td&gt;
-        &lt;/tr&gt;
-      &lt;/table&gt;
-    &lt;/code&gt;
-    &lt;p&gt;Instead, think like a zen master: to test sorting, test that it is sorted:&lt;/p&gt;
-    &lt;code&gt;
-      &lt;table&gt;
-        &lt;tr&gt;
-          &lt;td&gt;
-            &lt;quote&gt;1 2 3 4 &lt;/quote&gt;
-          &lt;/td&gt;
-          &lt;td&gt;
-            &lt;quote&gt;test "ordered sorts by project name" do names = Project.ordered.map(&amp;amp;:name) assert_equal names, names.sort end &lt;/quote&gt;
-          &lt;/td&gt;
-        &lt;/tr&gt;
-      &lt;/table&gt;
-    &lt;/code&gt;
-    &lt;p&gt;The test will now:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Fail if the collection is not sorted.&lt;/item&gt;
-      &lt;item&gt;Not be affected by any other change.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;To test a specific case of ordering, focus the test even more and only test that very specific ordering. For example, imagine you just fixed a bug where non latin characters were incorrectly sorted and you want to add a regression test. Do it this way:&lt;/p&gt;
-    &lt;code&gt;
-      &lt;table&gt;
-        &lt;tr&gt;
-          &lt;td&gt;
-            &lt;quote&gt;1 2 3 4 5 6 &lt;/quote&gt;
-          &lt;/td&gt;
-          &lt;td&gt;
-            &lt;quote&gt;test "ordered correctly sorts non latin characters" do # Č and Ć are non latin letters of the Croatian alphabet and unfortunately # their unicode code points are not in the same order as they are in the # alphabet, leading vanilla Ruby to sort them incorrectly. assert_equal [projectĆ, projectČ], Topic.ordered &amp;amp; [projectČ, projectĆ] end &lt;/quote&gt;
-          &lt;/td&gt;
-        &lt;/tr&gt;
-      &lt;/table&gt;
-    &lt;/code&gt;
-    &lt;p&gt;The test will now:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Fail if the non latin characters are incorrectly sorted.&lt;/item&gt;
-      &lt;item&gt;Not be affected by any other change in sorting logic.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Rewriting the test slightly made it both more precise and not freeze the fixtures.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Act 4: So … this makes fixtures better than factories?&lt;/head&gt;
-    &lt;p&gt;Now that you know how to minimise fixtures’ downsides without sacrificing any of the benefits, surely, this means they’re better than factories? Right?&lt;/p&gt;
-    &lt;p&gt;Fixtures vs factories is one of those topics that you really wouldn’t expect people to have strong feelings about but somehow they do. I like to irritate people by being pragmatic and not picking a side.&lt;/p&gt;
-    &lt;p&gt;Sometimes I use fixtures sometimes factories. They have different tradeoffs and each could fit a different project better.&lt;/p&gt;
-    &lt;p&gt;Sometimes I decide to go wild and use both, because that way I can annoy everyone at once!&lt;/p&gt;
-    &lt;p&gt;Which is why I didn’t write an article about which one is better, enough digital ink has been spilled on that hill. I did write before about a principle that makes factories easier to use, if that is something you’re interested in.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Footnotes&lt;/head&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;
-        &lt;p&gt;Bluntly but with a zen overtone. If you don’t like this, tough luck, ever since I became a dad I have an excuse for such jokes. ↩&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://radanskoric.com/articles/frozen-test-fixtures"/><published>2025-12-09T11:58:02+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46204139</id><title>Mazda suitcase car, a portable three-wheeled vehicle that fits in the luggage</title><updated>2025-12-09T14:45:11.881552+00:00</updated><content>&lt;doc fingerprint="bf393ec4e326b4e5"&gt;
+&lt;/doc&gt;</content><link href="https://retroscience.net/brents-c-programming-rules.html"/><published>2025-12-09T11:16:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46204139</id><title>Mazda suitcase car, a portable three-wheeled vehicle that fits in the luggage</title><updated>2025-12-09T15:13:00.807520+00:00</updated><content>&lt;doc fingerprint="bf393ec4e326b4e5"&gt;
   &lt;main&gt;
     &lt;p&gt;KEEP UP WITH OUR DAILY AND WEEKLY NEWSLETTERS&lt;/p&gt;
     &lt;p&gt;happening now! swiss mobility specialist schindler introduces its 2025 innovation, the schindler X8 elevator, bringing the company’s revolutionary design directly to cities like milan and basel.&lt;/p&gt;
@@ -1123,4 +1972,38 @@ struct Good {
     &lt;p&gt;connections: +700&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.designboom.com/technology/rediscover-mazda-suitcase-car-portable-three-wheeled-vehicle-fits-luggage-12-06-2025/"/><published>2025-12-09T12:20:24+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46204886</id><title>Rahm Emanuel says U.S. should follow Australia's youth social media ban</title><updated>2025-12-09T14:45:11.814724+00:00</updated><content/><link href="https://www.politico.com/news/2025/12/09/rahm-emanuel-says-u-s-should-follow-australias-youth-social-media-ban-00682185"/><published>2025-12-09T13:48:26+00:00</published></entry></feed>
+&lt;/doc&gt;</content><link href="https://www.designboom.com/technology/rediscover-mazda-suitcase-car-portable-three-wheeled-vehicle-fits-luggage-12-06-2025/"/><published>2025-12-09T12:20:24+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46205519</id><title>Kaiju – General purpose 3D/2D game engine in Go and Vulkan with built in editor</title><updated>2025-12-09T15:13:00.209128+00:00</updated><content>&lt;doc fingerprint="d71a40118926331e"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Kaiju is a 2D/3D game engine written in Go (Golang) backed by Vulkan. The goal of the engine is to use a modern, easy, systems level programming language, with a focus on simplicity, to create a new kind of game engine.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;📄 2D / 🧊 3D Game Engine&lt;/item&gt;
+      &lt;item&gt;🪟 Windows&lt;/item&gt;
+      &lt;item&gt;🐧 Linux&lt;/item&gt;
+      &lt;item&gt;🤖 Android (NEW, support now functional)&lt;/item&gt;
+      &lt;item&gt;🍎 Mac (support is currently WIP)&lt;/item&gt;
+      &lt;item&gt;🤖👉⌨️ Local AI (LLM) interop&lt;/item&gt;
+      &lt;item&gt;&lt;g-emoji&gt;⚠️&lt;/g-emoji&gt;🚧🏗️👷♂️ Work in progress, under heavy development&lt;/item&gt;
+      &lt;item&gt;🚚 Faster builds than other game engines&lt;/item&gt;
+      &lt;item&gt;🔥 Better performance than other game engines (9x faster than Unity out of the box)&lt;/item&gt;
+      &lt;item&gt;💾 Less memory than other engines&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;GitHub repository&lt;/item&gt;
+      &lt;item&gt;Mailing list &amp;lt;- Recommended for detailed updates&lt;/item&gt;
+      &lt;item&gt;Discord server&lt;/item&gt;
+      &lt;item&gt;Brent Farris on X/Twitter&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The current version of the base engine renders extremely fast, faster than most would think a garbage collected language could go. In my testing a release mode build of a game in Unity with nothing but a black background and a cube runs at about 1,600 FPS. In Kaiju, the same thing runs at around 5,400 FPS on the same machine. In fact, a complete game, with audio, custom cursors, real time PBR rendering with real time shadows, UI, and more runs at 2,712 FPS (in "debug" mode) screenshots or it didn't happen.&lt;/p&gt;
+    &lt;p&gt;I love C, and because I love C and found out that Ken Thompson played a part in designing Go, I gave Go a chance. It has been such a joy to use and work with I decided to port my C game engine to Go. Go is a modern system-level language that allows me to write code the way I want to write code and even have the opportunity to do some crazy things if I want to (no strings attached). Also the simplicity and "just works" of writing Assembly code was a great boost to my happiness.&lt;/p&gt;
+    &lt;p&gt;What's more, it's a language that other developers can easily learn and jump right into extending the engine/editor. No need for developers to re-figure out some bespoke macros or crazy templating nonsense. It's flat, easy, straight forward, and the foot-gun is hidden behind some walls, but there if you want it. Furthermore, developers can write their games in Go directly, no need for some alternative language that is different from the engine code (but we'll include Lua for modding).&lt;/p&gt;
+    &lt;p&gt;I am creating this section because I get asked about it when I mention "Go", possibly not realizing that most public game engines use a garbage collector (GC).&lt;/p&gt;
+    &lt;p&gt;The GC is actually a feature I'm happy with (shocker coming from a C guy). Well, the reason is simple, if you're going to make a game engine that the public will use and needs to be stable, you need a garbage collector. Unity has C# (and possibly an internal GC as well), Unreal has a GC (and it could use a tune up if you ask me), Godot has a GC albeit their scripting language or when you use C#. It is actually very important for public engines to have a GC because people are only human and make a lot of mistakes, mistakes they'll blame on you (the engine developer) before they blame themselves.&lt;/p&gt;
+    &lt;p&gt;Coincidentally, the overall design I have for the engine plays very well with the GC and last I measured, I have a net-0 heap allocation while running (may need a new review). If you don't abuse the GC, you shouldn't generally feel it, it runs concurrently as well.&lt;/p&gt;
+    &lt;p&gt;I'll be the first to admit, I think the developers of Go can create a better GC than I can, and probably better than Unreal and Unity too.&lt;/p&gt;
+    &lt;p&gt;Though the engine is production ready, the editor is not, feel free to join and contribute to its development.&lt;/p&gt;
+    &lt;p&gt;For the latest updates, please join the Discord or check my Twitter/X.&lt;/p&gt;
+    &lt;p&gt;Please review the Ad-Hoc editor readme&lt;/p&gt;
+    &lt;p&gt;Please see the documentation on how to get started and compile the engine&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://github.com/KaijuEngine/kaiju"/><published>2025-12-09T14:51:46+00:00</published></entry></feed>
