@@ -1,983 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Tue, 09 Dec 2025 15:12:59 +0000</lastBuildDate><item><title>AMD GPU Debugger</title><link>https://thegeeko.me/blog/amd-gpu-debugging/</link><description>&lt;doc fingerprint="ae1ad8512d473b89"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;AMD GPU Debugger&lt;/head&gt;
-    &lt;p&gt;I’ve always wondered why we don’t have a GPU debugger similar to the one used for CPUs. A tool that allows pausing execution and examining the current state. This capability feels essential, especially since the GPU’s concurrent execution model is much harder to reason about. After searching for solutions, I came across rocgdb, a debugger for AMD’s ROCm environment. Unfortunately, its scope is limited to that environment. Still, this shows it’s technically possible. I then found a helpful series of blog posts by Marcell Kiss, detailing how he achieved this, which inspired me to try to recreate the process myself.&lt;/p&gt;
-    &lt;head rend="h1"&gt;Let’s Try To Talk To The GPU Directly&lt;/head&gt;
-    &lt;p&gt;The best place to start learning about this is RADV. By tracing what it does, we can find how to do it. Our goal here is to run the most basic shader &lt;code&gt;nop 0&lt;/code&gt; without using Vulkan, aka RADV in our case.&lt;/p&gt;
-    &lt;p&gt;First of all, we need to open the DRM file to establish a connection with the KMD, using a simple open(“/dev/dri/cardX”), then we find that it’s calling &lt;code&gt;amdgpu_device_initialize&lt;/code&gt;, which is a function defined in &lt;code&gt;libdrm&lt;/code&gt;, which is a library that acts as middleware between user mode drivers(UMD) like &lt;code&gt;RADV&lt;/code&gt; and and kernel mode drivers(KMD) like amdgpu driver, and then when we try to do some actual work we have to create a context which can be achieved by calling &lt;code&gt;amdgpu_cs_ctx_create&lt;/code&gt; from &lt;code&gt;libdrm&lt;/code&gt; again, next up we need to allocate 2 buffers one of them for our code and the other for writing our commands into, we do this by calling a couple of functions, here’s how I do it:&lt;/p&gt;
-    &lt;code&gt;void bo_alloc(amdgpu_t* dev, size_t size, u32 domain, bool uncached, amdgpubo_t* bo) {
- s32    ret         = -1;
- u32    alignment   = 0;
- u32    flags       = 0;
- size_t actual_size = 0;
-
- amdgpu_bo_handle bo_handle = NULL;
- amdgpu_va_handle va_handle = NULL;
- u64              va_addr   = 0;
- void*            host_addr = NULL;&lt;/code&gt;
-    &lt;p&gt;Here we’re choosing the domain and assigning flags based on the params, some buffers we will need uncached, as we will see:&lt;/p&gt;
-    &lt;code&gt; if (
-   domain != AMDGPU_GEM_DOMAIN_GWS &amp;amp;&amp;amp; domain != AMDGPU_GEM_DOMAIN_GDS &amp;amp;&amp;amp;
-   domain != AMDGPU_GEM_DOMAIN_OA) {
-  actual_size = (size + 4096 - 1) &amp;amp; 0xFFFFFFFFFFFFF000ULL;
-  alignment   = 4096;
-  flags       = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED | AMDGPU_GEM_CREATE_VRAM_CLEARED |
-          AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
-  flags |=
-    uncached ? (domain == AMDGPU_GEM_DOMAIN_GTT) * AMDGPU_GEM_CREATE_CPU_GTT_USWC : 0;
- } else {
-  actual_size = size;
-  alignment   = 1;
-  flags       = AMDGPU_GEM_CREATE_NO_CPU_ACCESS;
- }
-
- struct amdgpu_bo_alloc_request req = {
-  .alloc_size     = actual_size,
-  .phys_alignment = alignment,
-  .preferred_heap = domain,
-  .flags          = flags,
- };
-
- // memory aquired!!
- ret = amdgpu_bo_alloc(dev-&amp;gt;dev_handle, &amp;amp;req, &amp;amp;bo_handle);
- HDB_ASSERT(!ret, "can't allocate bo");&lt;/code&gt;
-    &lt;p&gt;Now we have the memory, we need to map it. I opt to map anything that can be CPU-mapped for ease of use. We have to map the memory to both the GPU and the CPU virtual space. The KMD creates the page table when we open the DRM file, as shown here.&lt;/p&gt;
-    &lt;p&gt;So map it to the GPU VM and, if possible, to the CPU VM as well. Here, at this point, there’s a libdrm function that does all of this setup for us and maps the memory, but I found that even when specifying &lt;code&gt;AMDGPU_VM_MTYPE_UC&lt;/code&gt;, it doesn’t always tag the page as uncached, not quite sure if it’s a
-bug in my code or something in &lt;code&gt;libdrm&lt;/code&gt; anyways, the function is &lt;code&gt;amdgpu_bo_va_op&lt;/code&gt;, I opted to do it manually here and issue the IOCTL call myself:&lt;/p&gt;
-    &lt;code&gt; u32 kms_handle = 0;
- amdgpu_bo_export(bo_handle, amdgpu_bo_handle_type_kms, &amp;amp;kms_handle);
-
- ret = amdgpu_va_range_alloc(
-   dev-&amp;gt;dev_handle,
-   amdgpu_gpu_va_range_general,
-   actual_size,
-   4096,
-   0,
-   &amp;amp;va_addr,
-   &amp;amp;va_handle,
-   0);
- HDB_ASSERT(!ret, "can't allocate VA");
-
- u64 map_flags =
-   AMDGPU_VM_PAGE_EXECUTABLE | AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE;
- map_flags |= uncached ? AMDGPU_VM_MTYPE_UC | AMDGPU_VM_PAGE_NOALLOC : 0;
-
- struct drm_amdgpu_gem_va va = {
-  .handle       = kms_handle,
-  .operation    = AMDGPU_VA_OP_MAP,
-  .flags        = map_flags,
-  .va_address   = va_addr,
-  .offset_in_bo = 0,
-  .map_size     = actual_size,
-
- };
-
- ret = drm_ioctl_write_read(dev-&amp;gt;drm_fd, DRM_AMDGPU_GEM_VA, &amp;amp;va, sizeof(va));
- HDB_ASSERT(!ret, "can't map bo in GPU space");
- // ret = amdgpu_bo_va_op(bo_handle, 0, actual_size, va_addr, map_flags,
- // AMDGPU_VA_OP_MAP);
-
- if (flags &amp;amp; AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED) {
-  ret = amdgpu_bo_cpu_map(bo_handle, &amp;amp;host_addr);
-  HDB_ASSERT(!ret, "can't map bo in CPU space");
-
-  // AMDGPU_GEM_CREATE_VRAM_CLEARED doesn't really memset the memory to 0 anyways for
-  // debug I'll just do it manually for now
-  memset(host_addr, 0x0, actual_size);
- }
-
- *bo = (amdgpubo_t){
-  .bo_handle = bo_handle,
-  .va_handle = va_handle,
-  .va_addr   = va_addr,
-  .size      = actual_size,
-  .host_addr = host_addr,
- };
-}&lt;/code&gt;
-    &lt;p&gt;Now we have the context and 2 buffers. Next, fill those buffers and send our commands to the KMD, which will then forward them to the Command Processor (CP) in the GPU for processing.&lt;/p&gt;
-    &lt;p&gt;Let’s compile our code. We can use clang assembler for that, like this:&lt;/p&gt;
-    &lt;code&gt;# https://gitlab.freedesktop.org/martty/radbg-poc/-/blob/master/ll-as.sh
-clang -c -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1100 -o asm.o "$1"
-objdump -h asm.o | grep .text | awk '{print "dd if='asm.o' of='asmc.bin' bs=1 count=$[0x" $3 "] skip=$[0x" $6 "] status=none"}' | bash
-#rm asm.o&lt;/code&gt;
-    &lt;p&gt;The bash script compiles the code, and then we’re only interested in the actual machine code, so we use objdump to figure out the offset and the size of the section and copy it to a new file called asmc.bin, then we can just load the file and write its bytes to the CPU-mapped address of the code buffer.&lt;/p&gt;
-    &lt;p&gt;Next up, filling in the commands. This was extremely confusing for me because it’s not well documented. It was mostly learning how &lt;code&gt;RADV&lt;/code&gt; does things and trying to do similar things. Also, shout-out to the folks on the Graphics Programming Discord server for helping me, especially Picoduck. The commands are encoded in a special format called &lt;code&gt;PM4 Packets&lt;/code&gt;, which has multiple types. We only care about &lt;code&gt;Type 3&lt;/code&gt;: each packet has an opcode and the number of bytes it contains.&lt;/p&gt;
-    &lt;p&gt;The first thing we need to do is program the GPU registers, then dispatch the shader. Some of those registers are &lt;code&gt;rsrc[1-3]&lt;/code&gt;; those registers are responsible for a number of configurations, pgm_[lo/hi], which hold the pointer to the code buffer and &lt;code&gt;num_thread_[x/y/z]&lt;/code&gt;; those are responsible for the number of threads inside a work group. All of those are set using the &lt;code&gt;set shader register&lt;/code&gt; packets, and here is how to encode them:&lt;/p&gt;
-    &lt;p&gt;It’s worth mentioning that we can set multiple registers in 1 packet if they’re consecutive.&lt;/p&gt;
-    &lt;code&gt;void pkt3_set_sh_reg(pkt3_packets_t* packets, u32 reg, u32 value) {
- HDB_ASSERT(
-   reg &amp;gt;= SI_SH_REG_OFFSET &amp;amp;&amp;amp; reg &amp;lt; SI_SH_REG_END,
-   "can't set register outside sh registers span");
-
- // packet header
- da_append(packets, PKT3(PKT3_SET_SH_REG, 1, 0));
- // offset of the register
- da_append(packets, (reg - SI_SH_REG_OFFSET) / 4);
- da_append(packets, value);
-}&lt;/code&gt;
-    &lt;p&gt;Then we append the dispatch command:&lt;/p&gt;
-    &lt;code&gt;// we're going for 1 thread since we want the simplest case here.
-
-da_append(&amp;amp;pkt3_packets, PKT3(PKT3_DISPATCH_DIRECT, 3, 0) | PKT3_SHADER_TYPE_S(1));
-da_append(&amp;amp;pkt3_packets, 1u);
-da_append(&amp;amp;pkt3_packets, 1u);
-da_append(&amp;amp;pkt3_packets, 1u);
-da_append(&amp;amp;pkt3_packets, dispatch_initiator);&lt;/code&gt;
-    &lt;p&gt;Now we want to write those commands into our buffer and send them to the KMD:&lt;/p&gt;
-    &lt;code&gt;void dev_submit(
-  amdgpu_t*         dev,
-  pkt3_packets_t*   packets,
-  amdgpu_bo_handle* buffers,
-  u32               buffers_count,
-  amdgpu_submit_t*  submit
-) {
- s32        ret = -1;
- amdgpubo_t ib  = { 0 };
-
- bo_alloc(dev, pkt3_size(packets), AMDGPU_GEM_DOMAIN_GTT, false, &amp;amp;ib);
- bo_upload(&amp;amp;ib, packets-&amp;gt;data, pkt3_size(packets));
-
- amdgpu_bo_handle* bo_handles = // +1 for the indirect buffer
-   (amdgpu_bo_handle*)malloc(sizeof(amdgpu_bo_handle) * (buffers_count + 1));
-
- bo_handles[0] = ib.bo_handle;
- for_range(i, 0, buffers_count) {
-  bo_handles[i + 1] = buffers[i];
- }
-
- amdgpu_bo_list_handle bo_list = NULL;
- ret =
-   amdgpu_bo_list_create(dev-&amp;gt;dev_handle, buffers_count + 1, bo_handles, NULL, &amp;amp;bo_list);
- HDB_ASSERT(!ret, "can't create a bo list");
- free(bo_handles);
-
- struct amdgpu_cs_ib_info ib_info = {
-  .flags         = 0,
-  .ib_mc_address = ib.va_addr,
-  .size          = packets-&amp;gt;count,
- };
-
- struct amdgpu_cs_request req = {
-  .flags                  = 0,
-  .ip_type                = AMDGPU_HW_IP_COMPUTE,
-  .ip_instance            = 0,
-  .ring                   = 0,
-  .resources              = bo_list,
-  .number_of_dependencies = 0,
-  .dependencies           = NULL,
-  .number_of_ibs          = 1,
-  .ibs                    = &amp;amp;ib_info,
-  .seq_no                 = 0,
-  .fence_info             = { 0 },
- };
-
- ret = amdgpu_cs_submit(dev-&amp;gt;ctx_handle, 0, &amp;amp;req, 1);
- HDB_ASSERT(!ret, "can't submit indirect buffer request");
-
- *submit = (amdgpu_submit_t){
-    .ib = ib,
-    .bo_list = bo_list,
-    .fence = {
-      .context = dev-&amp;gt;ctx_handle,
-      .ip_type = AMDGPU_HW_IP_COMPUTE,
-      .ip_instance = 0,
-      .ring = 0,
-      .fence = req.seq_no,
-    },
-  };
-}&lt;/code&gt;
-    &lt;p&gt;Here is a good point to make a more complex shader that outputs something. For example, writing 1 to a buffer.&lt;/p&gt;
-    &lt;p&gt;No GPU hangs ?! nothing happened ?! cool, cool, now we have a shader that runs on the GPU, what’s next? Let’s try to hang the GPU by pausing the execution, aka make the GPU trap.&lt;/p&gt;
-    &lt;head rend="h1"&gt;TBA/TMA&lt;/head&gt;
-    &lt;p&gt;The RDNA3’s ISA manual does mention 2 registers, &lt;code&gt;TBA, TMA&lt;/code&gt;; here’s how they describe them respectively:&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;Holds the pointer to the current trap handler program address. Per-VMID register. Bit [63] indicates if the trap handler is present (1) or not (0) and is not considered part of the address (bit[62] is replicated into address bit[63]). Accessed via S_SENDMSG_RTN.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;quote&gt;
-      &lt;p&gt;Temporary register for shader operations. For example, it can hold a pointer to memory used by the trap handler.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;You can configure the GPU to enter the trap handler when encountering certain exceptions listed in the RDNA3 ISA manual.&lt;/p&gt;
-    &lt;p&gt;We know from Marcell Kiss’s blog posts that we need to compile a trap handler, which is a normal shader the GPU switches to when encountering a &lt;code&gt;s_trap&lt;/code&gt;. The TBA register has a special bit that indicates whether the trap handler is enabled.&lt;/p&gt;
-    &lt;p&gt;Since these are privileged registers, we cannot write to them from user space. To bridge this gap for debugging, we can utilize the debugfs interface. Luckily, we have UMR, which uses that debugfs interface, and it’s open source; we copy AMD’s homework here which is great.&lt;/p&gt;
-    &lt;head rend="h1"&gt;AMDGPU Debugfs&lt;/head&gt;
-    &lt;p&gt;The amdgpu KMD has a couple of files in debugfs under &lt;code&gt;/sys/kernel/debug/dri/{PCI address}&lt;/code&gt;; one of them is &lt;code&gt;regs2&lt;/code&gt;, which is an interface to a &lt;code&gt;amdgpu_debugfs_regs2_write&lt;/code&gt; in the kernel that writes to the registers. It works by simply opening the file, seeking the register’s offset, and then writing; it also performs some synchronisation and writes the value correctly. We need to provide more parameters about the register before writing to the file, tho and do that by using an ioctl call. Here are the ioctl arguments:&lt;/p&gt;
-    &lt;code&gt;typedef struct amdgpu_debugfs_regs2_iocdata_v2 {
- __u32 use_srbm, use_grbm, pg_lock;
- struct {
-  __u32 se, sh, instance;
- } grbm;
- struct {
-  __u32 me, pipe, queue, vmid;
- } srbm;
- __u32 xcc_id;
-} regs2_ioc_data_t;&lt;/code&gt;
-    &lt;p&gt;The 2 structs are because there are 2 types of registers, GRBM and SRBM, each of which is banked by different constructs; you can learn more about some of them here in the Linux kernel documentation.&lt;/p&gt;
-    &lt;p&gt;Turns out our registers here are SBRM registers and banked by VMIDs, meaning each VMID has its own TBA and TMA registers. Cool, now we need to figure out the VMID of our process. As far as I understand, VMIDs are a way for the GPU to identify a specific process context, including the page table base address, so the address translation unit can translate a virtual memory address. The context is created when we open the DRM file. They get assigned dynamically at dispatch time, which is a problem for us; we want to write to those registers before dispatch.&lt;/p&gt;
-    &lt;p&gt;We can obtain the VMID of the dispatched process by querying the &lt;code&gt;HW_ID2&lt;/code&gt; register with s_getreg_b32. I do a hack here, by enabling the trap handler in every VMID, and there are 16 of them, the first being special, and used by the KMD and the last 8 allocated to the amdkfd driver. We loop over the remaining VMIDs and write to those registers. This can cause issues to other processes using other VMIDs by enabling trap handlers in them and writing the virtual address of our trap handler, which is only valid within our virtual memory address space. It’s relatively safe tho since most other processes won’t cause a trap1.&lt;/p&gt;
-    &lt;p&gt;Now we can write to TMA and TBA, here’s the code:&lt;/p&gt;
-    &lt;code&gt;void dev_op_reg32(
-  amdgpu_t* dev, gc_11_reg_t reg, regs2_ioc_data_t ioc_data, reg_32_op_t op, u32* value) {
- s32 ret = 0;
-
- reg_info_t reg_info     = gc_11_regs_infos[reg];
- uint64_t   reg_offset   = gc_11_regs_offsets[reg];
- uint64_t   base_offset  = dev-&amp;gt;gc_regs_base_addr[reg_info.soc_index];
- uint64_t   total_offset = (reg_offset + base_offset);
-
- // seems like we're multiplying by 4 here because the registers database in UMRs
- // source has them in indexes rather than bytes.
- total_offset *= (reg_info.type == REG_MMIO) ? 4 : 1;
-
- ret = hdb_ioctl(dev-&amp;gt;regs2_fd, AMDGPU_DEBUGFS_REGS2_IOC_SET_STATE_V2, &amp;amp;ioc_data);
- HDB_ASSERT(!ret, "Failed to set registers state");
-
- size_t size = lseek(dev-&amp;gt;regs2_fd, total_offset, SEEK_SET);
- HDB_ASSERT(size == total_offset, "Failed to seek register address");
-
- switch (op) {
- case REG_OP_READ : size = read(dev-&amp;gt;regs2_fd, value, 4); break;
- case REG_OP_WRITE: size = write(dev-&amp;gt;regs2_fd, value, 4); break;
- default          : HDB_ASSERT(false, "unsupported op");
- }
-
- HDB_ASSERT(size == 4, "Failed to write/read the values to/from the register");
-}&lt;/code&gt;
-    &lt;p&gt;And here’s how we write to &lt;code&gt;TMA&lt;/code&gt; and &lt;code&gt;TBA&lt;/code&gt;:
-If you noticed, I’m using bitfields. I use them because working with them is much easier than macros, and while the byte order is not guaranteed by the C spec, it’s guaranteed by System V ABI, which Linux adheres to.&lt;/p&gt;
-    &lt;code&gt;void dev_setup_trap_handler(amdgpu_t* dev, u64 tba, u64 tma) {
- reg_sq_shader_tma_lo_t tma_lo = { .raw = (u32)(tma) };
- reg_sq_shader_tma_hi_t tma_hi = { .raw = (u32)(tma &amp;gt;&amp;gt; 32) };
-
- reg_sq_shader_tba_lo_t tba_lo = { .raw = (u32)(tba &amp;gt;&amp;gt; 8) };
- reg_sq_shader_tba_hi_t tba_hi = { .raw = (u32)(tba &amp;gt;&amp;gt; 40) };
-
- tba_hi.trap_en = 1;
-
- regs2_ioc_data_t ioc_data = {
-  .use_srbm = 1,
-  .xcc_id   = -1,
- };
-
- // NOTE(hadi):
- // vmid's get assigned when code starts executing before hand we don't know which vmid
- // will get assigned to our process so we just set all of them
- for_range(i, 1, 9) {
-  ioc_data.srbm.vmid = i;
-  dev_op_reg32(dev, REG_SQ_SHADER_TBA_LO, ioc_data, REG_OP_WRITE, &amp;amp;tba_lo.raw);
-  dev_op_reg32(dev, REG_SQ_SHADER_TBA_HI, ioc_data, REG_OP_WRITE, &amp;amp;tba_hi.raw);
-
-  dev_op_reg32(dev, REG_SQ_SHADER_TMA_LO, ioc_data, REG_OP_WRITE, &amp;amp;tma_lo.raw);
-  dev_op_reg32(dev, REG_SQ_SHADER_TMA_HI, ioc_data, REG_OP_WRITE, &amp;amp;tma_hi.raw);
- }
-}&lt;/code&gt;
-    &lt;p&gt;Anyway, now that we can write to those registers, if we enable the trap handler correctly, the GPU should hang when we launch our shader if we added &lt;code&gt;s_trap&lt;/code&gt; instruction to it, or we enabled the &lt;code&gt;TRAP_ON_START&lt;/code&gt; bit in rsrc32 register.&lt;/p&gt;
-    &lt;p&gt;Now, let’s try to write a trap handler.&lt;/p&gt;
-    &lt;head rend="h1"&gt;The Trap Handler&lt;/head&gt;
-    &lt;p&gt;If you wrote a different shader that outputs to a buffer, u can try writing to that shader from the trap handler, which is nice to make sure it’s actually being run.&lt;/p&gt;
-    &lt;p&gt;We need 2 things: our trap handler and some scratch memory to use when needed, which we will store the address of in the TMA register.&lt;/p&gt;
-    &lt;p&gt;The trap handler is just a normal program running in privileged state, meaning we have access to special registers like TTMP[0-15]. When we enter a trap handler, we need to first ensure that the state of the GPU registers is saved, just as the kernel does for CPU processes when context-switching, by saving a copy of the stable registers and the program counter, etc. The problem, tho, is that we don’t have a stable ABI for GPUs, or at least not one I’m aware of, and compilers use all the registers they can, so we need to save everything.&lt;/p&gt;
-    &lt;p&gt;AMD GPUs’ Command Processors (CPs) have context-switching functionality, and the amdkfd driver does implement some context-switching shaders. The problem is they’re not documented, and we have to figure them out from the amdkfd driver source and from other parts of the driver stack that interact with it, which is a pain in the ass. I kinda did a workaround here since I didn’t find luck understanding how it works, and some other reasons I’ll discuss later in the post.&lt;/p&gt;
-    &lt;p&gt;The workaround here is to use only TTMP registers and a combination of specific instructions to copy the values of some registers, allowing us to use more instructions to copy the remaining registers. The main idea is to make use of the &lt;code&gt;global_store_addtid_b32&lt;/code&gt; instruction, which adds the index of the current thread within the wave to the writing address, aka&lt;/p&gt;
-    &lt;p&gt;This allows us to write a unique value per thread using only TTMP registers, which are unique per wave, not per thread3, so we can save the context of a single wave.&lt;/p&gt;
-    &lt;p&gt;The problem is that if we have more than 1 wave, they will overlap, and we will have a race condition.&lt;/p&gt;
-    &lt;p&gt;Here is the code:&lt;/p&gt;
-    &lt;code&gt;start:
- ;; save the STATUS word into ttmp8
- s_getreg_b32 ttmp8, hwreg(HW_REG_STATUS)
-
- ;; save exec into ttmp[2:3]
- s_mov_b64 ttmp[2:3], exec
-
- ;; getting the address of our tma buffer
- s_sendmsg_rtn_b64 ttmp[4:5], sendmsg(MSG_RTN_GET_TMA)
- s_waitcnt lgkmcnt(0)
-
- ;; save vcc
- s_mov_b64 ttmp[6:7], vcc
-
- ;; enable all threads so they can write their vgpr registers
- s_mov_b64 exec, -1
-
- ;; FIXME(hadi): this assumes only 1 wave is running
- global_store_addtid_b32 v0, ttmp[4:5], offset:TMA_VREG_OFFSET        glc slc dlc
- global_store_addtid_b32 v1, ttmp[4:5], offset:TMA_VREG_OFFSET + 256  glc slc dlc
- global_store_addtid_b32 v2, ttmp[4:5], offset:TMA_VREG_OFFSET + 512  glc slc dlc
- global_store_addtid_b32 v3, ttmp[4:5], offset:TMA_VREG_OFFSET + 768  glc slc dlc
- global_store_addtid_b32 v4, ttmp[4:5], offset:TMA_VREG_OFFSET + 1024 glc slc dlc
- global_store_addtid_b32 v5, ttmp[4:5], offset:TMA_VREG_OFFSET + 1280 glc slc dlc
- global_store_addtid_b32 v6, ttmp[4:5], offset:TMA_VREG_OFFSET + 1536 glc slc dlc
- s_waitcnt vmcnt(0)
-
- ;; only first thread is supposed to write sgprs of the wave
- s_mov_b64 exec, 1
- v_mov_b32 v1, s0
- v_mov_b32 v2, s1
- v_mov_b32 v3, s2
- v_mov_b32 v4, s3
- v_mov_b32 v5, s4
- v_mov_b32 v0, 0
- global_store_b32 v0, v1, ttmp[4:5], offset:TMA_SREG_OFFSET glc slc dlc
- global_store_b32 v0, v2, ttmp[4:5], offset:TMA_SREG_OFFSET + 4 glc slc dlc
- global_store_b32 v0, v3, ttmp[4:5], offset:TMA_SREG_OFFSET + 8 glc slc dlc
- global_store_b32 v0, v4, ttmp[4:5], offset:TMA_SREG_OFFSET + 12 glc slc dlc
- global_store_b32 v0, v5, ttmp[4:5], offset:TMA_SREG_OFFSET + 16 glc slc dlc
- s_waitcnt vmcnt(0)
-
- ;; enable all threads
- s_mov_b64 exec, -1&lt;/code&gt;
-    &lt;p&gt;Now that we have those values in memory, we need to tell the CPU: Hey, we got the data, and pause the GPU’s execution until the CPU issues a command. Also, notice we can just modify those from the CPU.&lt;/p&gt;
-    &lt;p&gt;Before we tell the CPU, we need to write some values that might help the CPU. Here are they:&lt;/p&gt;
-    &lt;code&gt; ;; IDs to identify which parts of the hardware we are running on exactly
- s_getreg_b32 ttmp10, hwreg(HW_REG_HW_ID1)
- s_getreg_b32 ttmp11, hwreg(HW_REG_HW_ID2)
- v_mov_b32 v3, ttmp10
- v_mov_b32 v4, ttmp11
- global_store_dwordx2 v1, v[3:4], ttmp[4:5], offset:TMA_DATA_OFFSET glc slc dlc
-
- ;; the original vcc mask
- v_mov_b32 v3, ttmp6
- v_mov_b32 v4, ttmp7
- global_store_dwordx2 v1, v[3:4], ttmp[4:5], offset:2048 glc slc dlc
- s_waitcnt vmcnt(0)
-
- ;; the original exec mask
- v_mov_b32 v3, ttmp2
- v_mov_b32 v4, ttmp3
- global_store_dwordx2 v1, v[3:4], ttmp[4:5], offset:2056 glc slc dlc
- s_waitcnt vmcnt(0)
-
- ;; the program counter
- v_mov_b32 v3, ttmp0
- v_mov_b32 v4, ttmp1
- v_and_b32 v4, v4, 0xffff
- global_store_dwordx2 v1, v[3:4], ttmp[4:5], offset:16 glc slc dlc
-
- s_waitcnt vmcnt(0)&lt;/code&gt;
-    &lt;p&gt;Now the GPU should just wait for the CPU, and here’s the spin code it’s implemented as described by Marcell Kiss here:&lt;/p&gt;
-    &lt;code&gt;SPIN:
- global_load_dword v1, v2, ttmp[4:5] glc slc dlc
-
-SPIN1:
- // I found the bit range of 10 to 15 using trial and error in the
- // isa manual specifies that it's a 6-bit number but the offset 10
- // is just trial and error
-  s_getreg_b32 ttmp13, hwreg(HW_REG_IB_STS, 10, 15)
- s_and_b32 ttmp13, ttmp13, ttmp13
- s_cbranch_scc1 SPIN1
-
- v_readfirstlane_b32 ttmp13, v1
- s_and_b32 ttmp13, ttmp13, ttmp13
- s_cbranch_scc0 SPIN
-
-CLEAR:
- v_mov_b32 v2, 0
- v_mov_b32 v1, 0
- global_store_dword v1, v2, ttmp[4:5] glc slc dlc
- s_waitcnt vmcnt(0)&lt;/code&gt;
-    &lt;p&gt;The main loop in the CPU is like enable trap handler, then dispatch shader, then wait for the GPU to write some specific value in a specific address to signal all data is there, then examine and display, and tell the GPU all clear, go ahead.&lt;/p&gt;
-    &lt;p&gt;Now that our uncached buffers are in play, we just keep looping and checking whether the GPU has written the register values. When it does, the first thing we do is halt the wave by writing into the &lt;code&gt;SQ_CMD&lt;/code&gt; register to allow us to do whatever with the wave without causing any issues, tho if we halt for too long, the GPU CP will reset the command queue and kill the process, but we can change that behaviour by adjusting lockup_timeout parameter of the amdgpu kernel module:&lt;/p&gt;
-    &lt;code&gt;reg_sq_wave_hw_id1_t hw1 = { .raw = tma[2] };
-reg_sq_wave_hw_id2_t hw2 = { .raw = tma[3] };
-
-reg_sq_cmd_t halt_cmd = {
- .cmd  = 1,
- .mode = 1,
- .data = 1,
-};
-
-regs2_ioc_data_t ioc_data = {
- .use_srbm = false,
- .use_grbm = true,
-};
-
-dev_op_reg32(&amp;amp;amdgpu, REG_SQ_CMD, ioc_data, REG_OP_WRITE, &amp;amp;halt_cmd.raw);
-gpu_is_halted = true;&lt;/code&gt;
-    &lt;p&gt;From here on, we can do whatever with the data we have. All the data we need to build a proper debugger. We will come back to what to do with the data in a bit; let’s assume we did what was needed for now.&lt;/p&gt;
-    &lt;p&gt;Now that we’re done with the CPU, we need to write to the first byte in our TMA buffer, since the trap handler checks for that, then resume the wave, and the trap handler should pick it up. We can resume by writing to the &lt;code&gt;SQ_CMD&lt;/code&gt; register again:&lt;/p&gt;
-    &lt;code&gt;halt_cmd.mode = 0;
-dev_op_reg32(&amp;amp;amdgpu, REG_SQ_CMD, ioc_data, REG_OP_WRITE, &amp;amp;halt_cmd.raw);
-gpu_is_halted = false;&lt;/code&gt;
-    &lt;p&gt;Then the GPU should continue. We need to restore everything and return the program counter to the original address. Based on whether it’s a hardware trap or not, the program counter may point to the instruction before or the instruction itself. The ISA manual and Marcell Kiss’s posts explain that well, so refer to them.&lt;/p&gt;
-    &lt;code&gt;RETURN:
- ;; extract the trap ID from ttmp1
- s_and_b32 ttmp9, ttmp1, PC_HI_TRAP_ID_MASK
- s_lshr_b32 ttmp9, ttmp9, PC_HI_TRAP_ID_SHIFT
-
- ;; if the trapID == 0, then this is a hardware trap,
- ;; we don't need to fix up the return address
- s_cmpk_eq_u32 ttmp9, 0
- s_cbranch_scc1 RETURN_FROM_NON_S_TRAP
-
- ;; restore PC
- ;; add 4 to the faulting address, with carry
- s_add_u32 ttmp0, ttmp0, 4
- s_addc_u32 ttmp1, ttmp1, 0
-
-RETURN_FROM_NON_S_TRAP:
- s_load_dwordx4 s[0:3], ttmp[4:5], TMA_SREG_OFFSET glc dlc
- s_load_dword s4, ttmp[4:5], TMA_SREG_OFFSET + 16 glc dlc
- s_waitcnt lgkmcnt(0)
-
- s_mov_b64 exec, -1
- global_load_addtid_b32 v0, ttmp[4:5], offset:TMA_VREG_OFFSET        glc slc dlc
- global_load_addtid_b32 v1, ttmp[4:5], offset:TMA_VREG_OFFSET + 256  glc slc dlc
- global_load_addtid_b32 v2, ttmp[4:5], offset:TMA_VREG_OFFSET + 512  glc slc dlc
- global_load_addtid_b32 v3, ttmp[4:5], offset:TMA_VREG_OFFSET + 768  glc slc dlc
- global_load_addtid_b32 v4, ttmp[4:5], offset:TMA_VREG_OFFSET + 1024 glc slc dlc
- global_load_addtid_b32 v5, ttmp[4:5], offset:TMA_VREG_OFFSET + 1280 glc slc dlc
- global_load_addtid_b32 v6, ttmp[4:5], offset:TMA_VREG_OFFSET + 1536 glc slc dlc
- s_waitcnt vmcnt(0)
-
- ;; mask off non-address high bits from ttmp1
- s_and_b32 ttmp1, ttmp1, 0xffff
-
- ;; restore exec
- s_load_b64 vcc, ttmp[4:5], 2048 glc dlc
- s_load_b64 ttmp[2:3], ttmp[4:5], 2056 glc dlc
- s_waitcnt lgkmcnt(0)
- s_mov_b64 exec, ttmp[2:3]
-
- ;; restore STATUS.EXECZ, not writable by s_setreg_b32
- s_and_b64 exec, exec, exec
-
- ;; restore STATUS.VCCZ, not writable by s_setreg_b32
- s_and_b64 vcc, vcc, vcc
-
- ;; restore STATUS.SCC
- s_setreg_b32 hwreg(HW_REG_STATUS, 0, 1), ttmp8
-
- s_waitcnt vmcnt(0) lgkmcnt(0) expcnt(0)  ; Full pipeline flush
- ;; return from trap handler and restore STATUS.PRIV
- s_rfe_b64 [ttmp0, ttmp1]&lt;/code&gt;
-    &lt;head rend="h1"&gt;SPIR-V&lt;/head&gt;
-    &lt;p&gt;Now we can run compiled code directly, but we don’t want people to compile their code manually, then extract the text section, and give it to us. The plan is to take SPIR-V code, compile it correctly, then run it, or, even better, integrate with RADV and let RADV give us more information to work with.&lt;/p&gt;
-    &lt;p&gt;My main plan was making like fork RADV and then add then make report for us the vulkan calls and then we can have a better view on the GPU work know the buffers/textures it’s using etc, This seems like a lot more work tho so I’ll keep it in mind but not doing that for now unless someone is willing to pay me for that ;).&lt;/p&gt;
-    &lt;p&gt;For now, let’s just use RADV’s compiler &lt;code&gt;ACO&lt;/code&gt;. Luckily, RADV has a &lt;code&gt;null_winsys&lt;/code&gt; mode, aka it will not do actual work or open DRM files, just a fake Vulkan device, which is perfect for our case here, since we care about nothing other than just compiling code. We can enable it by setting the env var &lt;code&gt;RADV_FORCE_FAMILY&lt;/code&gt;, then we just call what we need like this:&lt;/p&gt;
-    &lt;code&gt;int32_t hdb_compile_spirv_to_bin(
-  const void* spirv_binary,
-  size_t size,
-  hdb_shader_stage_t stage,
-  hdb_shader_t* shader
-) {
- setenv("RADV_FORCE_FAMILY", "navi31", 1);
- //  setenv("RADV_DEBUG", "nocache,noopt", 1);
- setenv("ACO_DEBUG", "nocache,noopt", 1);
-
- VkInstanceCreateInfo i_cinfo = {
-  .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-  .pApplicationInfo =
-    &amp;amp;(VkApplicationInfo){
-      .sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-      .pApplicationName   = "HDB Shader Compiler",
-      .applicationVersion = 1,
-      .pEngineName        = "HDB",
-      .engineVersion      = 1,
-      .apiVersion         = VK_API_VERSION_1_4,
-    },
- };
-
- VkInstance vk_instance = {};
- radv_CreateInstance(&amp;amp;i_cinfo, NULL, &amp;amp;vk_instance);
-
- struct radv_instance* instance = radv_instance_from_handle(vk_instance);
- instance-&amp;gt;debug_flags |=
-   RADV_DEBUG_NIR_DEBUG_INFO | RADV_DEBUG_NO_CACHE | RADV_DEBUG_INFO;
-
- uint32_t         n       = 1;
- VkPhysicalDevice vk_pdev = {};
- instance-&amp;gt;vk.dispatch_table.EnumeratePhysicalDevices(vk_instance, &amp;amp;n, &amp;amp;vk_pdev);
-
- struct radv_physical_device* pdev = radv_physical_device_from_handle(vk_pdev);
- pdev-&amp;gt;use_llvm                    = false;
-
- VkDeviceCreateInfo d_cinfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
- VkDevice vk_dev = {};
- pdev-&amp;gt;vk.dispatch_table.CreateDevice(vk_pdev, &amp;amp;d_cinfo, NULL, &amp;amp;vk_dev);
-
- struct radv_device* dev = radv_device_from_handle(vk_dev);
-
- struct radv_shader_stage radv_stage = {
-  .spirv.data = spirv_binary,
-  .spirv.size = size,
-  .entrypoint = "main",
-  .stage      = MESA_SHADER_COMPUTE,
-  .layout = {
-   .push_constant_size = 16,
-  },
-  .key = {
-   .optimisations_disabled = true,
-  },
- };
-
- struct radv_shader_binary* cs_bin = NULL;
- struct radv_shader*        cs_shader =
-   radv_compile_cs(dev, NULL, &amp;amp;radv_stage, true, true, false, true, &amp;amp;cs_bin);
-
- *shader = (hdb_shader_t){
-  .bin              = cs_shader-&amp;gt;code,
-  .bin_size         = cs_shader-&amp;gt;code_size,
-  .rsrc1            = cs_shader-&amp;gt;config.rsrc1,
-  .rsrc2            = cs_shader-&amp;gt;config.rsrc2,
-  .rsrc3            = cs_shader-&amp;gt;config.rsrc3,
-  .debug_info       = cs_shader-&amp;gt;debug_info,
-  .debug_info_count = cs_shader-&amp;gt;debug_info_count,
- };
-
- return 0;
-}&lt;/code&gt;
-    &lt;p&gt;Now that we have a well-structured loop and communication between the GPU and the CPU, we can run SPIR-V binaries to some extent. Let’s see how we can make it an actual debugger.&lt;/p&gt;
-    &lt;head rend="h1"&gt;An Actual Debugger&lt;/head&gt;
-    &lt;p&gt;We talked earlier about CPs natively supporting context-switching, this appears to be compute spcific feature, which prevents from implementing it for other types of shaders, tho, it appears that mesh shaders and raytracing shaders are just compute shaders under the hood, which will allow us to use that functionality. For now debugging one wave feels enough, also we can moify the wave parameters to debug some specific indices.&lt;/p&gt;
-    &lt;p&gt;Here’s some of the features&lt;/p&gt;
-    &lt;head rend="h2"&gt;Breakpoints and Stepping&lt;/head&gt;
-    &lt;p&gt;For stepping, we can use 2 bits: one in &lt;code&gt;RSRC1&lt;/code&gt; and the other in &lt;code&gt;RSRC3&lt;/code&gt;. They’re &lt;code&gt;DEBUG_MODE&lt;/code&gt; and &lt;code&gt;TRAP_ON_START&lt;/code&gt;, respectively. The former enters the trap handler after each instruction, and the latter enters before the first instruction. This means we can automatically enable instruction-level stepping.&lt;/p&gt;
-    &lt;p&gt;Regarding breakpoints, I haven’t implemented them, but they’re rather simple to implement here by us having the base address of the code buffer and knowing the size of each instruction; we can calculate the program counter location ahead and have a list of them available to the GPU, and we can do a binary search on the trap handler.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Source Code Line Mapping&lt;/head&gt;
-    &lt;p&gt;The ACO shader compiler does generate instruction-level source code mapping, which is good enough for our purposes here. By taking the offset4 of the current program counter and indexing into the code buffer, we can retrieve the current instruction and disassemble it, as well as find the source code mapping from the debug info.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Address Watching aka Watchpoints&lt;/head&gt;
-    &lt;p&gt;We can implement this by marking the GPU page as protected. On a GPU fault, we enter the trap handler, check whether it’s within the range of our buffers and textures, and then act accordingly. Also, looking at the registers, we can find these:&lt;/p&gt;
-    &lt;code&gt;typedef union {
- struct {
-  uint32_t addr: 16;
- };
- uint32_t raw;
-} reg_sq_watch0_addr_h_t;
-
-typedef union {
- struct {
-  uint32_t __reserved_0 : 6;
-  uint32_t addr: 26;
- };
- uint32_t raw;
-} reg_sq_watch0_addr_l_t;&lt;/code&gt;
-    &lt;p&gt;which suggests that the hardware already supports this natively, so we don’t even need to do that dance. It needs more investigation on my part, tho, since I didn’t implement this.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Variables Types and Names&lt;/head&gt;
-    &lt;p&gt;This needs some serious plumbing, since we need to make NIR(Mesa’s intermediate representation) optimisation passes propagate debug info correctly. I already started on this here. Then we need to make ACO track variables and store the information.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Vulkan Integration&lt;/head&gt;
-    &lt;p&gt;This requires ditching our simple UMD we made earlier and using RADV, which is what should happen eventually, then we have our custom driver maybe pause on before a specific frame, or get triggered by a key, and then ask before each dispatch if to attach to it or not, or something similar, since we have a full proper Vulkan implementation we already have all the information we would need like buffers, textures, push constants, types, variable names, .. etc, that would be a much better and more pleasant debugger to use.&lt;/p&gt;
-    &lt;p&gt;Finally, here’s some live footage:&lt;/p&gt;
-    &lt;head rend="h1"&gt;Bonus Round&lt;/head&gt;
-    &lt;p&gt;Here is an incomplete user-mode page walking code for gfx11, aka rx7900xtx&lt;/p&gt;
-    &lt;code&gt;typedef struct {
- u64 valid         : 1;  // 0
- u64 system        : 1;  // 1
- u64 coherent      : 1;  // 2
- u64 __reserved_0  : 3;  // 5
- u64 pte_base_addr : 42; // 47
- u64 pa_rsvd       : 4;  // 51
- u64 __reserved_1  : 2;  // 53
- u64 mall_reuse    : 2;  // 55
- u64 tfs_addr      : 1;  // 56
- u64 __reserved_2  : 1;  // 57
- u64 frag_size     : 5;  // 62
- u64 pte           : 1;  // 63
-} pde_t;
-
-typedef struct {
- u64 valid          : 1; // = pte_entry &amp;amp; 1;
- u64 system         : 1; // = (pte_entry &amp;gt;&amp;gt; 1) &amp;amp; 1;
- u64 coherent       : 1; // = (pte_entry &amp;gt;&amp;gt; 2) &amp;amp; 1;
- u64 tmz            : 1; // = (pte_entry &amp;gt;&amp;gt; 3) &amp;amp; 1;
- u64 execute        : 1; // = (pte_entry &amp;gt;&amp;gt; 4) &amp;amp; 1;
- u64 read           : 1; // = (pte_entry &amp;gt;&amp;gt; 5) &amp;amp; 1;
- u64 write          : 1; // = (pte_entry &amp;gt;&amp;gt; 6) &amp;amp; 1;
- u64 fragment       : 5; // = (pte_entry &amp;gt;&amp;gt; 7) &amp;amp; 0x1F;
- u64 page_base_addr : 36;
- u64 mtype          : 2; // = (pte_entry &amp;gt;&amp;gt; 48) &amp;amp; 3;
- u64 prt            : 1; // = (pte_entry &amp;gt;&amp;gt; 51) &amp;amp; 1;
- u64 software       : 2; // = (pte_entry &amp;gt;&amp;gt; 52) &amp;amp; 3;
- u64 pde            : 1; // = (pte_entry &amp;gt;&amp;gt; 54) &amp;amp; 1;
- u64 __reserved_0   : 1;
- u64 further        : 1; // = (pte_entry &amp;gt;&amp;gt; 56) &amp;amp; 1;
- u64 gcr            : 1; // = (pte_entry &amp;gt;&amp;gt; 57) &amp;amp; 1;
- u64 llc_noalloc    : 1; // = (pte_entry &amp;gt;&amp;gt; 58) &amp;amp; 1;
-} pte_t;
-
-static inline pde_t decode_pde(u64 pde_raw) {
- pde_t pde         = *((pde_t*)(&amp;amp;pde_raw));
- pde.pte_base_addr = (u64)pde.pte_base_addr &amp;lt;&amp;lt; 6;
- return pde;
-}
-
-static inline pte_t decode_pte(u64 pde_raw) {
- pte_t pte          = *((pte_t*)(&amp;amp;pde_raw));
- pte.page_base_addr = (u64)pte.page_base_addr &amp;lt;&amp;lt; 12;
- return pte;
-}
-
-static inline u64 log2_range_round_up(u64 s, u64 e) {
- u64 x = e - s - 1;
- return (x == 0 || x == 1) ? 1 : 64 - __builtin_clzll(x);
-}
-
-void dev_linear_vram(amdgpu_t* dev, u64 phy_addr, size_t size, void* buf) {
- HDB_ASSERT(!((phy_addr &amp;amp; 3) || (size &amp;amp; 3)), "Must be page aligned address and size");
-
- size_t offset = lseek(dev-&amp;gt;vram_fd, phy_addr, SEEK_SET);
- HDB_ASSERT(offset == phy_addr, "Couldn't seek to the requested addr");
-
- offset = read(dev-&amp;gt;vram_fd, buf, size);
- HDB_ASSERT(offset == size, "Couldn't read the full requested size");
-}
-
-void dev_decode(amdgpu_t* dev, u32 vmid, u64 va_addr) {
- reg_gcmc_vm_fb_location_base_t fb_base_reg   = { 0 };
- reg_gcmc_vm_fb_location_top_t  fb_top_reg    = { 0 };
- reg_gcmc_vm_fb_offset_t        fb_offset_reg = { 0 };
-
- regs2_ioc_data_t ioc_data = { 0 };
- dev_op_reg32(
-   dev, REG_GCMC_VM_FB_LOCATION_BASE, ioc_data, REG_OP_READ, &amp;amp;fb_base_reg.raw);
- dev_op_reg32(dev, REG_GCMC_VM_FB_LOCATION_TOP, ioc_data, REG_OP_READ, &amp;amp;fb_top_reg.raw);
- dev_op_reg32(dev, REG_GCMC_VM_FB_OFFSET, ioc_data, REG_OP_READ, &amp;amp;fb_offset_reg.raw);
-
- u64 fb_offset = (u64)fb_offset_reg.fb_offset;
-
- // TODO(hadi): add zfb mode support
- bool zfb = fb_top_reg.fb_top + 1 &amp;lt; fb_base_reg.fb_base;
- HDB_ASSERT(!zfb, "ZFB mode is not implemented yet!");
-
- // printf(
- //   "fb base: 0x%x\nfb_top: 0x%x\nfb_offset: 0x%x\n",
- //   fb_base_reg.raw,
- //   fb_top_reg.raw,
- //   fb_offset_reg.raw);
-
- gc_11_reg_t pt_start_lo_id = { 0 };
- gc_11_reg_t pt_start_hi_id = { 0 };
- gc_11_reg_t pt_end_lo_id   = { 0 };
- gc_11_reg_t pt_end_hi_id   = { 0 };
- gc_11_reg_t pt_base_hi_id  = { 0 };
- gc_11_reg_t pt_base_lo_id  = { 0 };
- gc_11_reg_t ctx_cntl_id    = { 0 };
-
- switch (vmid) {
- case 0:
-  pt_start_lo_id = REG_GCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT0_CNTL;
-  break;
- case 1:
-  pt_start_lo_id = REG_GCVM_CONTEXT1_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT1_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT1_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT1_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT1_CNTL;
-  break;
- case 2:
-  pt_start_lo_id = REG_GCVM_CONTEXT2_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT2_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT2_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT2_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT2_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT2_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT2_CNTL;
-  break;
- case 3:
-  pt_start_lo_id = REG_GCVM_CONTEXT3_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT3_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT3_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT3_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT3_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT3_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT3_CNTL;
-  break;
- case 4:
-  pt_start_lo_id = REG_GCVM_CONTEXT4_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT4_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT4_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT4_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT4_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT4_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT4_CNTL;
-  break;
- case 5:
-  pt_start_lo_id = REG_GCVM_CONTEXT5_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT5_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT5_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT5_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT5_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT5_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT5_CNTL;
-  break;
- case 6:
-  pt_start_lo_id = REG_GCVM_CONTEXT6_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT6_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT6_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT6_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT6_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT6_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT6_CNTL;
-  break;
- case 7:
-  pt_start_lo_id = REG_GCVM_CONTEXT7_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT7_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT7_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT7_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT7_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT7_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT7_CNTL;
-  break;
- case 8:
-  pt_start_lo_id = REG_GCVM_CONTEXT8_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT8_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT8_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT8_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT7_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT7_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT7_CNTL;
-  break;
- case 9:
-  pt_start_lo_id = REG_GCVM_CONTEXT9_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT9_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT9_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT9_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT7_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT7_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT7_CNTL;
-  break;
- case 10:
-  pt_start_lo_id = REG_GCVM_CONTEXT10_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT10_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT10_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT10_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT10_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT10_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT10_CNTL;
-  break;
- case 11:
-  pt_start_lo_id = REG_GCVM_CONTEXT11_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT11_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT11_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT11_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT11_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT11_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT11_CNTL;
-  break;
- case 12:
-  pt_start_lo_id = REG_GCVM_CONTEXT12_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT12_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT12_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT12_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT12_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT12_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT12_CNTL;
-  break;
- case 13:
-  pt_start_lo_id = REG_GCVM_CONTEXT13_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT13_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT13_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT13_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT13_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT13_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT13_CNTL;
-  break;
- case 14:
-  pt_start_lo_id = REG_GCVM_CONTEXT14_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT14_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT14_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT14_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT14_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT14_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT14_CNTL;
-  break;
- case 15:
-  pt_start_lo_id = REG_GCVM_CONTEXT15_PAGE_TABLE_START_ADDR_LO32;
-  pt_start_hi_id = REG_GCVM_CONTEXT15_PAGE_TABLE_START_ADDR_HI32;
-  pt_end_lo_id   = REG_GCVM_CONTEXT15_PAGE_TABLE_END_ADDR_LO32;
-  pt_end_hi_id   = REG_GCVM_CONTEXT15_PAGE_TABLE_END_ADDR_HI32;
-  pt_base_lo_id  = REG_GCVM_CONTEXT15_PAGE_TABLE_BASE_ADDR_LO32;
-  pt_base_hi_id  = REG_GCVM_CONTEXT15_PAGE_TABLE_BASE_ADDR_HI32;
-  ctx_cntl_id    = REG_GCVM_CONTEXT15_CNTL;
-  break;
- default: HDB_ASSERT(false, "Out of range VMID 0-15 trying to access %u", vmid);
- }
-
- // all the types of the contexts are the same so will just use 0 but pass the correct
- // register enum to the read function
- reg_gcvm_context0_page_table_start_addr_lo32_t pt_start_lo = { 0 };
- reg_gcvm_context0_page_table_start_addr_hi32_t pt_start_hi = { 0 };
- reg_gcvm_context0_page_table_end_addr_lo32_t   pt_end_lo   = { 0 };
- reg_gcvm_context0_page_table_end_addr_hi32_t   pt_end_hi   = { 0 };
- reg_gcvm_context0_page_table_base_addr_lo32_t  pt_base_lo  = { 0 };
- reg_gcvm_context0_page_table_base_addr_hi32_t  pt_base_hi  = { 0 };
- reg_gcvm_context0_cntl_t                       ctx_cntl    = { 0 };
-
- dev_op_reg32(dev, pt_start_lo_id, ioc_data, REG_OP_READ, &amp;amp;pt_start_lo.raw);
- dev_op_reg32(dev, pt_start_hi_id, ioc_data, REG_OP_READ, &amp;amp;pt_start_hi.raw);
- dev_op_reg32(dev, pt_end_lo_id, ioc_data, REG_OP_READ, &amp;amp;pt_end_lo.raw);
- dev_op_reg32(dev, pt_end_hi_id, ioc_data, REG_OP_READ, &amp;amp;pt_end_hi.raw);
- dev_op_reg32(dev, pt_base_lo_id, ioc_data, REG_OP_READ, &amp;amp;pt_base_lo.raw);
- dev_op_reg32(dev, pt_base_hi_id, ioc_data, REG_OP_READ, &amp;amp;pt_base_hi.raw);
- dev_op_reg32(dev, ctx_cntl_id, ioc_data, REG_OP_READ, &amp;amp;ctx_cntl.raw);
-
- u64 pt_start_addr = ((u64)pt_start_lo.raw &amp;lt;&amp;lt; 12) | ((u64)pt_start_hi.raw &amp;lt;&amp;lt; 44);
- u64 pt_end_addr   = ((u64)pt_end_lo.raw &amp;lt;&amp;lt; 12) | ((u64)pt_end_hi.raw &amp;lt;&amp;lt; 44);
- u64 pt_base_addr  = ((u64)pt_base_lo.raw &amp;lt;&amp;lt; 0) | ((u64)pt_base_hi.raw &amp;lt;&amp;lt; 32);
- u32 pt_depth      = ctx_cntl.page_table_depth;
- u32 ptb_size      = ctx_cntl.page_table_block_size;
-
- HDB_ASSERT(pt_base_addr != 0xffffffffffffffffull, "Invalid page table base addr");
-
- printf(
-   "\tPage Table Start: 0x%lx\n\tPage Table End: 0x%lx\n\tPage Table Base: "
-   "0x%lx\n\tPage Table Depth: %u\n\tBlock Size: %u\n",
-   pt_start_addr,
-   pt_end_addr,
-   pt_base_addr,
-   pt_depth,
-   ptb_size);
-
- // decode base PDB
- pde_t pde = decode_pde(pt_base_addr);
- pt_base_addr -= fb_offset * !pde.system; // substract only on vram
-
- u64 pt_last_byte_addr = pt_end_addr + 0xfff; // 0xfff is 1 page
- HDB_ASSERT(
-   pt_start_addr &amp;lt;= va_addr || va_addr &amp;lt; pt_last_byte_addr,
-   "Invalid virtual address outside the range of the root page table of this vm");
-
- va_addr -= pt_start_addr;
- //
- // Size of the first PDB depends on the total coverage of the
- // page table and the PAGE_TABLE_BLOCK_SIZE.
- // Entire table takes ceil(log2(total_vm_size)) bits
- // All PDBs except the first one take 9 bits each
- // The PTB covers at least 2 MiB (21 bits)
- // And PAGE_TABLE_BLOCK_SIZE is log2(num 2MiB ranges PTB covers)
- // As such, the formula for the size of the first PDB is:
- //                       PDB1, PDB0, etc.      PTB covers at least 2 MiB
- //                                        Block size can make it cover more
- //   total_vm_bits - (9 * num_middle_pdbs) - (page_table_block_size + 21)
- //
- // we need the total range range here not the last byte addr like above
- u32 total_vaddr_bits = log2_range_round_up(pt_start_addr, pt_end_addr + 0x1000);
-
- u32 total_pdb_bits = total_vaddr_bits;
- // substract everything from the va_addr to leave just the pdb bits
- total_pdb_bits -= 9 * (pt_depth - 1); // middle PDBs each is 9 bits
- total_pdb_bits -= (ptb_size + 21);    // at least 2mb(21) bits + ptb_size
-
- // u64 va_mask = (1ull &amp;lt;&amp;lt; total_pdb_bits) - 1;
- // va_mask &amp;lt;&amp;lt;= (total_vaddr_bits - total_pdb_bits);
-
- // pde_t pdes[8]  = { 0 };
- // u32   curr_pde = 0;
- // u64   pde_addr = 0;
- // u64  loop_pde = pt_base_addr;
-
- if (pt_depth == 0) { HDB_ASSERT(false, "DEPTH = 0 is not implemented yet"); }
-
- pde_t curr_pde    = pde;
- u64   entry_bits  = 0;
- s32   curr_depth  = pt_depth;
- bool  pde0_is_pte = false;
- // walk all middle PDEs
- while (curr_depth &amp;gt; 0) {
-  // printf("pde(%u):0x%lx \n", curr_depth, curr_pde.pte_base_addr);
-  u64 next_entry_addr = 0;
-
-  u32 shift_amount = total_vaddr_bits;
-  shift_amount -= total_pdb_bits;
-  // for each pdb shift 9 more
-  shift_amount -= ((pt_depth - curr_depth) * 9);
-
-  // shift address and mask out unused bits
-  u64 next_pde_idx = va_addr &amp;gt;&amp;gt; shift_amount;
-  next_pde_idx &amp;amp;= 0x1ff;
-
-  // if on vram we need to apply this offset
-  if (!curr_pde.system) curr_pde.pte_base_addr -= fb_offset;
-
-  next_entry_addr = curr_pde.pte_base_addr + next_pde_idx * 8;
-  curr_depth--;
-
-  if (!curr_pde.system) {
-   dev_linear_vram(dev, next_entry_addr, 8, &amp;amp;entry_bits);
-   curr_pde = decode_pde(entry_bits);
-   printf(
-     "\tPage Dir Entry(%u):\n\t  Addr:0x%lx\n\t  Base: 0x%lx\n\n\t        ↓\n\n",
-     curr_depth,
-     next_entry_addr,
-     curr_pde.pte_base_addr);
-  } else {
-   HDB_ASSERT(false, "GTT physical memory access is not implemented yet");
-  }
-
-  if (!curr_pde.valid) { break; }
-
-  if (curr_pde.pte) {
-   // PDB0 can act as a pte
-   // also I'm making an assumption here that UMRs code doesn't make
-   // that the the PDB0 as PTE path can't have the further bit set
-   pde0_is_pte = true;
-   break;
-  }
- }
-
- if (pde0_is_pte) { HDB_ASSERT(false, "PDE0 as PTE is not implemented yet"); }
-
- // page_table_block_size is the number of 2MiB regions covered by a PTB
- // If we set it to 0, then PTB cover 2 MiB
- // If it's 9 PTB cover 1024 MiB
- // pde0_block_fragment_size tells us how many 4 KiB regions each PTE covers
- // If it's 0 PTEs cover 4 KiB
- // If it's 9 PTEs cover 2 MiB
- // So the number of PTEs in a PTB is 2^(9+ptbs-pbfs)
- //
- // size here is actually the log_2 of the size
- u32 pte_page_size  = curr_pde.frag_size;
- u32 ptes_per_ptb   = 9 + ptb_size - pte_page_size;
- u64 pte_index_mask = (1ul &amp;lt;&amp;lt; ptes_per_ptb) - 1;
-
- u32 pte_bits_count   = pte_page_size + 12;
- u64 page_offset_mask = (1ul &amp;lt;&amp;lt; pte_bits_count) - 1; // minimum of 12
-
- u64 pte_index = (va_addr &amp;gt;&amp;gt; pte_bits_count) &amp;amp; pte_index_mask;
- u64 pte_addr  = curr_pde.pte_base_addr + pte_index * 8;
-
- pte_t pte = { 0 };
- if (!curr_pde.system) {
-  dev_linear_vram(dev, pte_addr, 8, &amp;amp;entry_bits);
-  pte = decode_pte(entry_bits);
-
-  printf("\tPage Table Entry: 0x%lx\n", pte.page_base_addr);
- } else {
-  HDB_ASSERT(false, "GTT physical memory access is not implemented yet");
- }
-
- if (pte.further) { HDB_ASSERT(false, "PTE as PDE walking is not implemented yet"); }
- if (!pte.system) pte.page_base_addr -= fb_offset;
-
- u64 offset_in_page = va_addr &amp;amp; page_offset_mask;
- u64 physical_addr  = pte.page_base_addr + offset_in_page;
- printf("\tFinal Physical Address: 0x%lx\n", physical_addr);
-}&lt;/code&gt;
-    &lt;head rend="h2"&gt;Footnotes&lt;/head&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;
-        &lt;p&gt;Other processes need to have a s_trap instruction or have trap on exception flags set, which is not true for most normal GPU processes. ↩&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Available since RDNA3, if I’m not mistaken. ↩&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;VGPRs are unique per thread, and SGPRs are unique per wave ↩&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;We can get that by subtracting the current program counter from the address of the code buffer. ↩&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46193931</guid><pubDate>Mon, 08 Dec 2025 16:06:14 +0000</pubDate></item><item><title>Let's put Tailscale on a jailbroken Kindle</title><link>https://tailscale.com/blog/tailscale-jailbroken-kindle</link><description>&lt;doc fingerprint="77000a1e01fd3fdc"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Tue, 09 Dec 2025 15:41:29 +0000</lastBuildDate><item><title>Let's put Tailscale on a jailbroken Kindle</title><link>https://tailscale.com/blog/tailscale-jailbroken-kindle</link><description>&lt;doc fingerprint="77000a1e01fd3fdc"&gt;
   &lt;main&gt;
     &lt;p&gt;“It’s a rite of passage to run Tailscale on weird devices.”&lt;/p&gt;
     &lt;p&gt;So writes Mitanshu Sukhwani on his blog, detailing the steps for getting Tailscale onto a jailbroken Kindle. Getting there, and seeing a kindle entry with a satisfying green dot in your Tailscale admin console, takes some doing. But take the trip, and you’ll end up with an e-reader that can run some neat unofficial apps, and is more open to third-party and DRM-free ebooks. And with a Tailscale connection, it’s easier to connect to files and a command line on your underpowered little Linux slab.&lt;/p&gt;
@@ -1032,56 +54,7 @@ void dev_decode(amdgpu_t* dev, u32 vmid, u64 va_addr) {
     &lt;p&gt;If you’ve gotten Tailscale to run on weird (or just uncommon) devices, we’d more than love to hear about it. Let us know on Reddit, Discord, Bluesky, Mastodon, or LinkedIn.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46194337</guid><pubDate>Mon, 08 Dec 2025 16:34:08 +0000</pubDate></item><item><title>Hunting for North Korean Fiber Optic Cables</title><link>https://nkinternet.com/2025/12/08/hunting-for-north-korean-fiber-optic-cables/</link><description>&lt;doc fingerprint="2fecda19652117ea"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Before we go any further, one thing that I want to make clear is that the word assume is going to be doing some heavy lifting throughout this post. This was a rabbit hole that I recently went down and I probably have more questions than answers, but I still wanted to document what I had found so far. If you have additional information or findings you want to share, as always feel free to reach out: contact@nkinternet.com.&lt;/p&gt;
-    &lt;p&gt;It all started with a PowerPoint that I came across a few weeks ago. It was presented by the DPRK to the ICAO on the state of their aviation industry and their ADS-B deployment inside North Korea. However, one slide in particular caught my eye because it showed a fiber optic cable running across the country&lt;/p&gt;
-    &lt;p&gt;This got me wondering more about the physical layout of the network inside North Korea. From the map we know that there’s a connection between Pyongyang and Odaejin, although given the mountains in the middle of the country it probably isn’t a direct link. There isn’t a lot of information on fiber in North Korea, but there are a few outside sources that help provide clues about how things might be laid out.&lt;/p&gt;
-    &lt;p&gt;Historic Fiber Information&lt;/p&gt;
-    &lt;p&gt;38North first reported the connection from Russia’s TTK to the DPRK over the Korea–Russia Friendship Bridge back in 2017. Additionally, a picture found on Flickr looking toward Tumangang after the bridge doesn’t show any utility poles and instead seems to display some kind of infrastructure in the grass to the side of the tracks. Assuming this interpretation is correct, the fiber is likely buried underground as it enters the country and passes through the vicinity of Tumangang Station.&lt;/p&gt;
-    &lt;p&gt;According to a report from The Nautilus Institute we can gather a few additional details about the internet inside North Korea&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;One of the first lines was installed in September 1995 between Pyongyang and Hamhung&lt;/item&gt;
-      &lt;item&gt;In February 1998 a link between Pyongyang and Sinuiju was completed&lt;/item&gt;
-      &lt;item&gt;As of 2000, DPRK’s operational optical fiber telecom lines included: Pyongyang – Hamhung; Pyongyang – Sinuiju including all cities and counties in North Pyongan Province; Hamhung Rajin-Sonbong; Rajin-Songbong – Hunchun (China), Pyongyang – Nampo.&lt;/item&gt;
-      &lt;item&gt;In 2003 the original domestic cell phone network was built for North Korean citizens in Pyongyang, Namp’o, reportedly in all provincial capitals, on the Pyongyang-Myohyangsan tourist highway, and the Pyongyang-Kaesong and Wonsan-Hamhung highways&lt;/item&gt;
-      &lt;item&gt;The Kwangmyong network’s data is transmitted via fiber optic cable with a backbone capacity of 2.5 GB per second between all the provinces.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Based on these notes, it starts to paint a picture that the fiber link coming from Russia likely travels down the east coast of the DPRK before connecting to Pyongyang. Several city pairs—Pyongyang–Hamhung and Rajin–Sonbong—line up with earlier deployments of east-coast fiber infrastructure.&lt;/p&gt;
-    &lt;p&gt;Kwangmyong Internal Topology&lt;/p&gt;
-    &lt;p&gt;The report also notes that all of the provinces in North Korea were connected to the Kwangmyong via fiber. The Kwangmyong for those not familiar is the intranet that most citizens in the DPRK can access as they do not have access to the outside internet. While not much information is available about the Kwangmyong, these notes from Choi Sung, Professor of Computer Science at Namseoul University provides some additional details on how the network is laid how, as well as information on the regional networks that are connected. A map provided in his notes shows some of the main points of the Kwangmyong with three of them located along the northeast of North Korea.&lt;/p&gt;
-    &lt;p&gt;Railways, Roads, and Practical Fiber Routing&lt;/p&gt;
-    &lt;p&gt;This starts to paint a rough picture of how the network is physically deployed in North Korea but we can also look to some outside sources to get some confirmation. 38North once again provides some great detail on cell phone towers in North Korea. The interesting thing being an apparent line down the east coast which follows major roads and highways but would also in theory have easier access to the fiber back haul to support the cell network.&lt;/p&gt;
-    &lt;p&gt;All of this seems to suggest that the fiber lines were run along major roads and railways up the east coast. A map from Beyond Parallel shows the major rail lines, which has the Pyongra line up the east coast.&lt;/p&gt;
-    &lt;p&gt;Looking For Clues Along the Railway&lt;/p&gt;
-    &lt;p&gt;Some additional digging for pictures from along the line suggest that there is infrastructure deployed along the tracks, although it’s difficult to confirm from pictures exactly what is buried. The following shows what appears to be a junction box at the base of a pole along the line.&lt;/p&gt;
-    &lt;p&gt;The line does have a path along it as well with mile markers. While it is used by bikes and pedestrians, it provides a nice path for supporting fiber and other communications runs along the tracks.&lt;/p&gt;
-    &lt;p&gt;The Pyongra line also crosses through the mountains at points but it is assumed at certain junctions the fiber was laid along the AH 6/National Highway 7 up the coast as there are parts of the line discovered that do not have a path along the tracks. In these places it is assumed they follow the road, although finding pictures of the highway to further examine is challenging.&lt;/p&gt;
-    &lt;p&gt;Lastly at certain stations we can see utility boxes along the side of the track suggesting buried conduits/cables are laid along the tracks.&lt;/p&gt;
-    &lt;p&gt;From a video taken in 2012 there does appear to be some signs of objects along the tracks, although difficult to confirm due to the video quality. The screenshot below is the clearest I could find of a rectangular box buried in a clearing along the line.&lt;/p&gt;
-    &lt;p&gt;Based on this information of what is confirmed and looking at major cities, it appears there is a route that follows Pyongyang → Wonsan → Hamhung → Chongjin → Rajin → Tumangang which follows the Pyongra line as well as the AH 6/National Highway 7 up the coast. The following map highlights a rough path.&lt;/p&gt;
-    &lt;p&gt;Interestingly by mapping out the possible fiber locations we can start to draw conclusions based on other sources. According to a video by Cappy’s Army he proposes that when the US Navy Seals landed in NOrth Korea in 2019 the most likely place this would have occurred is Sinpo. As the goal was to depoy a covert listening device this could also line up with supporting the idea that a fiber backbone runs down the east coast of North Korea as Sinpo would be relatively close.&lt;/p&gt;
-    &lt;p&gt;What Does This Mean For the Network?&lt;/p&gt;
-    &lt;p&gt;In addition to the fiber link via Russia, the other fiber optic cable into North Korea comes in via China by way of Sinuiju and Dandong. Although we don’t know for sure where servers are deployed inside North Korea, based on the map of Kwangmyong the first assumption is that things are mainly centralized in Pyongyang.&lt;/p&gt;
-    &lt;p&gt;Out of the 1,024 IPs assigned to North Korea we observe the following behavior based on the CIDR block:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;175.45.176.0/24 is exclusively routed via China Unicom&lt;/item&gt;
-      &lt;item&gt;175.45.177.0/24 is exclusively routed via Russia TransTelekom&lt;/item&gt;
-      &lt;item&gt;175.45.178.0/24 is dual-homed and can take either path before crossing into North Korea&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;With this information in mind, running a traceroute with the TCP flag set gives us a slightly better look at how traffic behaves once it reaches the country. For the following tests we’re going to assume there is a fiber path on the west coming in from China toward Pyongyang, as well as a path on the east side coming from Russia.&lt;/p&gt;
-    &lt;p&gt;From the US east coast to 175.45.176.71, the final hop in China before entering North Korea shows roughly 50 ms of additional latency before reaching the DPRK host. This suggests there may be extra devices, distance, or internal routing inside the country before the packet reaches its final destination.&lt;/p&gt;
-    &lt;quote&gt;10 103.35.255.254 (103.35.255.254) 234.306 ms 234.082 ms 234.329 ms&lt;lb/&gt;11 * * *&lt;lb/&gt;12 * * *&lt;lb/&gt;13 * * *&lt;lb/&gt;14 175.45.176.71 (175.45.176.71) 296.081 ms 294.795 ms 294.605 ms&lt;lb/&gt;15 175.45.176.71 (175.45.176.71) 282.938 ms 284.446 ms 282.227 ms&lt;/quote&gt;
-    &lt;p&gt;Interestingly, running a traceroute to 175.45.177.10 shows a similar pattern in terms of missing hops, but with much lower internal latency. In fact, the ~4 ms difference between the last Russian router and the DPRK host suggests the handoff between Russia and North Korea happens very close—network-wise—to where this device is located. This contrasts with the China path, which appears to take a longer or more complex route before reaching its final destination.&lt;/p&gt;
-    &lt;quote&gt;10 188.43.225.153 185.192 ms 183.649 ms 189.089 ms&lt;lb/&gt;11 * *&lt;lb/&gt;12 * *&lt;lb/&gt;13 * *&lt;lb/&gt;14 175.45.177.10 195.996 ms 186.801 ms 186.353 ms&lt;lb/&gt;15 175.45.177.10 188.886 ms 201.103 ms 193.334&lt;/quote&gt;
-    &lt;p&gt;If everything is centralized in Pyongyang this would mean the handoff from Russia is completed in Pyongyang as well. However, it could also indicate that 175.45.177.0/24 is not hosted in Pyongyang at all and is instead located closer to the Russia–North Korea border. More testing is definitely required however before any conclusions can be drawn about where these devices physically reside.&lt;/p&gt;
-    &lt;p&gt;What can we learn from all of this?&lt;/p&gt;
-    &lt;p&gt;Making some assumptions we can get a better idea of how the internet works and is laid out inside North Korea. While not much is officially confirmed using some other sources we can get a possible idea of how things work. As mentioned at the start, the word assume does a lot of heavy lifting. However if you do have other information or ideas feel free to reach out at contact@nkinternet.com&lt;/p&gt;
-    &lt;head rend="h3"&gt;Discover more from North Korean Internet&lt;/head&gt;
-    &lt;p&gt;Subscribe to get the latest posts sent to your email.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46194384</guid><pubDate>Mon, 08 Dec 2025 16:38:08 +0000</pubDate></item><item><title>Launch HN: Nia (YC S25) – Give better context to coding agents</title><link>https://www.trynia.ai/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46194828</guid><pubDate>Mon, 08 Dec 2025 17:10:14 +0000</pubDate></item><item><title>Jepsen: NATS 2.12.1</title><link>https://jepsen.io/analyses/nats-2.12.1</link><description>&lt;doc fingerprint="2790905544351bb0"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46194337</guid><pubDate>Mon, 08 Dec 2025 16:34:08 +0000</pubDate></item><item><title>Launch HN: Nia (YC S25) – Give better context to coding agents</title><link>https://www.trynia.ai/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46194828</guid><pubDate>Mon, 08 Dec 2025 17:10:14 +0000</pubDate></item><item><title>Jepsen: NATS 2.12.1</title><link>https://jepsen.io/analyses/nats-2.12.1</link><description>&lt;doc fingerprint="2790905544351bb0"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;1 Background&lt;/head&gt;
     &lt;p&gt;NATS is a popular streaming system. Producers publish messages to streams, and consumers subscribe to those streams, fetching messages from them. Regular NATS streams are allowed to drop messages. However, NATS has a subsystem called JetStream, which uses the Raft consensus algorithm to replicate data among nodes. JetStream promises âat least onceâ delivery: messages may be duplicated, but acknowledged messages1 should not be lost.2 Moreover, JetStream streams are totally ordered logs.&lt;/p&gt;
@@ -1479,47 +452,7 @@ jepsen-stream', will cleanup&lt;/code&gt;
 &lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46199530</guid><pubDate>Tue, 09 Dec 2025 00:07:42 +0000</pubDate></item><item><title>The universal weight subspace hypothesis</title><link>https://arxiv.org/abs/2512.05117</link><description>&lt;doc fingerprint="3c1d2c0bdef3808e"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;Computer Science &amp;gt; Machine Learning&lt;/head&gt;&lt;p&gt; [Submitted on 4 Dec 2025 (v1), last revised 6 Dec 2025 (this version, v2)]&lt;/p&gt;&lt;head rend="h1"&gt;Title:The Universal Weight Subspace Hypothesis&lt;/head&gt;View PDF HTML (experimental)&lt;quote&gt;Abstract:We show that deep neural networks trained across diverse tasks exhibit remarkably similar low-dimensional parametric subspaces. We provide the first large-scale empirical evidence that demonstrates that neural networks systematically converge to shared spectral subspaces regardless of initialization, task, or domain. Through mode-wise spectral analysis of over 1100 models - including 500 Mistral-7B LoRAs, 500 Vision Transformers, and 50 LLaMA-8B models - we identify universal subspaces capturing majority variance in just a few principal directions. By applying spectral decomposition techniques to the weight matrices of various architectures trained on a wide range of tasks and datasets, we identify sparse, joint subspaces that are consistently exploited, within shared architectures across diverse tasks and datasets. Our findings offer new insights into the intrinsic organization of information within deep networks and raise important questions about the possibility of discovering these universal subspaces without the need for extensive data and computational resources. Furthermore, this inherent structure has significant implications for model reusability, multi-task learning, model merging, and the development of training and inference-efficient algorithms, potentially reducing the carbon footprint of large-scale neural models.&lt;/quote&gt;&lt;head rend="h2"&gt;Submission history&lt;/head&gt;From: Prakhar Kaushik [view email]&lt;p&gt;[v1] Thu, 4 Dec 2025 18:59:58 UTC (14,316 KB)&lt;/p&gt;&lt;p&gt;[v2] Sat, 6 Dec 2025 04:42:07 UTC (14,321 KB)&lt;/p&gt;&lt;p&gt; Current browse context: &lt;/p&gt;&lt;p&gt;cs.LG&lt;/p&gt;&lt;head rend="h3"&gt;References &amp;amp; Citations&lt;/head&gt;&lt;p&gt; export BibTeX citation Loading... &lt;/p&gt;&lt;head rend="h1"&gt;Bibliographic and Citation Tools&lt;/head&gt;&lt;p&gt; Bibliographic Explorer (What is the Explorer?) &lt;/p&gt;&lt;p&gt; Connected Papers (What is Connected Papers?) &lt;/p&gt;&lt;p&gt; Litmaps (What is Litmaps?) &lt;/p&gt;&lt;p&gt; scite Smart Citations (What are Smart Citations?) &lt;/p&gt;&lt;head rend="h1"&gt;Code, Data and Media Associated with this Article&lt;/head&gt;&lt;p&gt; alphaXiv (What is alphaXiv?) &lt;/p&gt;&lt;p&gt; CatalyzeX Code Finder for Papers (What is CatalyzeX?) &lt;/p&gt;&lt;p&gt; DagsHub (What is DagsHub?) &lt;/p&gt;&lt;p&gt; Gotit.pub (What is GotitPub?) &lt;/p&gt;&lt;p&gt; Hugging Face (What is Huggingface?) &lt;/p&gt;&lt;p&gt; Papers with Code (What is Papers with Code?) &lt;/p&gt;&lt;p&gt; ScienceCast (What is ScienceCast?) &lt;/p&gt;&lt;head rend="h1"&gt;Demos&lt;/head&gt;&lt;head rend="h1"&gt;Recommenders and Search Tools&lt;/head&gt;&lt;p&gt; Influence Flower (What are Influence Flowers?) &lt;/p&gt;&lt;p&gt; CORE Recommender (What is CORE?) &lt;/p&gt;&lt;p&gt; IArxiv Recommender (What is IArxiv?) &lt;/p&gt;&lt;head rend="h1"&gt;arXivLabs: experimental projects with community collaborators&lt;/head&gt;&lt;p&gt;arXivLabs is a framework that allows collaborators to develop and share new arXiv features directly on our website.&lt;/p&gt;&lt;p&gt;Both individuals and organizations that work with arXivLabs have embraced and accepted our values of openness, community, excellence, and user data privacy. arXiv is committed to these values and only works with partners that adhere to them.&lt;/p&gt;&lt;p&gt;Have an idea for a project that will add value for arXiv's community? Learn more about arXivLabs.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46199623</guid><pubDate>Tue, 09 Dec 2025 00:16:46 +0000</pubDate></item><item><title>Horses: AI progress is steady. Human equivalence is sudden</title><link>https://andyljones.com/posts/horses.html</link><description>&lt;doc fingerprint="5b9e92572bb22e27"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Horses&lt;/head&gt;
-    &lt;p&gt;So after all these hours talking about AI, in these last five minutes I am going to talk about: horses.&lt;/p&gt;
-    &lt;p&gt;Engines, steam engines, were invented in 1700.&lt;/p&gt;
-    &lt;p&gt;And what followed was 200 years of steady improvement, with engines getting 20% better a decade.&lt;/p&gt;
-    &lt;p&gt;For the first 120 years of that steady improvement, horses didn't notice at all.&lt;/p&gt;
-    &lt;p&gt;Then, between 1930 and 1950, 90% of the horses in the US disappeared.&lt;/p&gt;
-    &lt;p&gt;Progress in engines was steady. Equivalence to horses was sudden.&lt;/p&gt;
-    &lt;p&gt;But enough about horses. Let's talk about chess!&lt;/p&gt;
-    &lt;p&gt;Folks started tracking computer chess in 1985.&lt;/p&gt;
-    &lt;p&gt;And for the next 40 years, computer chess would improve by 50 Elo per year.&lt;/p&gt;
-    &lt;p&gt;That meant in 2000, a human grandmaster could expect to win 90% of their games against a computer.&lt;/p&gt;
-    &lt;p&gt;But ten years later, the same human grandmaster would lose 90% of their games against a computer.&lt;/p&gt;
-    &lt;p&gt;Progress in chess was steady. Equivalence to humans was sudden.&lt;/p&gt;
-    &lt;p&gt;Enough about chess! Let's talk about AI.&lt;/p&gt;
-    &lt;p&gt;Capital expenditure on AI has been pretty steady.&lt;/p&gt;
-    &lt;p&gt;Right now we're - globally - spending the equivalent of 2% of US GDP on AI datacenters each year.&lt;/p&gt;
-    &lt;p&gt;That number seems to have steadily been doubling over the past few years.&lt;/p&gt;
-    &lt;p&gt;And it seems - according to the deals signed - likely to carry on doubling for the next few years.&lt;/p&gt;
-    &lt;p&gt;But from my perspective, from equivalence to me, it hasn't been steady at all.&lt;/p&gt;
-    &lt;p&gt;I was one of the first researchers hired at Anthropic.&lt;/p&gt;
-    &lt;p&gt;This pink line, back in 2024, was a large part of my job. Answer technical questions for new hires.&lt;/p&gt;
-    &lt;p&gt;Back then, me and other old-timers were answering about 4,000 new-hire questions a month.&lt;/p&gt;
-    &lt;p&gt;Then in December, Claude finally got good enough to answer some of those questions for us.&lt;/p&gt;
-    &lt;p&gt;In December, it was some of those questions. Six months later, 80% of the questions I'd been being asked had disappeared.&lt;/p&gt;
-    &lt;p&gt;Claude, meanwhile, was now answering 30,000 questions a month; eight times as many questions as me &amp;amp; mine ever did.&lt;/p&gt;
-    &lt;p&gt;Now. Answering those questions was only part of my job.&lt;/p&gt;
-    &lt;p&gt;But while it took horses decades to be overcome, and chess masters years, it took me all of six months to be surpassed.&lt;/p&gt;
-    &lt;p&gt;Surpassed by a system that costs one thousand times less than I do.&lt;/p&gt;
-    &lt;p&gt;A system that costs less, per word thought or written, than it'd cost to hire the cheapest human labor on the face of the planet.&lt;/p&gt;
-    &lt;p&gt;And so I find myself thinking a lot about horses, nowadays.&lt;/p&gt;
-    &lt;p&gt;In 1920, there were 25 million horses in the United States, 25 million horses totally ambivalent to two hundred years of progress in mechanical engines.&lt;/p&gt;
-    &lt;p&gt;And not very long after, 93 per cent of those horses had disappeared.&lt;/p&gt;
-    &lt;p&gt;I very much hope we'll get the two decades that horses did.&lt;/p&gt;
-    &lt;p&gt;But looking at how fast Claude is automating my job, I think we're getting a lot less.&lt;/p&gt;
-    &lt;p&gt;This was a five-minute lightning talk given over the summer of 2025 to round out a small workshop.&lt;/p&gt;
-    &lt;p&gt;All opinions are my own and not those of my employer.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46199723</guid><pubDate>Tue, 09 Dec 2025 00:26:35 +0000</pubDate></item><item><title>30 Year Anniversary of WarCraft II: Tides of Darkness</title><link>https://www.jorsys.org/archive/december_2025.html#newsitem_2025-12-09T07:42:19Z</link><description>&lt;doc fingerprint="be435c9aabb33e50"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46199623</guid><pubDate>Tue, 09 Dec 2025 00:16:46 +0000</pubDate></item><item><title>30 Year Anniversary of WarCraft II: Tides of Darkness</title><link>https://www.jorsys.org/archive/december_2025.html#newsitem_2025-12-09T07:42:19Z</link><description>&lt;doc fingerprint="be435c9aabb33e50"&gt;
   &lt;main&gt;
     &lt;p&gt;It has now been 30 years since WarCraft II: Tides of Darkness was released. After the great response to Warcraft: Orcs and Humans, released in November 1994, Blizzard began working on Warcraft II: Tides of Darkness. Development stared in the first months of 1995, and the game was released in North America and Australia on December 9, 1995.&lt;/p&gt;
     &lt;p&gt;While WarCraft: Orcs and Humans had laid the foundations of the series — arguably even for the RTS genre at a whole — it was really WarCraft II that took things to new heights. More units could be selected at once, the player could right-click to issue commands, naval and aerial combat was introduced, and buildings and units could be upgraded. The graphics were more vivid and visually appealing, and features like the Fog of War was introduced, where you could only see in the vicinity of your own units — unlike in the first game, where you could indefinitely see any area you had previously visited, you now had to continuously scout the map.&lt;/p&gt;
@@ -2006,4 +939,135 @@ struct Good {
     &lt;p&gt;Please see the documentation on how to get started and compile the engine&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46205519</guid><pubDate>Tue, 09 Dec 2025 14:51:46 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46205519</guid><pubDate>Tue, 09 Dec 2025 14:51:46 +0000</pubDate></item><item><title>Engineers: Stop trying to win other people's game</title><link>https://www.anthonyputignano.com/p/the-western-front-advantage-how-junior</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46205532</guid><pubDate>Tue, 09 Dec 2025 14:53:13 +0000</pubDate></item><item><title>New Pebble Device</title><link>https://repebble.com/blog/meet-pebble-index-01-external-memory-for-your-brain</link><description>&lt;doc fingerprint="5c6b48dfd9872b65"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Catch your best ideas before they slip through your fingers&lt;/p&gt;
+    &lt;p&gt;Do you ever have flashes of insight or an idea worth remembering? This happens to me 5-10 times every day. If I don’t write down the thought immediately, it slips out of my mind. Worst of all, I remember that I’ve forgotten something and spend the next 10 minutes trying to remember what it is. So I invented external memory for my brain.&lt;/p&gt;
+    &lt;p&gt;Introducing Pebble Index 01 - a small ring with a button and microphone. Hold the button, whisper your thought, and it’s sent to your phone. It’s added to your notes, set as a reminder, or saved for later review.&lt;/p&gt;
+    &lt;p&gt;Index 01 is designed to become muscle memory, since it’s always with you. It’s private by design (no recording until you press the button) and requires no internet connection or paid subscription. It’s as small as a wedding band and comes in 3 colours. It’s made from durable stainless steel and is water-resistant. Like all Pebble products, it’s extremely customizable and built with open source software.&lt;/p&gt;
+    &lt;p&gt;Here’s the best part: the battery lasts for years. You never need to charge it.&lt;/p&gt;
+    &lt;p&gt;Pre-order today for $75. After worldwide shipping begins in March 2026, the price will go up to $99.&lt;/p&gt;
+    &lt;head rend="h3"&gt;#Design&lt;/head&gt;
+    &lt;p&gt;Now that I’ve worn my Index 01 for several months, I can safely say that it has changed my life - just like with Pebble, I couldn’t go back to a world without this. There are so many situations each day where my hands are full (while biking or driving, washing dishes, wrangling my kids, etc) and I need to remember something. A random sampling of my recent recordings:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Set a timer for 3pm to go pick up the kids&lt;/item&gt;
+      &lt;item&gt;Remind me to phone the pharmacy at 11am&lt;/item&gt;
+      &lt;item&gt;Peter is coming by tomorrow at 11:30am, add that to my calendar&lt;/item&gt;
+      &lt;item&gt;Jerry recommends reading Breakneck&lt;/item&gt;
+      &lt;item&gt;Mark wants a Black/Red PT2&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Before, I would take my phone out of my pocket to jot these down, but I couldn’t always do that (eg, while bicycling). I also wanted to start using my phone less, especially in front of my kids.&lt;/p&gt;
+    &lt;p&gt;Initially, we experimented by building this as an app on Pebble, since it has a mic and I’m always wearing one. But, I realized quickly that this was suboptimal - it required me to use my other hand to press the button to start recording (lift-to-wake gestures and wake-words are too unreliable). This was tough to use while bicycling or carrying stuff.&lt;/p&gt;
+    &lt;p&gt;Then a genius electrical engineer friend of mine came up with an idea to fit everything into a tiny ring. It is the perfect form factor! Honestly, I’m still amazed that it all fits.&lt;/p&gt;
+    &lt;p&gt;The design needed to satisfy several critical conditions:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Must work reliably 100% of the time. If it didn’t work or failed to record a thought, I knew I would take it off and revert back to my old habit of just forgetting things.&lt;/item&gt;
+      &lt;item&gt;It had to have a physical press-button, with a satisfying click-feel. I want to know for sure if the button is pressed and my thought is captured.&lt;/item&gt;
+      &lt;item&gt;Long battery life - every time you take something off to charge, there’s a chance you’ll forget to put it back on.&lt;/item&gt;
+      &lt;item&gt;Must be privacy-preserving. These are your inner thoughts. All recordings must be processed and stored on your phone. Only record when the button is pressed.&lt;/item&gt;
+      &lt;item&gt;It had to be as small as a wedding band. Since it’s worn on the index finger, if it were too large or bulky, it would hit your phone while you held it in your hand.&lt;/item&gt;
+      &lt;item&gt;Water resistance - must be able to wash hands, shower, and get wet.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;We’ve been working on this for a while, testing new versions and making tweaks. We’re really excited to get this out into the world.&lt;/p&gt;
+    &lt;p&gt;Here are a few of my favourite things about Index 01:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;It does one thing really well - it helps me remember things.&lt;/item&gt;
+      &lt;item&gt;It’s discreet. It's not distracting. It doesn't take you out of the moment.&lt;/item&gt;
+      &lt;item&gt;There’s no AI friend persona and it’s not always recording.&lt;/item&gt;
+      &lt;item&gt;It’s inexpensive. We hope you try it and see if you like it as well!&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h3"&gt;#Key Details&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Available in 3 colours and 8 sizes &lt;list rend="ul"&gt;&lt;item&gt;Colours: polished silver, polished gold, and matte black&lt;/item&gt;&lt;item&gt;US ring sizes: 6, 7, 8, 9, 10, 11, 12, 13&lt;/item&gt;&lt;item&gt;You can pre-order now and pick your size/colour later before your ring ships.&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
+      &lt;item&gt;Cost and availability: Pre-order price is $75, rises to $99 later. Ships worldwide, beginning in March.&lt;/item&gt;
+      &lt;item&gt;Works with iPhone and Android: We overcame Apple’s best efforts to make life terrible for 3rd party accessory makers and have Index 01 working well on iOS and Android.&lt;/item&gt;
+      &lt;item&gt;Extremely private and secure: Your thoughts are processed by open source speech-to-text (STT) and AI models locally on your phone. You can read the code and see exactly how it works - our Pebble mobile app is open source. Higher-quality STT is available through an optional cloud service.&lt;/item&gt;
+      &lt;item&gt;No charging: The battery lasts for up to years of average use. After the end of its life, send your ring back to us for recycling.&lt;/item&gt;
+      &lt;item&gt;On-ring storage: Recording works even if your phone is out of range. Up to 5 minutes of audio can be stored on-ring, then synced later.&lt;/item&gt;
+      &lt;item&gt;No speaker or vibrating motor: This is an input device only. There is an RGB LED, but it’s rarely used (to save battery life and to reduce distraction).&lt;/item&gt;
+      &lt;item&gt;Works great with Pebble or other smartwatches: After recording, the thought will appear on your watch, and you can check that it’s correct. You can ask questions like ‘What’s the weather today?’ and see the answer on your watch.&lt;/item&gt;
+      &lt;item&gt;Raw audio playback: Very helpful if STT doesn’t work perfectly due to wind or loud background noises.&lt;/item&gt;
+      &lt;item&gt;Actions: While the primary task is remembering things for you, you can also ask it to do things like ’Send a Beeper message to my wife - running late’ or answer simple questions that could be answered by searching the web. You can configure button clicks to control your music - I love using this to play/pause or skip tracks. You can also configure where to save your notes and reminders (I have it set to add to Notion).&lt;/item&gt;
+      &lt;item&gt;Customizable and hackable: Configure single/double button clicks to control whatever you want (take a photo, turn on lights, Tasker, etc). Add your own voice actions via MCP. Or route the audio recordings directly to your own app or server!&lt;/item&gt;
+      &lt;item&gt;99+ languages: Speech to text and local LLM support over 99 languages! Naturally, the quality of each may vary.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h3"&gt;#Future Plans&lt;/head&gt;
+    &lt;p&gt;Let me be very clear - Index 01 is designed at its core to be a device that helps you remember things. We want it to be 100% reliable at its primary task. But we’re leaving the side door open for folks to customize, build new interactions and actions.&lt;/p&gt;
+    &lt;p&gt;Here’s how I’m thinking about it - a single click-hold + voice input will be routed to the primary memory processing path. Double-click-hold + voice input would be routed to a more general purpose voice agent (think ChatGPT with web search). Responses from the agent would be presented on Pebble (eg ‘What’s the weather tomorrow?’, ‘When’s the next northbound Caltrain?’) or other smartwatches (as a notification). Maybe this could even be an input for something like ChatGPT Voice Mode, enabling you to hear the AI response from your earbuds.&lt;/p&gt;
+    &lt;p&gt;The built in actions, set reminder, create note, alarms, etc, are actually MCPs - basically mini apps that AI agents know how to operate. They run locally in WASM within the Pebble mobile app (no cloud MCP server required). Basically any MCP server can be used with the system, so intrepid folks may have fun adding various actions like Beeper, Google Calendar, weather, etc that already offer MCPs.&lt;/p&gt;
+    &lt;p&gt;Not everything will be available at launch, but this is the direction we are working towards. There will be 3 ways to customize your Index 01:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Trigger actions via button clicks - configure a single or double click to do things like take a photo, control your Home Assistant smart home, Tasker function, unlock your car. This will work better on Android since iOS Shortcuts doesn’t have an open API.&lt;/item&gt;
+      &lt;item&gt;Trigger actions via voice input - write an MCP to do….basically anything? This is pretty open ended.&lt;/item&gt;
+      &lt;item&gt;Route your voice recordings and/or transcriptions to your own webhook - or skip our AI processing entirely and send every recording to your own app or webapp.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;How does it work?&lt;/p&gt;
+    &lt;p&gt;People usually wear it on the index finger. Inside the ring is a button, a microphone, a Bluetooth chip, memory, and a battery that lasts for years. Click the button with your thumb, talk into the mic, and it records to internal memory. When your phone is in range, the recording is streamed to the Pebble app. It’s converted to text on-device, then processed by an on-device large language model (LLM) which selects an action to take (create note, add to reminders, etc).&lt;/p&gt;
+    &lt;p&gt;When do I pick my size?&lt;/p&gt;
+    &lt;p&gt;You’ll be able to pick your ring size and color after placing a pre-order. If you have a 3D printer, you can print our CAD designs to try on. We’re also planning a sizing kit. You can view the measurements of the inner diameter of each ring size.&lt;/p&gt;
+    &lt;p&gt;How long does the battery last?&lt;/p&gt;
+    &lt;p&gt;Roughly 12 to 15 hours of recording. On average, I use it 10-20 times per day to record 3-6 second thoughts. That’s up to 2 years of usage.&lt;/p&gt;
+    &lt;p&gt;Is it secure and private?&lt;/p&gt;
+    &lt;p&gt;Yes, extremely. The connection between ring and phone is encrypted. Recordings are processed locally on your phone in the open-source Pebble app. The app works offline (no internet connection) and does not require a cloud service. An optional cloud storage system for backing up recordings is available. Our plan is for this to be optionally encrypted, but we haven’t built it yet.&lt;/p&gt;
+    &lt;p&gt;Is a paid subscription required?&lt;/p&gt;
+    &lt;p&gt;No.&lt;/p&gt;
+    &lt;p&gt;What kind of battery is inside?&lt;/p&gt;
+    &lt;p&gt;Index 01 uses silver-oxide batteries.&lt;/p&gt;
+    &lt;p&gt;Why can’t it be recharged?&lt;/p&gt;
+    &lt;p&gt;We considered this but decided not to for several reasons:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;You’d probably lose the charger before the battery runs out!&lt;/item&gt;
+      &lt;item&gt;Adding charge circuitry and including a charger would make the product larger and more expensive.&lt;/item&gt;
+      &lt;item&gt;You send it back to us to recycle.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Wait, it’s single use?&lt;/p&gt;
+    &lt;p&gt;Yes. We know this sounds a bit odd, but in this particular circumstance we believe it’s the best solution to the given set of constraints. Other smart rings like Oura cost $250+ and need to be charged every few days. We didn’t want to build a device like that. Before the battery runs out, the Pebble app notifies and asks if you’d like to order another ring.&lt;/p&gt;
+    &lt;p&gt;Is it always listening?&lt;/p&gt;
+    &lt;p&gt;No. It only records while the button is pressed. It’s not designed to record your whole life, or meetings.&lt;/p&gt;
+    &lt;p&gt;What if the speech-to-text processing misses a word or something?&lt;/p&gt;
+    &lt;p&gt;You can always listen to the each recording in the app.&lt;/p&gt;
+    &lt;p&gt;Why no touchpad?&lt;/p&gt;
+    &lt;p&gt;We experimented with a touchpad, but found it too easy to accidentally swipe and press. Also, nothing beats the feedback of a real gosh darn pressable button.&lt;/p&gt;
+    &lt;p&gt;Is there a speaker or vibrating motor?&lt;/p&gt;
+    &lt;p&gt;No. The button has a great click-feel to indicate when you are pressing.&lt;/p&gt;
+    &lt;p&gt;Does it do health tracking like Oura?&lt;/p&gt;
+    &lt;p&gt;Nope&lt;/p&gt;
+    &lt;p&gt;How durable and water-resistant is it?&lt;/p&gt;
+    &lt;p&gt;It’s primarily made from stainless steel 316, with a liquid silicone rubber (LSR) button. It’s water-resistant to 1 meter. You can wash your hands, do dishes, and shower with it on, but we don’t recommend swimming with it.&lt;/p&gt;
+    &lt;p&gt;Does it work with iPhone and Android?&lt;/p&gt;
+    &lt;p&gt;Yes&lt;/p&gt;
+    &lt;p&gt;I love customizing and hacking on my devices. What could I do with Index 01?&lt;/p&gt;
+    &lt;p&gt;Lots of stuff! Control things with the buttons. Route raw audio or transcribed text directly to your own app via webhook. Use MCPs (also run locally on-device! No cloud server required) to add more actions.&lt;/p&gt;
+    &lt;p&gt;Is this an AI friend thingy or always-recording device?&lt;/p&gt;
+    &lt;p&gt;No.&lt;/p&gt;
+    &lt;p&gt;How far along is development?&lt;/p&gt;
+    &lt;p&gt;We’ve been working on this in the background to watch development. It helps that our Pebble Time 2 partner factory is also building Index 01! We’re currently in the DVT stage, testing pre-production samples. We’ll start a wider alpha test in January with a lot more people. Here’s some shots from the pre-production assembly line:&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46205661</guid><pubDate>Tue, 09 Dec 2025 15:03:09 +0000</pubDate></item><item><title>Apple's Slow AI Pace Becomes a Strength as Market Grows Weary of Spending</title><link>https://finance.yahoo.com/news/apple-slow-ai-pace-becomes-104658095.html</link><description>&lt;doc fingerprint="5f1d1981b3685bf"&gt;
+  &lt;main&gt;
+    &lt;p&gt;(Bloomberg) -- Shares of Apple Inc. were battered earlier this year as the iPhone maker faced repeated complaints about its lack of an artificial intelligence strategy. But as the AI trade faces increasing scrutiny, that hesitance has gone from a weakness to a strength — and it’s showing up in the stock market.&lt;/p&gt;
+    &lt;p&gt;Through the first six months of 2025, Apple was the second-worst performer among the Magnificent Seven tech giants, as its shares tumbled 18% through the end of June. That has reversed since then, with the stock soaring 35%, while AI darlings like Meta Platforms Inc. and Microsoft Corp. slid into the red and even Nvidia Corp. underperformed. The S&amp;amp;P 500 Index rose 10% in that time, and the tech-heavy Nasdaq 100 Index gained 13%.&lt;/p&gt;
+    &lt;p&gt;Most Read from Bloomberg&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;NJ’s Montclair Cuts School Staff and Mulls March Tax-Hike Vote&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Trump Replaces Architect to Lead $300 Million Ballroom Design&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Owner of NYC’s Fordham Landing Housing Project Files Bankruptcy&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Democrats Want Probe of Trump Officials and Immigration Deals&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;“It is remarkable how they have kept their heads and are in control of spending, when all of their peers have gone the other direction,” said John Barr, portfolio manager of the Needham Aggressive Growth Fund, which owns Apple shares.&lt;/p&gt;
+    &lt;p&gt;As a result, Apple now has a $4.1 trillion market capitalization and the second biggest weight in the S&amp;amp;P 500, leaping over Microsoft and closing in on Nvidia. The shift reflects the market’s questioning of the hundreds of billions of dollars Big Tech firms are throwing at AI development, as well as Apple’s positioning to eventually benefit when the technology is ready for mass use.&lt;/p&gt;
+    &lt;p&gt;“While they most certainly will incorporate more AI into the phones over time, Apple has avoided the AI arms race and the massive capex that accompanies it,” said Bill Stone, chief investment officer at Glenview Trust Company, who owns the stock and views it as “a bit of an anti-AI holding.”&lt;/p&gt;
+    &lt;p&gt;Of course, the rally has made Apple’s stock pricier than it has been in a long time. The shares are trading for around 33 times expected earnings over the next 12 months, a level they’ve only hit a few times in the past 15 years, with a high of 35 in September 2020. The stock’s average multiple over that time is less than 19 times. Apple is now the second most expensive stock in the Bloomberg Magnificent Seven Index, trailing only Tesla Inc.’s whopping valuation of 203 times forward earnings. Apple’s shares climbed about 0.5% in early Tuesday trading.&lt;/p&gt;
+    &lt;p&gt;“It’s really hard to see how the stock can continue to compound value at a level that makes this a compelling entry point,” said Craig Moffett, co-founder of research firm MoffettNathanson. “The obvious question is, are investors overpaying for Apple’s defensiveness? We think so.”&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46205724</guid><pubDate>Tue, 09 Dec 2025 15:08:24 +0000</pubDate></item></channel></rss>
