@@ -1,5 +1,148 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 13 Dec 2025 06:16:03 +0000</lastBuildDate><item><title>Koralm Railway</title><link>https://infrastruktur.oebb.at/en/projects-for-austria/railway-lines/southern-line-vienna-villach/koralm-railway</link><description>&lt;doc fingerprint="715d5db4db36ea94"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 13 Dec 2025 06:48:38 +0000</lastBuildDate><item><title>Building small Docker images faster</title><link>https://sgt.hootr.club/blog/docker-protips/</link><description>&lt;doc fingerprint="2c0c3e395f6515e0"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Building smaller Docker images faster&lt;/head&gt;
+    &lt;p&gt;I've been tasked (more or less) with building the first Go service at &lt;code&gt;$DAYJOB&lt;/code&gt;, which is almost exclusively a Python shop. Why Go of all languages? Well, some of my coworkers are big fans of the gopher, it's an easy language, it's attached to one of the big companies, and it's much faster than Python, so I feel more comfortable pushing for this rather than Rust or (sadly) Nix.&lt;/p&gt;
+    &lt;p&gt;The project that recently fell onto my lap is basically RCE-as-a-service, and it just so happens that one of the few languages that I would feel comfortable letting users execute remotely on our servers has a Go implementation, which is as good an excuse as any to take a break from the usual snekslop.&lt;/p&gt;
+    &lt;p&gt;I still haven't convinced anybody here to get on the Nix train, so after a short stint of building the project and the OCI images with a recursive cycle of Make and Nix, I breathed a heavy sigh and dropped it for Docker and Docker Compose, which is what we generally use here.&lt;/p&gt;
+    &lt;p&gt;Which is a shame, because Nix is pretty good at building OCI images. This is all the code you need to create a minimal image that contains only your service and nothing else, not even &lt;code&gt;/bin/sh&lt;/code&gt;.&lt;/p&gt;
+    &lt;code&gt;{ pkgs ? import &amp;lt;nixpkgs&amp;gt; {} }:
+pkgs.dockerTools.streamLayeredImage {
+  name = "someimage";
+  tag = "latest";
+  config.Cmd = [
+    "${pkgs.hello}/bin/hello"
+  ];
+}
+&lt;/code&gt;
+    &lt;p&gt;You can build that with &lt;code&gt;nix-build docker-test.nix&lt;/code&gt; and inside &lt;code&gt;./result&lt;/code&gt; you'll find a script that generates the image's tarball. Load it up with &lt;code&gt;./result | docker load&lt;/code&gt; and Docker will report a new image called &lt;code&gt;someimage:latest&lt;/code&gt; when you run &lt;code&gt;docker image ls&lt;/code&gt;. It's only 45.8MB, and most of that is taken up by glibc.&lt;/p&gt;
+    &lt;p&gt;But what if I told you that you can get more or less the same result with a simple &lt;code&gt;Dockerfile&lt;/code&gt; if you know what you're doing? Especially if you're building a static executable, which Go famously does (at least when you set &lt;code&gt;CGO_ENABLED=0&lt;/code&gt;) and if you're willing to sacrifice a few affordances. Who needs coreutils anyway?&lt;/p&gt;
+    &lt;p&gt;In this post I'll show you a few tricks I found while striving to make small and fast-building images. I'm not an expert in Docker by any stretch so maybe you know all of this stuff already, but perhaps you might learn something new.&lt;/p&gt;
+    &lt;head rend="h2"&gt;A barebones image&lt;/head&gt;
+    &lt;p&gt;I'm using &lt;code&gt;goose&lt;/code&gt; for database migrations. I configured the &lt;code&gt;docker-compose.yml&lt;/code&gt; to run its container just after the database has started and before the actual service runs, and since it's a very small self-contained tool I figured I could try to make the image as small and quick to build as possible. Let me show you the relevant part of the &lt;code&gt;docker-compose.yml&lt;/code&gt; first:&lt;/p&gt;
+    &lt;code&gt;services:
+  migrate:
+    image: migrate:latest
+    pull_policy: build
+    build:
+      context: https://github.com/pressly/goose.git#v3.26.0
+      dockerfile: $PWD/Dockerfile.migrate
+    environment:
+      GOOSE_DBSTRING: postgresql://AzureDiamond:hunter2@db:5432/bobby
+      GOOSE_MIGRATION_DIR: /migrations
+      GOOSE_DRIVER: postgres
+    depends_on:
+      db:
+        condition: service_started
+    volumes:
+      - ./migrations:/migrations
+&lt;/code&gt;
+    &lt;p&gt;The &lt;code&gt;build.context&lt;/code&gt; parameter specifies the "set of files" that are available from the host while building a Docker image. It's the parameter that you pass after &lt;code&gt;docker build&lt;/code&gt;, generally &lt;code&gt;.&lt;/code&gt; (the PWD). Here I specified a GitHub URL with a tag, so when I'm referring to &lt;code&gt;.&lt;/code&gt; in the &lt;code&gt;Dockerfile&lt;/code&gt; above I get the root of the &lt;code&gt;goose&lt;/code&gt; project on that tag's commit. I didn't know Docker could do that!&lt;/p&gt;
+    &lt;p&gt;The &lt;code&gt;build.dockerfile&lt;/code&gt; path includes &lt;code&gt;$PWD&lt;/code&gt; because even if Docker itself can refer to Dockerfiles outside of its context, Docker Compose apparently can't unless you specify it as an absolute path. I think this will break if you try to run &lt;code&gt;docker compose&lt;/code&gt; from another directory, but it's good enough for now.&lt;/p&gt;
+    &lt;p&gt;Now let's take a look at the &lt;code&gt;Dockerfile&lt;/code&gt; itself:&lt;/p&gt;
+    &lt;code&gt;FROM golang:1.25-alpine3.23 AS builder
+
+WORKDIR /build
+
+ARG CGO_ENABLED=0
+
+ARG GOCACHE=/root/.cache/go-build
+ARG GOMODCACHE=/root/.cache/go-mod
+
+RUN --mount=type=cache,target=/root/.cache/go-build \
+  --mount=type=cache,target=/root/.cache/go-mod \
+  --mount=type=bind,source=.,target=/build \
+  go build -tags='no_clickhouse no_libsql no_sqlite3 no_mssql no_vertica no_mysql no_ydb' -o /goose ./cmd/goose
+
+FROM scratch
+
+COPY --from=builder /goose /goose
+
+CMD ["/goose", "up"]
+&lt;/code&gt;
+    &lt;p&gt;A few things to note:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;I used the Alpine image for Go because it's the smallest and it includes everything I need to build the tool.&lt;/item&gt;
+      &lt;item&gt;I set &lt;code&gt;CGO_ENABLED=0&lt;/code&gt;to ensure that the executable only builds with the Go toolchain and does not link to libc. According to the docs, The cgo tool is enabled by default for native builds on systems where it is expected to work so you have to take extra care to disable it if you don't want or need it.&lt;/item&gt;
+      &lt;item&gt;I set &lt;code&gt;GOCACHE&lt;/code&gt;and&lt;code&gt;GOMODCACHE&lt;/code&gt;(docs) to a known location to ensure that I can take advantage of cache mounts on subsequent rebuilds. Admittedly this is not very useful for an external tool that I'm only expecting to build once but hey, every little bit helps.&lt;/item&gt;
+      &lt;item&gt;Instead of &lt;code&gt;ADD&lt;/code&gt;ing or&lt;code&gt;COPY&lt;/code&gt;ing the package's source I bind mounted it to the workdir. This should make it a bit faster because it avoids an extra copy into the build container.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;FROM scratch&lt;/code&gt;defines a second build stage that ensures any artifacts from the actual build are discarded.&lt;code&gt;scratch&lt;/code&gt;is the null image.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The result is an image with one layer containing one file that builds, loads and boots extremely fast and is only *chef's kiss* 15.9MB in size. Not too bad!&lt;/p&gt;
+    &lt;head rend="h2"&gt;The build context&lt;/head&gt;
+    &lt;p&gt;Earlier I mentioned the build context. Keeping it small is important because Docker copies all files available in the build context to the builder every time you run a &lt;code&gt;docker build&lt;/code&gt;, so if you have lots of files in your repo that you don't need to build the image you'll probably want to exclude them. The way you do that is by keeping a &lt;code&gt;.dockerignore&lt;/code&gt; file alongside your &lt;code&gt;Dockerfile&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;I have to stress one point: the build context includes everything inside the directory you run &lt;code&gt;docker build&lt;/code&gt; from unless it's listed in &lt;code&gt;.dockerignore&lt;/code&gt;. I thought some obvious things like &lt;code&gt;.git&lt;/code&gt; would be excluded by default, but a quick test disproved that:&lt;/p&gt;
+    &lt;code&gt;FROM busybox
+WORKDIR /
+COPY . ./
+CMD []
+&lt;/code&gt;
+    &lt;p&gt;Try saving that file as &lt;code&gt;Dockerfile.test&lt;/code&gt; in one of your repos, build it with &lt;code&gt;docker build -f Dockerfile.text -t build-context .&lt;/code&gt;, open a shell with &lt;code&gt;docker run --rm -it build-context /bin/sh&lt;/code&gt; and run &lt;code&gt;find&lt;/code&gt;. Everything's in there: &lt;code&gt;.git&lt;/code&gt;, &lt;code&gt;.jj&lt;/code&gt;, the &lt;code&gt;Dockerfile.test&lt;/code&gt; itself, and all the rest of the build artifacts and assorted junk you have accumulated in your project directory. Ignoring them won't make your images smaller, but it might make the build quicker.&lt;/p&gt;
+    &lt;code&gt;# .dockerignore
+.*
+
+Dockerfile*
+docker-compose.yml
+
+# ...
+&lt;/code&gt;
+    &lt;head rend="h2"&gt;Granular layers&lt;/head&gt;
+    &lt;p&gt;Splitting and ordering layers is probably the most well-known and obvious Docker build time optimization there is, but it doesn't hurt to mention. This is the &lt;code&gt;Dockerfile&lt;/code&gt; for the service I'm building:&lt;/p&gt;
+    &lt;code&gt;FROM golang:1.25-alpine3.23 AS builder
+
+WORKDIR /build
+
+ARG CGO_ENABLED=0
+
+ARG GOCACHE=/root/.cache/go-build
+ARG GOMODCACHE=/root/.cache/go-mod
+
+RUN --mount=type=cache,target=/root/.cache/go-build \
+  --mount=type=cache,target=/root/.cache/go-mod \
+  go install github.com/DataDog/orchestrion@latest
+
+RUN --mount=type=bind,source=go.mod,target=go.mod \
+  --mount=type=bind,source=go.sum,target=go.sum \
+  --mount=type=cache,target=/root/.cache/go-build \
+  --mount=type=cache,target=/root/.cache/go-mod \
+  go mod download
+
+RUN --mount=type=bind,source=go.mod,target=go.mod \
+  --mount=type=bind,source=go.sum,target=go.sum \
+  --mount=type=cache,target=/root/.cache/go-build \
+  --mount=type=cache,target=/root/.cache/go-mod \
+  --mount=type=bind,source=internal,target=internal \
+  --mount=type=bind,source=cmd,target=cmd \
+  --mount=type=bind,source=orchestrion.tool.go,target=orchestrion.tool.go \
+  orchestrion go build -o server ./cmd/server
+
+FROM alpine:3.23 AS prod
+
+WORKDIR /app
+
+COPY --from=builder /build/server .
+
+ENTRYPOINT ["/app/server"]
+&lt;/code&gt;
+    &lt;p&gt;You can see all the bind and cache mount tricks from earlier, not much has changed. I'm installing &lt;code&gt;orchestrion&lt;/code&gt; (a great tool to bloat up your binary size if you ever feel like it) early because that's the least likely to change. After that I bind mount &lt;code&gt;go.mod&lt;/code&gt; and &lt;code&gt;go.sum&lt;/code&gt; and only download the dependencies, because that's the step that generally takes the most time and dependencies change less often than code. Only at the end do I bind mount the package directories and build the server.&lt;/p&gt;
+    &lt;p&gt;You can iterate on this by changing one of the relevant files and ensuring that all the previous steps are marked as &lt;code&gt;CACHED&lt;/code&gt; on the next &lt;code&gt;docker build&lt;/code&gt;. Again, this won't save you space but it'll save you a lot of time while iterating.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Conclusions&lt;/head&gt;
+    &lt;p&gt;Summing up:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Read the Optimize cache usage in builds page in the Docker documentation, and maybe take a look at the rest while you're there.&lt;/item&gt;
+      &lt;item&gt;Split, merge and order layers according to how often you expect them to be rebuilt. Directives like &lt;code&gt;ENV&lt;/code&gt;,&lt;code&gt;ARG&lt;/code&gt;and&lt;code&gt;WORKDIR&lt;/code&gt;should go before everything else.&lt;/item&gt;
+      &lt;item&gt;Use multi-stage builds to shrink the final image size. Consider if you can get away with using &lt;code&gt;scratch&lt;/code&gt;,&lt;code&gt;busybox&lt;/code&gt;or&lt;code&gt;alpine&lt;/code&gt;for the final image.&lt;/item&gt;
+      &lt;item&gt;If your project contains multiple separate applications (for example a backend and a frontend) you can create separate build stages for each of them, and then copy the results into a final image. Stages that don't depend on each other are built in parallel if you're using BuildKit, and you can do all sorts of tricks with multi-stage builds to ensure your CPU runs hot all the time.&lt;/item&gt;
+      &lt;item&gt;Add a &lt;code&gt;.dockerignore&lt;/code&gt;to your project, and make sure to put&lt;code&gt;.git&lt;/code&gt;in there if you don't need it.&lt;/item&gt;
+      &lt;item&gt;Try to set up cache mounts to make sure dependencies and intermediate build artifacts are persisted across builds. Some CI services (GitHub actions, apparently) even let you set up external caches.&lt;/item&gt;
+      &lt;item&gt;Try to use bind mounts instead of &lt;code&gt;COPY&lt;/code&gt;ing source files into the builder. Bind mounts are usually read-only, but you can make them read-write if you really need to.&lt;/item&gt;
+      &lt;item&gt;I didn't use it in my &lt;code&gt;Dockerfile&lt;/code&gt;s, but apparently you should be using&lt;code&gt;ADD&lt;/code&gt;for downloading files, archives or Git repos during your build. The docs mention that&lt;code&gt;COPY&lt;/code&gt;should mostly be used for copying files between stages or for files you need in your final image, and for the rest you should try to use bind mounts.&lt;/item&gt;
+      &lt;item&gt;Use smaller base images when possible and if you really have to install stuff with &lt;code&gt;apt&lt;/code&gt;you should make an intermediate image and upload it to your container repository of choice so your poor runners don't have to hammer Debian's mirrors every single time you push.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;One last trick before the post is over: I just discovered that Docker Compose has a watch mode that tracks changes in the build context and rebuilds (or does other things with) your image on every change. Nice!&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46242700</guid><pubDate>Fri, 12 Dec 2025 10:23:23 +0000</pubDate></item><item><title>Koralm Railway</title><link>https://infrastruktur.oebb.at/en/projects-for-austria/railway-lines/southern-line-vienna-villach/koralm-railway</link><description>&lt;doc fingerprint="715d5db4db36ea94"&gt;
   &lt;main&gt;
     &lt;p&gt;Crossing the Koralpe massif more quickly and with more comfort. That’s what the future of train travel from Graz to Klagenfurt looks like. With the Koralm Railway, you will arrive at your destination even quicker. The fastest connection will shrink from three hours to just 45 minutes. Western Styria and southern Carinthia can be reached even more easily – as can our neighbouring countries Hungary and Italy.&lt;/p&gt;
     &lt;head rend="h2"&gt;Koralm Railway connects Europe&lt;/head&gt;
@@ -158,116 +301,7 @@
     &lt;p&gt;At YoloRun.Capital, we invest in ambitious, boundary-pushing projects like this, even the beautifully impractical ones. Have a wild idea? Let's talk.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46248323</guid><pubDate>Fri, 12 Dec 2025 20:15:58 +0000</pubDate></item><item><title>Security issues with electronic invoices</title><link>https://invoice.secvuln.info/</link><description>&lt;doc fingerprint="94f099d3c2f05d8d"&gt;
-  &lt;main&gt;
-    &lt;p&gt;This page provides supplementary material for a presentation given at the German OWASP Day 2025 (Presentation Slides).&lt;/p&gt;
-    &lt;head rend="h2"&gt;Intro&lt;/head&gt;
-    &lt;p&gt;With the eInvoicing Directive (2014/55/EU), the European Union introduced “standardized” electronic invoices in XML format. Increasingly, institutions and businesses in EU member states will be required to support these electronic invoices.&lt;/p&gt;
-    &lt;p&gt;While machine-readable invoices are, in general, a good idea, there are various issues with the EU’s approach, including needless complexity, a lack of true standardization (multiple syntaxes and various sub-formats), and a tendency to use technologies with inherent security problems.&lt;/p&gt;
-    &lt;p&gt;Due to a combination of unfortunate design decisions, implementing software for electronic invoices is likely to be affected by security flaws if no countermeasures are implemented.&lt;/p&gt;
-    &lt;head rend="h2"&gt;XML Insecurity and XXE&lt;/head&gt;
-    &lt;p&gt;The XML format is known to have inherent security flaws, the most dangerous ones being XXE vulnerabilities (XML eXternal Entity injection).&lt;/p&gt;
-    &lt;p&gt;XXE vulnerabilities often allow the exfiltration of files. While some XML implementations have implemented secure defaults or were never vulnerable to begin with (e.g., Python, libxml2, .NET, Expat), others remain insecure by default.&lt;/p&gt;
-    &lt;p&gt;Two notable examples of implementations with insecure defaults are the Java standard library and the Saxon library. Both are commonly used within the electronic invoicing ecosystem.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The problem with XSLT 2.0&lt;/head&gt;
-    &lt;p&gt;XSLT is a document transformation language. Only XSLT version 1.0 is widely supported. For XSLT 2.0 and above, only one freely available implementation exists: Saxon.&lt;/p&gt;
-    &lt;p&gt;To check compliance with the EN16931 standards, the EU provides validation artifacts based on Schematron. Those validation artifacts require XSLT 2.0.&lt;/p&gt;
-    &lt;p&gt;Thus, anyone using these validation artifacts will likely use Saxon to implement invoice parsing. Saxon, as mentioned, is vulnerable to XXE by default.&lt;/p&gt;
-    &lt;p&gt;Despite its poor implementation status and the fact that its primary implementation has insecure defaults, XSLT 2.0 (and its successor 3.0) is a W3C recommendation. I raised these concerns with the W3C.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Discussion about XSLT 2.0/3.0 at W3C (2025)&lt;/item&gt;
-      &lt;item&gt;Statement from back-then libxslt maintainer that no XSLT 2.0 support is planned (2007)&lt;/item&gt;
-      &lt;item&gt;Comment from 2005 that XSLT 2.0 “was likely to be just a single implementation language”&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h2"&gt;Security test suite&lt;/head&gt;
-    &lt;p&gt;A security test suite for electronic invoices is provided here.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Getting the EN16931 standards&lt;/head&gt;
-    &lt;p&gt;The EU requirements for electronic invoices are standardized by the European Committee for Standardization (CEN) in a set of standards named EN16931. The first two parts are available free of charge. Subsequent parts cost money.&lt;/p&gt;
-    &lt;p&gt;Accessing these standards is surprisingly difficult. A link on the EU web page to CEN is currently broken. CEN does not provide direct downloads of these documents and refers to national standardization organizations. Those often require account registrations even to access the free-of-charge parts of the standard.&lt;/p&gt;
-    &lt;p&gt;The Estonian standardization organization (EVS) provides downloads of parts one and two without registration:&lt;/p&gt;
-    &lt;p&gt;For the parts of EN16931 that are not available free of charge, prices at EVS are cheaper than those at most other national standardization organizations.&lt;/p&gt;
-    &lt;head rend="h2"&gt;XXE vulnerabilties&lt;/head&gt;
-    &lt;p&gt;List of security vulnerabilities discovered in electronic invoicing software during this research:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;Product&lt;/cell&gt;
-        &lt;cell role="head"&gt;Vuln type&lt;/cell&gt;
-        &lt;cell role="head"&gt;Info&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;kivitendo&lt;/cell&gt;
-        &lt;cell&gt;XXE&lt;/cell&gt;
-        &lt;cell&gt;Reported 2025-03-25, Fixed in 3.9.2beta (2025-03-28) / 3.9.2 (2025-05-05), Software Stack: Perl/XML::LibXML, CVE-2025-66370&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;peppol-py&lt;/cell&gt;
-        &lt;cell&gt;Blind XXE&lt;/cell&gt;
-        &lt;cell&gt;Reported: 2025-11-13, fixed in 1.1.1 (2025-11-13), Software Stack: Python/Saxon, CVE-2025-66371&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;ZUV*&lt;/cell&gt;
-        &lt;cell&gt;Blind XXE&lt;/cell&gt;
-        &lt;cell&gt;Reported: 2025-11-17, no longer developed according to README, Software Stack: Java/Saxon&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;papierkram.de E-Rechnung-Viewer&lt;/cell&gt;
-        &lt;cell&gt;XXE&lt;/cell&gt;
-        &lt;cell&gt;Reported: 2025-03-30, fixed: 2025-03-31&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;EPO E-Invoice Viewer&lt;/cell&gt;
-        &lt;cell&gt;XXE&lt;/cell&gt;
-        &lt;cell&gt;Reported: 2025-10-13, fixed: 2025-10-14&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;portinvoice&lt;/cell&gt;
-        &lt;cell&gt;XXE&lt;/cell&gt;
-        &lt;cell&gt;Reported: 2025-10-29, fixed: 2025-10-29&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;xrechnung-erstellen.com E-Rechnung Viewer&lt;/cell&gt;
-        &lt;cell&gt;XXE&lt;/cell&gt;
-        &lt;cell&gt;Reported: 2025-10-14, fixed: 2025-10-16&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Belegmeister ZUGFERD VIEWER&lt;/cell&gt;
-        &lt;cell&gt;Blind XXE&lt;/cell&gt;
-        &lt;cell&gt;Reported: 2025-11-15 (only supports PDF upload), fixed: 2025-11-25&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;E-Rechnungs-Validator by winball.de&lt;/cell&gt;
-        &lt;cell&gt;Blind XXE&lt;/cell&gt;
-        &lt;cell&gt;Reported: 2025-11-17, fixed: 2025-11-19, confirmation&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;ZUGFeRD Community ZF/FX Invoiceportal&lt;/cell&gt;
-        &lt;cell&gt;Blind XXE&lt;/cell&gt;
-        &lt;cell&gt;Reported: 2025-11-17, no reply, re-tested on 2025-11-25, validation functionality was removed (relied on ZUV)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;REDACTED1&lt;/cell&gt;
-        &lt;cell&gt;XXE&lt;/cell&gt;
-        &lt;cell&gt;Reported: 2025-10-29, no reply, re-tested on 2025-11-18, fix incomplete (see next line)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;REDACTED1&lt;/cell&gt;
-        &lt;cell&gt;Blind XXE&lt;/cell&gt;
-        &lt;cell&gt;Reported: 2025-11-18, no reply, unfixed&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;REDACTED2&lt;/cell&gt;
-        &lt;cell&gt;Blind XXE&lt;/cell&gt;
-        &lt;cell&gt;Reported: 2025-11-17, no reply, unfixed&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;* ZUV is no longer developed, and it is recommended to use Mustang instead. Mustang was also vulnerable to XXE in versions before 2.16.3 (CVE-2025-66372).&lt;/p&gt;
-    &lt;head rend="h2"&gt;More&lt;/head&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;ZUGFeRD, XRechnung und Co.: Wie elektronische Rechnungen zum Sicherheitsrisiko werden (German article, Golem, 2025-12-12)&lt;/item&gt;
-    &lt;/list&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46248470</guid><pubDate>Fri, 12 Dec 2025 20:28:41 +0000</pubDate></item><item><title>macOS 26.2 enables fast AI clusters with RDMA over Thunderbolt</title><link>https://developer.apple.com/documentation/macos-release-notes/macos-26_2-release-notes#RDMA-over-Thunderbolt</link><description>&lt;doc fingerprint="33a9437a9587dba1"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46248323</guid><pubDate>Fri, 12 Dec 2025 20:15:58 +0000</pubDate></item><item><title>macOS 26.2 enables fast AI clusters with RDMA over Thunderbolt</title><link>https://developer.apple.com/documentation/macos-release-notes/macos-26_2-release-notes#RDMA-over-Thunderbolt</link><description>&lt;doc fingerprint="33a9437a9587dba1"&gt;
   &lt;main&gt;
     &lt;p&gt;This page requires JavaScript. Please turn on JavaScript in your browser and refresh the page to view its content.&lt;/p&gt;
   &lt;/main&gt;
