@@ -1,5 +1,159 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Fri, 12 Dec 2025 23:36:58 +0000</lastBuildDate><item><title>Fedora: Open-source repository for long-term digital preservation</title><link>https://fedorarepository.org/</link><description>&lt;doc fingerprint="3cd1965b918fe919"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 13 Dec 2025 00:49:12 +0000</lastBuildDate><item><title>Building small Docker images faster</title><link>https://sgt.hootr.club/blog/docker-protips/</link><description>&lt;doc fingerprint="2c0c3e395f6515e0"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Building smaller Docker images faster&lt;/head&gt;
+    &lt;p&gt;I've been tasked (more or less) with building the first Go service at &lt;code&gt;$DAYJOB&lt;/code&gt;, which is almost exclusively a Python shop. Why Go of all languages? Well, some of my coworkers are big fans of the gopher, it's an easy language, it's attached to one of the big companies, and it's much faster than Python, so I feel more comfortable pushing for this rather than Rust or (sadly) Nix.&lt;/p&gt;
+    &lt;p&gt;The project that recently fell onto my lap is basically RCE-as-a-service, and it just so happens that one of the few languages that I would feel comfortable letting users execute remotely on our servers has a Go implementation, which is as good an excuse as any to take a break from the usual snekslop.&lt;/p&gt;
+    &lt;p&gt;I still haven't convinced anybody here to get on the Nix train, so after a short stint of building the project and the OCI images with a recursive cycle of Make and Nix, I breathed a heavy sigh and dropped it for Docker and Docker Compose, which is what we generally use here.&lt;/p&gt;
+    &lt;p&gt;Which is a shame, because Nix is pretty good at building OCI images. This is all the code you need to create a minimal image that contains only your service and nothing else, not even &lt;code&gt;/bin/sh&lt;/code&gt;.&lt;/p&gt;
+    &lt;code&gt;{ pkgs ? import &amp;lt;nixpkgs&amp;gt; {} }:
+pkgs.dockerTools.streamLayeredImage {
+  name = "someimage";
+  tag = "latest";
+  config.Cmd = [
+    "${pkgs.hello}/bin/hello"
+  ];
+}
+&lt;/code&gt;
+    &lt;p&gt;You can build that with &lt;code&gt;nix-build docker-test.nix&lt;/code&gt; and inside &lt;code&gt;./result&lt;/code&gt; you'll find a script that generates the image's tarball. Load it up with &lt;code&gt;./result | docker load&lt;/code&gt; and Docker will report a new image called &lt;code&gt;someimage:latest&lt;/code&gt; when you run &lt;code&gt;docker image ls&lt;/code&gt;. It's only 45.8MB, and most of that is taken up by glibc.&lt;/p&gt;
+    &lt;p&gt;But what if I told you that you can get more or less the same result with a simple &lt;code&gt;Dockerfile&lt;/code&gt; if you know what you're doing? Especially if you're building a static executable, which Go famously does (at least when you set &lt;code&gt;CGO_ENABLED=0&lt;/code&gt;) and if you're willing to sacrifice a few affordances. Who needs coreutils anyway?&lt;/p&gt;
+    &lt;p&gt;In this post I'll show you a few tricks I found while striving to make small and fast-building images. I'm not an expert in Docker by any stretch so maybe you know all of this stuff already, but perhaps you might learn something new.&lt;/p&gt;
+    &lt;head rend="h2"&gt;A barebones image&lt;/head&gt;
+    &lt;p&gt;I'm using &lt;code&gt;goose&lt;/code&gt; for database migrations. I configured the &lt;code&gt;docker-compose.yml&lt;/code&gt; to run its container just after the database has started and before the actual service runs, and since it's a very small self-contained tool I figured I could try to make the image as small and quick to build as possible. Let me show you the relevant part of the &lt;code&gt;docker-compose.yml&lt;/code&gt; first:&lt;/p&gt;
+    &lt;code&gt;services:
+  migrate:
+    image: migrate:latest
+    pull_policy: build
+    build:
+      context: https://github.com/pressly/goose.git#v3.26.0
+      dockerfile: $PWD/Dockerfile.migrate
+    environment:
+      GOOSE_DBSTRING: postgresql://AzureDiamond:hunter2@db:5432/bobby
+      GOOSE_MIGRATION_DIR: /migrations
+      GOOSE_DRIVER: postgres
+    depends_on:
+      db:
+        condition: service_started
+    volumes:
+      - ./migrations:/migrations
+&lt;/code&gt;
+    &lt;p&gt;The &lt;code&gt;build.context&lt;/code&gt; parameter specifies the "set of files" that are available from the host while building a Docker image. It's the parameter that you pass after &lt;code&gt;docker build&lt;/code&gt;, generally &lt;code&gt;.&lt;/code&gt; (the PWD). Here I specified a GitHub URL with a tag, so when I'm referring to &lt;code&gt;.&lt;/code&gt; in the &lt;code&gt;Dockerfile&lt;/code&gt; above I get the root of the &lt;code&gt;goose&lt;/code&gt; project on that tag's commit. I didn't know Docker could do that!&lt;/p&gt;
+    &lt;p&gt;The &lt;code&gt;build.dockerfile&lt;/code&gt; path includes &lt;code&gt;$PWD&lt;/code&gt; because even if Docker itself can refer to Dockerfiles outside of its context, Docker Compose apparently can't unless you specify it as an absolute path. I think this will break if you try to run &lt;code&gt;docker compose&lt;/code&gt; from another directory, but it's good enough for now.&lt;/p&gt;
+    &lt;p&gt;Now let's take a look at the &lt;code&gt;Dockerfile&lt;/code&gt; itself:&lt;/p&gt;
+    &lt;code&gt;FROM golang:1.25-alpine3.23 AS builder
+
+WORKDIR /build
+
+ARG CGO_ENABLED=0
+
+ARG GOCACHE=/root/.cache/go-build
+ARG GOMODCACHE=/root/.cache/go-mod
+
+RUN --mount=type=cache,target=/root/.cache/go-build \
+  --mount=type=cache,target=/root/.cache/go-mod \
+  --mount=type=bind,source=.,target=/build \
+  go build -tags='no_clickhouse no_libsql no_sqlite3 no_mssql no_vertica no_mysql no_ydb' -o /goose ./cmd/goose
+
+FROM scratch
+
+COPY --from=builder /goose /goose
+
+CMD ["/goose", "up"]
+&lt;/code&gt;
+    &lt;p&gt;A few things to note:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;I used the Alpine image for Go because it's the smallest and it includes everything I need to build the tool.&lt;/item&gt;
+      &lt;item&gt;I set &lt;code&gt;CGO_ENABLED=0&lt;/code&gt;to ensure that the executable only builds with the Go toolchain and does not link to libc. According to the docs, The cgo tool is enabled by default for native builds on systems where it is expected to work so you have to take extra care to disable it if you don't want or need it.&lt;/item&gt;
+      &lt;item&gt;I set &lt;code&gt;GOCACHE&lt;/code&gt;and&lt;code&gt;GOMODCACHE&lt;/code&gt;(docs) to a known location to ensure that I can take advantage of cache mounts on subsequent rebuilds. Admittedly this is not very useful for an external tool that I'm only expecting to build once but hey, every little bit helps.&lt;/item&gt;
+      &lt;item&gt;Instead of &lt;code&gt;ADD&lt;/code&gt;ing or&lt;code&gt;COPY&lt;/code&gt;ing the package's source I bind mounted it to the workdir. This should make it a bit faster because it avoids an extra copy into the build container.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;FROM scratch&lt;/code&gt;defines a second build stage that ensures any artifacts from the actual build are discarded.&lt;code&gt;scratch&lt;/code&gt;is the null image.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The result is an image with one layer containing one file that builds, loads and boots extremely fast and is only *chef's kiss* 15.9MB in size. Not too bad!&lt;/p&gt;
+    &lt;head rend="h2"&gt;The build context&lt;/head&gt;
+    &lt;p&gt;Earlier I mentioned the build context. Keeping it small is important because Docker copies all files available in the build context to the builder every time you run a &lt;code&gt;docker build&lt;/code&gt;, so if you have lots of files in your repo that you don't need to build the image you'll probably want to exclude them. The way you do that is by keeping a &lt;code&gt;.dockerignore&lt;/code&gt; file alongside your &lt;code&gt;Dockerfile&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;I have to stress one point: the build context includes everything inside the directory you run &lt;code&gt;docker build&lt;/code&gt; from unless it's listed in &lt;code&gt;.dockerignore&lt;/code&gt;. I thought some obvious things like &lt;code&gt;.git&lt;/code&gt; would be excluded by default, but a quick test disproved that:&lt;/p&gt;
+    &lt;code&gt;FROM busybox
+WORKDIR /
+COPY . ./
+CMD []
+&lt;/code&gt;
+    &lt;p&gt;Try saving that file as &lt;code&gt;Dockerfile.test&lt;/code&gt; in one of your repos, build it with &lt;code&gt;docker build -f Dockerfile.text -t build-context .&lt;/code&gt;, open a shell with &lt;code&gt;docker run --rm -it build-context /bin/sh&lt;/code&gt; and run &lt;code&gt;find&lt;/code&gt;. Everything's in there: &lt;code&gt;.git&lt;/code&gt;, &lt;code&gt;.jj&lt;/code&gt;, the &lt;code&gt;Dockerfile.test&lt;/code&gt; itself, and all the rest of the build artifacts and assorted junk you have accumulated in your project directory. Ignoring them won't make your images smaller, but it might make the build quicker.&lt;/p&gt;
+    &lt;code&gt;# .dockerignore
+.*
+
+Dockerfile*
+docker-compose.yml
+
+# ...
+&lt;/code&gt;
+    &lt;head rend="h2"&gt;Granular layers&lt;/head&gt;
+    &lt;p&gt;Splitting and ordering layers is probably the most well-known and obvious Docker build time optimization there is, but it doesn't hurt to mention. This is the &lt;code&gt;Dockerfile&lt;/code&gt; for the service I'm building:&lt;/p&gt;
+    &lt;code&gt;FROM golang:1.25-alpine3.23 AS builder
+
+WORKDIR /build
+
+ARG CGO_ENABLED=0
+
+ARG GOCACHE=/root/.cache/go-build
+ARG GOMODCACHE=/root/.cache/go-mod
+
+RUN --mount=type=cache,target=/root/.cache/go-build \
+  --mount=type=cache,target=/root/.cache/go-mod \
+  go install github.com/DataDog/orchestrion@latest
+
+RUN --mount=type=bind,source=go.mod,target=go.mod \
+  --mount=type=bind,source=go.sum,target=go.sum \
+  --mount=type=cache,target=/root/.cache/go-build \
+  --mount=type=cache,target=/root/.cache/go-mod \
+  go mod download
+
+RUN --mount=type=bind,source=go.mod,target=go.mod \
+  --mount=type=bind,source=go.sum,target=go.sum \
+  --mount=type=cache,target=/root/.cache/go-build \
+  --mount=type=cache,target=/root/.cache/go-mod \
+  --mount=type=bind,source=internal,target=internal \
+  --mount=type=bind,source=cmd,target=cmd \
+  --mount=type=bind,source=orchestrion.tool.go,target=orchestrion.tool.go \
+  orchestrion go build -o server ./cmd/server
+
+FROM alpine:3.23 AS prod
+
+WORKDIR /app
+
+COPY --from=builder /build/server .
+
+ENTRYPOINT ["/app/server"]
+&lt;/code&gt;
+    &lt;p&gt;You can see all the bind and cache mount tricks from earlier, not much has changed. I'm installing &lt;code&gt;orchestrion&lt;/code&gt; (a great tool to bloat up your binary size if you ever feel like it) early because that's the least likely to change. After that I bind mount &lt;code&gt;go.mod&lt;/code&gt; and &lt;code&gt;go.sum&lt;/code&gt; and only download the dependencies, because that's the step that generally takes the most time and dependencies change less often than code. Only at the end do I bind mount the package directories and build the server.&lt;/p&gt;
+    &lt;p&gt;You can iterate on this by changing one of the relevant files and ensuring that all the previous steps are marked as &lt;code&gt;CACHED&lt;/code&gt; on the next &lt;code&gt;docker build&lt;/code&gt;. Again, this won't save you space but it'll save you a lot of time while iterating.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Conclusions&lt;/head&gt;
+    &lt;p&gt;Summing up:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Read the Optimize cache usage in builds page in the Docker documentation, and maybe take a look at the rest while you're there.&lt;/item&gt;
+      &lt;item&gt;Split, merge and order layers according to how often you expect them to be rebuilt. Directives like &lt;code&gt;ENV&lt;/code&gt;,&lt;code&gt;ARG&lt;/code&gt;and&lt;code&gt;WORKDIR&lt;/code&gt;should go before everything else.&lt;/item&gt;
+      &lt;item&gt;Use multi-stage builds to shrink the final image size. Consider if you can get away with using &lt;code&gt;scratch&lt;/code&gt;,&lt;code&gt;busybox&lt;/code&gt;or&lt;code&gt;alpine&lt;/code&gt;for the final image.&lt;/item&gt;
+      &lt;item&gt;If your project contains multiple separate applications (for example a backend and a frontend) you can create separate build stages for each of them, and then copy the results into a final image. Stages that don't depend on each other are built in parallel if you're using BuildKit, and you can do all sorts of tricks with multi-stage builds to ensure your CPU runs hot all the time.&lt;/item&gt;
+      &lt;item&gt;Add a &lt;code&gt;.dockerignore&lt;/code&gt;to your project, and make sure to put&lt;code&gt;.git&lt;/code&gt;in there if you don't need it.&lt;/item&gt;
+      &lt;item&gt;Try to set up cache mounts to make sure dependencies and intermediate build artifacts are persisted across builds. Some CI services (GitHub actions, apparently) even let you set up external caches.&lt;/item&gt;
+      &lt;item&gt;Try to use bind mounts instead of &lt;code&gt;COPY&lt;/code&gt;ing source files into the builder. Bind mounts are usually read-only, but you can make them read-write if you really need to.&lt;/item&gt;
+      &lt;item&gt;I didn't use it in my &lt;code&gt;Dockerfile&lt;/code&gt;s, but apparently you should be using&lt;code&gt;ADD&lt;/code&gt;for downloading files, archives or Git repos during your build. The docs mention that&lt;code&gt;COPY&lt;/code&gt;should mostly be used for copying files between stages or for files you need in your final image, and for the rest you should try to use bind mounts.&lt;/item&gt;
+      &lt;item&gt;Use smaller base images when possible and if you really have to install stuff with &lt;code&gt;apt&lt;/code&gt;you should make an intermediate image and upload it to your container repository of choice so your poor runners don't have to hammer Debian's mirrors every single time you push.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;One last trick before the post is over: I just discovered that Docker Compose has a watch mode that tracks changes in the build context and rebuilds (or does other things with) your image on every change. Nice!&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46242700</guid><pubDate>Fri, 12 Dec 2025 10:23:23 +0000</pubDate></item><item><title>Sick of smart TVs? Here are your best options</title><link>https://arstechnica.com/gadgets/2025/12/the-ars-technica-guide-to-dumb-tvs/</link><description>&lt;doc fingerprint="a7ccd93c51a39178"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Smart TVs can feel like a dumb choice if you’re looking for privacy, reliability, and simplicity.&lt;/p&gt;
+    &lt;p&gt;Today’s TVs and streaming sticks are usually loaded up with advertisements and user tracking, making offline TVs seem very attractive. But ever since smart TV operating systems began making money, “dumb” TVs have been hard to find.&lt;/p&gt;
+    &lt;p&gt;In response, we created this non-smart TV guide that includes much more than dumb TVs. Since non-smart TVs are so rare, this guide also breaks down additional ways to watch TV and movies online and locally without dealing with smart TVs’ evolution toward software-centric features and snooping. We’ll discuss a range of options suitable for various budgets, different experience levels, and different rooms in your home.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Our best recommendation&lt;/head&gt;
+    &lt;p&gt;This is a dumb TV guide, but first, let’s briefly highlight the best recommendation for most people: Take your TV offline and plug in an Apple TV box.&lt;/p&gt;
+    &lt;p&gt;An Apple TV lets you replace smart TV software with Apple’s cleaner tvOS, and it’s more intuitive than using most smart TVs and other streaming devices. Apple’s tvOS usually runs faster and more reliably, and it isn’t riddled with distracting ads or recommendations. And there’s virtually no learning curve for family members or visitors, something that can’t always be said for DIY alternatives.&lt;/p&gt;
+    &lt;p&gt;Critically, Apple TV boxes are also an easy recommendation on the privacy front. The setup process makes it simple for anyone to ensure that the device is using relatively minimal user tracking. You’re likely to use an Apple TV box with the Apple TV app or with an Apple account, which means sending some data to Apple. But Apple has a better reputation for keeping user information in-house, and Apple TV boxes don’t have automatic content recognition (ACR).&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46243655</guid><pubDate>Fri, 12 Dec 2025 12:51:40 +0000</pubDate></item><item><title>Fedora: Open-source repository for long-term digital preservation</title><link>https://fedorarepository.org/</link><description>&lt;doc fingerprint="3cd1965b918fe919"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Fedora is the flexible, standards-based, open-source repository software built to support long-term digital preservation.&lt;/head&gt;
     &lt;head rend="h2"&gt;Why Choose Fedora?&lt;/head&gt;
@@ -127,25 +281,142 @@ CREATE INDEX idx_events_user_id ON events(user_id);
     &lt;p&gt;You can find a little more detail and benchmark results on my sbc-reviews issue for the CM0.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46244922</guid><pubDate>Fri, 12 Dec 2025 15:19:19 +0000</pubDate></item><item><title>Framework Raises DDR5 Memory Prices by 50% for DIY Laptops</title><link>https://www.phoronix.com/news/Framework-50p-DDR5-Memory</link><description>&lt;doc fingerprint="32ec5f9b3cb39588"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46244922</guid><pubDate>Fri, 12 Dec 2025 15:19:19 +0000</pubDate></item><item><title>I couldn't find a logging library that worked for my library, so I made one</title><link>https://hackers.pub/@hongminhee/2025/logtape-fedify-case-study</link><description>&lt;doc fingerprint="a0d0d31be9b65ef2"&gt;
   &lt;main&gt;
-    &lt;head rend="h1"&gt;Framework Raises DDR5 Memory Prices By 50% For DIY Laptops&lt;/head&gt;
-    &lt;p&gt; Framework Computer had worked to keep their memory prices lower than other laptop vendors amid the ongoing memory shortages throughput the industry worldwide. But today they've finally had to cave in and increase their DDR5 memory modules for the Framework Laptop DIY Editions by 50%. &lt;lb/&gt;Due to the ongoing price hikes around system memory with shortages throughout the supply chain, Framework raised their DDR5 memory options today by 50% for the Framework Laptop DIY Edition. Framework Computer is keeping the prior prices for existing pre-orders and also is foregoing any price changes for their pre-built laptops or the Framework Desktop. Framework Computer also lets you order DIY laptops without any memory at all if so desired for re-using existing modules or should you score a deal elsewhere.&lt;lb/&gt;Due to their memory pricing said to be more competitive below market rates, they also adjusted their return policy to prevent scalpers from purchasing DIY Edition laptops with memory while then returning just the laptops. The DDR5 must be returned now with DIY laptop order returns.&lt;lb/&gt;More details on Framework Computer needing to begin raising system memory prices can be found via the Framework Blog.&lt;/p&gt;
-    &lt;p&gt;Due to the ongoing price hikes around system memory with shortages throughout the supply chain, Framework raised their DDR5 memory options today by 50% for the Framework Laptop DIY Edition. Framework Computer is keeping the prior prices for existing pre-orders and also is foregoing any price changes for their pre-built laptops or the Framework Desktop. Framework Computer also lets you order DIY laptops without any memory at all if so desired for re-using existing modules or should you score a deal elsewhere.&lt;/p&gt;
-    &lt;p&gt;Due to their memory pricing said to be more competitive below market rates, they also adjusted their return policy to prevent scalpers from purchasing DIY Edition laptops with memory while then returning just the laptops. The DDR5 must be returned now with DIY laptop order returns.&lt;/p&gt;
-    &lt;p&gt;More details on Framework Computer needing to begin raising system memory prices can be found via the Framework Blog.&lt;/p&gt;
+    &lt;head rend="h1"&gt;I couldn't find a logging library that worked for my library, so I made one&lt;/head&gt;
+    &lt;p&gt;洪 民憙 (Hong Minhee) @hongminhee@hackers.pub&lt;/p&gt;
+    &lt;p&gt;When I started building Fedify, an ActivityPub server framework, I ran into a problem that surprised me: I couldn't figure out how to add logging.&lt;/p&gt;
+    &lt;p&gt;Not because logging is hard—there are dozens of mature logging libraries for JavaScript. The problem was that they're primarily designed for applications, not for libraries that want to stay unobtrusive.&lt;/p&gt;
+    &lt;p&gt;I wrote about this a few months ago, and the response was modest—some interest, some skepticism, and quite a bit of debate about whether the post was AI-generated. I'll be honest: English isn't my first language, so I use LLMs to polish my writing. But the ideas and technical content are mine.&lt;/p&gt;
+    &lt;p&gt;Several readers wanted to see a real-world example rather than theory.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The problem: existing loggers assume you're building an app&lt;/head&gt;
+    &lt;p&gt;Fedify helps developers build federated social applications using the ActivityPub protocol. If you've ever worked with federation, you know debugging can be painful. When an activity fails to deliver, you need to answer questions like:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Did the HTTP request actually go out?&lt;/item&gt;
+      &lt;item&gt;Was the signature generated correctly?&lt;/item&gt;
+      &lt;item&gt;Did the remote server reject it? Why?&lt;/item&gt;
+      &lt;item&gt;Was there a problem parsing the response?&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;These questions span multiple subsystems: HTTP handling, cryptographic signatures, JSON-LD processing, queue management, and more. Without good logging, debugging turns into guesswork.&lt;/p&gt;
+    &lt;p&gt;But here's the dilemma I faced as a library author: if I add verbose logging to help with debugging, I risk annoying users who don't want their console cluttered with Fedify's internal chatter. If I stay silent, users struggle to diagnose issues.&lt;/p&gt;
+    &lt;p&gt;I looked at the existing options. With winston or Pino, I would have to either:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Configure a logger inside Fedify (imposing my choices on users), or&lt;/item&gt;
+      &lt;item&gt;Ask users to pass a logger instance to Fedify (adding boilerplate)&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;There's also &lt;code&gt;debug&lt;/code&gt;, which is designed for this use case. But it doesn't give you structured, level-based logs that ops teams expect—and it relies on environment variables, which some runtimes like Deno restrict by default for security reasons.&lt;/p&gt;
+    &lt;p&gt;None of these felt right. So I built LogTape—a logging library designed from the ground up for library authors. And Fedify became its first real user.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The solution: hierarchical categories with zero default output&lt;/head&gt;
+    &lt;p&gt;The key insight was simple: a library should be able to log without producing any output unless the application developer explicitly enables it.&lt;/p&gt;
+    &lt;p&gt;Fedify uses LogTape's hierarchical category system to give users fine-grained control over what they see. Here's how the categories are organized:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="2"&gt;
+        &lt;cell role="head"&gt;Category&lt;/cell&gt;
+        &lt;cell role="head"&gt;What it logs&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;["fedify"]&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Everything from the library&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;["fedify", "federation", "inbox"]&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Incoming activities&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;["fedify", "federation", "outbox"]&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Outgoing activities&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;["fedify", "federation", "http"]&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;HTTP requests and responses&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;["fedify", "sig", "http"]&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;HTTP Signature operations&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;["fedify", "sig", "ld"]&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Linked Data Signature operations&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;["fedify", "sig", "key"]&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Key generation and retrieval&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;["fedify", "runtime", "docloader"]&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;JSON-LD document loading&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;
+          &lt;code&gt;["fedify", "webfinger", "lookup"]&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;WebFinger resource lookups&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;…and about a dozen more. Each category corresponds to a distinct subsystem.&lt;/p&gt;
+    &lt;p&gt;This means a user can configure logging like this:&lt;/p&gt;
+    &lt;code&gt;await configure({
+  sinks: { console: getConsoleSink() },
+  loggers: [
+    // Show errors from all of Fedify
+    { category: "fedify", sinks: ["console"], lowestLevel: "error" },
+    // But show debug info for inbox processing specifically
+    { category: ["fedify", "federation", "inbox"], sinks: ["console"], lowestLevel: "debug" },
+  ],
+});&lt;/code&gt;
+    &lt;p&gt;When something goes wrong with incoming activities, they get detailed logs for that subsystem while keeping everything else quiet. No code changes required—just configuration.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Request tracing with implicit contexts&lt;/head&gt;
+    &lt;p&gt;The hierarchical categories solved the filtering problem, but there was another challenge: correlating logs across async boundaries.&lt;/p&gt;
+    &lt;p&gt;In a federated system, a single user action might trigger a cascade of operations: fetch a remote actor, verify their signature, process the activity, fan out to followers, and so on. When something fails, you need to correlate all the log entries for that specific request.&lt;/p&gt;
+    &lt;p&gt;Fedify uses LogTape's implicit context feature to automatically tag every log entry with a &lt;code&gt;requestId&lt;/code&gt;:&lt;/p&gt;
+    &lt;code&gt;await configure({
+  sinks: {
+    file: getFileSink("fedify.jsonl", { formatter: jsonLinesFormatter })
+  },
+  loggers: [
+    { category: "fedify", sinks: ["file"], lowestLevel: "info" },
+  ],
+  contextLocalStorage: new AsyncLocalStorage(),  // Enables implicit contexts
+});&lt;/code&gt;
+    &lt;p&gt;With this configuration, every log entry automatically includes a &lt;code&gt;requestId&lt;/code&gt; property. When you need to debug a specific request, you can filter your logs:&lt;/p&gt;
+    &lt;code&gt;jq 'select(.properties.requestId == "abc-123")' fedify.jsonl&lt;/code&gt;
+    &lt;p&gt;And you'll see every log entry from that request—across all subsystems, all in order. No manual correlation needed.&lt;/p&gt;
+    &lt;p&gt;The &lt;code&gt;requestId&lt;/code&gt; is derived from standard headers when available (&lt;code&gt;X-Request-Id&lt;/code&gt;, &lt;code&gt;Traceparent&lt;/code&gt;, etc.), so it integrates naturally with existing observability infrastructure.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What users actually see&lt;/head&gt;
+    &lt;p&gt;So what does all this configuration actually mean for someone using Fedify?&lt;/p&gt;
+    &lt;p&gt;If a Fedify user doesn't configure LogTape at all, they see nothing. No warnings about missing configuration, no default output, and minimal performance overhead—the logging calls are essentially no-ops.&lt;/p&gt;
+    &lt;p&gt;For basic visibility, they can enable error-level logging for all of Fedify with three lines of configuration. When debugging a specific issue, they can enable debug-level logging for just the relevant subsystem.&lt;/p&gt;
+    &lt;p&gt;And if they're running in production with serious observability requirements, they can pipe structured JSON logs to their monitoring system with request correlation built in.&lt;/p&gt;
+    &lt;p&gt;The same library code supports all these scenarios—whether the user is running on Node.js, Deno, Bun, or edge functions, without extra polyfills or shims. The user decides what they need.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Lessons learned&lt;/head&gt;
+    &lt;p&gt;Building Fedify with LogTape taught me a few things:&lt;/p&gt;
+    &lt;p&gt;Design your categories early. The hierarchical structure should reflect how users will actually want to filter logs. I organized Fedify's categories around subsystems that users might need to debug independently.&lt;/p&gt;
+    &lt;p&gt;Use structured logging. Properties like &lt;code&gt;requestId&lt;/code&gt;, &lt;code&gt;activityId&lt;/code&gt;, and &lt;code&gt;actorId&lt;/code&gt; are far more useful than string interpolation when you need to analyze logs programmatically.&lt;/p&gt;
+    &lt;p&gt;Implicit contexts turned out to be more useful than I expected. Being able to correlate logs across async boundaries without passing context manually made debugging distributed operations much easier. When a user reports that activity delivery failed, I can give them a single &lt;code&gt;jq&lt;/code&gt; command to extract everything relevant.&lt;/p&gt;
+    &lt;p&gt;Trust your users. Some library authors worry about exposing too much internal detail through logs. I've found the opposite—users appreciate being able to see what's happening when they need to. The key is making it opt-in.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Try it yourself&lt;/head&gt;
+    &lt;p&gt;If you're building a library and struggling with the logging question—how much to log, how to give users control, how to avoid being noisy—I'd encourage you to look at how Fedify does it.&lt;/p&gt;
+    &lt;p&gt;The Fedify logging documentation explains everything in detail. And if you want to understand the philosophy behind LogTape's design, my earlier post covers that.&lt;/p&gt;
+    &lt;p&gt;LogTape isn't trying to replace winston or Pino for application developers who are happy with those tools. It fills a different gap: logging for libraries that want to stay out of the way until users need them. If that's what you're looking for, it might be a better fit than the usual app-centric loggers.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46245331</guid><pubDate>Fri, 12 Dec 2025 15:58:10 +0000</pubDate></item><item><title>Epic celebrates "the end of the Apple Tax" after court win in iOS payments case</title><link>https://arstechnica.com/tech-policy/2025/12/epic-celebrates-the-end-of-the-apple-tax-after-appeals-court-win-in-ios-payments-case/</link><description>&lt;doc fingerprint="8684f31c96ad1135"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Back in April, District Court Judge Yvonne Gonzalez Rogers delivered a scathing judgment finding that Apple was in “willful violation” of her 2021 injunction intended to open up iOS App Store payments. That contempt of court finding has now been almost entirely upheld by the Ninth Circuit Court of Appeals, a development that Epic Games’ Tim Sweeney tells Ars he hopes will “do a lot of good for developers and start to really change the App Store situation worldwide, I think.”&lt;/p&gt;
-    &lt;p&gt;The ruling, signed by a panel of three appellate court judges, affirmed that Apple’s initial attempts to charge a 27 percent fee to iOS developers using outside payment options “had a prohibitive effect, in violation of the injunction.” Similarly, Apple’s restrictions on how those outside links had to be designed were overly broad; the appeals court suggests that Apple can only ensure that internal and external payment options are presented in a similar fashion.&lt;/p&gt;
-    &lt;p&gt;The appeals court also agreed that Apple acted in “bad faith” by refusing to comply with the injunction, rejecting viable, compliant alternatives in internal discussions. And the appeals court was also not convinced by Apple’s process-focused arguments, saying the district court properly evaluated materials Apple argued were protected by attorney-client privilege.&lt;/p&gt;
-    &lt;p&gt;While the district court barred Apple from charging any fees for payments made outside of its App Store, the appeals court now suggests that Apple should still be able to charge a “reasonable fee” based on its “actual costs to ensure user security and privacy.” It will be up to Apple and the district court to determine what that kind of “reasonable fee” should look like going forward.&lt;/p&gt;
-    &lt;p&gt;Speaking to reporters Thursday night, though, Epic founder and CEO Tim Sweeney said he believes those should be “super super minor fees,” on the order of “tens or hundreds of dollars” every time an iOS app update goes through Apple for review. That should be more than enough to compensate the employees reviewing the apps to make sure outside payment links are not scams and lead to a system of “normal fees for normal businesses that sell normal things to normal customers,” Sweeney said.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46245398</guid><pubDate>Fri, 12 Dec 2025 16:04:16 +0000</pubDate></item><item><title>String theory inspires a brilliant, baffling new math proof</title><link>https://www.quantamagazine.org/string-theory-inspires-a-brilliant-baffling-new-math-proof-20251212/</link><description>&lt;doc fingerprint="3e75981c062e07f4"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46245211</guid><pubDate>Fri, 12 Dec 2025 15:46:44 +0000</pubDate></item><item><title>String theory inspires a brilliant, baffling new math proof</title><link>https://www.quantamagazine.org/string-theory-inspires-a-brilliant-baffling-new-math-proof-20251212/</link><description>&lt;doc fingerprint="3e75981c062e07f4"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;String Theory Inspires a Brilliant, Baffling New Math Proof&lt;/head&gt;
     &lt;head rend="h2"&gt;Introduction&lt;/head&gt;
@@ -536,31 +807,7 @@ main(int argc, char **argv)
 }&lt;/code&gt;&lt;lb/&gt;I like this API. It’s very much like read or write in that it either gives you an answer, or tells you to come back later, and then it’s up to you to decide when that is. &lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46245923</guid><pubDate>Fri, 12 Dec 2025 16:52:41 +0000</pubDate></item><item><title>Google releases its new Google Sans Flex font as open source</title><link>https://www.omgubuntu.co.uk/2025/11/google-sans-flex-font-ubuntu</link><description>&lt;doc fingerprint="342af17119b63188"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Google has made its ‘next generation brand typeface’, Google Sans Flex, available for download — under an open source license, which is welcome news.&lt;/p&gt;
-    &lt;p&gt;A modern sans serif font purpose-designed for use on screens and OSes, Google Sans Flex is a ground-up, multi-axis rebuild of the proprietary Google Sans font, by typographer David Berlow (of Font Bureau fame).&lt;/p&gt;
-    &lt;p&gt;The “flex” in GS Flex is because it’s a variable font that is “extremely flexible [with] variable axes for weight, width, optical size, slant, as well as an axis for rounded terminals” (as in terminals in letters, not command-line apps).”&lt;/p&gt;
-    &lt;p&gt;Android and web developers will find the varied variable axes on offer a creative boon for “expressive” design work.&lt;/p&gt;
-    &lt;p&gt;Changing system font is a simple way to give Ubuntu (or any other Linux) desktop a subtle new vibe without having to futz around with themes, icon packs or other eye-candy extras which substantially alter the stock experience:&lt;/p&gt;
-    &lt;p&gt;However, Linux desktop environments don’t yet support doing anything fancy with variable fonts, beyond the basics.&lt;/p&gt;
-    &lt;p&gt;Ergo, unlike on modern Android, you can’t toggle Dark Mode in GNOME or KDE with this font enabled to make it automatically adjust its GRAD axis to compensate for the optical thinning that typically occurs when white text is rendered against darker backgrounds.&lt;/p&gt;
-    &lt;p&gt;It’s not a major drawback, and GS Flex works great as a competent, classy system UI font on Linux, especially on HiDPI displays with fractional scaling. For my tastes, Google Sans Flex has (like GNOME’s default Adwaita Sans font) more presence than the Ubuntu font.&lt;/p&gt;
-    &lt;p&gt;Want to try it out? Google has released the font under the SIL Open Font License (OFL), meaning you can modify, redistribute and use it in your own projects.&lt;/p&gt;
-    &lt;p&gt;To get it:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Go to Google Fonts&lt;/item&gt;
-      &lt;item&gt;Search for ‘Google Sans Flex’&lt;/item&gt;
-      &lt;item&gt;Hit “Get Font” &amp;gt; “Download All”&lt;/item&gt;
-      &lt;item&gt;Extract the ZIP&lt;/item&gt;
-      &lt;item&gt;Find the .ttf file inside and either: &lt;list rend="ul"&gt;&lt;item&gt;Move it to &lt;code&gt;~/.local/share/fonts&lt;/code&gt;; or&lt;/item&gt;&lt;item&gt;Install via your desktop’s font manager GUI&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
-      &lt;item&gt;Move it to &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Once installed it’ll be available to use/select in other apps, settings and so on.&lt;/p&gt;
-    &lt;p&gt;To change UI font on Ubuntu you can install the GNOME Tweaks tool and then open it, go to Appearance and set the UI font to Google Sans Flex. Although you may see variable options listed to pick from, GNOME will always render the ‘regular’ version.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46246802</guid><pubDate>Fri, 12 Dec 2025 18:07:57 +0000</pubDate></item><item><title>Home Depot GitHub token exposed for a year, granted access to internal systems</title><link>https://techcrunch.com/2025/12/12/home-depot-exposed-access-to-internal-systems-for-a-year-says-researcher/</link><description>&lt;doc fingerprint="3446549a0e6331dc"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46245923</guid><pubDate>Fri, 12 Dec 2025 16:52:41 +0000</pubDate></item><item><title>Home Depot GitHub token exposed for a year, granted access to internal systems</title><link>https://techcrunch.com/2025/12/12/home-depot-exposed-access-to-internal-systems-for-a-year-says-researcher/</link><description>&lt;doc fingerprint="3446549a0e6331dc"&gt;
   &lt;main&gt;
     &lt;p&gt;A security researcher said Home Depot exposed access to its internal systems for a year after one of its employees published a private access token online, likely by mistake. The researcher found the exposed token and tried to privately alert Home Depot to its security lapse but was ignored for several weeks.&lt;/p&gt;
     &lt;p&gt;The exposure is now fixed after TechCrunch contacted company representatives last week.&lt;/p&gt;
@@ -576,38 +823,7 @@ main(int argc, char **argv)
     &lt;p&gt;We also asked Lane if Home Depot has the technical means, such as logs, to determine if anyone else used the token during the months it was left online to access any of Home Depot’s internal systems. We did not hear back.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46247000</guid><pubDate>Fri, 12 Dec 2025 18:23:21 +0000</pubDate></item><item><title>The true story of the Windows 3.1 'Hot Dog Stand' color scheme</title><link>https://www.pcgamer.com/software/windows/windows-3-1-included-a-red-and-yellow-hot-dog-stand-color-scheme-so-garish-it-was-long-assumed-to-be-a-joke-so-i-tracked-down-the-original-designer-to-get-the-true-story/</link><description>&lt;doc fingerprint="6b2895f1f0627d7"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Windows 3.1 included a red and yellow 'Hot Dog Stand' color scheme so garish it was long assumed to be a joke, so I tracked down Microsoft's original UI designer to get the true story&lt;/head&gt;
-    &lt;p&gt;Setting the record straight, 33 years later.&lt;/p&gt;
-    &lt;p&gt;Every so often, a wonderful thing happens: someone young enough to have missed out on using computers in the early 1990s is introduced to the Windows 3.1 "Hot Dog Stand" color scheme. Back in the day Windows was pretty plain looking out of the box, with grey windows and blue highlights as the default. A number of optional color palettes gave it a bit more pep, like the wine-tinged Bordeaux or the more sophisticated teal of Designer.&lt;/p&gt;
-    &lt;p&gt;And then there was Hot Dog Stand, which more or less turned Windows into a carnival.&lt;/p&gt;
-    &lt;p&gt;"The truly funny thing about this color scheme is that all the other Windows 3.1 color schemes are surprisingly rational, totally reasonable color schemes," tech blogger Jeff Atwood wrote back in 2005. "And then you get to 'Hot Dog Stand. Which is utterly insane. … I have to think it was included as a joke."&lt;/p&gt;
-    &lt;p&gt;If you read the comments to Atwood's article, you'll see some speculation that it's actually great if you're color blind, and then you'll see that speculation debunked. You'll also find a comment from a year later, in 2006, claiming that the creator of the scheme "presented a great seminar on UI design" at a conference in 1997. "She claimed that Hot Dog was a challenge from the Windows 3.1 team to come up with the worst scheme possible," wrote commenter PJ14.&lt;/p&gt;
-    &lt;p&gt;Did Windows 3.1 really ship with a garish color scheme that was dared into being? That was a story I needed to hear, so I went digging for the credits of the Microsoft employees who worked on the user interface back then and found my way to Virginia Howlett, who joined Microsoft in 1985 as the company's first interface designer, and worked there up through the launch of Windows 95.&lt;/p&gt;
-    &lt;p&gt;Howlett also co-created the font Verdana, which is partially named after her daughter Ana and is up there with Helvetica as one of the most-used fonts of the last 30 years. But enough about her world-changing contributions to modern technology: we're here to talk Hot Dog Stand.&lt;/p&gt;
-    &lt;p&gt;"I confess that I'm surprised anyone cares about Windows 3.1 in late 2025! It was such a long time ago and the world has changed so much," Howlett told me when I reached out over email. She confirmed that she and a "small team of designers" created Windows 3.1's themes, which were a "radically new" feature at the time—prior to its release, you couldn't customize different parts of the OS, like the backgrounds and title bars of windows, with different colors.&lt;/p&gt;
-    &lt;p&gt;Keep up to date with the most important stories and the best deals, as picked by the PC Gamer team.&lt;/p&gt;
-    &lt;p&gt;I asked if the designers at Microsoft really had included Hot Dog Stand as a joke, or if it was inspired by a particular stand they frequented near the corporate campus (hey, it was a longshot, but you never know). I'll let Virginia tell the rest of the story:&lt;/p&gt;
-    &lt;p&gt;As I recall there were 16 colors: white, black, gray, RGB, CMY, and the dark versions of those colors—so dark red, dark green, dark blue, dark cyan, dark magenta, dark yellow, dark gray. (Normal people might call some of these colors teal, navy, burgundy, etc.) Much of the user interface was black lines on a white background and used 2 shades of gray to create 3-D buttons: 'affordances.'&lt;/p&gt;
-    &lt;p&gt;We designed a long list of themes using those 16 colors. No one today seems interested in 'Bordeaux' or 'Tweed' or 'Arizona.' We were covering all the bases, hoping to come up with color schemes that would appeal to a broad range of people. 'Hot Dog Stand' used bright yellow and red.&lt;/p&gt;
-    &lt;p&gt;I have been mystified about why that particular theme causes so much comment in the media. Maybe it's partly the catchy name. (Never underestimate the power of a good brand name!)&lt;/p&gt;
-    &lt;p&gt;I do remember some discussion about whether we should include it, and some snarky laughter. But it was not intended as a joke. It was not inspired by any hot dog stands, and it was not included as an example of a bad interface—although it was one. It was just a garish choice, in case somebody out there liked ugly bright red and yellow.&lt;/p&gt;
-    &lt;p&gt;The 'Fluorescent' theme was also pretty ugly, but it didn't have a catchy name, so I've never heard anything about it.&lt;/p&gt;
-    &lt;p&gt;I'm really glad that 'Hot Dog Stand' has entertained so many people for so many years.&lt;/p&gt;
-    &lt;p&gt;With regards to design historians everywhere,&lt;/p&gt;
-    &lt;p&gt;Virginia Howlett&lt;/p&gt;
-    &lt;p&gt;As delightfully garish as Hot Dog Stand is, Howlett is right that it's far from the only eye searing theme in the Windows 3.1 collection. Check out Fluorescent and Plasma Power Saver:&lt;/p&gt;
-    &lt;p&gt;You can play around with Windows 3.1 in your browser thanks to the emulator PCjs Machines; if you get really into it, you can even customize every color yourself instead of relying on one of the preset themes.&lt;/p&gt;
-    &lt;p&gt;So that's that: Hot Dog Stand may have inadvertently served as a warning to aspiring theme customizers that madness was just a few overzealous color choices away, but that wasn't its original intent. It wasn't included on the floppy disks as a dare, or a joke—it just happened to end up one of the funniest and most memorable relics of Windows history.&lt;/p&gt;
-    &lt;p&gt;Virginia Howlett recently guested on an episode of the design podcast Complementary, so give it a listen if you'd like to hear her talk about interface design and her time at Microsoft.&lt;/p&gt;
-    &lt;p&gt;Wes has been covering games and hardware for more than 10 years, first at tech sites like The Wirecutter and Tested before joining the PC Gamer team in 2014. Wes plays a little bit of everything, but he'll always jump at the chance to cover emulation and Japanese games.&lt;/p&gt;
-    &lt;p&gt;When he's not obsessively optimizing and re-optimizing a tangle of conveyor belts in Satisfactory (it's really becoming a problem), he's probably playing a 20-year-old Final Fantasy or some opaque ASCII roguelike. With a focus on writing and editing features, he seeks out personal stories and in-depth histories from the corners of PC gaming and its niche communities. 50% pizza by volume (deep dish, to be specific).&lt;/p&gt;
-    &lt;p&gt;You must confirm your public display name before commenting&lt;/p&gt;
-    &lt;p&gt;Please logout and then login again, you will then be prompted to enter your display name.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46247605</guid><pubDate>Fri, 12 Dec 2025 19:13:35 +0000</pubDate></item><item><title>Rats Play DOOM</title><link>https://ratsplaydoom.com/</link><description>&lt;doc fingerprint="f15d927525a98820"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46247000</guid><pubDate>Fri, 12 Dec 2025 18:23:21 +0000</pubDate></item><item><title>Rats Play DOOM</title><link>https://ratsplaydoom.com/</link><description>&lt;doc fingerprint="f15d927525a98820"&gt;
   &lt;main&gt;
     &lt;p&gt;We built a complete VR setup from scratch to let rats play DOOM. The system includes a motion-tracked treadmill ball, a panoramic headset, an input trigger, and a reward circuit. All hardware and software components are open sourced, including 3D-printable designs, circuit diagrams, firmware, and control software.&lt;/p&gt;
     &lt;p&gt;The first version (v1) was built in New York by Viktor, who trained rats to walk through a corridor in DOOM using a simpler rig. That version was featured on Vice and PC Gamer. After moving back home, the project was paused. Public interest reignited development, leading to v2, a more advanced and modular version built in collaboration with electrical engineer Sándor Makra. Akos Blaschek later assisted significantly in documenting the project for open-sourcing, aiming to enable others to replicate and build upon this work. Key metallic components were designed and sourced in collaboration with SZURWIN KFT.&lt;/p&gt;
@@ -669,21 +885,7 @@ main(int argc, char **argv)
     &lt;p&gt;At YoloRun.Capital, we invest in ambitious, boundary-pushing projects like this, even the beautifully impractical ones. Have a wild idea? Let's talk.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46248323</guid><pubDate>Fri, 12 Dec 2025 20:15:58 +0000</pubDate></item><item><title>New Kindle feature uses AI to answer questions about books</title><link>https://reactormag.com/new-kindle-feature-ai-answer-questions-books-authors/</link><description>&lt;doc fingerprint="19439b962db60bc4"&gt;
-  &lt;main&gt;
-    &lt;p&gt;At present, there are multiple cases in which authors are suing AI companies for scraping their works without payment or permission. While these legal battles have been going on, Amazon has quietly added a new AI feature to its Kindle iOS app—a feature that “lets you ask questions about the book you’re reading and receive spoiler-free answers,” according to an Amazon announcement.&lt;/p&gt;
-    &lt;p&gt;The company says the feature, which is called Ask this Book, serves as “your expert reading assistant, instantly answering questions about plot details, character relationships, and thematic elements without disrupting your reading flow.”&lt;/p&gt;
-    &lt;p&gt;Publishing industry resource Publishers Lunch noticed Ask this Book earlier this week, and asked Amazon about it. Amazon spokesperson Ale Iraheta told PubLunch, “The feature uses technology, including AI, to provide instant, spoiler-free answers to customers’ questions about what they’re reading. Ask this Book provides short answers based on factual information about the book which are accessible only to readers who have purchased or borrowed the book and are non-shareable and non-copyable.”&lt;/p&gt;
-    &lt;p&gt;As PubLunch summed up: “In other words, speaking plainly, it’s an in-book chatbot.”&lt;/p&gt;
-    &lt;p&gt;Amazon did not answer PubLunch’s questions about “what rights the company was relying upon to execute the new feature was not answered, nor did they elaborate on the technical details of the service and any protections involved (whether to prevent against hallucinations, or to protect the text from AI training).”&lt;/p&gt;
-    &lt;p&gt;Perhaps most alarmingly, the Amazon spokesperson said, “To ensure a consistent reading experience, the feature is always on, and there is no option for authors or publishers to opt titles out.”&lt;/p&gt;
-    &lt;p&gt;It also sounds as though authors and publishers were, for the most part, not notified of this feature’s existence.&lt;/p&gt;
-    &lt;p&gt;Amazon is already in the news this week for its flawed AI recaps of television shows. After a Fallout recap was “garbage filled with mistakes,” as io9 called it, the company paused the feature. A similar thing happened earlier this year with Amazon’s AI dubs for anime series.&lt;/p&gt;
-    &lt;p&gt;As PubLunch says of Ask this Book, “Many rightsholders and creators are likely not to want an in-book chatbot without their specific review and approval (or at all), and we expect that message will be getting delivered to publishers and Amazon loud and clear in the ensuing days. And many people would deem the outputs of generative AI analyzing a particular copyrighted work as the very embodiment of a derivative work (or simply a direct infringement).”&lt;/p&gt;
-    &lt;p&gt;Ask this Book is currently only available in the Kindle iOS app in the US, but Amazon says it “will come to Kindle devices and Android OS next year.”&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46248417</guid><pubDate>Fri, 12 Dec 2025 20:24:04 +0000</pubDate></item><item><title>Security issues with electronic invoices</title><link>https://invoice.secvuln.info/</link><description>&lt;doc fingerprint="94f099d3c2f05d8d"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46248323</guid><pubDate>Fri, 12 Dec 2025 20:15:58 +0000</pubDate></item><item><title>Security issues with electronic invoices</title><link>https://invoice.secvuln.info/</link><description>&lt;doc fingerprint="94f099d3c2f05d8d"&gt;
   &lt;main&gt;
     &lt;p&gt;This page provides supplementary material for a presentation given at the German OWASP Day 2025 (Presentation Slides).&lt;/p&gt;
     &lt;head rend="h2"&gt;Intro&lt;/head&gt;
@@ -1669,7 +1871,87 @@ main(int argc, char **argv)
     &lt;p&gt;You need to enable JavaScript to run this app.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46248892</guid><pubDate>Fri, 12 Dec 2025 21:00:54 +0000</pubDate></item><item><title>Show HN: Tiny VM sandbox in C with apps in Rust, C and Zig</title><link>https://github.com/ringtailsoftware/uvm32</link><description>&lt;doc fingerprint="e4d8f8990355ff80"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46248892</guid><pubDate>Fri, 12 Dec 2025 21:00:54 +0000</pubDate></item><item><title>Capsudo: Rethinking Sudo with Object Capabilities</title><link>https://ariadne.space/2025/12/12/rethinking-sudo-with-object-capabilities.html</link><description>&lt;doc fingerprint="372878dd7da40869"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Rethinking sudo with object capabilities&lt;/head&gt;
+    &lt;p&gt;I hate &lt;code&gt;sudo&lt;/code&gt; with a passion.  It represents everything I find offensive about the modern Unix security model:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;like &lt;code&gt;su&lt;/code&gt;, it must be a SUID binary to work&lt;/item&gt;
+      &lt;item&gt;it is monolithic: everything &lt;code&gt;sudo&lt;/code&gt;does runs as&lt;code&gt;root&lt;/code&gt;, there is no privilege separation&lt;/item&gt;
+      &lt;item&gt;it uses a non-declarative and non-hierarchical configuration format leading to forests of complex access-control policies and user errors due to lack of concision&lt;/item&gt;
+      &lt;item&gt;it supports plugins to extend the policy engine which run directly in the privileged SUID process&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;I could go on, but hopefully you get the point. Alpine moved to &lt;code&gt;doas&lt;/code&gt; as the default privilege escalation tool several years ago, in Alpine 3.15, because of the large attack surface that &lt;code&gt;sudo&lt;/code&gt; brings due to its design.&lt;/p&gt;
+    &lt;p&gt;Systems built around identity-based access control tend to rely on ambient authority: policy is centralized and errors in the policy configuration or bugs in the policy engine can allow attackers to make full use of that ambient authority. In the case of a SUID binary like &lt;code&gt;doas&lt;/code&gt; or &lt;code&gt;sudo&lt;/code&gt;, that means an attacker can obtain root access in the event of a bug or misconfiguration.&lt;/p&gt;
+    &lt;p&gt;What if there was a better way? Instead of thinking about privilege escalation as becoming root for a moment, what if it meant being handed a narrowly scoped capability, one with just enough authority to perform a specific action and nothing more? Enter the object-capability model.&lt;/p&gt;
+    &lt;p&gt;In an object-capability system, there is no global decision point that asks who you are and what you might be allowed to do. Authority is explicit and local: a program can only perform an action if it has been given the capability to do so. This makes privilege boundaries visible, composable, and far easier to reason about, shifting privilege escalation from a question of identity to a question of possession.&lt;/p&gt;
+    &lt;p&gt;Inspired by the object-capability model, I’ve been working on a project named capsudo. Instead of treating privilege escalation as a temporary change of identity, capsudo reframes it as a mediated interaction with a service called &lt;code&gt;capsudod&lt;/code&gt; that holds specific authority, which may range from full root privileges to a narrowly scoped set of capabilities depending on how it is deployed.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Delegating root privilege with object capabilities&lt;/head&gt;
+    &lt;p&gt;What does that look like in practice? First, let’s consider a system service which needs to perform a few privileged operations, such as mounting and unmounting filesystems, and how capsudo can be used to provide capabilities to that service. With capsudo, we have a few different options. We could, for example, grant generic &lt;code&gt;mount&lt;/code&gt; and &lt;code&gt;umount&lt;/code&gt; capabilities, or alternatively we could grant constrained &lt;code&gt;mount&lt;/code&gt; and &lt;code&gt;umount&lt;/code&gt; capabilities to specific device nodes instead.&lt;/p&gt;
+    &lt;p&gt;First, let’s take a look at what generic &lt;code&gt;mount&lt;/code&gt; and &lt;code&gt;umount&lt;/code&gt; capabilities would look like, as it is a good example for showing how constrained capabilities work.  To begin with, consider a volume management service running under the &lt;code&gt;mountd&lt;/code&gt; user.  We will grant capabilities to that &lt;code&gt;mountd&lt;/code&gt; user to then invoke using &lt;code&gt;capsudo&lt;/code&gt; by running a few instances of the &lt;code&gt;capsudod&lt;/code&gt; daemon.&lt;/p&gt;
+    &lt;code&gt;root# capsudod -o mountd:mountd -s /run/user/mountd/cap/mount -- mount &amp;amp;
+root# capsudod -o mountd:mountd -s /run/user/mountd/cap/umount -- umount &amp;amp;
+&lt;/code&gt;
+    &lt;p&gt;You might notice that the capabilities above have had commands bound to them. This is an important feature of capsudo which I will elaborate on in a moment.&lt;/p&gt;
+    &lt;p&gt;Let’s say that the user has plugged in a USB stick and wants it to be mounted to &lt;code&gt;/media/usb&lt;/code&gt;.  To do this with capsudo, the volume manager simply makes use of the &lt;code&gt;/run/user/mountd/cap/mount&lt;/code&gt; capability which has been delegated to it:&lt;/p&gt;
+    &lt;code&gt;mountd$ capsudo -s /run/user/mountd/cap/mount -- /dev/sdb1 /media/usb
+&lt;/code&gt;
+    &lt;p&gt;What is going on here? When &lt;code&gt;capsudod&lt;/code&gt; was started, it bound the capability it provides to the &lt;code&gt;mount&lt;/code&gt; command by setting the executable it will run.  This means that the &lt;code&gt;/run/user/mountd/cap/mount&lt;/code&gt; capability cannot run any other command besides &lt;code&gt;mount&lt;/code&gt;.  This is technically a suboptimal delegation, however.  So let’s fix that delegation by stopping the &lt;code&gt;capsudod&lt;/code&gt; process and fixing it:&lt;/p&gt;
+    &lt;code&gt;root# capsudod -s /run/user/mountd/cap/mount -- /usr/sbin/mount
+&lt;/code&gt;
+    &lt;p&gt;Now when the capability is invoked, &lt;code&gt;capsudo&lt;/code&gt; will run &lt;code&gt;/usr/sbin/mount&lt;/code&gt; directly rather than checking the &lt;code&gt;PATH&lt;/code&gt; environment variable it was spawned with.&lt;/p&gt;
+    &lt;p&gt;We can build on this by creating a specific capability for mounting the device node, and another for unmounting the specific mount point:&lt;/p&gt;
+    &lt;code&gt;root# capsudod -s /run/user/mountd/cap/mount-dev-sdb1 -- /usr/sbin/mount /dev/sdb1
+root# capsudod -s /run/user/mountd/cap/umount-media-usb -- /usr/sbin/umount /media/usb
+&lt;/code&gt;
+    &lt;p&gt;These would then be invoked as one would expect:&lt;/p&gt;
+    &lt;code&gt;mountd$ capsudo -s /run/user/mountd/cap/mount-dev-sdb1 -- /media/usb
+mountd$ capsudo -s /run/user/mountd/cap/umount-media-usb
+&lt;/code&gt;
+    &lt;p&gt;So in essence a capability is represented as a Unix socket, an optional argv list and optionally a set of mandatory environmental variables, creating a very composable interface for delegating authority.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Non-root delegations, or service accounts meet service capabilities&lt;/head&gt;
+    &lt;p&gt;Now let’s talk about a scenario where traditionally root privilege is not required: service accounts.&lt;/p&gt;
+    &lt;p&gt;Suppose we have a web application deployment system where developers are allowed to update files in a specific directory and restart a service, but otherwise shouldn’t have administrative access to the system. Traditionally, this might still be implemented using &lt;code&gt;sudo&lt;/code&gt;, despite the fact that no global privileges are actually needed.&lt;/p&gt;
+    &lt;p&gt;With capsudo, we can instead run the &lt;code&gt;capsudod&lt;/code&gt; daemon under a dedicated service account which only owns the resources it is meant to manage.&lt;/p&gt;
+    &lt;p&gt;Assume a deployment service running under the &lt;code&gt;www-deployment&lt;/code&gt; user, which owns &lt;code&gt;/srv/www/app&lt;/code&gt; and is allowed to reload the uWSGI service via a capability delegated to the &lt;code&gt;www-deployment&lt;/code&gt; user.  We can start &lt;code&gt;capsudod&lt;/code&gt; instances under that user directly:&lt;/p&gt;
+    &lt;code&gt;root# capsudod -o www-deployment:www-deployment \
+   -s /run/user/www-deployment/cap/service-uwsgi \
+   -- /usr/sbin/rc-service uwsgi &amp;amp;
+www-deployment$ capsudod -o www-deployment:www-developers \
+   -s /run/user/www-deployment/cap/update-site -- /usr/bin/rsync -a &amp;amp;
+www-deployment$ capsudod -o www-deployment:www-developers \
+   -s /run/user/www-deployment/cap/reload-site -- \
+   /usr/bin/capsudo -s /run/user/www-deployment/cap/service-uwsgi \
+      -- reload &amp;amp;
+&lt;/code&gt;
+    &lt;p&gt;A developer in the &lt;code&gt;www-developers&lt;/code&gt; group might then invoke these capabilities:&lt;/p&gt;
+    &lt;code&gt;dev$ capsudo -s /run/user/www-deployment/cap/update-site \
+  -- ./build/ /srv/www/app/
+dev$ capsudo -s /run/user/www-deployment/cap/reload-site
+&lt;/code&gt;
+    &lt;head rend="h3"&gt;Unpacking the delegations&lt;/head&gt;
+    &lt;p&gt;There is a lot going on here, so let’s walk through it step by step.&lt;/p&gt;
+    &lt;p&gt;First, the system administrator delegates a small amount of authority to the &lt;code&gt;www-deployment&lt;/code&gt; service account.  This is done by running a &lt;code&gt;capsudod&lt;/code&gt; instance that is able to manage the uWSGI service:&lt;/p&gt;
+    &lt;code&gt;root# capsudod -o www-deployment:www-deployment \
+  -s /run/user/www-deployment/cap/service-uwsgi \
+  -- /usr/sbin/rc-service uwsgi &amp;amp;
+&lt;/code&gt;
+    &lt;p&gt;This capability is owned by the &lt;code&gt;www-deployment&lt;/code&gt; user and allows exactly one operation: invoking the system’s service manager to act on the &lt;code&gt;uwsgi&lt;/code&gt; service.  No other services can be touched, and no other commands can be executed through this capability.&lt;/p&gt;
+    &lt;p&gt;Second, the &lt;code&gt;www-deployment&lt;/code&gt; account uses that authority to construct more narrowly scoped capabilities for others. Two additional &lt;code&gt;capsudod&lt;/code&gt; instances are started under the &lt;code&gt;www-deployment&lt;/code&gt; account, but with ownership granted to the &lt;code&gt;www-developers&lt;/code&gt; group:&lt;/p&gt;
+    &lt;code&gt;www-deployment$ capsudod -o www-deployment:www-developers \
+   -s /run/user/www-deployment/cap/update-site -- /usr/bin/rsync -a &amp;amp;
+
+www-deployment$ capsudod -o www-deployment:www-developers \
+   -s /run/user/www-deployment/cap/reload-site -- \
+   /usr/bin/capsudo -s /run/user/www-deployment/cap/service-uwsgi -- reload &amp;amp;
+&lt;/code&gt;
+    &lt;p&gt;The first of these allows developers to update the application files using &lt;code&gt;rsync&lt;/code&gt;, but only through the &lt;code&gt;www-deployment&lt;/code&gt; account’s existing filesystem permissions.  The second is more interesting: it does not directly reload the service.  Instead, it delegates a constrained use of the previously granted uWSGI capability.&lt;/p&gt;
+    &lt;p&gt;When a developer invokes &lt;code&gt;reload-site&lt;/code&gt;, they are not calling &lt;code&gt;rc-service&lt;/code&gt; themselves, and they are not interacting with the system service manager directly. They are invoking a capability that is itself built on top of another capability, with additional constraints applied.&lt;/p&gt;
+    &lt;p&gt;The important property here is that authority only ever moves downward in scope. It is possible to further delegate a subset of the authority granted by a capability, but not more. This kind of authority layering is a natural fit for the object-capability model, but it is awkward and fragile to express with identity-based access control.&lt;/p&gt;
+    &lt;p&gt;Identity-based access control asks who should be allowed to act. Object-capability systems ask where authority should live and how it should flow. &lt;code&gt;capsudo&lt;/code&gt; today is an exploration of what happens when you take the second question seriously, treating privilege escalation as explicit delegation and opening the door to further refinements like passing concrete resources, such as pre-opened file descriptors, instead of whole identities.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46249337</guid><pubDate>Fri, 12 Dec 2025 21:42:04 +0000</pubDate></item><item><title>Show HN: Tiny VM sandbox in C with apps in Rust, C and Zig</title><link>https://github.com/ringtailsoftware/uvm32</link><description>&lt;doc fingerprint="e4d8f8990355ff80"&gt;
   &lt;main&gt;
     &lt;p&gt;uvm32 is a minimalist, dependency-free virtual machine sandbox designed for microcontrollers and other resource-constrained devices. Single C file, no dynamic memory allocations, asynchronous design, pure C99.&lt;/p&gt;
     &lt;p&gt;On an STM32L0 (ARM Cortex-M0+) the required footprint is under 4KB flash/1KB RAM.&lt;/p&gt;
@@ -1786,7 +2068,7 @@ make dockershell
     &lt;p&gt;This project is licensed under the MIT License. Feel free to use in research, products and embedded devices.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46249538</guid><pubDate>Fri, 12 Dec 2025 22:02:14 +0000</pubDate></item><item><title>Wine 11.0 RC2 – Run Windows Applications on Linux, BSD, Solaris and macOS</title><link>https://gitlab.winehq.org/wine/wine/-/releases/wine-11.0-rc2</link><guid isPermaLink="false">https://news.ycombinator.com/item?id=46249566</guid><pubDate>Fri, 12 Dec 2025 22:05:04 +0000</pubDate></item><item><title>Can I use HTTPS RRs?</title><link>https://www.netmeister.org/blog/https-caniuse.html</link><description>&lt;doc fingerprint="228dd9d4ef2490cd"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46249538</guid><pubDate>Fri, 12 Dec 2025 22:02:14 +0000</pubDate></item><item><title>Can I use HTTPS RRs?</title><link>https://www.netmeister.org/blog/https-caniuse.html</link><description>&lt;doc fingerprint="228dd9d4ef2490cd"&gt;
   &lt;main&gt;
     &lt;table&gt;
       &lt;row&gt;
@@ -1830,4 +2112,99 @@ make dockershell
     &lt;/table&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46249834</guid><pubDate>Fri, 12 Dec 2025 22:34:13 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46249834</guid><pubDate>Fri, 12 Dec 2025 22:34:13 +0000</pubDate></item><item><title>50 years of proof assistants</title><link>https://lawrencecpaulson.github.io//2025/12/05/History_of_Proof_Assistants.html</link><description>&lt;doc fingerprint="8f5c535502b923f7"&gt;
+  &lt;main&gt;&lt;head rend="h2"&gt;50 years of proof assistants&lt;/head&gt;[&lt;code&gt;&lt;nobr&gt;memories&lt;/nobr&gt;&lt;/code&gt; 
+  
+    
+    &lt;code&gt;&lt;nobr&gt;LCF&lt;/nobr&gt;&lt;/code&gt; 
+  
+    
+    &lt;code&gt;&lt;nobr&gt;HOL system&lt;/nobr&gt;&lt;/code&gt; 
+  
+    
+    &lt;code&gt;&lt;nobr&gt;Isabelle&lt;/nobr&gt;&lt;/code&gt; 
+  
+    
+    &lt;code&gt;&lt;nobr&gt;Coq&lt;/nobr&gt;&lt;/code&gt; 
+  
+    
+    &lt;code&gt;&lt;nobr&gt;MJC Gordon&lt;/nobr&gt;&lt;/code&gt; 
+  
+]
+
+&lt;p&gt;Crackpots ranging from billionaire Peter Thiel to random YouTube influencers claim that science has been stagnating for the past 50 years. They admit that computing is an exception: they don’t pretend that my personal 32GB laptop is not an advance over the 16MB mainframe that served the whole Caltech community when I was there. Instead they claim that advances in computing were driven solely by industrial research, quite overlooking the role of academia and government funding in pushing the VLSI revolution, RISC processor design, networking, hypertext, virtual memory and indeed computers themselves. As for the industrial research, most of it came from just two “blue sky” institutes – Bell Labs and Xerox PARC – that closed a long time ago. LCF-style proof assistants are a world away from mainstream computing, so let’s look at 50 years of progress there.&lt;/p&gt;&lt;head rend="h3"&gt;1975–1985: Edinburgh LCF&lt;/head&gt;&lt;p&gt;The first instance of LCF was Stanford LCF, developed by Robin Milner in 1972, but it was not an LCF-style proof assistant! LCF meant “Logic for Computable Functions”, a quirky formalism based on Scott domains and intended for reasoning about small functional programs. But “LCF-style proof assistant” means one that, like Edinburgh LCF, was coded in some form of the ML programming language and provided a proof kernel, encapsulated in an abstract type definition, to ensure that a theorem could only be generated by applying inference rules to axioms or other theorems:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;… the ML type discipline is used… so that—whatever complex procedures are defined—all values of type&lt;/p&gt;&lt;code&gt;thm&lt;/code&gt;must be theorems, as only inferences can compute such values…. This security releases us from the need to preserve whole proofs… — an important practical gain since large proofs tended to clog up the working space… [Edinburgh LCF, page IV]&lt;/quote&gt;&lt;p&gt;Edinburgh LCF was first announced in 1975, which conveniently is exactly 50 years ago, at the almost mythical conference on Proving and Improving Programs held at Arc-et-Senans. The user manual, published in the Springer lecture notes series, came out in 1979. Edinburgh LCF introduced some other principles that people still adhere to today:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;inference rules in the natural deduction style, with a dynamic set of assumptions&lt;/item&gt;&lt;item&gt;a goal-directed proof style, where you start with the theorem statement and work backwards&lt;/item&gt;&lt;item&gt;a structured system of theories to organise groups of definitions&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Edinburgh LCF had its own version of the ML language. It supported a fragment of first-order logic containing the logical symbols $\forall$, $\land$ and $\to$ along with the relation symbols $\equiv$ and $\sqsubseteq$. It introduced proof tactics and also tacticals: operators for combining tactics. Tactics supported goal-directed proof, but Edinburgh LCF had no notion of the current goal or anything to help the user manage the tree of subgoals. Its user interface was simply the ML top level and the various theorem-proving primitives were simply ML functions. ML stood for metalanguage, since managing the process of proof was its exact job.&lt;/p&gt;&lt;p&gt;Avra Cohn and Robin Milner wrote a report on proving the correctness of a parsing algorithm using Edinburgh LCF. The proof consists of one single induction followed by a little simplification and other reasoning. The report includes a succinct description of Edinburgh LCF and is a nice snapshot of the state of the art in 1982 when Cambridge in 1982 to join a project run by Robin Milner and Mike Gordon. Full of youthful enthusiasm, I told Mike that it would be great if one day we could formalise the Prime Number Theorem. I hardly knew what the theorem was about or how to prove it, but my college roommate had told me it was really deep.&lt;/p&gt;&lt;p&gt;Disappointed to discover that we only had $\forall$, $\land$ and $\to$, I set out to fix that, to support full first-order logic. I ended up changing so much (backwards compatibility is overrated) that people eventually shamed me into writing my own user manual. Cambridge LCF never caught on because, well, nobody liked the LCF formalism. But I used it for a development that seemed big at the time: to verify the unification algorithm. This development was later ported to Isabelle. It contains 36 inductions, so we were making progress. And this takes us to 1985, exactly 40 years ago; see also this survey of the state of play. But there was almost no mathematics: no negative numbers and no decimal notation, so you could not even write 2+2=4. As far as the broader computer science community was concerned, we were a joke.&lt;/p&gt;&lt;head rend="h3"&gt;1985–1995: Cambridge LCF and HOL&lt;/head&gt;&lt;p&gt;Cambridge LCF was in itself a dead end, but because it included a much faster ML compiler, it ended up being incorporated into a lot of other proof assistants, notably Mike’s HOL88. And just like that, hardware verification became a reality. Although software verification seemed stuck in the doldrums, a couple of production-ready chip designs were verified! Mike’s explanation was that hardware verification was simply easier.&lt;/p&gt;&lt;p&gt;Also in 1985, we got a new standard for the ML language and, soon, two compilers for it. So then I started working on experiments that would lead to Isabelle. It would be like LCF but would support constructive type theory, crucially allowing both unification and backtracking, like in Prolog. But there was no working system yet, just a grant application. And that was the state of play 40 years ago.&lt;/p&gt;&lt;p&gt;Funding secured, Isabelle development started in earnest in 1986. It was coded in Standard ML from the start, while HOL88 was ported from the Cambridge LCF version of ML to Standard ML, emerging as HOL90. Mike acquired a bevy of energetic PhD students, who engaged in verification projects or built extensions for HOL. Versions of HOL were being used in institutes around the world.&lt;/p&gt;&lt;p&gt;Stepping aside from HOL for a moment, other proof assistants had made great progress by the mid 1990s. The addition of inductive definitions to the calculus of constructions gave us the calculus of inductive constructions, which in essence is the formalism used today by Rocq and Lean. The very first release of Isabelle/HOL happened in 1991, primarily the work of Tobias Nipkow, though I was soon to join in. Isabelle/ZF, which was my pet project, formalised axiomatic set theory to some quite deep results.&lt;/p&gt;&lt;p&gt;But I am still not certain whether negative numbers were supported (can somebody help me?). Our weak support for arithmetic may seem odd when our research community was aware that the real numbers had been formalised in AUTOMATH, but we didn’t seem to want them. To many, we were still a joke. This was about to change.&lt;/p&gt;&lt;head rend="h3"&gt;1995–2005: Proof assistants come of age&lt;/head&gt;&lt;p&gt;In 1994, came the Pentium with its FDIV bug: a probably insignificant but detectable error in floating-point division. The subsequent product recall cost Intel nearly half a billion dollars. John Harrison, a student of Mike’s, decided to devote his PhD research to the verification of floating-point arithmetic. By June 1996 he had submitted an extraordinary thesis, Theorem Proving with the Real Numbers, which described a formidable series of achievements:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;a formalisation of the real member system in HOL&lt;/item&gt;&lt;item&gt;formalised analysis including metric spaces, sequences and series, limits, continuity and differentiation, power series and transcendental functions, integration&lt;/item&gt;&lt;item&gt;proper numerals represented internally by symbolic binary, and calculations on them&lt;/item&gt;&lt;item&gt;computer algebra techniques including a decision procedure for real algebra&lt;/item&gt;&lt;item&gt;tools and techniques for floating-point verification by reference to the IEEE standard&lt;/item&gt;&lt;/list&gt;&lt;p&gt;This thesis, which I had the privilege to examine, won a Distinguished Dissertation Award and was published as a book by Springer. So by the middle of the 1990s, which was 30 years ago, we had gone from almost no arithmetic to a decent chunk of formalised real analysis that was good enough to verify actual floating-point algorithms.&lt;/p&gt;&lt;p&gt;This period also saw something of an arms race in automation. My earlier, Prolog-inspired vision of backtracking search had led to some fairly general automation that was effective not just in standard predicate logic but with any theorems were expressed in a form suitable for forward or backward chaining. I had also done experiments with classical automatic techniques such as model elimination, which, although pathetic compared with automatic provers of that era, was good enough to troll users on the &lt;code&gt;hol-info&lt;/code&gt; mailing list.
+Soon I had provoked John Harrison to build a superior version of ME for HOL Light.
+Later, Joe Hurd built his &lt;code&gt;metis&lt;/code&gt; superposition prover, which found its way into HOL4.
+Not to be outdone, Tobias made Isabelle’s simplifier the best in its class incorporating a number of sophisticated refinements, including some great ideas from Nqthm.&lt;/p&gt;&lt;p&gt;Twenty years from the start of this chronology we now had several reasonably mature and powerful systems, including Isabelle/ZF, Isabelle/HOL, multiple versions of the HOL system, and Coq (now Rocq).1 Many of them used Proof General, a common user interface for tactic-based proof assistants based on the Emacs editor. And we had 100MHz machines, some with 64MB of memory! We were ready to do big things.&lt;/p&gt;&lt;p&gt;During this period, I did a lot of work on the verification of cryptographic protocols, also here. These secure Internet connections and other network communications; they are valuable when you need to know who is on the other end and need to keep messaging secure from eavesdropping and tampering. Among the protocols investigated were the ubiquitous TLS and the late, unlamented SET protocol. These proofs were not at the level of code or bits; buggy implementations could and did emerge.&lt;/p&gt;&lt;p&gt;In 2005, the big thing that caught everyone’s eye was George Gonthier’s formalisation (in Coq) of the Four Colour Theorem. Most educated people had heard of the theorem already, and its history is fascinating: numerous proofs had been attempted and rejected since the mid 19th century. The 1977 proof by Appel and Haken was questioned because it relied on a lot of ad-hoc computer code. Suddenly, despite the still unwelcome involvement of computers, no one could doubt the theorem anymore.&lt;/p&gt;&lt;p&gt;At the opposite extreme was my own formalisation of Gödel’s proof of the relative consistency of the axiom of choice in Isabelle/ZF. This was the apex of my ZF work, technically difficult but incomprehensible to most people. My early dream of having a formalisation of the Prime Number Theorem came true in 2005 when Jeremy Avigad formalised the theorem in Isabelle. Somewhat later, John Harrison formalised a different proof in HOL Light. And there was much more. Without any doubt, our systems were capable of serious mathematics.&lt;/p&gt;&lt;p&gt;Perhaps the most consequential achievement of this period was Mike Gordon’s collaboration with Graham Birtwistle and Anthony Fox to verify the ARM6 processor. Graham, at Leeds, formally specified the instruction set architecture of the processor (i.e. the assembly language level), while Mike and Anthony at Cambridge verified the implementation of that architecture in terms of lower level hardware components. Eventually a number of other processors were similarly specified, and some verified. Without any doubt, our systems were capable of serious verification.&lt;/p&gt;&lt;p&gt;Despite of the focus on applications in this section, system development continued in the run-up to 2005. I am only familiar with Isabelle development, but they were tremendous:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;the Isar language for structured, legible proofs (a break with the LCF idea that the top level must be a programming language, i.e. ML)&lt;/item&gt;&lt;item&gt;axiomatic type classes, providing principled overloading&lt;/item&gt;&lt;item&gt;counterexample finders: Quickcheck and Refute (now Nitpick)&lt;/item&gt;&lt;item&gt;code generation from the executable fragment of higher-order logic, and reflection&lt;/item&gt;&lt;item&gt;sledgehammer was under active development, but only ready a couple of years later.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;With so much going on, it’s not surprising that our community started doing big things, and other people were starting to notice.&lt;/p&gt;&lt;head rend="h3"&gt;2005–2015: The first landmarks&lt;/head&gt;&lt;p&gt;I am not used to phone calls from journalists: for most of my career, formal verification has been seen as (at best) niche. But the journalist on the end of the line was asking for information about seL4, the first operating system kernel ever to be formally verified. Tools for extended static checking were by then able to detect a lot of program faults, but the seL4 verification claimed to cover full functional correctness: the code did exactly what it was supposed to do. There is now an entire ecosystem around seL4, backed by a million lines of Isabelle/HOL proofs.&lt;/p&gt;&lt;p&gt;People have wanted to verify compilers since forever. The task of fully specifying a programming language, target machine and compiler already seemed impossible, let alone providing the actual proof. With CompCert, that task was finally fulfilled, for a large subset of the C language:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;What sets CompCert apart from any other production compiler, is that it is formally verified, using machine- assisted mathematical proofs, to be exempt from mis- compilation issues. In other words, the executable code it produces is proved to behave exactly as specified by the semantics of the source C program.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;A seemingly intractable problem with compiler verification was how to translate your verified compiler into machine code. For example, CompCert is mostly written in Rocq, which is then extracted to OCaml code. The OCaml compiler had never been verified, so how do we know that its compiled code is correct?&lt;/p&gt;&lt;p&gt;CakeML squares this circle through bootstrapping. CakeML translates from its source language (a dialect of ML) to assembly language, accompanied by a proof that the two pieces of code are equivalent. This work was an outgrowth of the ARM6 project mentioned earlier. Magnus Myreen had developed techniques for automatically and verifiably translating between assembly language and recursive functions in higher-order logic, in both directions. At the start of the bootstrapping process, a tiny compiler was written in pure logic and proved correct. It was now safe to run this compiler and use its tiny language to implement a bigger language. This process ultimately produced a verified compiler in both source form and assembly language form, with a proof of their equivalence, as well as verified extraction from higher-order logic to ML.&lt;/p&gt;&lt;p&gt;The end of the decade also saw impressive results in the formalisation of mathematics:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;Gödel second incompleteness theorem, by yours truly, in Isabelle/HOL&lt;/item&gt;&lt;item&gt;the Central Limit Theorem, by Avigad et al., ditto&lt;/item&gt;&lt;item&gt;the Flyspeck project, by Hales et al., in Isabelle/HOL and HOL Light&lt;/item&gt;&lt;item&gt;the odd order theorem, in Rocq&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Without going into details here, each of these was an ambitious proof, combining in various ways deep mathematics, intricate technicalities and sheer bulk. Our community was proud of our achievements. We were no longer a joke, but what exactly we were good for?&lt;/p&gt;&lt;head rend="h3"&gt;2015–2025: Breaking through&lt;/head&gt;&lt;p&gt;This period brought something astonishing: acceptance of proof assistants by many mainstream mathematicians. I mostly recall mathematicians regardeding computers with something close to contempt. Even some logicians regarded formalised mathematics as impossible, somehow fixating on Gödel’s incompleteness or that notorious proof of 1+1=2 on page 360. Regarding my work formalising big chunks of ZF theory, someone commented “only for finite sets obviously”.&lt;/p&gt;&lt;p&gt;My EU-funded ALEXANDRIA project started in 2017. My team formalised more advanced and deep mathematics than I ever imagined to be possible, using Isabelle/HOL. (I have told this story in an earlier blogpost.) But ALEXANDRIA alone would not have had much of an impact on mathematical practice. What made a difference was Kevin Buzzard and his enthusiastic, tireless promotion of the idea of formalising mathematics in Lean. He recruited a veritable army. I got the idea of blogging from him, but my blog has not had the same impact. Where are you guys?&lt;/p&gt;&lt;p&gt;In 2022, for the first time ever, machine assistance was used to confirm brand-new mathematics that a Fields Medallist had concerns about. Mathematicians will for the most part continue to work the way they always have done, but proof assistants are getting better and better, and they will encroach more and more on the everyday practice of mathematics.&lt;/p&gt;&lt;p&gt;Meanwhile, Isabelle continued to be useful for verification. I was amazed to hear that that the systems group here in the Computer Lab had completed a major verification using Isabelle/HOL. The tradition is for systems people to despise verification tools for sweeping aside ugly things like overflow and floating point errors, even though they no longer do. Besides, a research tool like Isabelle is only used by its own developer and his students. Times were changing.&lt;/p&gt;&lt;p&gt;Isabelle is also one of the several proof assistants involved with CHERI, a large-scale project reviving the old idea of capabilities to ensure security at the hardware level. CHERI has produced numerous publications, some of which (for example this one and that one) describe very large proofs. These concern the design and implementation of novel computer architectures with fine-grained memory protection, and a design process with formal verification at its heart.&lt;/p&gt;&lt;p&gt;Isabelle has also contributed to the design of WebAssembly, a relatively new platform for web applications. By subjecting the WebAssembly specification to formal scrutiny, Conrad Watt was able to identify a number of issues in time for them to be fixed.&lt;/p&gt;&lt;p&gt;Finally, I’d like to mention this announcement (4 December 2025) by Dominic Mulligan of Amazon Web Services (AWS):&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Over three years, lots of hard work, and 260,000 lines of Isabelle/HOL code later, the Nitro Isolation Engine (NIE) is finally announced alongside Graviton5.&lt;/p&gt;&lt;p&gt;Working with our colleagues in EC2, Annapurna, and AWS AppSec, we have been working to rearchitect the Nitro system for Graviton5+ instances around a small, trusted separation kernel. Written from scratch in Rust, we have additionally specified the behaviour of a core subset of the Nitro Isolation Engine kernel, verified that the implementation meets this specification, and additionally proved deep security properties—confidentiality and integrity—of the implementation.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;I am biased, since I’ve been working with AWS on this exact project, but this is a big deal. AWS has been using formal verification tools for a considerable time. A notable earlier accomplishment was verify tricky but efficient algorithms using HOL Light, speeding up RSA encryption by a massive factor.&lt;/p&gt;&lt;head rend="h3"&gt;2025–2035 Becoming ordinary&lt;/head&gt;&lt;p&gt;A couple of months ago, Apple announced new models in their iPhone range, but no crowds formed around Apple Stores. They once did: the iPhone was once regarded as revolutionary. Now, smartphones are a commodity, which is the final stage of a new technology. Formal verification is not ordinary yet. But it’s coming: more and more software will be seen as too important to develop any other way, as is already the case for hardware.&lt;/p&gt;&lt;head rend="h3"&gt;Postscript&lt;/head&gt;&lt;p&gt;I am well aware that there is much outstanding work adjacent to that described here, e.g. using other interactive tools, such as Nqthm and ACL2, PVS and Agda, and much else using Rocq. There have been amazing advances in the broader theorem proving world, also in model checking, SAT/SMT solving and their applications to extended static checking of software. I have related what I personally know. And remember, the point of this post is not (simply) to boast but to demonstrate the progress of our research community, so the more achievements the better. Feel free to add some in the comments!&lt;/p&gt;&lt;p&gt;This post does not prove anything about other fields of science, such as solid-state physics, molecular biology or mathematics. But it’s fair to assume that such fields have not been idle either. People have proved Fermat’s Last Theorem and the Poincaré conjecture, and settled more obscure questions such as the projective plane of order 10. People have located the remains of King Richard III, who died in 1485, excavating and positively identifying the body by its DNA. People have linked a piece of bloody cloth to Adolf Hitler and diagnosed that he had a specific genetic condition. The immensely complex James Webb Space Telescope was successfully deployed; it is now revealing secrets about the early Universe.&lt;/p&gt;&lt;p&gt;Sometimes I wonder about the motives of those who claim that science is moribund. Do they have political aims, or just unrealistic expectations? Were they expecting time travel or some sort of warp drive? People need to remember that movies are fiction.&lt;/p&gt;&lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46250309</guid><pubDate>Fri, 12 Dec 2025 23:26:26 +0000</pubDate></item><item><title>OpenAI are quietly adopting skills, now available in ChatGPT and Codex CLI</title><link>https://simonwillison.net/2025/Dec/12/openai-skills/</link><description>&lt;doc fingerprint="bc04005d8facf9e4"&gt;
+  &lt;main&gt;
+    &lt;head rend="h2"&gt;OpenAI are quietly adopting skills, now available in ChatGPT and Codex CLI&lt;/head&gt;
+    &lt;p&gt;12th December 2025&lt;/p&gt;
+    &lt;p&gt;One of the things that most excited me about Anthropic’s new Skills mechanism back in October is how easy it looked for other platforms to implement. A skill is just a folder with a Markdown file and some optional extra resources and scripts, so any LLM tool with the ability to navigate and read from a filesystem should be capable of using them. It turns out OpenAI are doing exactly that, with skills support quietly showing up in both their Codex CLI tool and now also in ChatGPT itself.&lt;/p&gt;
+    &lt;head rend="h4"&gt;Skills in ChatGPT&lt;/head&gt;
+    &lt;p&gt;I learned about this from Elias Judin this morning. It turns out the Code Interpreter feature of ChatGPT now has a new &lt;code&gt;/home/oai/skills&lt;/code&gt; folder which you can access simply by prompting:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;code&gt;Create a zip file of /home/oai/skills&lt;/code&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;I tried that myself and got back this zip file. Here’s a UI for exploring its content (more about that tool).&lt;/p&gt;
+    &lt;p&gt;So far they cover spreadsheets, docx and PDFs. Interestingly their chosen approach for PDFs and documents is to convert them to rendered per-page PNGs and then pass those through their vision-enabled GPT models, presumably to maintain information from layout and graphics that would be lost if they just ran text extraction.&lt;/p&gt;
+    &lt;p&gt;Elias shared copies in a GitHub repo. They look very similar to Anthropic’s implementation of the same kind of idea, currently published in their anthropics/skills repository.&lt;/p&gt;
+    &lt;p&gt;I tried it out by prompting:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Create a PDF with a summary of the rimu tree situation right now and what it means for kakapo breeding season&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Sure enough, GPT-5.2 Thinking started with:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Reading skill.md for PDF creation guidelines&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Then:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Searching rimu mast and Kākāpō 2025 breeding status&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;It took just over eleven minutes to produce this PDF, which was long enough that I had Claude Code for web build me a custom PDF viewing tool while I waited.&lt;/p&gt;
+    &lt;p&gt;Here’s ChatGPT’s PDF in that tool.&lt;/p&gt;
+    &lt;p&gt;(I am very excited about Kākāpō breeding season this year.)&lt;/p&gt;
+    &lt;p&gt;The reason it took so long is that it was fastidious about looking at and tweaking its own work. I appreciated that at one point it tried rendering the PDF and noticed that the macrons in kākāpō were not supported by the chosen font, so it switched to something else:&lt;/p&gt;
+    &lt;head rend="h4"&gt;Skills in Codex CLI&lt;/head&gt;
+    &lt;p&gt;Meanwhile, two weeks ago OpenAI’s open source Codex CLI tool landed a PR titled feat: experimental support for skills.md. The most recent docs for that are in docs/skills.md.&lt;/p&gt;
+    &lt;p&gt;The documentation suggests that any folder in &lt;code&gt;~/.codex/skills&lt;/code&gt; will be treated as a skill.&lt;/p&gt;
+    &lt;p&gt;I used Claude Opus 4.5’s skill authoring skill to create this skill for creating Datasette plugins, then installed it into my Codex CLI skills folder like this:&lt;/p&gt;
+    &lt;code&gt;git clone https://github.com/datasette/skill \
+  ~/.codex/skills/datasette-plugin&lt;/code&gt;
+    &lt;p&gt;You have to run Codex with the &lt;code&gt;--enable skills&lt;/code&gt; option. I ran this:&lt;/p&gt;
+    &lt;code&gt;cd /tmp
+mkdir datasette-cowsay
+cd datasette-cowsay
+codex --enable skills -m gpt-5.2&lt;/code&gt;
+    &lt;p&gt;Then prompted:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;code&gt;list skills&lt;/code&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;And Codex replied:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;code&gt;- datasette-plugins — Writing Datasette plugins using Python + pluggy (file: /Users/simon/.codex/skills/datasette-plugin/SKILL.md)&lt;/code&gt;
+      &lt;code&gt;- Discovery — How to find/identify available skills (no SKILL.md path provided in the list)&lt;/code&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Then I said:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;code&gt;Write a Datasette plugin in this folder adding a /-/cowsay?text=hello page that displays a pre with cowsay from PyPI saying that text&lt;/code&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;It worked perfectly! Here’s the plugin code it wrote and here’s a copy of the full Codex CLI transcript, generated with my terminal-to-html tool.&lt;/p&gt;
+    &lt;p&gt;You can try that out yourself if you have &lt;code&gt;uvx&lt;/code&gt; installed like this:&lt;/p&gt;
+    &lt;code&gt;uvx --with https://github.com/simonw/datasette-cowsay/archive/refs/heads/main.zip \
+  datasette&lt;/code&gt;
+    &lt;p&gt;Then visit:&lt;/p&gt;
+    &lt;code&gt;http://127.0.0.1:8001/-/cowsay?text=This+is+pretty+fun
+&lt;/code&gt;
+    &lt;head rend="h4"&gt;Skills are a keeper&lt;/head&gt;
+    &lt;p&gt;When I first wrote about skills in October I said Claude Skills are awesome, maybe a bigger deal than MCP. The fact that it’s just turned December and OpenAI have already leaned into them in a big way reinforces to me that I called that one correctly.&lt;/p&gt;
+    &lt;p&gt;Skills are based on a very light specification, if you could even call it that, but I still think it would be good for these to be formally documented somewhere. This could be a good initiative for the new Agentic AI Foundation (previously) to take on.&lt;/p&gt;
+    &lt;head rend="h2"&gt;More recent articles&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;GPT-5.2 - 11th December 2025&lt;/item&gt;
+      &lt;item&gt;Useful patterns for building HTML tools - 10th December 2025&lt;/item&gt;
+    &lt;/list&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46250332</guid><pubDate>Fri, 12 Dec 2025 23:30:19 +0000</pubDate></item></channel></rss>
