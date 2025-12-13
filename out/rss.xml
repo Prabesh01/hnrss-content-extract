@@ -1,146 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 13 Dec 2025 18:44:43 +0000</lastBuildDate><item><title>Go Proposal: Secret Mode</title><link>https://antonz.org/accepted/runtime-secret/</link><description>&lt;doc fingerprint="2ef19c89eeb6b090"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Go proposal: Secret mode&lt;/head&gt;
-    &lt;p&gt;Part of the Accepted! series, explaining the upcoming Go changes in simple terms.&lt;/p&gt;
-    &lt;p&gt;Automatically erase used memory to prevent secret leaks.&lt;/p&gt;
-    &lt;p&gt;Ver. 1.26 • Stdlib • Low impact&lt;/p&gt;
-    &lt;head rend="h2"&gt;Summary&lt;/head&gt;
-    &lt;p&gt;The new &lt;code&gt;runtime/secret&lt;/code&gt; package lets you run a function in secret mode. After the function finishes, it immediately erases (zeroes out) the registers and stack it used. Heap allocations made by the function are erased as soon as the garbage collector decides they are no longer reachable.&lt;/p&gt;
-    &lt;code&gt;secret.Do(func() {
-    // Generate a session key and
-    // use it to encrypt the data.
-})
-&lt;/code&gt;
-    &lt;p&gt;This helps make sure sensitive information doesn't stay in memory longer than needed, lowering the risk of attackers getting to it.&lt;/p&gt;
-    &lt;p&gt;The package is experimental and is mainly for developers of cryptographic libraries, not for application developers.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Motivation&lt;/head&gt;
-    &lt;p&gt;Cryptographic protocols like WireGuard or TLS have a property called "forward secrecy". This means that even if an attacker gains access to long-term secrets (like a private key in TLS), they shouldn't be able to decrypt past communication sessions. To make this work, session keys (used to encrypt and decrypt data during a specific communication session) need to be erased from memory after they're used. If there's no reliable way to clear this memory, the keys could stay there indefinitely, which would break forward secrecy.&lt;/p&gt;
-    &lt;p&gt;In Go, the runtime manages memory, and it doesn't guarantee when or how memory is cleared. Sensitive data might remain in heap allocations or stack frames, potentially exposed in core dumps or through memory attacks. Developers often have to use unreliable "hacks" with reflection to try to zero out internal buffers in cryptographic libraries. Even so, some data might still stay in memory where the developer can't reach or control it.&lt;/p&gt;
-    &lt;p&gt;The solution is to provide a runtime mechanism that automatically erases all temporary storage used during sensitive operations. This will make it easier for library developers to write secure code without using workarounds.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Description&lt;/head&gt;
-    &lt;p&gt;Add the &lt;code&gt;runtime/secret&lt;/code&gt; package with &lt;code&gt;Do&lt;/code&gt; and &lt;code&gt;Enabled&lt;/code&gt; functions:&lt;/p&gt;
-    &lt;code&gt;// Do invokes f.
-//
-// Do ensures that any temporary storage used by f is erased in a
-// timely manner. (In this context, "f" is shorthand for the
-// entire call tree initiated by f.)
-//   - Any registers used by f are erased before Do returns.
-//   - Any stack used by f is erased before Do returns.
-//   - Any heap allocation done by f is erased as soon as the garbage
-//     collector realizes that it is no longer reachable.
-//   - Do works even if f panics or calls runtime.Goexit. As part of
-//     that, any panic raised by f will appear as if it originates from
-//     Do itself.
-func Do(f func())
-&lt;/code&gt;
-    &lt;code&gt;// Enabled reports whether Do appears anywhere on the call stack.
-func Enabled() bool
-&lt;/code&gt;
-    &lt;p&gt;The current implementation has several limitations:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Only supported on linux/amd64 and linux/arm64. On unsupported platforms, &lt;code&gt;Do&lt;/code&gt;invokes&lt;code&gt;f&lt;/code&gt;directly.&lt;/item&gt;
-      &lt;item&gt;Protection does not cover any global variables that &lt;code&gt;f&lt;/code&gt;writes to.&lt;/item&gt;
-      &lt;item&gt;Trying to start a goroutine within &lt;code&gt;f&lt;/code&gt;causes a panic.&lt;/item&gt;
-      &lt;item&gt;If &lt;code&gt;f&lt;/code&gt;calls&lt;code&gt;runtime.Goexit&lt;/code&gt;, erasure is delayed until all deferred functions are executed.&lt;/item&gt;
-      &lt;item&gt;Heap allocations are only erased if ➊ the program drops all references to them, and ➋ then the garbage collector notices that those references are gone. The program controls the first part, but the second part depends on when the runtime decides to act.&lt;/item&gt;
-      &lt;item&gt;If &lt;code&gt;f&lt;/code&gt;panics, the panicked value might reference memory allocated inside&lt;code&gt;f&lt;/code&gt;. That memory won't be erased until (at least) the panicked value is no longer reachable.&lt;/item&gt;
-      &lt;item&gt;Pointer addresses might leak into data buffers that the runtime uses for garbage collection. Do not put confidential information into pointers.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;The last point might not be immediately obvious, so here's an example. If an offset in an array is itself secret (you have a &lt;code&gt;data&lt;/code&gt; array and the secret key always starts at &lt;code&gt;data[100]&lt;/code&gt;), don't create a pointer to that location (don't create a pointer &lt;code&gt;p&lt;/code&gt; to &lt;code&gt;&amp;amp;data[100]&lt;/code&gt;). Otherwise, the garbage collector might store this pointer, since it needs to know about all active pointers to do its job. If someone launches an attack to access the GC's memory, your secret offset could be exposed.&lt;/p&gt;
-    &lt;p&gt;The package is mainly for developers who work on cryptographic libraries. Most apps should use higher-level libraries that use &lt;code&gt;secret.Do&lt;/code&gt; behind the scenes.&lt;/p&gt;
-    &lt;p&gt;As of Go 1.26, the &lt;code&gt;runtime/secret&lt;/code&gt; package is experimental and can be enabled by setting &lt;code&gt;GOEXPERIMENT=runtimesecret&lt;/code&gt; at build time.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Example&lt;/head&gt;
-    &lt;p&gt;Use &lt;code&gt;secret.Do&lt;/code&gt; to generate a session key and encrypt a message using AES-GCM:&lt;/p&gt;
-    &lt;code&gt;// Encrypt generates an ephemeral key and encrypts the message.
-// It wraps the entire sensitive operation in secret.Do to ensure
-// the key and internal AES state are erased from memory.
-func Encrypt(message []byte) ([]byte, error) {
-    var ciphertext []byte
-    var encErr error
-
-    secret.Do(func() {
-        // 1. Generate an ephemeral 32-byte key.
-        // This allocation is protected by secret.Do.
-        key := make([]byte, 32)
-        if _, err := io.ReadFull(rand.Reader, key); err != nil {
-            encErr = err
-            return
-        }
-
-        // 2. Create the cipher (expands key into round keys).
-        // This structure is also protected.
-        block, err := aes.NewCipher(key)
-        if err != nil {
-            encErr = err
-            return
-        }
-
-        gcm, err := cipher.NewGCM(block)
-        if err != nil {
-            encErr = err
-            return
-        }
-
-        nonce := make([]byte, gcm.NonceSize())
-        if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-            encErr = err
-            return
-        }
-
-        // 3. Seal the data.
-        // Only the ciphertext leaves this closure.
-        ciphertext = gcm.Seal(nonce, nonce, message, nil)
-    })
-
-    return ciphertext, encErr
-}
-&lt;/code&gt;
-    &lt;p&gt;Note that &lt;code&gt;secret.Do&lt;/code&gt; protects not just the raw key, but also the &lt;code&gt;cipher.Block&lt;/code&gt; structure (which contains the expanded key schedule) created inside the function.&lt;/p&gt;
-    &lt;p&gt;This is a simplified example, of course — it only shows how memory erasure works, not a full cryptographic exchange. In real situations, the key needs to be shared securely with the receiver (for example, through key exchange) so decryption can work.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Links &amp;amp; Credits&lt;/head&gt;
-    &lt;p&gt;𝗣 21865 👥 Dave Anderson, Filippo Valsorda, Jason A. Donenfeld, Russ Cox&lt;/p&gt;
-    &lt;p&gt;𝗖𝗟 704615 👥 Daniel Morsing, Keith Randall&lt;/p&gt;
-    &lt;p&gt;★ Subscribe to keep up with new posts.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46210705</guid><pubDate>Tue, 09 Dec 2025 21:10:52 +0000</pubDate></item><item><title>Researchers seeking better measures of cognitive fatigue</title><link>https://www.nature.com/articles/d41586-025-03974-w</link><description>&lt;doc fingerprint="27133020a53d0fe2"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Thank you for visiting nature.com. You are using a browser version with limited support for CSS. To obtain the best experience, we recommend you use a more up to date browser (or turn off compatibility mode in Internet Explorer). In the meantime, to ensure continued support, we are displaying the site without styles and JavaScript.&lt;/p&gt;
-    &lt;p&gt;Near the end of his first series of chess matches against IBM’s Deep Blue computer in 1996, the Russian grandmaster Garry Kasparov lamented what he saw as an unfair disadvantage: “I’m really tired. These games took a lot of energy. But if I play a normal human match, my opponent would also be exhausted.”&lt;/p&gt;
-    &lt;p&gt;Whereas machine intelligence can keep running as long as it has a power supply, a human brain will become fatigued — and you don’t have to be a chess grandmaster to understand the feeling. Anyone can end up drained after a long day of work, at school or juggling the countless decisions of daily life. This mental exhaustion can sap motivation, dull focus and erode judgement. It can raise the odds of careless mistakes. Especially when combined with sleep loss or circadian disruption, cognitive fatigue can also contribute to deadly medical errors and road traffic accidents.&lt;/p&gt;
-    &lt;p&gt;It was partly Kasparov’s weary comments that inspired Mathias Pessiglione, a cognitive neuroscientist and research director at the Paris Brain Institute, to study the tired brain. He wanted to know: “Why is this cognitive system prone to fatigue?”&lt;/p&gt;
-    &lt;p&gt;Researchers and clinicians have long struggled to define, measure and treat cognitive fatigue — relying mostly on self-reports of how tired someone says they feel. Now, however, scientists from across disciplines are enlisting innovative experimental approaches and biological markers to probe the metabolic roots and consequences of cognitive fatigue.&lt;/p&gt;
-    &lt;p&gt;The efforts are getting a boost in attention and funding in large part because of long COVID, which afflicts roughly 6 in every 100 people after infection with the coronavirus SARS-CoV-2, says Vikram Chib, a biomedical engineer at Johns Hopkins University in Baltimore, Maryland. “The primary symptom of long COVID is fatigue,” says Chib. “I think that has opened a lot of people’s eyes.”&lt;/p&gt;
-    &lt;p&gt;Chib and others hope that a fundamental understanding of cognitive fatigue will help the billions of people who face it from time to time, as well as the tens of millions who carry it as a more extreme and chronic companion. As well as being common in long COVID, debilitating fatigue is a symptom of chronic fatigue syndrome, also known as myalgic encephalomyelitis (ME/CFS), post-traumatic stress disorder, multiple sclerosis, depression and Parkinson’s disease. Extreme mental exhaustion can also follow cancer treatment, head injury, stroke or exposure to certain toxins.&lt;/p&gt;
-    &lt;p&gt;“Fatigue is a really big problem,” says Chib. “We really need to figure this out — how to study it and how to intervene.”&lt;/p&gt;
-    &lt;p&gt;What is cognitive fatigue?&lt;/p&gt;
-    &lt;p&gt;At the start of a chess match, a professional player might rely on well-rehearsed openings. “The first five, six or seven moves can be done without thinking,” says Pessiglione. But when there’s an unfamiliar position on the board, the player no longer has a ready routine. They are “required to think”, he says. The same is true for a driver who turns on to an unfamiliar street. On roads they’ve been down hundreds of times, mental autopilot can kick in. But if they take an unknown route, Pessiglione says, the demands on the brain intensify.&lt;/p&gt;
-    &lt;p&gt;Cognitive control is the term that scientists give to this effortful directing and regulating of thought. Over time, as a leading theory goes, maintaining control becomes costly for the brain, and fatigue emerges. Scientists aren’t entirely sure why. Some think it is related to how cells cope when their energy supply is strained; others point to a build-up of toxins from neural activity1. But researchers tend to agree that the sensation of fatigue is protective — a warning that the brain is nearing a physiological boundary and it’s time to rest.&lt;/p&gt;
-    &lt;p&gt;Molecular players across several brain regions might be involved, scientists say. Researchers have found potential links between cognitive fatigue and changing levels of metabolites such as glucose and lactate, neurochemical messengers such as glutamate and adenosine, and a protein involved in learning and memory called brain-derived neurotrophic factor2. Even amyloid-β, a protein fragment associated with Alzheimer’s disease, might contribute by disrupting synapses, interfering with the clearance of glutamate or increasing neuroinflammation3. But it is uncertain what is a marker and what is a cause.&lt;/p&gt;
-    &lt;p&gt;Cognitive neuroscientist Clay Holroyd at Ghent University in Belgium is among the researchers who favour the toxic-build-up theory of cognitive fatigue. This idea has been gaining traction over the past five years or so, although it’s not yet clear what the waste metabolite is. He likens the sensation of fatigue to pain: both have a role in protecting the body from accumulating damage.&lt;/p&gt;
-    &lt;p&gt;But even if a person ignores the sensation at first, he says, there’s little risk of real metabolic harm in most cases. “We have an automatic fail-safe,” he says. “You can work really, really, really hard for a time, but eventually you’re going to need to go to sleep.” Although taking a break from a task can offer temporary relief, sleep has a much more restorative role. Sleep, especially slow-wave deep sleep, acts as the brain’s nightly maintenance. It clears out metabolic debris and recalibrates circuits and cells so that they can best use energy reserves.&lt;/p&gt;
-    &lt;p&gt;Seeking better measures&lt;/p&gt;
-    &lt;p&gt;Conventionally, cognitive fatigue has been quantified either by asking a person to report their own levels of fatigue or by detecting a change in their performance on working-memory tests or other tasks. These are not great measurements, scientists say. Drops in performance can be obscured by factors such as motivation, boredom and frustration. Performance can also be offset by training, such as when a chess player automates a sequence of moves.&lt;/p&gt;
-    &lt;p&gt;Self-reports, meanwhile, are subjective and unreliable. “People are terrible judges of their own fatigue,” says Daniel Forger, a researcher in computational medicine at the University of Michigan in Ann Arbor, who is investigating new ways to assess cognitive fatigue.&lt;/p&gt;
-    &lt;p&gt;To better understand fatigue, Pessiglione, Chib and other researchers are trying to bridge an understanding of its biochemical workings with how it affects motivation4. The current hypothesis: cognitive fatigue arises from metabolic changes in parts of the brain that are responsible for cognitive control. And those changes, whether resulting from depleted energy stores or amassed waste, alter how brain circuits weigh the costs and benefits of exerting mental effort — nudging decisions towards easier options that are more immediately rewarding1.&lt;/p&gt;
-    &lt;p&gt;In a 2022 study5, Pessiglione and his team simulated a workday by asking otherwise healthy participants to spend several hours on either easy or hard versions of the same cognitive tasks. In one task, participants viewed letters appearing one after another on a screen and had to decide whether each new letter matched one a certain number of letters earlier. Recalling whether the letter on screen matched the third letter back, for example, would be much more difficult than recalling whether it matched the first letter back.&lt;/p&gt;
-    &lt;p&gt;After this simulated workday, participants made choices between smaller immediate rewards and larger delayed ones. Those who had completed the harder tasks were more likely to opt for instant gratification. That preference was also consistent with greater accumulation of glutamate — one of the metabolites suspected to build up with cognitive exertion — in the lateral prefrontal cortex. This brain region is involved in executive functions, such as working memory and decision-making, and has been found to have lower activity after a hard day of simulated work6.&lt;/p&gt;
-    &lt;p&gt;Matthew Apps, a cognitive neuroscientist at the University of Birmingham, UK, says that the dynamics of dopamine — which interacts closely with adenosine, glutamate and other metabolic players in the brain — might help to explain the connection between neurometabolic strain and the experience of fatigue. Because dopamine enhances the perceived value of rewards, it typically boosts motivation to invest effort. He proposes that sustained effort might cause dopamine levels to drop, leaving people less willing to work for the same pay-off.&lt;/p&gt;
-    &lt;p&gt;Together, these and similar lines of research are starting to reveal how levels of these molecules and measures of brain activity align with fatigue.&lt;/p&gt;
-    &lt;p&gt;The bottom line, says Chib, is that there is “something happening with the chemistry of your brain” that changes your calculation on whether you should exert cognitive effort. He says that baseline chemistry will differ between people: “You and I might have different concentrations of neurotransmitters in our brain, and that inherent difference could make me feel very tired, whereas you’re able to persist.”&lt;/p&gt;
-    &lt;p&gt;These, or similar differences in chemistry, might help to explain chronic and other extreme fatigue. In people with long COVID or ME/CFS, a small mental task can feel as intimidating as performing brain surgery.&lt;/p&gt;
-    &lt;p&gt;For Ana Lia Tamariz, an artist and health-and-wellness coach in Miami, Florida, who has ME/CFS, simply listening to music or reading a book often requires immense effort. “Sometimes, I cannot read one more word,” she says. “Imagine coming out of anaesthesia from a surgical procedure groggy. Imagine you never exit that state.”&lt;/p&gt;
-    &lt;p&gt;For her, the cognitive and physical fatigue can be hard to separate. Any cognitively demanding task can make her physically drained, she says. And anything physically demanding can leave her mentally spent. Tamariz says she is constantly doing the calculation: “Is this worth my energy?”&lt;/p&gt;
-    &lt;p&gt;Research supports the idea that some shared mechanisms might drive both physical and cognitive fatigue, and that the two interact7. “If you run a marathon, yes, there is physical fatigue in your body,” says Apps. “But by God, you’re going to feel all kinds of cognitive fatigue as well from the strain and the concentration that’s required to maintain your performance.”&lt;/p&gt;
-    &lt;p&gt;The reverse also seems to be true. In a preprint from last year, Chib’s team found that otherwise healthy participants were less willing to exert physical effort after performing a mentally taxing task8.&lt;/p&gt;
-    &lt;p&gt;Other researchers are studying the roles of stress, sleep, circadian rhythms and inflammation in cognitive fatigue, as well as the consequences. When the brain doesn’t get restorative sleep, small clusters of neurons can go briefly offline. These local sleep-like episodes can cause momentary lapses in attention and other slips in performance.&lt;/p&gt;
-    &lt;p&gt;Enjoying our latest content? Log in or create an account to continue&lt;/p&gt;
-    &lt;p&gt;Access the most recent journalism from Nature's award-winning team&lt;/p&gt;
-    &lt;p&gt;Explore the latest features &amp;amp; opinion covering groundbreaking research&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46222162</guid><pubDate>Wed, 10 Dec 2025 19:13:49 +0000</pubDate></item><item><title>Useful patterns for building HTML tools</title><link>https://simonwillison.net/2025/Dec/10/html-tools/</link><description>&lt;doc fingerprint="b4400d591bb7aef1"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 13 Dec 2025 19:07:31 +0000</lastBuildDate><item><title>Useful patterns for building HTML tools</title><link>https://simonwillison.net/2025/Dec/10/html-tools/</link><description>&lt;doc fingerprint="b4400d591bb7aef1"&gt;
   &lt;main&gt;
     &lt;head rend="h2"&gt;Useful patterns for building HTML tools&lt;/head&gt;
     &lt;p&gt;10th December 2025&lt;/p&gt;
@@ -2011,16 +1870,13 @@ Some of the tests compare the output results of Hy and the output of the QFTASM 
     &lt;p&gt;I am desperate to resolve this and restore my digital life. If you can help, please email paris AT paris.id.au&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46252114</guid><pubDate>Sat, 13 Dec 2025 04:55:59 +0000</pubDate></item><item><title>Computer Animator and Amiga fanatic Dick Van Dyke turns 100</title><link>https://news.ycombinator.com/item?id=46252993</link><description>&lt;doc fingerprint="5211010f9dc29bbd"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46252114</guid><pubDate>Sat, 13 Dec 2025 04:55:59 +0000</pubDate></item><item><title>Computer Animator and Amiga fanatic Dick Van Dyke turns 100</title><link>https://news.ycombinator.com/item?id=46252993</link><description>&lt;doc fingerprint="663101079fc6fb9d"&gt;
   &lt;main&gt;
     &lt;p&gt;&amp;gt; In my 30’s, I exercised to look good. In my 50’s, to stay fit. In my 70’s, to stay ambulatory. In my 80’s, to avoid assisted living. Now in my 90’s, I’m just doing it out of pure defiance&lt;/p&gt;
     &lt;p&gt;Of all of my grandparents and great grandparents, they all lived really hard lives eating high fat diets, drinking and smoking, and lived into their 80s. Genetics is really the biggest determining factor outside of going completely off the rails with binge eating and drug use.&lt;/p&gt;
     &lt;p&gt;Now, that's not to say that healthy living is pointless. Their quality of life from late 60s on was not great: alcoholism, poverty, multiple heart attacks, emphasima, a stroke here and there, from which they eventually, sort of, not really recovered. They were deeply unhappy people who never really seemed to have time or care for their families. I definitely don't want to live like that. So treat yourself right, but not because you're trying to reach a certain age.&lt;/p&gt;
     &lt;p&gt;&amp;gt; Genetics is really the biggest determining factor outside of going completely off the rails with binge eating and drug use.&lt;/p&gt;
     &lt;p&gt;So true. I'm fortunate that both my parents have long-life family histories. Both families were old-fashioned Southern Baptists who didn't drink, smoke, dance or, apparently, believe in having fun of any kind :-). But that just kept them from messing up their good genetic luck. I'm an old-fashioned atheist but have chosen to never drink, smoke or do drugs just because I never saw a compelling reason to. Now I'm pushing 60 and have so far had zero serious health issues. Hoping to keep a good thing going.&lt;/p&gt;
-    &lt;p&gt;Or maybe rape isn’t quite as damaging or deviant as modern humans (especially those of us in the west) treat it.&lt;/p&gt;
-    &lt;p&gt;I’ve long suspected that some portion of the psychological harm done to rape victims is just a byproduct of how society treats rape, rapists, and rape victims and isn’t inherent in the act itself.&lt;/p&gt;
-    &lt;p&gt;Rape has been extremely common throughout human history. All of us are here due largely to it. But it’s only in the past century (and especially the last 30-40 years) that it has become treated as some life-shattering irrecoverable event that we seem to expect leads to emotional and social death. It clearly wasn’t ’that bad’ for most human history given how prevalent it was. But in the modern world we are trauma merchants.&lt;/p&gt;
     &lt;p&gt;&amp;gt; It clearly wasn’t ’that bad’ for most human history given how prevalent it was. But in the modern world we are trauma merchants.&lt;/p&gt;
     &lt;p&gt;What in the actual fuck kind of logic brought you here to that conclusion? I worry for you and whatever content you’ve consumed over the years that allowed you to build up this theory.&lt;/p&gt;
     &lt;p&gt;Well I did a Psych minor for lols back in the day and there's no doubt that almost all of current social psychology is made up of trauma merchants peddling their wares. 'Step 1: gaslight you into thinking you're fucked up Step 2: Convince you I'm the one who can help you' kind of shit. Psychologists obviously get upset by the suggestion.&lt;/p&gt;
@@ -2107,7 +1963,165 @@ SC = [(01) + (11)](2BR·MT)
     &lt;p&gt;Feedback, issues, and PRs are always welcome. Thanks for reading!&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46255007</guid><pubDate>Sat, 13 Dec 2025 15:04:29 +0000</pubDate></item><item><title>I tried Gleam for Advent of Code</title><link>https://blog.tymscar.com/posts/gleamaoc2025/</link><description>&lt;doc fingerprint="4758503509883eb8"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46255007</guid><pubDate>Sat, 13 Dec 2025 15:04:29 +0000</pubDate></item><item><title>Show HN: I audited 500 K8s pods. Java wastes ~48% RAM, Go ~18%</title><link>https://github.com/WozzHQ/wozz</link><description>&lt;doc fingerprint="83d2d20ccde20580"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Find over-provisioned resources in your K8s cluster. See exactly what you're wasting.&lt;/p&gt;
+    &lt;code&gt;curl -sL wozz.io/audit.sh | bash&lt;/code&gt;
+    &lt;p&gt;See your waste breakdown instantly. No signup. No agents. Runs locally.&lt;/p&gt;
+    &lt;p&gt;Most K8s clusters over-provision CPU and memory by 30-60%. This script analyzes your pod resource configs and shows you the gap.&lt;/p&gt;
+    &lt;code&gt;# What teams typically set:
+resources:
+  limits:
+    memory: "4Gi"
+    cpu: "1"
+
+# What the app actually needs:
+# memory: ~800Mi
+# cpu: ~200m&lt;/code&gt;
+    &lt;p&gt;Wozz finds these gaps and estimates the cost.&lt;/p&gt;
+    &lt;code&gt;━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WOZZ KUBERNETES AUDIT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💰 ANNUAL WASTE DETECTED: $14,880
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Breakdown by Category:
+  Memory: $840/mo ($10,080/year)
+  CPU: $360/mo ($4,320/year)
+  Load Balancers: $40/mo ($480/year) — 2 orphaned
+
+🎯 #1 Biggest Waster:
+  Pod: api-gateway
+  Namespace: production
+  💸 Wasting: $8,400/year
+  
+  💡 Fix: Lower memory request to match actual usage
+&lt;/code&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;Issue&lt;/cell&gt;
+        &lt;cell role="head"&gt;Description&lt;/cell&gt;
+        &lt;cell role="head"&gt;Typical Savings&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Over-provisioned memory&lt;/cell&gt;
+        &lt;cell&gt;Requests &amp;gt; Actual Usage (kubectl top)&lt;/cell&gt;
+        &lt;cell&gt;$5-50/pod/month&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Over-provisioned CPU&lt;/cell&gt;
+        &lt;cell&gt;Requests &amp;gt; Actual Usage (kubectl top)&lt;/cell&gt;
+        &lt;cell&gt;$5-30/pod/month&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Orphaned load balancers&lt;/cell&gt;
+        &lt;cell&gt;LBs with no backend&lt;/cell&gt;
+        &lt;cell&gt;~$20/month each&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Unbound volumes&lt;/cell&gt;
+        &lt;cell&gt;PVs not attached&lt;/cell&gt;
+        &lt;cell&gt;~$10/100GB/month&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Note: Requires metrics-server for accurate usage data. Falls back to request/limit analysis if metrics unavailable.&lt;/p&gt;
+    &lt;p&gt;Runs these read-only kubectl commands:&lt;/p&gt;
+    &lt;code&gt;kubectl get pods --all-namespaces -o json
+kubectl get nodes -o json
+kubectl get pv -o json
+kubectl get svc --all-namespaces -o json
+kubectl top pods --all-namespaces  # For actual usage metrics&lt;/code&gt;
+    &lt;p&gt;Analysis Method:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;With metrics-server: Compares actual pod usage (kubectl top) vs resource requests&lt;/item&gt;
+      &lt;item&gt;Without metrics-server: Falls back to comparing requests vs limits&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;No writes. No modifications. No agents installed.&lt;/p&gt;
+    &lt;p&gt;Push results to view in a dashboard:&lt;/p&gt;
+    &lt;code&gt;curl -sL wozz.io/audit.sh | bash -s -- --push&lt;/code&gt;
+    &lt;p&gt;Dashboard features:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Namespace breakdown&lt;/item&gt;
+      &lt;item&gt;Historical trends&lt;/item&gt;
+      &lt;item&gt;PDF export&lt;/item&gt;
+      &lt;item&gt;Alerts when waste increases&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Runs locally - All analysis happens on your machine&lt;/item&gt;
+      &lt;item&gt;Optional upload - Only sends data if you use &lt;code&gt;--push&lt;/code&gt;&lt;/item&gt;
+      &lt;item&gt;No agents - Just standard kubectl commands&lt;/item&gt;
+      &lt;item&gt;Open source - Inspect the code yourself&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Disable telemetry: &lt;code&gt;WOZZ_NO_TELEMETRY=1&lt;/code&gt;&lt;/p&gt;
+    &lt;p&gt;Uses conservative cloud pricing averages:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;Resource&lt;/cell&gt;
+        &lt;cell role="head"&gt;Cost&lt;/cell&gt;
+        &lt;cell role="head"&gt;Source&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Memory&lt;/cell&gt;
+        &lt;cell&gt;$7.20/GB/month&lt;/cell&gt;
+        &lt;cell&gt;AWS/GCP/Azure avg&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;CPU&lt;/cell&gt;
+        &lt;cell&gt;$21.60/core/month&lt;/cell&gt;
+        &lt;cell&gt;AWS/GCP/Azure avg&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Storage&lt;/cell&gt;
+        &lt;cell&gt;$0.10/GB/month&lt;/cell&gt;
+        &lt;cell&gt;EBS gp3 / PD-SSD&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Load Balancer&lt;/cell&gt;
+        &lt;cell&gt;$20/month&lt;/cell&gt;
+        &lt;cell&gt;ALB/NLB avg&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Your actual costs may vary with reserved instances, spot pricing, etc.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;&lt;code&gt;kubectl&lt;/code&gt;configured with cluster access&lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;curl&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;jq&lt;/code&gt;(optional, for detailed analysis)&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;code&gt;# Basic audit (local only)
+curl -sL wozz.io/audit.sh | bash
+
+# Push to dashboard
+curl -sL wozz.io/audit.sh | bash -s -- --push
+
+# With API token (saves to your account)
+curl -sL wozz.io/audit.sh | bash -s -- --push --token YOUR_TOKEN
+
+# Disable telemetry
+WOZZ_NO_TELEMETRY=1 curl -sL wozz.io/audit.sh | bash&lt;/code&gt;
+    &lt;p&gt;Download and inspect first:&lt;/p&gt;
+    &lt;code&gt;curl -o wozz-audit.sh https://wozz.io/audit.sh
+cat wozz-audit.sh
+bash wozz-audit.sh&lt;/code&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Website: wozz.io&lt;/item&gt;
+      &lt;item&gt;Docs: wozz.io/docs&lt;/item&gt;
+      &lt;item&gt;Issues: GitHub Issues&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;MIT - See LICENSE&lt;/p&gt;
+    &lt;p&gt;PRs welcome. See CONTRIBUTING.md.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46255158</guid><pubDate>Sat, 13 Dec 2025 15:23:34 +0000</pubDate></item><item><title>Hacking Google Chrome Source Code: Make Puppeteer work over Redis PubSub</title><link>https://www.deadf00d.com/post/chromium-pub-sub-redis.html</link><description>&lt;doc fingerprint="2478893a2fa1fdcc"&gt;
+  &lt;main&gt;&lt;p&gt;During my time at Pikkit, we frequently needed to spin up large numbers of browser sessions to automate tasks across various websites.&lt;/p&gt;&lt;p&gt;The traditional approach is to run Chromium inside containers and expose a DevTools endpoint using the &lt;code&gt;--remote-debugging&lt;/code&gt; flag. Architecturally, it looks like this:&lt;/p&gt;&lt;code&gt;Puppeteer client (Devtools) ⇌ Chromium Remote Debugging Server (Devtools)&lt;/code&gt;&lt;p&gt;The main challenge with this setup is that the Chromium Remote Debugging Server don't become available instantly, it takes time for the browser to start. This forces you to repeatedly poll for reachability, which introduce complexity and instability.&lt;/p&gt;&lt;p&gt;Also, because DevTools communicates strictly over TCP/IP, any lost packets can instantly break the session. Which is an issue that happens on about 1% of the sessions in production.&lt;/p&gt;&lt;p&gt;One way to solve this would be to use a reverse connection model. Instead of waiting for the client to connect to the Chromium Remote Debugging Server, we could make the Chromium Remote Debugging part connect to a central server. Or even better, a publish and subscribe stream through Redis, which would handle buffering for us:&lt;/p&gt;&lt;code&gt;Puppeteer client (Devtools) ⇌ Puppeteer Server (Devtools) ⇌ Redis (Redis) ⇌ Chromium Remote Debugging&lt;/code&gt;&lt;p&gt;Unfortunately, Chromium doesn’t support Redis, or any similar messaging layers, out of the box. Most setups work around this by introducing an additional intermediate layer that forward packets by connecting in between the Redis and Devtools.&lt;/p&gt;&lt;code&gt;Puppeteer client (Devtools) ⇌ Puppeteer Server (Devtools) ⇌ Redis (Redis) ⇌ Redis to devtool translation ⇌ Chromium Remote Debugging&lt;/code&gt;&lt;p&gt;While functional, this approach adds even more moving parts, which hurts both speed and reliability. So instead of layering on additional components, I want to take this a step further and integrate Redis support directly into Chromium’s DevTools server.&lt;/p&gt;&lt;p&gt;Let's dive in.&lt;/p&gt;&lt;head rend="h2"&gt;Chromium's Codebase&lt;/head&gt;&lt;p&gt;Chromium’s codebase is enormous. Whenever I work with a project of this size, I start with a full-text search to locate the areas I care about, then work my way up the call tree to understand the surrounding architecture. With Chromium, however, there are a few additional things worth knowing before diving in.&lt;/p&gt;&lt;p&gt;If you plan to work on Chromium yourself, I highly recommend reading the documentation files scattered throughout the repository. Many are outdated, but they provide valuable historical context and help clarify why certain systems exist and how they fit together.&lt;/p&gt;&lt;p&gt;Here’s a high-level look at how the major pieces of Chromium fit together:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;Blink (Rendering Engine): &lt;code&gt;third_party/blink/&lt;/code&gt;&lt;/item&gt;&lt;item&gt;V8 (JavaScript Engine): &lt;code&gt;v8/&lt;/code&gt;&lt;/item&gt;&lt;item&gt;Net (Network Stack): &lt;code&gt;net/&lt;/code&gt;&lt;/item&gt;&lt;item&gt;Mojo (IPC framework): handles communication between components such as the browser process and renderer process — &lt;code&gt;mojo/&lt;/code&gt;, with legacy code in&lt;code&gt;ipc/&lt;/code&gt;&lt;/item&gt;&lt;item&gt;Content (Browser Engine): a reusable, platform-agnostic browser engine &lt;code&gt;content/&lt;/code&gt;&lt;/item&gt;&lt;item&gt;Chrome — the actual Chrome browser implementation built on top of all the above — &lt;code&gt;chrome/&lt;/code&gt;&lt;/item&gt;&lt;/list&gt;&lt;head rend="h2"&gt;About devtools&lt;/head&gt;&lt;p&gt;In our case, DevTools lives inside the Browser Engine, under &lt;code&gt;content/browser/devtools&lt;/code&gt;:&lt;/p&gt;&lt;p&gt;Within this directory, Chromium provides two different DevTools handler implementations:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;&lt;code&gt;devtools_http_handler&lt;/code&gt;: serves DevTools over an HTTP server&lt;/item&gt;&lt;item&gt;&lt;code&gt;devtools_pipe_handler&lt;/code&gt;: communicates via Unix or Windows pipes&lt;/item&gt;&lt;/list&gt;&lt;p&gt;These correspond to the various command-line flags Chrome exposes for enabling DevTools over different transports:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;remote-debugging-address: Use the given address instead of the default loopback for accepting remote debugging connections. Note that the remote debugging protocol does not perform any authentication, so exposing it too widely can be a security risk.&lt;/item&gt;&lt;item&gt;remote-debugging-io-pipes: Specifies pipe names for the incoming and outbound messages on the Windows platform. This is a comma separated list of two pipe handles serialized as unsigned integers, e.g. "--remote-debugging-io-pipes=3,4".&lt;/item&gt;&lt;item&gt;remote-debugging-pipe: Enables remote debug over stdio pipes or over the remote pipes specified in the 'remote-debugging-io-pipes' switch. Optionally, specifies the format for the protocol messages, can be either "JSON" (the default) or "CBOR".&lt;/item&gt;&lt;item&gt;remote-debugging-port: Enables remote debug over HTTP on the specified port.&lt;/item&gt;&lt;item&gt;remote-debugging-socket-name: Enables remote debug over HTTP on the specified socket name.&lt;/item&gt;&lt;item&gt;remote-debugging-targets: Provides a list of addresses to discover DevTools remote debugging targets.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;(From https://peter.sh/experiments/chromium-command-line-switches/)&lt;/p&gt;&lt;p&gt;After exploring both implementations, I chose to focus on the pipe handler. Its architecture is significantly simpler and easier to extend for our needs.&lt;/p&gt;&lt;head rend="h2"&gt;Pipe Handler Workflow&lt;/head&gt;&lt;p&gt;You can explore the implementation here: https://source.chromium.org/chromium/chromium/src/+/main:content/browser/devtools/devtools_pipe_handler.cc&lt;/p&gt;&lt;p&gt;At first glance the code may look intimidating, but the overall workflow is actually fairly straightforward.&lt;/p&gt;&lt;p&gt;&lt;code&gt;DevToolsPipeHandler::DevToolsPipeHandler&lt;/code&gt; is instantied with read and write descriptors:&lt;/p&gt;&lt;p&gt;devtools_pipe_handler.cc - DevToolsPipeHandler&lt;/p&gt;click to expand&lt;p&gt;A new DevTools agent is then created through &lt;code&gt;DevToolsAgentHost::CreateForBrowser&lt;/code&gt;&lt;/p&gt;&lt;p&gt;Next, the &lt;code&gt;remote-debugging-pipe&lt;/code&gt; argument is parsed to determine which protocol format to use:&lt;/p&gt;&lt;p&gt;The pipe handler supports two modes: CBOR and ASCII. (If you're unfamiliar with CBOR, think of it as a compact binary encoding of JSON.) Depending on which mode is selected, Chromium instantiates either &lt;code&gt;PipeReaderCBOR&lt;/code&gt; or &lt;code&gt;PipeReaderASCIIZ&lt;/code&gt;, both subclasses of &lt;code&gt;PipeReaderBase&lt;/code&gt;.&lt;/p&gt;&lt;head rend="h5"&gt;Reader: reading messages from the DevTools client&lt;/head&gt;&lt;p&gt;devtools_pipe_handler.cc - Reader Classes&lt;/p&gt;click to expand&lt;head rend="h5"&gt;Writer: Write messages to the DevTools client&lt;/head&gt;&lt;p&gt;devtools_pipe_handler.cc - Writer Classes&lt;/p&gt;click to expand&lt;p&gt;Both the Reader and Writer run concurrently, each operating on its own descriptor.&lt;/p&gt;&lt;p&gt;When the Reader receives data, it parses the message according to the selected encoding and then forwards it to &lt;code&gt;PipeReaderBase::HandleMessage&lt;/code&gt;:&lt;/p&gt;&lt;p&gt;This method posts the work to the UI thread, where the local DevTools handler processes the instruction and applies it to the page.&lt;/p&gt;&lt;p&gt;The Writer, in turn, is responsible for sending responses back to the client. When an outgoing DevTools message is ready, it triggers &lt;code&gt;DevToolsPipeHandler::HandleMessage&lt;/code&gt; (note: this is distinct from &lt;code&gt;PipeReaderBase::HandleMessage&lt;/code&gt;) that then call &lt;code&gt;PipeWriter*::Write&lt;/code&gt;:&lt;/p&gt;&lt;p&gt;And that’s the full message round-trip: commands flow in through the Reader, actions execute on the UI thread, and results flow out through the Writer.&lt;/p&gt;&lt;p&gt;The HTTP-based DevTools handler follows the same logical structure, though with extra layers to support the added complexity of HTTP.&lt;/p&gt;&lt;head rend="h2"&gt;Implementing our own handler&lt;/head&gt;&lt;p&gt;If we want to introduce our own DevTools handler with Redis support, the first step is implementing a Redis client in C++.&lt;/p&gt;&lt;p&gt;There are several existing libraries we could pull in, but managing external dependencies along with build configurations, can get complicated inside Chromium’s build system. To avoid that friction, I opted to implement a minimal Redis client myself, using standard library as much as possible.&lt;/p&gt;&lt;p&gt;It’s intentionally lightweight, not feature complete, just enough to support the message patterns we need. And, for better or worse, this is what ChatGPT originally generated:&lt;/p&gt;&lt;p&gt;redis_client.cc&lt;/p&gt;click to expand&lt;p&gt;I placed this Redis client implementation in the same directory as the existing DevTools files, and added it to &lt;code&gt;content/browser/BUILD.gn&lt;/code&gt; so Chromium’s build system would pick it up.&lt;/p&gt;&lt;p&gt;Next, rather than introducing a brand-new handler type (and dealing with the complexity of wiring it into the build system), we’ll modify the existing pipe handler directly. This approach keeps the changes localized and ensures the browser behaves as intended as long as the patch is applied.&lt;/p&gt;&lt;p&gt;The first step is to adjust how the &lt;code&gt;remote-debugging-pipe&lt;/code&gt; argument is parsed. Instead of treating it as a mode selector, we reinterpret it as a value in the format:&lt;/p&gt;&lt;code&gt;&amp;lt;uuid&amp;gt;@&amp;lt;host&amp;gt;:&amp;lt;port&amp;gt;&lt;/code&gt;
+
+&lt;p&gt;This allows us to specify the Redis endpoint to connect to and assign a unique identifier for the browser instance. From there, we create both &lt;code&gt;redis_client_&lt;/code&gt; and &lt;code&gt;redis_client_subscriber_&lt;/code&gt;. Here’s how I implement this:&lt;/p&gt;&lt;p&gt;We can then inject &lt;code&gt;redis_client_subscriber_&lt;/code&gt; into our Reader and Writer classes, together with the channel name derived from the provided &lt;code&gt;&amp;lt;uuid&amp;gt;&lt;/code&gt;. This setup allows each browser instance to communicate over its own isolated Redis channels.&lt;/p&gt;&lt;p&gt;During initialization, the handler also publishes a message to the &lt;code&gt;create:callback&lt;/code&gt; channel to notify the client that the browser is ready, so the automation can begin immediately after setup completes. Here’s how I implement that step:&lt;/p&gt;&lt;p&gt;Now that our Redis subscriber is wired up, we can update the Reader so it pulls messages from Redis PUBSUB on the &lt;code&gt;uuid + ":read"&lt;/code&gt; channel:&lt;/p&gt;&lt;p&gt;devtools_pipe_handler.cc - Reader Classes Patch&lt;/p&gt;click to expand&lt;p&gt;A lot is happening here. We drop the original &lt;code&gt;PipeReaderBase::ClosePipe&lt;/code&gt; and &lt;code&gt;PipeReaderBase::ReadBytes&lt;/code&gt; logic entirely, this class now simply stores references to our &lt;code&gt;redis_client&lt;/code&gt; and the channel name.&lt;/p&gt;&lt;p&gt;Both &lt;code&gt;PipeReaderASCIIZ::ReadLoopInternal&lt;/code&gt; and &lt;code&gt;PipeReaderCBOR::ReadLoopInternal&lt;/code&gt; receive similar simplifications. Since all we need is the next message from Redis, each method now forwards incoming messages directly to the UI thread. In doing so, both modes behave identically, so CBOR support ends up effectively removed.&lt;/p&gt;&lt;p&gt;Next, we apply the same transformation to the Writer:&lt;/p&gt;&lt;p&gt;devtools_pipe_handler.cc - Writer Classes Patch&lt;/p&gt;click to expand&lt;p&gt;As with the Writer, we strip out all unused pipe logic and replace it with our Redis-based implementation, which publishes messages to the &lt;code&gt;uuid + ":write"&lt;/code&gt; channel. There’s one catch: &lt;code&gt;RedisClient::Publish&lt;/code&gt; is relatively slow, so we dispatch it to a task runner thread, allowing both &lt;code&gt;PipeWriterASCIIZ::WriteIntoPipe&lt;/code&gt; and &lt;code&gt;PipeWriterCBOR::WriteIntoPipe&lt;/code&gt; to return early without blocking execution.&lt;/p&gt;&lt;p&gt;And that's it!&lt;/p&gt;&lt;head rend="h2"&gt;Using it&lt;/head&gt;&lt;p&gt;After compiling Chromium with the patch, you can launch it and connect to Redis like this:&lt;/p&gt;&lt;code&gt;$ chromium-browser --remote-debugging-pipe="5b032229-1d6e-43e2-9369-44a3d11b2a55@127.0.0.1:6379"&lt;/code&gt;
+
+&lt;p&gt;From there, publishing DevTools commands to &lt;code&gt;5b032229-1d6e-43e2-9369-44a3d11b2a55:read&lt;/code&gt; will execute them inside the browser. The results will then be available on &lt;code&gt;5b032229-1d6e-43e2-9369-44a3d11b2a55:write&lt;/code&gt;.&lt;/p&gt;&lt;p&gt;On its own this isn’t particularly convenient, since DevTools clients only speak WebSocket. But adding a small WebSocket-to-Redis gateway solves that immediately:&lt;/p&gt;&lt;p&gt;app.js - WebSocket &amp;lt;-&amp;gt; Redis gateway&lt;/p&gt;click to expand&lt;p&gt;With that in place, you can create and connect to any remote browser simply by pointing your DevTools client to the gateway:&lt;/p&gt;&lt;p&gt;test.js&lt;/p&gt;click to expand&lt;head rend="h2"&gt;Conclusion&lt;/head&gt;&lt;p&gt;It’s certainly not the prettiest patch, but it worked, and it worked well. It allowed us to scale to tens of thousands of sessions, with browsers spinning up reliably and no lost packets along the way.&lt;/p&gt;&lt;p&gt;There's a lot more that goes into a production ready, high scale on-demand browser service. I'll cover more of those pieces in follow-up posts.&lt;/p&gt;&lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46255522</guid><pubDate>Sat, 13 Dec 2025 16:03:18 +0000</pubDate></item><item><title>I tried Gleam for Advent of Code</title><link>https://blog.tymscar.com/posts/gleamaoc2025/</link><description>&lt;doc fingerprint="4758503509883eb8"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;I Tried Gleam for Advent of Code, and I Get the Hype&lt;/head&gt;
     &lt;p&gt;I do Advent of Code every year.&lt;/p&gt;
