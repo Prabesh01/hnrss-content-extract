@@ -1,159 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-12-13T04:16:24.802702+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46242700</id><title>Building small Docker images faster</title><updated>2025-12-13T04:16:32.071620+00:00</updated><content>&lt;doc fingerprint="2c0c3e395f6515e0"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Building smaller Docker images faster&lt;/head&gt;
-    &lt;p&gt;I've been tasked (more or less) with building the first Go service at &lt;code&gt;$DAYJOB&lt;/code&gt;, which is almost exclusively a Python shop. Why Go of all languages? Well, some of my coworkers are big fans of the gopher, it's an easy language, it's attached to one of the big companies, and it's much faster than Python, so I feel more comfortable pushing for this rather than Rust or (sadly) Nix.&lt;/p&gt;
-    &lt;p&gt;The project that recently fell onto my lap is basically RCE-as-a-service, and it just so happens that one of the few languages that I would feel comfortable letting users execute remotely on our servers has a Go implementation, which is as good an excuse as any to take a break from the usual snekslop.&lt;/p&gt;
-    &lt;p&gt;I still haven't convinced anybody here to get on the Nix train, so after a short stint of building the project and the OCI images with a recursive cycle of Make and Nix, I breathed a heavy sigh and dropped it for Docker and Docker Compose, which is what we generally use here.&lt;/p&gt;
-    &lt;p&gt;Which is a shame, because Nix is pretty good at building OCI images. This is all the code you need to create a minimal image that contains only your service and nothing else, not even &lt;code&gt;/bin/sh&lt;/code&gt;.&lt;/p&gt;
-    &lt;code&gt;{ pkgs ? import &amp;lt;nixpkgs&amp;gt; {} }:
-pkgs.dockerTools.streamLayeredImage {
-  name = "someimage";
-  tag = "latest";
-  config.Cmd = [
-    "${pkgs.hello}/bin/hello"
-  ];
-}
-&lt;/code&gt;
-    &lt;p&gt;You can build that with &lt;code&gt;nix-build docker-test.nix&lt;/code&gt; and inside &lt;code&gt;./result&lt;/code&gt; you'll find a script that generates the image's tarball. Load it up with &lt;code&gt;./result | docker load&lt;/code&gt; and Docker will report a new image called &lt;code&gt;someimage:latest&lt;/code&gt; when you run &lt;code&gt;docker image ls&lt;/code&gt;. It's only 45.8MB, and most of that is taken up by glibc.&lt;/p&gt;
-    &lt;p&gt;But what if I told you that you can get more or less the same result with a simple &lt;code&gt;Dockerfile&lt;/code&gt; if you know what you're doing? Especially if you're building a static executable, which Go famously does (at least when you set &lt;code&gt;CGO_ENABLED=0&lt;/code&gt;) and if you're willing to sacrifice a few affordances. Who needs coreutils anyway?&lt;/p&gt;
-    &lt;p&gt;In this post I'll show you a few tricks I found while striving to make small and fast-building images. I'm not an expert in Docker by any stretch so maybe you know all of this stuff already, but perhaps you might learn something new.&lt;/p&gt;
-    &lt;head rend="h2"&gt;A barebones image&lt;/head&gt;
-    &lt;p&gt;I'm using &lt;code&gt;goose&lt;/code&gt; for database migrations. I configured the &lt;code&gt;docker-compose.yml&lt;/code&gt; to run its container just after the database has started and before the actual service runs, and since it's a very small self-contained tool I figured I could try to make the image as small and quick to build as possible. Let me show you the relevant part of the &lt;code&gt;docker-compose.yml&lt;/code&gt; first:&lt;/p&gt;
-    &lt;code&gt;services:
-  migrate:
-    image: migrate:latest
-    pull_policy: build
-    build:
-      context: https://github.com/pressly/goose.git#v3.26.0
-      dockerfile: $PWD/Dockerfile.migrate
-    environment:
-      GOOSE_DBSTRING: postgresql://AzureDiamond:hunter2@db:5432/bobby
-      GOOSE_MIGRATION_DIR: /migrations
-      GOOSE_DRIVER: postgres
-    depends_on:
-      db:
-        condition: service_started
-    volumes:
-      - ./migrations:/migrations
-&lt;/code&gt;
-    &lt;p&gt;The &lt;code&gt;build.context&lt;/code&gt; parameter specifies the "set of files" that are available from the host while building a Docker image. It's the parameter that you pass after &lt;code&gt;docker build&lt;/code&gt;, generally &lt;code&gt;.&lt;/code&gt; (the PWD). Here I specified a GitHub URL with a tag, so when I'm referring to &lt;code&gt;.&lt;/code&gt; in the &lt;code&gt;Dockerfile&lt;/code&gt; above I get the root of the &lt;code&gt;goose&lt;/code&gt; project on that tag's commit. I didn't know Docker could do that!&lt;/p&gt;
-    &lt;p&gt;The &lt;code&gt;build.dockerfile&lt;/code&gt; path includes &lt;code&gt;$PWD&lt;/code&gt; because even if Docker itself can refer to Dockerfiles outside of its context, Docker Compose apparently can't unless you specify it as an absolute path. I think this will break if you try to run &lt;code&gt;docker compose&lt;/code&gt; from another directory, but it's good enough for now.&lt;/p&gt;
-    &lt;p&gt;Now let's take a look at the &lt;code&gt;Dockerfile&lt;/code&gt; itself:&lt;/p&gt;
-    &lt;code&gt;FROM golang:1.25-alpine3.23 AS builder
-
-WORKDIR /build
-
-ARG CGO_ENABLED=0
-
-ARG GOCACHE=/root/.cache/go-build
-ARG GOMODCACHE=/root/.cache/go-mod
-
-RUN --mount=type=cache,target=/root/.cache/go-build \
-  --mount=type=cache,target=/root/.cache/go-mod \
-  --mount=type=bind,source=.,target=/build \
-  go build -tags='no_clickhouse no_libsql no_sqlite3 no_mssql no_vertica no_mysql no_ydb' -o /goose ./cmd/goose
-
-FROM scratch
-
-COPY --from=builder /goose /goose
-
-CMD ["/goose", "up"]
-&lt;/code&gt;
-    &lt;p&gt;A few things to note:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;I used the Alpine image for Go because it's the smallest and it includes everything I need to build the tool.&lt;/item&gt;
-      &lt;item&gt;I set &lt;code&gt;CGO_ENABLED=0&lt;/code&gt;to ensure that the executable only builds with the Go toolchain and does not link to libc. According to the docs, The cgo tool is enabled by default for native builds on systems where it is expected to work so you have to take extra care to disable it if you don't want or need it.&lt;/item&gt;
-      &lt;item&gt;I set &lt;code&gt;GOCACHE&lt;/code&gt;and&lt;code&gt;GOMODCACHE&lt;/code&gt;(docs) to a known location to ensure that I can take advantage of cache mounts on subsequent rebuilds. Admittedly this is not very useful for an external tool that I'm only expecting to build once but hey, every little bit helps.&lt;/item&gt;
-      &lt;item&gt;Instead of &lt;code&gt;ADD&lt;/code&gt;ing or&lt;code&gt;COPY&lt;/code&gt;ing the package's source I bind mounted it to the workdir. This should make it a bit faster because it avoids an extra copy into the build container.&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;FROM scratch&lt;/code&gt;defines a second build stage that ensures any artifacts from the actual build are discarded.&lt;code&gt;scratch&lt;/code&gt;is the null image.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;The result is an image with one layer containing one file that builds, loads and boots extremely fast and is only *chef's kiss* 15.9MB in size. Not too bad!&lt;/p&gt;
-    &lt;head rend="h2"&gt;The build context&lt;/head&gt;
-    &lt;p&gt;Earlier I mentioned the build context. Keeping it small is important because Docker copies all files available in the build context to the builder every time you run a &lt;code&gt;docker build&lt;/code&gt;, so if you have lots of files in your repo that you don't need to build the image you'll probably want to exclude them. The way you do that is by keeping a &lt;code&gt;.dockerignore&lt;/code&gt; file alongside your &lt;code&gt;Dockerfile&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;I have to stress one point: the build context includes everything inside the directory you run &lt;code&gt;docker build&lt;/code&gt; from unless it's listed in &lt;code&gt;.dockerignore&lt;/code&gt;. I thought some obvious things like &lt;code&gt;.git&lt;/code&gt; would be excluded by default, but a quick test disproved that:&lt;/p&gt;
-    &lt;code&gt;FROM busybox
-WORKDIR /
-COPY . ./
-CMD []
-&lt;/code&gt;
-    &lt;p&gt;Try saving that file as &lt;code&gt;Dockerfile.test&lt;/code&gt; in one of your repos, build it with &lt;code&gt;docker build -f Dockerfile.text -t build-context .&lt;/code&gt;, open a shell with &lt;code&gt;docker run --rm -it build-context /bin/sh&lt;/code&gt; and run &lt;code&gt;find&lt;/code&gt;. Everything's in there: &lt;code&gt;.git&lt;/code&gt;, &lt;code&gt;.jj&lt;/code&gt;, the &lt;code&gt;Dockerfile.test&lt;/code&gt; itself, and all the rest of the build artifacts and assorted junk you have accumulated in your project directory. Ignoring them won't make your images smaller, but it might make the build quicker.&lt;/p&gt;
-    &lt;code&gt;# .dockerignore
-.*
-
-Dockerfile*
-docker-compose.yml
-
-# ...
-&lt;/code&gt;
-    &lt;head rend="h2"&gt;Granular layers&lt;/head&gt;
-    &lt;p&gt;Splitting and ordering layers is probably the most well-known and obvious Docker build time optimization there is, but it doesn't hurt to mention. This is the &lt;code&gt;Dockerfile&lt;/code&gt; for the service I'm building:&lt;/p&gt;
-    &lt;code&gt;FROM golang:1.25-alpine3.23 AS builder
-
-WORKDIR /build
-
-ARG CGO_ENABLED=0
-
-ARG GOCACHE=/root/.cache/go-build
-ARG GOMODCACHE=/root/.cache/go-mod
-
-RUN --mount=type=cache,target=/root/.cache/go-build \
-  --mount=type=cache,target=/root/.cache/go-mod \
-  go install github.com/DataDog/orchestrion@latest
-
-RUN --mount=type=bind,source=go.mod,target=go.mod \
-  --mount=type=bind,source=go.sum,target=go.sum \
-  --mount=type=cache,target=/root/.cache/go-build \
-  --mount=type=cache,target=/root/.cache/go-mod \
-  go mod download
-
-RUN --mount=type=bind,source=go.mod,target=go.mod \
-  --mount=type=bind,source=go.sum,target=go.sum \
-  --mount=type=cache,target=/root/.cache/go-build \
-  --mount=type=cache,target=/root/.cache/go-mod \
-  --mount=type=bind,source=internal,target=internal \
-  --mount=type=bind,source=cmd,target=cmd \
-  --mount=type=bind,source=orchestrion.tool.go,target=orchestrion.tool.go \
-  orchestrion go build -o server ./cmd/server
-
-FROM alpine:3.23 AS prod
-
-WORKDIR /app
-
-COPY --from=builder /build/server .
-
-ENTRYPOINT ["/app/server"]
-&lt;/code&gt;
-    &lt;p&gt;You can see all the bind and cache mount tricks from earlier, not much has changed. I'm installing &lt;code&gt;orchestrion&lt;/code&gt; (a great tool to bloat up your binary size if you ever feel like it) early because that's the least likely to change. After that I bind mount &lt;code&gt;go.mod&lt;/code&gt; and &lt;code&gt;go.sum&lt;/code&gt; and only download the dependencies, because that's the step that generally takes the most time and dependencies change less often than code. Only at the end do I bind mount the package directories and build the server.&lt;/p&gt;
-    &lt;p&gt;You can iterate on this by changing one of the relevant files and ensuring that all the previous steps are marked as &lt;code&gt;CACHED&lt;/code&gt; on the next &lt;code&gt;docker build&lt;/code&gt;. Again, this won't save you space but it'll save you a lot of time while iterating.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Conclusions&lt;/head&gt;
-    &lt;p&gt;Summing up:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Read the Optimize cache usage in builds page in the Docker documentation, and maybe take a look at the rest while you're there.&lt;/item&gt;
-      &lt;item&gt;Split, merge and order layers according to how often you expect them to be rebuilt. Directives like &lt;code&gt;ENV&lt;/code&gt;,&lt;code&gt;ARG&lt;/code&gt;and&lt;code&gt;WORKDIR&lt;/code&gt;should go before everything else.&lt;/item&gt;
-      &lt;item&gt;Use multi-stage builds to shrink the final image size. Consider if you can get away with using &lt;code&gt;scratch&lt;/code&gt;,&lt;code&gt;busybox&lt;/code&gt;or&lt;code&gt;alpine&lt;/code&gt;for the final image.&lt;/item&gt;
-      &lt;item&gt;If your project contains multiple separate applications (for example a backend and a frontend) you can create separate build stages for each of them, and then copy the results into a final image. Stages that don't depend on each other are built in parallel if you're using BuildKit, and you can do all sorts of tricks with multi-stage builds to ensure your CPU runs hot all the time.&lt;/item&gt;
-      &lt;item&gt;Add a &lt;code&gt;.dockerignore&lt;/code&gt;to your project, and make sure to put&lt;code&gt;.git&lt;/code&gt;in there if you don't need it.&lt;/item&gt;
-      &lt;item&gt;Try to set up cache mounts to make sure dependencies and intermediate build artifacts are persisted across builds. Some CI services (GitHub actions, apparently) even let you set up external caches.&lt;/item&gt;
-      &lt;item&gt;Try to use bind mounts instead of &lt;code&gt;COPY&lt;/code&gt;ing source files into the builder. Bind mounts are usually read-only, but you can make them read-write if you really need to.&lt;/item&gt;
-      &lt;item&gt;I didn't use it in my &lt;code&gt;Dockerfile&lt;/code&gt;s, but apparently you should be using&lt;code&gt;ADD&lt;/code&gt;for downloading files, archives or Git repos during your build. The docs mention that&lt;code&gt;COPY&lt;/code&gt;should mostly be used for copying files between stages or for files you need in your final image, and for the rest you should try to use bind mounts.&lt;/item&gt;
-      &lt;item&gt;Use smaller base images when possible and if you really have to install stuff with &lt;code&gt;apt&lt;/code&gt;you should make an intermediate image and upload it to your container repository of choice so your poor runners don't have to hammer Debian's mirrors every single time you push.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;One last trick before the post is over: I just discovered that Docker Compose has a watch mode that tracks changes in the build context and rebuilds (or does other things with) your image on every change. Nice!&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://sgt.hootr.club/blog/docker-protips/"/><published>2025-12-12T10:23:23+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46243655</id><title>Sick of smart TVs? Here are your best options</title><updated>2025-12-13T04:16:31.650902+00:00</updated><content>&lt;doc fingerprint="a7ccd93c51a39178"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Smart TVs can feel like a dumb choice if you’re looking for privacy, reliability, and simplicity.&lt;/p&gt;
-    &lt;p&gt;Today’s TVs and streaming sticks are usually loaded up with advertisements and user tracking, making offline TVs seem very attractive. But ever since smart TV operating systems began making money, “dumb” TVs have been hard to find.&lt;/p&gt;
-    &lt;p&gt;In response, we created this non-smart TV guide that includes much more than dumb TVs. Since non-smart TVs are so rare, this guide also breaks down additional ways to watch TV and movies online and locally without dealing with smart TVs’ evolution toward software-centric features and snooping. We’ll discuss a range of options suitable for various budgets, different experience levels, and different rooms in your home.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Our best recommendation&lt;/head&gt;
-    &lt;p&gt;This is a dumb TV guide, but first, let’s briefly highlight the best recommendation for most people: Take your TV offline and plug in an Apple TV box.&lt;/p&gt;
-    &lt;p&gt;An Apple TV lets you replace smart TV software with Apple’s cleaner tvOS, and it’s more intuitive than using most smart TVs and other streaming devices. Apple’s tvOS usually runs faster and more reliably, and it isn’t riddled with distracting ads or recommendations. And there’s virtually no learning curve for family members or visitors, something that can’t always be said for DIY alternatives.&lt;/p&gt;
-    &lt;p&gt;Critically, Apple TV boxes are also an easy recommendation on the privacy front. The setup process makes it simple for anyone to ensure that the device is using relatively minimal user tracking. You’re likely to use an Apple TV box with the Apple TV app or with an Apple account, which means sending some data to Apple. But Apple has a better reputation for keeping user information in-house, and Apple TV boxes don’t have automatic content recognition (ACR).&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://arstechnica.com/gadgets/2025/12/the-ars-technica-guide-to-dumb-tvs/"/><published>2025-12-12T12:51:40+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46243883</id><title>Fedora: Open-source repository for long-term digital preservation</title><updated>2025-12-13T04:16:31.303344+00:00</updated><content>&lt;doc fingerprint="3cd1965b918fe919"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-12-13T04:44:29.617072+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46243883</id><title>Fedora: Open-source repository for long-term digital preservation</title><updated>2025-12-13T04:44:37.038163+00:00</updated><content>&lt;doc fingerprint="3cd1965b918fe919"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Fedora is the flexible, standards-based, open-source repository software built to support long-term digital preservation.&lt;/head&gt;
     &lt;head rend="h2"&gt;Why Choose Fedora?&lt;/head&gt;
@@ -179,7 +25,7 @@ ENTRYPOINT ["/app/server"]
     &lt;p&gt;Long-term digital preservation starts here.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://fedorarepository.org/"/><published>2025-12-12T13:23:31+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46243904</id><title>SQLite JSON at full index speed using generated columns</title><updated>2025-12-13T04:16:30.853864+00:00</updated><content>&lt;doc fingerprint="3adc827f54e65bc2"&gt;
+&lt;/doc&gt;</content><link href="https://fedorarepository.org/"/><published>2025-12-12T13:23:31+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46243904</id><title>SQLite JSON at full index speed using generated columns</title><updated>2025-12-13T04:44:36.203046+00:00</updated><content>&lt;doc fingerprint="3adc827f54e65bc2"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;SQLite JSON Superpower: Virtual Columns + Indexing&lt;/head&gt;
     &lt;p&gt;We absolutely love SQLite here at DB Pro. You'd be hard-pressed to find anyone who actively dislikes it. Sure, it has limitations, and I do mean limitations, not weaknesses. SQLite can absolutely be used in production when it's deployed properly and tuned with care.&lt;/p&gt;
@@ -235,7 +81,7 @@ CREATE INDEX idx_events_user_id ON events(user_id);
     &lt;p&gt;Jay&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.dbpro.app/blog/sqlite-json-virtual-columns-indexing"/><published>2025-12-12T13:25:19+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46244922</id><title>CM0 – A new Raspberry Pi you can't buy</title><updated>2025-12-13T04:16:30.676606+00:00</updated><content>&lt;doc fingerprint="bf35175918e780e8"&gt;
+&lt;/doc&gt;</content><link href="https://www.dbpro.app/blog/sqlite-json-virtual-columns-indexing"/><published>2025-12-12T13:25:19+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46244922</id><title>CM0 – A new Raspberry Pi you can't buy</title><updated>2025-12-13T04:44:36.022055+00:00</updated><content>&lt;doc fingerprint="bf35175918e780e8"&gt;
   &lt;main&gt;
     &lt;p&gt;This little postage stamp is actually a full Raspberry Pi Zero 2, complete with eMMC storage and WiFi.&lt;/p&gt;
     &lt;p&gt;But you can't get one. Well, not unless you buy the CM0NANO development board from EDAtec, or you live in China.&lt;/p&gt;
@@ -281,7 +127,7 @@ CREATE INDEX idx_events_user_id ON events(user_id);
     &lt;p&gt;You can find a little more detail and benchmark results on my sbc-reviews issue for the CM0.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.jeffgeerling.com/blog/2025/cm0-new-raspberry-pi-you-cant-buy"/><published>2025-12-12T15:19:19+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46245622</id><title>String theory inspires a brilliant, baffling new math proof</title><updated>2025-12-13T04:16:30.442772+00:00</updated><content>&lt;doc fingerprint="3e75981c062e07f4"&gt;
+&lt;/doc&gt;</content><link href="https://www.jeffgeerling.com/blog/2025/cm0-new-raspberry-pi-you-cant-buy"/><published>2025-12-12T15:19:19+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46245622</id><title>String theory inspires a brilliant, baffling new math proof</title><updated>2025-12-13T04:44:35.674985+00:00</updated><content>&lt;doc fingerprint="3e75981c062e07f4"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;String Theory Inspires a Brilliant, Baffling New Math Proof&lt;/head&gt;
     &lt;head rend="h2"&gt;Introduction&lt;/head&gt;
@@ -348,7 +194,7 @@ CREATE INDEX idx_events_user_id ON events(user_id);
     &lt;p&gt;“I’m very old, and very tired,” Katzarkov said. “But I’m willing to develop this theory as long as I’m alive.”&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.quantamagazine.org/string-theory-inspires-a-brilliant-baffling-new-math-proof-20251212/"/><published>2025-12-12T16:23:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46245923</id><title>Async DNS</title><updated>2025-12-13T04:16:30.086045+00:00</updated><content>&lt;doc fingerprint="eeb8855f7ee79a0d"&gt;
+&lt;/doc&gt;</content><link href="https://www.quantamagazine.org/string-theory-inspires-a-brilliant-baffling-new-math-proof-20251212/"/><published>2025-12-12T16:23:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46245923</id><title>Async DNS</title><updated>2025-12-13T04:44:35.290402+00:00</updated><content>&lt;doc fingerprint="eeb8855f7ee79a0d"&gt;
   &lt;main&gt;
     &lt;head rend="h2"&gt;async dns&lt;/head&gt;
     &lt;p&gt;curl experimented with using pthread_cancel to timeout async DNS requests and it blew up. What else can we do?&lt;/p&gt;
@@ -619,7 +465,7 @@ main(int argc, char **argv)
 }&lt;/code&gt;&lt;lb/&gt;I like this API. It’s very much like read or write in that it either gives you an answer, or tells you to come back later, and then it’s up to you to decide when that is. &lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://flak.tedunangst.com/post/async-dns"/><published>2025-12-12T16:52:41+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46247000</id><title>Home Depot GitHub token exposed for a year, granted access to internal systems</title><updated>2025-12-13T04:16:29.889907+00:00</updated><content>&lt;doc fingerprint="3446549a0e6331dc"&gt;
+&lt;/doc&gt;</content><link href="https://flak.tedunangst.com/post/async-dns"/><published>2025-12-12T16:52:41+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46247000</id><title>Home Depot GitHub token exposed for a year, granted access to internal systems</title><updated>2025-12-13T04:44:35.193385+00:00</updated><content>&lt;doc fingerprint="3446549a0e6331dc"&gt;
   &lt;main&gt;
     &lt;p&gt;A security researcher said Home Depot exposed access to its internal systems for a year after one of its employees published a private access token online, likely by mistake. The researcher found the exposed token and tried to privately alert Home Depot to its security lapse but was ignored for several weeks.&lt;/p&gt;
     &lt;p&gt;The exposure is now fixed after TechCrunch contacted company representatives last week.&lt;/p&gt;
@@ -635,7 +481,7 @@ main(int argc, char **argv)
     &lt;p&gt;We also asked Lane if Home Depot has the technical means, such as logs, to determine if anyone else used the token during the months it was left online to access any of Home Depot’s internal systems. We did not hear back.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://techcrunch.com/2025/12/12/home-depot-exposed-access-to-internal-systems-for-a-year-says-researcher/"/><published>2025-12-12T18:23:21+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46248323</id><title>Rats Play DOOM</title><updated>2025-12-13T04:16:29.681970+00:00</updated><content>&lt;doc fingerprint="f15d927525a98820"&gt;
+&lt;/doc&gt;</content><link href="https://techcrunch.com/2025/12/12/home-depot-exposed-access-to-internal-systems-for-a-year-says-researcher/"/><published>2025-12-12T18:23:21+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46248323</id><title>Rats Play DOOM</title><updated>2025-12-13T04:44:34.920814+00:00</updated><content>&lt;doc fingerprint="f15d927525a98820"&gt;
   &lt;main&gt;
     &lt;p&gt;We built a complete VR setup from scratch to let rats play DOOM. The system includes a motion-tracked treadmill ball, a panoramic headset, an input trigger, and a reward circuit. All hardware and software components are open sourced, including 3D-printable designs, circuit diagrams, firmware, and control software.&lt;/p&gt;
     &lt;p&gt;The first version (v1) was built in New York by Viktor, who trained rats to walk through a corridor in DOOM using a simpler rig. That version was featured on Vice and PC Gamer. After moving back home, the project was paused. Public interest reignited development, leading to v2, a more advanced and modular version built in collaboration with electrical engineer Sándor Makra. Akos Blaschek later assisted significantly in documenting the project for open-sourcing, aiming to enable others to replicate and build upon this work. Key metallic components were designed and sourced in collaboration with SZURWIN KFT.&lt;/p&gt;
@@ -697,7 +543,7 @@ main(int argc, char **argv)
     &lt;p&gt;At YoloRun.Capital, we invest in ambitious, boundary-pushing projects like this, even the beautifully impractical ones. Have a wild idea? Let's talk.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://ratsplaydoom.com/"/><published>2025-12-12T20:15:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46248470</id><title>Security issues with electronic invoices</title><updated>2025-12-13T04:16:28.706424+00:00</updated><content>&lt;doc fingerprint="94f099d3c2f05d8d"&gt;
+&lt;/doc&gt;</content><link href="https://ratsplaydoom.com/"/><published>2025-12-12T20:15:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46248470</id><title>Security issues with electronic invoices</title><updated>2025-12-13T04:44:34.033105+00:00</updated><content>&lt;doc fingerprint="94f099d3c2f05d8d"&gt;
   &lt;main&gt;
     &lt;p&gt;This page provides supplementary material for a presentation given at the German OWASP Day 2025 (Presentation Slides).&lt;/p&gt;
     &lt;head rend="h2"&gt;Intro&lt;/head&gt;
@@ -806,12 +652,12 @@ main(int argc, char **argv)
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://invoice.secvuln.info/"/><published>2025-12-12T20:28:41+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46248644</id><title>macOS 26.2 enables fast AI clusters with RDMA over Thunderbolt</title><updated>2025-12-13T04:16:28.472647+00:00</updated><content>&lt;doc fingerprint="33a9437a9587dba1"&gt;
+&lt;/doc&gt;</content><link href="https://invoice.secvuln.info/"/><published>2025-12-12T20:28:41+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46248644</id><title>macOS 26.2 enables fast AI clusters with RDMA over Thunderbolt</title><updated>2025-12-13T04:44:33.784089+00:00</updated><content>&lt;doc fingerprint="33a9437a9587dba1"&gt;
   &lt;main&gt;
     &lt;p&gt;This page requires JavaScript. Please turn on JavaScript in your browser and refresh the page to view its content.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://developer.apple.com/documentation/macos-release-notes/macos-26_2-release-notes#RDMA-over-Thunderbolt"/><published>2025-12-12T20:41:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46248859</id><title>GNU Unifont</title><updated>2025-12-13T04:16:27.864013+00:00</updated><content>&lt;doc fingerprint="a6fb54c3eae6b68b"&gt;
+&lt;/doc&gt;</content><link href="https://developer.apple.com/documentation/macos-release-notes/macos-26_2-release-notes#RDMA-over-Thunderbolt"/><published>2025-12-12T20:41:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46248859</id><title>GNU Unifont</title><updated>2025-12-13T04:44:33.132205+00:00</updated><content>&lt;doc fingerprint="a6fb54c3eae6b68b"&gt;
   &lt;main&gt;
     &lt;table&gt;
       &lt;row/&gt;
@@ -1678,12 +1524,12 @@ main(int argc, char **argv)
     &lt;p&gt;With the great work done by contributors in providing ConScript Unicode Registry (CSUR) glyphs, they are available in font files that have "_csur" in their name.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://unifoundry.com/unifont/index.html"/><published>2025-12-12T20:57:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46248892</id><title>Motion (YC W20) Is Hiring Senior Staff Front End Engineers</title><updated>2025-12-13T04:16:27.606090+00:00</updated><content>&lt;doc fingerprint="e10fcdab2cdf53e4"&gt;
+&lt;/doc&gt;</content><link href="https://unifoundry.com/unifont/index.html"/><published>2025-12-12T20:57:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46248892</id><title>Motion (YC W20) Is Hiring Senior Staff Front End Engineers</title><updated>2025-12-13T04:44:32.879240+00:00</updated><content>&lt;doc fingerprint="e10fcdab2cdf53e4"&gt;
   &lt;main&gt;
     &lt;p&gt;You need to enable JavaScript to run this app.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://jobs.ashbyhq.com/motion/715d9646-27d4-44f6-9229-61eb0380ae39"/><published>2025-12-12T21:00:54+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46249337</id><title>Capsudo: Rethinking Sudo with Object Capabilities</title><updated>2025-12-13T04:16:27.297383+00:00</updated><content>&lt;doc fingerprint="372878dd7da40869"&gt;
+&lt;/doc&gt;</content><link href="https://jobs.ashbyhq.com/motion/715d9646-27d4-44f6-9229-61eb0380ae39"/><published>2025-12-12T21:00:54+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46249337</id><title>Capsudo: Rethinking Sudo with Object Capabilities</title><updated>2025-12-13T04:44:32.689850+00:00</updated><content>&lt;doc fingerprint="372878dd7da40869"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Rethinking sudo with object capabilities&lt;/head&gt;
     &lt;p&gt;I hate &lt;code&gt;sudo&lt;/code&gt; with a passion.  It represents everything I find offensive about the modern Unix security model:&lt;/p&gt;
@@ -1763,7 +1609,7 @@ www-deployment$ capsudod -o www-deployment:www-developers \
     &lt;p&gt;Identity-based access control asks who should be allowed to act. Object-capability systems ask where authority should live and how it should flow. &lt;code&gt;capsudo&lt;/code&gt; today is an exploration of what happens when you take the second question seriously, treating privilege escalation as explicit delegation and opening the door to further refinements like passing concrete resources, such as pre-opened file descriptors, instead of whole identities.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://ariadne.space/2025/12/12/rethinking-sudo-with-object-capabilities.html"/><published>2025-12-12T21:42:04+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46249538</id><title>Show HN: Tiny VM sandbox in C with apps in Rust, C and Zig</title><updated>2025-12-13T04:16:26.735147+00:00</updated><content>&lt;doc fingerprint="e4d8f8990355ff80"&gt;
+&lt;/doc&gt;</content><link href="https://ariadne.space/2025/12/12/rethinking-sudo-with-object-capabilities.html"/><published>2025-12-12T21:42:04+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46249538</id><title>Show HN: Tiny VM sandbox in C with apps in Rust, C and Zig</title><updated>2025-12-13T04:44:32.191101+00:00</updated><content>&lt;doc fingerprint="e4d8f8990355ff80"&gt;
   &lt;main&gt;
     &lt;p&gt;uvm32 is a minimalist, dependency-free virtual machine sandbox designed for microcontrollers and other resource-constrained devices. Single C file, no dynamic memory allocations, asynchronous design, pure C99.&lt;/p&gt;
     &lt;p&gt;On an STM32L0 (ARM Cortex-M0+) the required footprint is under 4KB flash/1KB RAM.&lt;/p&gt;
@@ -1880,7 +1726,7 @@ make dockershell
     &lt;p&gt;This project is licensed under the MIT License. Feel free to use in research, products and embedded devices.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/ringtailsoftware/uvm32"/><published>2025-12-12T22:02:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46250309</id><title>50 years of proof assistants</title><updated>2025-12-13T04:16:26.395846+00:00</updated><content>&lt;doc fingerprint="8f5c535502b923f7"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/ringtailsoftware/uvm32"/><published>2025-12-12T22:02:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46250309</id><title>50 years of proof assistants</title><updated>2025-12-13T04:44:32.036949+00:00</updated><content>&lt;doc fingerprint="8f5c535502b923f7"&gt;
   &lt;main&gt;&lt;head rend="h2"&gt;50 years of proof assistants&lt;/head&gt;[&lt;code&gt;&lt;nobr&gt;memories&lt;/nobr&gt;&lt;/code&gt; 
   
     
@@ -1905,7 +1751,7 @@ Soon I had provoked John Harrison to build a superior version of ME for HOL Ligh
 Later, Joe Hurd built his &lt;code&gt;metis&lt;/code&gt; superposition prover, which found its way into HOL4.
 Not to be outdone, Tobias made Isabelle’s simplifier the best in its class incorporating a number of sophisticated refinements, including some great ideas from Nqthm.&lt;/p&gt;&lt;p&gt;Twenty years from the start of this chronology we now had several reasonably mature and powerful systems, including Isabelle/ZF, Isabelle/HOL, multiple versions of the HOL system, and Coq (now Rocq).1 Many of them used Proof General, a common user interface for tactic-based proof assistants based on the Emacs editor. And we had 100MHz machines, some with 64MB of memory! We were ready to do big things.&lt;/p&gt;&lt;p&gt;During this period, I did a lot of work on the verification of cryptographic protocols, also here. These secure Internet connections and other network communications; they are valuable when you need to know who is on the other end and need to keep messaging secure from eavesdropping and tampering. Among the protocols investigated were the ubiquitous TLS and the late, unlamented SET protocol. These proofs were not at the level of code or bits; buggy implementations could and did emerge.&lt;/p&gt;&lt;p&gt;In 2005, the big thing that caught everyone’s eye was George Gonthier’s formalisation (in Coq) of the Four Colour Theorem. Most educated people had heard of the theorem already, and its history is fascinating: numerous proofs had been attempted and rejected since the mid 19th century. The 1977 proof by Appel and Haken was questioned because it relied on a lot of ad-hoc computer code. Suddenly, despite the still unwelcome involvement of computers, no one could doubt the theorem anymore.&lt;/p&gt;&lt;p&gt;At the opposite extreme was my own formalisation of Gödel’s proof of the relative consistency of the axiom of choice in Isabelle/ZF. This was the apex of my ZF work, technically difficult but incomprehensible to most people. My early dream of having a formalisation of the Prime Number Theorem came true in 2005 when Jeremy Avigad formalised the theorem in Isabelle. Somewhat later, John Harrison formalised a different proof in HOL Light. And there was much more. Without any doubt, our systems were capable of serious mathematics.&lt;/p&gt;&lt;p&gt;Perhaps the most consequential achievement of this period was Mike Gordon’s collaboration with Graham Birtwistle and Anthony Fox to verify the ARM6 processor. Graham, at Leeds, formally specified the instruction set architecture of the processor (i.e. the assembly language level), while Mike and Anthony at Cambridge verified the implementation of that architecture in terms of lower level hardware components. Eventually a number of other processors were similarly specified, and some verified. Without any doubt, our systems were capable of serious verification.&lt;/p&gt;&lt;p&gt;Despite of the focus on applications in this section, system development continued in the run-up to 2005. I am only familiar with Isabelle development, but they were tremendous:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;the Isar language for structured, legible proofs (a break with the LCF idea that the top level must be a programming language, i.e. ML)&lt;/item&gt;&lt;item&gt;axiomatic type classes, providing principled overloading&lt;/item&gt;&lt;item&gt;counterexample finders: Quickcheck and Refute (now Nitpick)&lt;/item&gt;&lt;item&gt;code generation from the executable fragment of higher-order logic, and reflection&lt;/item&gt;&lt;item&gt;sledgehammer was under active development, but only ready a couple of years later.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;With so much going on, it’s not surprising that our community started doing big things, and other people were starting to notice.&lt;/p&gt;&lt;head rend="h3"&gt;2005–2015: The first landmarks&lt;/head&gt;&lt;p&gt;I am not used to phone calls from journalists: for most of my career, formal verification has been seen as (at best) niche. But the journalist on the end of the line was asking for information about seL4, the first operating system kernel ever to be formally verified. Tools for extended static checking were by then able to detect a lot of program faults, but the seL4 verification claimed to cover full functional correctness: the code did exactly what it was supposed to do. There is now an entire ecosystem around seL4, backed by a million lines of Isabelle/HOL proofs.&lt;/p&gt;&lt;p&gt;People have wanted to verify compilers since forever. The task of fully specifying a programming language, target machine and compiler already seemed impossible, let alone providing the actual proof. With CompCert, that task was finally fulfilled, for a large subset of the C language:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;What sets CompCert apart from any other production compiler, is that it is formally verified, using machine- assisted mathematical proofs, to be exempt from mis- compilation issues. In other words, the executable code it produces is proved to behave exactly as specified by the semantics of the source C program.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;A seemingly intractable problem with compiler verification was how to translate your verified compiler into machine code. For example, CompCert is mostly written in Rocq, which is then extracted to OCaml code. The OCaml compiler had never been verified, so how do we know that its compiled code is correct?&lt;/p&gt;&lt;p&gt;CakeML squares this circle through bootstrapping. CakeML translates from its source language (a dialect of ML) to assembly language, accompanied by a proof that the two pieces of code are equivalent. This work was an outgrowth of the ARM6 project mentioned earlier. Magnus Myreen had developed techniques for automatically and verifiably translating between assembly language and recursive functions in higher-order logic, in both directions. At the start of the bootstrapping process, a tiny compiler was written in pure logic and proved correct. It was now safe to run this compiler and use its tiny language to implement a bigger language. This process ultimately produced a verified compiler in both source form and assembly language form, with a proof of their equivalence, as well as verified extraction from higher-order logic to ML.&lt;/p&gt;&lt;p&gt;The end of the decade also saw impressive results in the formalisation of mathematics:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;Gödel second incompleteness theorem, by yours truly, in Isabelle/HOL&lt;/item&gt;&lt;item&gt;the Central Limit Theorem, by Avigad et al., ditto&lt;/item&gt;&lt;item&gt;the Flyspeck project, by Hales et al., in Isabelle/HOL and HOL Light&lt;/item&gt;&lt;item&gt;the odd order theorem, in Rocq&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Without going into details here, each of these was an ambitious proof, combining in various ways deep mathematics, intricate technicalities and sheer bulk. Our community was proud of our achievements. We were no longer a joke, but what exactly we were good for?&lt;/p&gt;&lt;head rend="h3"&gt;2015–2025: Breaking through&lt;/head&gt;&lt;p&gt;This period brought something astonishing: acceptance of proof assistants by many mainstream mathematicians. I mostly recall mathematicians regardeding computers with something close to contempt. Even some logicians regarded formalised mathematics as impossible, somehow fixating on Gödel’s incompleteness or that notorious proof of 1+1=2 on page 360. Regarding my work formalising big chunks of ZF theory, someone commented “only for finite sets obviously”.&lt;/p&gt;&lt;p&gt;My EU-funded ALEXANDRIA project started in 2017. My team formalised more advanced and deep mathematics than I ever imagined to be possible, using Isabelle/HOL. (I have told this story in an earlier blogpost.) But ALEXANDRIA alone would not have had much of an impact on mathematical practice. What made a difference was Kevin Buzzard and his enthusiastic, tireless promotion of the idea of formalising mathematics in Lean. He recruited a veritable army. I got the idea of blogging from him, but my blog has not had the same impact. Where are you guys?&lt;/p&gt;&lt;p&gt;In 2022, for the first time ever, machine assistance was used to confirm brand-new mathematics that a Fields Medallist had concerns about. Mathematicians will for the most part continue to work the way they always have done, but proof assistants are getting better and better, and they will encroach more and more on the everyday practice of mathematics.&lt;/p&gt;&lt;p&gt;Meanwhile, Isabelle continued to be useful for verification. I was amazed to hear that that the systems group here in the Computer Lab had completed a major verification using Isabelle/HOL. The tradition is for systems people to despise verification tools for sweeping aside ugly things like overflow and floating point errors, even though they no longer do. Besides, a research tool like Isabelle is only used by its own developer and his students. Times were changing.&lt;/p&gt;&lt;p&gt;Isabelle is also one of the several proof assistants involved with CHERI, a large-scale project reviving the old idea of capabilities to ensure security at the hardware level. CHERI has produced numerous publications, some of which (for example this one and that one) describe very large proofs. These concern the design and implementation of novel computer architectures with fine-grained memory protection, and a design process with formal verification at its heart.&lt;/p&gt;&lt;p&gt;Isabelle has also contributed to the design of WebAssembly, a relatively new platform for web applications. By subjecting the WebAssembly specification to formal scrutiny, Conrad Watt was able to identify a number of issues in time for them to be fixed.&lt;/p&gt;&lt;p&gt;Finally, I’d like to mention this announcement (4 December 2025) by Dominic Mulligan of Amazon Web Services (AWS):&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Over three years, lots of hard work, and 260,000 lines of Isabelle/HOL code later, the Nitro Isolation Engine (NIE) is finally announced alongside Graviton5.&lt;/p&gt;&lt;p&gt;Working with our colleagues in EC2, Annapurna, and AWS AppSec, we have been working to rearchitect the Nitro system for Graviton5+ instances around a small, trusted separation kernel. Written from scratch in Rust, we have additionally specified the behaviour of a core subset of the Nitro Isolation Engine kernel, verified that the implementation meets this specification, and additionally proved deep security properties—confidentiality and integrity—of the implementation.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;I am biased, since I’ve been working with AWS on this exact project, but this is a big deal. AWS has been using formal verification tools for a considerable time. A notable earlier accomplishment was verify tricky but efficient algorithms using HOL Light, speeding up RSA encryption by a massive factor.&lt;/p&gt;&lt;head rend="h3"&gt;2025–2035 Becoming ordinary&lt;/head&gt;&lt;p&gt;A couple of months ago, Apple announced new models in their iPhone range, but no crowds formed around Apple Stores. They once did: the iPhone was once regarded as revolutionary. Now, smartphones are a commodity, which is the final stage of a new technology. Formal verification is not ordinary yet. But it’s coming: more and more software will be seen as too important to develop any other way, as is already the case for hardware.&lt;/p&gt;&lt;head rend="h3"&gt;Postscript&lt;/head&gt;&lt;p&gt;I am well aware that there is much outstanding work adjacent to that described here, e.g. using other interactive tools, such as Nqthm and ACL2, PVS and Agda, and much else using Rocq. There have been amazing advances in the broader theorem proving world, also in model checking, SAT/SMT solving and their applications to extended static checking of software. I have related what I personally know. And remember, the point of this post is not (simply) to boast but to demonstrate the progress of our research community, so the more achievements the better. Feel free to add some in the comments!&lt;/p&gt;&lt;p&gt;This post does not prove anything about other fields of science, such as solid-state physics, molecular biology or mathematics. But it’s fair to assume that such fields have not been idle either. People have proved Fermat’s Last Theorem and the Poincaré conjecture, and settled more obscure questions such as the projective plane of order 10. People have located the remains of King Richard III, who died in 1485, excavating and positively identifying the body by its DNA. People have linked a piece of bloody cloth to Adolf Hitler and diagnosed that he had a specific genetic condition. The immensely complex James Webb Space Telescope was successfully deployed; it is now revealing secrets about the early Universe.&lt;/p&gt;&lt;p&gt;Sometimes I wonder about the motives of those who claim that science is moribund. Do they have political aims, or just unrealistic expectations? Were they expecting time travel or some sort of warp drive? People need to remember that movies are fiction.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://lawrencecpaulson.github.io//2025/12/05/History_of_Proof_Assistants.html"/><published>2025-12-12T23:26:26+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46250332</id><title>OpenAI are quietly adopting skills, now available in ChatGPT and Codex CLI</title><updated>2025-12-13T04:16:26.239357+00:00</updated><content>&lt;doc fingerprint="bc04005d8facf9e4"&gt;
+&lt;/doc&gt;</content><link href="https://lawrencecpaulson.github.io//2025/12/05/History_of_Proof_Assistants.html"/><published>2025-12-12T23:26:26+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46250332</id><title>OpenAI are quietly adopting skills, now available in ChatGPT and Codex CLI</title><updated>2025-12-13T04:44:31.861828+00:00</updated><content>&lt;doc fingerprint="bc04005d8facf9e4"&gt;
   &lt;main&gt;
     &lt;head rend="h2"&gt;OpenAI are quietly adopting skills, now available in ChatGPT and Codex CLI&lt;/head&gt;
     &lt;p&gt;12th December 2025&lt;/p&gt;
@@ -1975,7 +1821,7 @@ codex --enable skills -m gpt-5.2&lt;/code&gt;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://simonwillison.net/2025/Dec/12/openai-skills/"/><published>2025-12-12T23:30:19+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46250862</id><title>The Checkerboard</title><updated>2025-12-13T04:16:25.839212+00:00</updated><content>&lt;doc fingerprint="ae68e17ace01035b"&gt;
+&lt;/doc&gt;</content><link href="https://simonwillison.net/2025/Dec/12/openai-skills/"/><published>2025-12-12T23:30:19+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46250862</id><title>The Checkerboard</title><updated>2025-12-13T04:44:31.549702+00:00</updated><content>&lt;doc fingerprint="ae68e17ace01035b"&gt;
   &lt;main&gt;
     &lt;p&gt;In 2019, hunters Brad Cape and Phil Yeomans were scouting for elk in southeast Wyoming when they came across a rocky peak that seemed perfect for elk hunting, a suspicion only heightened by its name: Elk Mountain. But finding a way onto Elk Mountain would turn out to be extremely difficult, and whether Brad and Phil succeeded would have lasting consequences for the future of land use everywhere in the U.S. because the single largest obstacle preventing the hunters from making it onto the mountain wasn’t the elevation or the topography. It was that the mountain was on a special type of land known as “the checkerboard”.&lt;/p&gt;
     &lt;p&gt;The checkerboard is a pattern of land ownership, unique to the American West, found in huge areas from New Mexico all the way up to Washington. On a map, these particular areas resemble a checkerboard, but instead of alternating black and white squares, checkerboarded land alternates between single square-mile parcels of public land and square mile parcels of private land.&lt;/p&gt;
@@ -1989,7 +1835,54 @@ codex --enable skills -m gpt-5.2&lt;/code&gt;
     &lt;p&gt;The Tenth Circuit’s decision won’t bring total closure. Its decision only affects six western states, and the U.S. Supreme Court refused to take up the case, which means that, for now, the status of corner crossing and public land access in the other 44 states remains murky. It’s unlikely Brad and Phil will be involved in whatever comes next. One thing is for sure though: they’re eager to go back to hunt Elk Mountain.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://99percentinvisible.org/episode/650-the-checkerboard/"/><published>2025-12-13T00:50:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46251654</id><title>Oliver Sacks fabricated key details in his books</title><updated>2025-12-13T04:16:25.668953+00:00</updated><content/><link href="https://boingboing.net/2025/12/12/oliver-sacks-fabricated-key-details-in-his-books.html"/><published>2025-12-13T03:12:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46251684</id><title>Google Removes Sci-Hub Domains from U.S. Search Results Due to Dated Court Order</title><updated>2025-12-13T04:16:25.454521+00:00</updated><content>&lt;doc fingerprint="ba0083d00f8603e0"&gt;
+&lt;/doc&gt;</content><link href="https://99percentinvisible.org/episode/650-the-checkerboard/"/><published>2025-12-13T00:50:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46251582</id><title>1300 Still Images from the Animated Films of Hayao Miyazaki's Studio Ghibli</title><updated>2025-12-13T04:44:30.722500+00:00</updated><content>&lt;doc fingerprint="536fd5a56c585c00"&gt;
+  &lt;main&gt;&lt;head rend="h2"&gt;ãåãã¡ã¯ã©ãçããããã®å ´é¢åçãæä¾è´ãã¾ã&lt;/head&gt;2023.08.18&lt;p&gt;ç¾å¨ãåå ´å ¬éä¸ã®ãåãã¡ã¯ã©ãçããããã®å ´é¢åç 14æããæ¬æ¥ããæä¾ãããã¾ãã&lt;/p&gt;&lt;p&gt;ããã¾ã§ã®åã¨åæ§ã«ãå¸¸èã®ç¯å²ã§ãèªç±ã«ãä½¿ããã ããã&lt;/p&gt;&lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://www.ghibli.jp/info/013772/"/><published>2025-12-13T02:56:49+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46251654</id><title>Oliver Sacks fabricated key details in his books</title><updated>2025-12-13T04:44:30.624285+00:00</updated><content/><link href="https://boingboing.net/2025/12/12/oliver-sacks-fabricated-key-details-in-his-books.html"/><published>2025-12-13T03:12:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46251667</id><title>The Coming Need for Formal Specification</title><updated>2025-12-13T04:44:30.153537+00:00</updated><content>&lt;doc fingerprint="b66d115f664337c8"&gt;
+  &lt;main&gt;
+    &lt;p&gt;In late 2022, I had a conversation with a senior engineer on the coming problem of “what to do when AI is writing most of the code”. His opinion, which I found striking at the time, was that engineers would transition from writing mostly “implementation” code, to mostly writing tests and specifications.&lt;/p&gt;
+    &lt;p&gt;I remember thinking at the time that this was prescient. With three years of hindsight, it seems like things are trending in a different direction. I thought that the reason that testing and specifications would be useful was that AI agents would be struggling to “grok” coding for quite some time, and that you’d need to have robust specifications such that they could stumble toward correctness.&lt;/p&gt;
+    &lt;p&gt;In reality, AI written tests were one of the first tasks I felt comfortable delegating. Unit tests are squarely in-distribution for what the models have seen on all public open source code. There’s a lot of unit tests in open source code, and they follow predictable patterns. I’d expect that the variance of implementation code – and the requirement for out-of-distribution patterns – is much higher than testing code. The result is that models are now quite good at translating English descriptions into quite crisp test cases.1&lt;/p&gt;
+    &lt;head rend="h2"&gt;System Design&lt;/head&gt;
+    &lt;p&gt;There exists a higher level problem of holistic system behavior verification, though. Let’s take a quick diversion into systems design to see why.&lt;/p&gt;
+    &lt;p&gt;System design happens on multiple scales. You want systems to be robust – both in their runtime, and their ability to iteratively evolve. This nudges towards decomposing systems into distinct components, each of which can be internally complicated but exposes a firm interface boundary that allows you to abstract over this internal complexity.&lt;/p&gt;
+    &lt;p&gt;If we design things well, we can swap out parts of our system without disrupting other parts or harming the top-level description of what the system does. We can also perform top-down changes iteratively – adding new components, and retiring old ones, at each level of description of the system.&lt;/p&gt;
+    &lt;p&gt;This all requires careful thinking of how to build these interfaces and component boundaries in such a way that (1) there is a clean boundary between components and (2) that stringing all the components together actually produces the desired top-level behavior.&lt;/p&gt;
+    &lt;p&gt;To do this effectively, we require maps of various levels of description of the system’s territory. My conjecture is that code is not a good map for this territory.&lt;/p&gt;
+    &lt;p&gt;To be clear, I’ve found a lot of value in throwing out system diagram maps and looking directly at the code territory when debugging issues. However, code-level reasoning is often not the best level of abstraction to use for reasoning about systems. This is for a similar reason that “modeling all the individual molecules of a car” is not a great way to estimate that car’s braking distance.&lt;/p&gt;
+    &lt;p&gt;LLMs have increasingly longer context windows, so one could naively say “just throw all the code in the context and have it work it out”. Perhaps. But this is still just clearly not the most efficient way to reason about large-scale systems.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Formal Verification&lt;/head&gt;
+    &lt;p&gt;The promise of formal verification is that we can construct provably composable maps which still match the ground-level territory. Formal verification of code allows you to specify a system using mathematical proofs, and then exhaustively prove that a system is correct. As an analogy: unit tests are like running an experiment. Each passing test is an assertion that, for the conditions checked, the code is correct. There could still exist some untested input that would demonstrate incorrect behavior. You only need one negative test to show the code is incorrect, but only a provably exhaustive set of inputs would be sufficient to show the code is fully correct. Writing a formal verification of a program is more like writing a proof. Writing a self-consistent proof is sufficient to show that the properties you’ve proven always hold.&lt;/p&gt;
+    &lt;p&gt;I saw Martin Kleppmann’s “Prediction: AI will make formal verification go mainstream” right after I posted “The Decline of the Software Drafter?”, which became the inspiration for this post. Kleppmann’s argument is that, just as the cost of generating code is coming down, so too will the cost of formal verification of code:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;For example, as of 2009, the formally verified seL4 microkernel consisted of 8,700 lines of C code, but proving it correct required 20 person-years and 200,000 lines of Isabelle code – or 23 lines of proof and half a person-day for every single line of implementation. Moreover, there are maybe a few hundred people in the world (wild guess) who know how to write such proofs, since it requires a lot of arcane knowledge about the proof system.&lt;/p&gt;
+      &lt;p&gt;…&lt;/p&gt;
+      &lt;p&gt;If formal verification becomes vastly cheaper, then we can afford to verify much more software. But on top of that, AI also creates a need to formally verify more software: rather than having humans review AI-generated code, I’d much rather have the AI prove to me that the code it has generated is correct. If it can do that, I’ll take AI-generated code over handcrafted code (with all its artisanal bugs) any day!&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;I’ve long been interested in formal verification tools like TLA+ and Rocq (née Coq). I haven’t (yet) been able to justify to myself spending all that much time on them. I think that’s changing: the cost of writing code is coming down dramatically. The cost of reviewing and maintaining it is also coming down, but at a slower rate. I agree with Kleppmann that we need systematic tooling for dealing with this mismatch.&lt;/p&gt;
+    &lt;p&gt;Wishcasting a future world, I would be excited to see something like:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;One starts with a high-level system specification, in English.&lt;/item&gt;
+      &lt;item&gt;This specification is spun out into multiple TLA+ models at various levels of component specificity.&lt;/item&gt;
+      &lt;item&gt;These models would allow us to determine the components that are load-bearing for system correctness.&lt;/item&gt;
+      &lt;item&gt;The most critical set of load-bearing components are implemented with a corresponding formal verification proof, in something like Rocq.&lt;/item&gt;
+      &lt;item&gt;The rest of the system components are still audited by an LLM to ensure they correctly match the behavior of their associated component in the TLA+ spec.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The biggest concern to me related to formal verification is the following two excerpts, first from Kleppmann, and then from Hillel Wayne, a notable proponent of TLA+:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;There are maybe a few hundred people in the world (wild guess) who know how to write such proofs, since it requires a lot of arcane knowledge about the proof system. – Martin Kleppmann&lt;/p&gt;
+      &lt;p&gt;TLA+ is one of the more popular formal specification languages and you can probably fit every TLA+ expert in the world in a large schoolbus. – Hillel Wayne&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;For formal verification to be useful in practice, at least some of the arcane knowledge of its internals will need to be broadly disseminated. Reviewing an AI-generated formal spec of a problem won’t be useful if you don’t have enough knowledge of the proof system to poke holes in what the AI came up with.&lt;/p&gt;
+    &lt;p&gt;I’d argue that undergraduate Computer Science programs should allocate some of their curriculum to formal verification. After all, students should have more time on their hands as they delegate implementation of their homework to AI agents.&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;That is, under current optimization pressures. We’re only a few months past the Sonnet 3.7 and OpenAI o3 models, both of which had a penchant for reward hacking on tests. ↩︎&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://benjamincongdon.me/blog/2025/12/12/The-Coming-Need-for-Formal-Specification/"/><published>2025-12-13T03:17:18+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46251684</id><title>Google Removes Sci-Hub Domains from U.S. Search Results Due to Dated Court Order</title><updated>2025-12-13T04:44:30.011001+00:00</updated><content>&lt;doc fingerprint="ba0083d00f8603e0"&gt;
   &lt;main&gt;
     &lt;p&gt;In 2017, American Chemical Society (ACS), a leading source of academic publications in the field of chemistry, won a lawsuit against Sci-Hub and its operator, Alexandra Elbakyan.&lt;/p&gt;
     &lt;p&gt;The ‘Pirate Bay of Science’ had failed to appear at a Virginia federal court, resulting in an easy win for the publisher and a $4.8 million default judgment award for damages.&lt;/p&gt;

@@ -1,159 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 13 Dec 2025 04:16:24 +0000</lastBuildDate><item><title>Building small Docker images faster</title><link>https://sgt.hootr.club/blog/docker-protips/</link><description>&lt;doc fingerprint="2c0c3e395f6515e0"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Building smaller Docker images faster&lt;/head&gt;
-    &lt;p&gt;I've been tasked (more or less) with building the first Go service at &lt;code&gt;$DAYJOB&lt;/code&gt;, which is almost exclusively a Python shop. Why Go of all languages? Well, some of my coworkers are big fans of the gopher, it's an easy language, it's attached to one of the big companies, and it's much faster than Python, so I feel more comfortable pushing for this rather than Rust or (sadly) Nix.&lt;/p&gt;
-    &lt;p&gt;The project that recently fell onto my lap is basically RCE-as-a-service, and it just so happens that one of the few languages that I would feel comfortable letting users execute remotely on our servers has a Go implementation, which is as good an excuse as any to take a break from the usual snekslop.&lt;/p&gt;
-    &lt;p&gt;I still haven't convinced anybody here to get on the Nix train, so after a short stint of building the project and the OCI images with a recursive cycle of Make and Nix, I breathed a heavy sigh and dropped it for Docker and Docker Compose, which is what we generally use here.&lt;/p&gt;
-    &lt;p&gt;Which is a shame, because Nix is pretty good at building OCI images. This is all the code you need to create a minimal image that contains only your service and nothing else, not even &lt;code&gt;/bin/sh&lt;/code&gt;.&lt;/p&gt;
-    &lt;code&gt;{ pkgs ? import &amp;lt;nixpkgs&amp;gt; {} }:
-pkgs.dockerTools.streamLayeredImage {
-  name = "someimage";
-  tag = "latest";
-  config.Cmd = [
-    "${pkgs.hello}/bin/hello"
-  ];
-}
-&lt;/code&gt;
-    &lt;p&gt;You can build that with &lt;code&gt;nix-build docker-test.nix&lt;/code&gt; and inside &lt;code&gt;./result&lt;/code&gt; you'll find a script that generates the image's tarball. Load it up with &lt;code&gt;./result | docker load&lt;/code&gt; and Docker will report a new image called &lt;code&gt;someimage:latest&lt;/code&gt; when you run &lt;code&gt;docker image ls&lt;/code&gt;. It's only 45.8MB, and most of that is taken up by glibc.&lt;/p&gt;
-    &lt;p&gt;But what if I told you that you can get more or less the same result with a simple &lt;code&gt;Dockerfile&lt;/code&gt; if you know what you're doing? Especially if you're building a static executable, which Go famously does (at least when you set &lt;code&gt;CGO_ENABLED=0&lt;/code&gt;) and if you're willing to sacrifice a few affordances. Who needs coreutils anyway?&lt;/p&gt;
-    &lt;p&gt;In this post I'll show you a few tricks I found while striving to make small and fast-building images. I'm not an expert in Docker by any stretch so maybe you know all of this stuff already, but perhaps you might learn something new.&lt;/p&gt;
-    &lt;head rend="h2"&gt;A barebones image&lt;/head&gt;
-    &lt;p&gt;I'm using &lt;code&gt;goose&lt;/code&gt; for database migrations. I configured the &lt;code&gt;docker-compose.yml&lt;/code&gt; to run its container just after the database has started and before the actual service runs, and since it's a very small self-contained tool I figured I could try to make the image as small and quick to build as possible. Let me show you the relevant part of the &lt;code&gt;docker-compose.yml&lt;/code&gt; first:&lt;/p&gt;
-    &lt;code&gt;services:
-  migrate:
-    image: migrate:latest
-    pull_policy: build
-    build:
-      context: https://github.com/pressly/goose.git#v3.26.0
-      dockerfile: $PWD/Dockerfile.migrate
-    environment:
-      GOOSE_DBSTRING: postgresql://AzureDiamond:hunter2@db:5432/bobby
-      GOOSE_MIGRATION_DIR: /migrations
-      GOOSE_DRIVER: postgres
-    depends_on:
-      db:
-        condition: service_started
-    volumes:
-      - ./migrations:/migrations
-&lt;/code&gt;
-    &lt;p&gt;The &lt;code&gt;build.context&lt;/code&gt; parameter specifies the "set of files" that are available from the host while building a Docker image. It's the parameter that you pass after &lt;code&gt;docker build&lt;/code&gt;, generally &lt;code&gt;.&lt;/code&gt; (the PWD). Here I specified a GitHub URL with a tag, so when I'm referring to &lt;code&gt;.&lt;/code&gt; in the &lt;code&gt;Dockerfile&lt;/code&gt; above I get the root of the &lt;code&gt;goose&lt;/code&gt; project on that tag's commit. I didn't know Docker could do that!&lt;/p&gt;
-    &lt;p&gt;The &lt;code&gt;build.dockerfile&lt;/code&gt; path includes &lt;code&gt;$PWD&lt;/code&gt; because even if Docker itself can refer to Dockerfiles outside of its context, Docker Compose apparently can't unless you specify it as an absolute path. I think this will break if you try to run &lt;code&gt;docker compose&lt;/code&gt; from another directory, but it's good enough for now.&lt;/p&gt;
-    &lt;p&gt;Now let's take a look at the &lt;code&gt;Dockerfile&lt;/code&gt; itself:&lt;/p&gt;
-    &lt;code&gt;FROM golang:1.25-alpine3.23 AS builder
-
-WORKDIR /build
-
-ARG CGO_ENABLED=0
-
-ARG GOCACHE=/root/.cache/go-build
-ARG GOMODCACHE=/root/.cache/go-mod
-
-RUN --mount=type=cache,target=/root/.cache/go-build \
-  --mount=type=cache,target=/root/.cache/go-mod \
-  --mount=type=bind,source=.,target=/build \
-  go build -tags='no_clickhouse no_libsql no_sqlite3 no_mssql no_vertica no_mysql no_ydb' -o /goose ./cmd/goose
-
-FROM scratch
-
-COPY --from=builder /goose /goose
-
-CMD ["/goose", "up"]
-&lt;/code&gt;
-    &lt;p&gt;A few things to note:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;I used the Alpine image for Go because it's the smallest and it includes everything I need to build the tool.&lt;/item&gt;
-      &lt;item&gt;I set &lt;code&gt;CGO_ENABLED=0&lt;/code&gt;to ensure that the executable only builds with the Go toolchain and does not link to libc. According to the docs, The cgo tool is enabled by default for native builds on systems where it is expected to work so you have to take extra care to disable it if you don't want or need it.&lt;/item&gt;
-      &lt;item&gt;I set &lt;code&gt;GOCACHE&lt;/code&gt;and&lt;code&gt;GOMODCACHE&lt;/code&gt;(docs) to a known location to ensure that I can take advantage of cache mounts on subsequent rebuilds. Admittedly this is not very useful for an external tool that I'm only expecting to build once but hey, every little bit helps.&lt;/item&gt;
-      &lt;item&gt;Instead of &lt;code&gt;ADD&lt;/code&gt;ing or&lt;code&gt;COPY&lt;/code&gt;ing the package's source I bind mounted it to the workdir. This should make it a bit faster because it avoids an extra copy into the build container.&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;FROM scratch&lt;/code&gt;defines a second build stage that ensures any artifacts from the actual build are discarded.&lt;code&gt;scratch&lt;/code&gt;is the null image.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;The result is an image with one layer containing one file that builds, loads and boots extremely fast and is only *chef's kiss* 15.9MB in size. Not too bad!&lt;/p&gt;
-    &lt;head rend="h2"&gt;The build context&lt;/head&gt;
-    &lt;p&gt;Earlier I mentioned the build context. Keeping it small is important because Docker copies all files available in the build context to the builder every time you run a &lt;code&gt;docker build&lt;/code&gt;, so if you have lots of files in your repo that you don't need to build the image you'll probably want to exclude them. The way you do that is by keeping a &lt;code&gt;.dockerignore&lt;/code&gt; file alongside your &lt;code&gt;Dockerfile&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;I have to stress one point: the build context includes everything inside the directory you run &lt;code&gt;docker build&lt;/code&gt; from unless it's listed in &lt;code&gt;.dockerignore&lt;/code&gt;. I thought some obvious things like &lt;code&gt;.git&lt;/code&gt; would be excluded by default, but a quick test disproved that:&lt;/p&gt;
-    &lt;code&gt;FROM busybox
-WORKDIR /
-COPY . ./
-CMD []
-&lt;/code&gt;
-    &lt;p&gt;Try saving that file as &lt;code&gt;Dockerfile.test&lt;/code&gt; in one of your repos, build it with &lt;code&gt;docker build -f Dockerfile.text -t build-context .&lt;/code&gt;, open a shell with &lt;code&gt;docker run --rm -it build-context /bin/sh&lt;/code&gt; and run &lt;code&gt;find&lt;/code&gt;. Everything's in there: &lt;code&gt;.git&lt;/code&gt;, &lt;code&gt;.jj&lt;/code&gt;, the &lt;code&gt;Dockerfile.test&lt;/code&gt; itself, and all the rest of the build artifacts and assorted junk you have accumulated in your project directory. Ignoring them won't make your images smaller, but it might make the build quicker.&lt;/p&gt;
-    &lt;code&gt;# .dockerignore
-.*
-
-Dockerfile*
-docker-compose.yml
-
-# ...
-&lt;/code&gt;
-    &lt;head rend="h2"&gt;Granular layers&lt;/head&gt;
-    &lt;p&gt;Splitting and ordering layers is probably the most well-known and obvious Docker build time optimization there is, but it doesn't hurt to mention. This is the &lt;code&gt;Dockerfile&lt;/code&gt; for the service I'm building:&lt;/p&gt;
-    &lt;code&gt;FROM golang:1.25-alpine3.23 AS builder
-
-WORKDIR /build
-
-ARG CGO_ENABLED=0
-
-ARG GOCACHE=/root/.cache/go-build
-ARG GOMODCACHE=/root/.cache/go-mod
-
-RUN --mount=type=cache,target=/root/.cache/go-build \
-  --mount=type=cache,target=/root/.cache/go-mod \
-  go install github.com/DataDog/orchestrion@latest
-
-RUN --mount=type=bind,source=go.mod,target=go.mod \
-  --mount=type=bind,source=go.sum,target=go.sum \
-  --mount=type=cache,target=/root/.cache/go-build \
-  --mount=type=cache,target=/root/.cache/go-mod \
-  go mod download
-
-RUN --mount=type=bind,source=go.mod,target=go.mod \
-  --mount=type=bind,source=go.sum,target=go.sum \
-  --mount=type=cache,target=/root/.cache/go-build \
-  --mount=type=cache,target=/root/.cache/go-mod \
-  --mount=type=bind,source=internal,target=internal \
-  --mount=type=bind,source=cmd,target=cmd \
-  --mount=type=bind,source=orchestrion.tool.go,target=orchestrion.tool.go \
-  orchestrion go build -o server ./cmd/server
-
-FROM alpine:3.23 AS prod
-
-WORKDIR /app
-
-COPY --from=builder /build/server .
-
-ENTRYPOINT ["/app/server"]
-&lt;/code&gt;
-    &lt;p&gt;You can see all the bind and cache mount tricks from earlier, not much has changed. I'm installing &lt;code&gt;orchestrion&lt;/code&gt; (a great tool to bloat up your binary size if you ever feel like it) early because that's the least likely to change. After that I bind mount &lt;code&gt;go.mod&lt;/code&gt; and &lt;code&gt;go.sum&lt;/code&gt; and only download the dependencies, because that's the step that generally takes the most time and dependencies change less often than code. Only at the end do I bind mount the package directories and build the server.&lt;/p&gt;
-    &lt;p&gt;You can iterate on this by changing one of the relevant files and ensuring that all the previous steps are marked as &lt;code&gt;CACHED&lt;/code&gt; on the next &lt;code&gt;docker build&lt;/code&gt;. Again, this won't save you space but it'll save you a lot of time while iterating.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Conclusions&lt;/head&gt;
-    &lt;p&gt;Summing up:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Read the Optimize cache usage in builds page in the Docker documentation, and maybe take a look at the rest while you're there.&lt;/item&gt;
-      &lt;item&gt;Split, merge and order layers according to how often you expect them to be rebuilt. Directives like &lt;code&gt;ENV&lt;/code&gt;,&lt;code&gt;ARG&lt;/code&gt;and&lt;code&gt;WORKDIR&lt;/code&gt;should go before everything else.&lt;/item&gt;
-      &lt;item&gt;Use multi-stage builds to shrink the final image size. Consider if you can get away with using &lt;code&gt;scratch&lt;/code&gt;,&lt;code&gt;busybox&lt;/code&gt;or&lt;code&gt;alpine&lt;/code&gt;for the final image.&lt;/item&gt;
-      &lt;item&gt;If your project contains multiple separate applications (for example a backend and a frontend) you can create separate build stages for each of them, and then copy the results into a final image. Stages that don't depend on each other are built in parallel if you're using BuildKit, and you can do all sorts of tricks with multi-stage builds to ensure your CPU runs hot all the time.&lt;/item&gt;
-      &lt;item&gt;Add a &lt;code&gt;.dockerignore&lt;/code&gt;to your project, and make sure to put&lt;code&gt;.git&lt;/code&gt;in there if you don't need it.&lt;/item&gt;
-      &lt;item&gt;Try to set up cache mounts to make sure dependencies and intermediate build artifacts are persisted across builds. Some CI services (GitHub actions, apparently) even let you set up external caches.&lt;/item&gt;
-      &lt;item&gt;Try to use bind mounts instead of &lt;code&gt;COPY&lt;/code&gt;ing source files into the builder. Bind mounts are usually read-only, but you can make them read-write if you really need to.&lt;/item&gt;
-      &lt;item&gt;I didn't use it in my &lt;code&gt;Dockerfile&lt;/code&gt;s, but apparently you should be using&lt;code&gt;ADD&lt;/code&gt;for downloading files, archives or Git repos during your build. The docs mention that&lt;code&gt;COPY&lt;/code&gt;should mostly be used for copying files between stages or for files you need in your final image, and for the rest you should try to use bind mounts.&lt;/item&gt;
-      &lt;item&gt;Use smaller base images when possible and if you really have to install stuff with &lt;code&gt;apt&lt;/code&gt;you should make an intermediate image and upload it to your container repository of choice so your poor runners don't have to hammer Debian's mirrors every single time you push.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;One last trick before the post is over: I just discovered that Docker Compose has a watch mode that tracks changes in the build context and rebuilds (or does other things with) your image on every change. Nice!&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46242700</guid><pubDate>Fri, 12 Dec 2025 10:23:23 +0000</pubDate></item><item><title>Sick of smart TVs? Here are your best options</title><link>https://arstechnica.com/gadgets/2025/12/the-ars-technica-guide-to-dumb-tvs/</link><description>&lt;doc fingerprint="a7ccd93c51a39178"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Smart TVs can feel like a dumb choice if you’re looking for privacy, reliability, and simplicity.&lt;/p&gt;
-    &lt;p&gt;Today’s TVs and streaming sticks are usually loaded up with advertisements and user tracking, making offline TVs seem very attractive. But ever since smart TV operating systems began making money, “dumb” TVs have been hard to find.&lt;/p&gt;
-    &lt;p&gt;In response, we created this non-smart TV guide that includes much more than dumb TVs. Since non-smart TVs are so rare, this guide also breaks down additional ways to watch TV and movies online and locally without dealing with smart TVs’ evolution toward software-centric features and snooping. We’ll discuss a range of options suitable for various budgets, different experience levels, and different rooms in your home.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Our best recommendation&lt;/head&gt;
-    &lt;p&gt;This is a dumb TV guide, but first, let’s briefly highlight the best recommendation for most people: Take your TV offline and plug in an Apple TV box.&lt;/p&gt;
-    &lt;p&gt;An Apple TV lets you replace smart TV software with Apple’s cleaner tvOS, and it’s more intuitive than using most smart TVs and other streaming devices. Apple’s tvOS usually runs faster and more reliably, and it isn’t riddled with distracting ads or recommendations. And there’s virtually no learning curve for family members or visitors, something that can’t always be said for DIY alternatives.&lt;/p&gt;
-    &lt;p&gt;Critically, Apple TV boxes are also an easy recommendation on the privacy front. The setup process makes it simple for anyone to ensure that the device is using relatively minimal user tracking. You’re likely to use an Apple TV box with the Apple TV app or with an Apple account, which means sending some data to Apple. But Apple has a better reputation for keeping user information in-house, and Apple TV boxes don’t have automatic content recognition (ACR).&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46243655</guid><pubDate>Fri, 12 Dec 2025 12:51:40 +0000</pubDate></item><item><title>Fedora: Open-source repository for long-term digital preservation</title><link>https://fedorarepository.org/</link><description>&lt;doc fingerprint="3cd1965b918fe919"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 13 Dec 2025 04:44:29 +0000</lastBuildDate><item><title>Fedora: Open-source repository for long-term digital preservation</title><link>https://fedorarepository.org/</link><description>&lt;doc fingerprint="3cd1965b918fe919"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Fedora is the flexible, standards-based, open-source repository software built to support long-term digital preservation.&lt;/head&gt;
     &lt;head rend="h2"&gt;Why Choose Fedora?&lt;/head&gt;
@@ -1989,7 +1835,54 @@ codex --enable skills -m gpt-5.2&lt;/code&gt;
     &lt;p&gt;The Tenth Circuit’s decision won’t bring total closure. Its decision only affects six western states, and the U.S. Supreme Court refused to take up the case, which means that, for now, the status of corner crossing and public land access in the other 44 states remains murky. It’s unlikely Brad and Phil will be involved in whatever comes next. One thing is for sure though: they’re eager to go back to hunt Elk Mountain.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46250862</guid><pubDate>Sat, 13 Dec 2025 00:50:47 +0000</pubDate></item><item><title>Oliver Sacks fabricated key details in his books</title><link>https://boingboing.net/2025/12/12/oliver-sacks-fabricated-key-details-in-his-books.html</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46251654</guid><pubDate>Sat, 13 Dec 2025 03:12:47 +0000</pubDate></item><item><title>Google Removes Sci-Hub Domains from U.S. Search Results Due to Dated Court Order</title><link>https://torrentfreak.com/google-removes-sci-hub-domains-from-u-s-search-results-due-to-dated-court-order/</link><description>&lt;doc fingerprint="ba0083d00f8603e0"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46250862</guid><pubDate>Sat, 13 Dec 2025 00:50:47 +0000</pubDate></item><item><title>1300 Still Images from the Animated Films of Hayao Miyazaki's Studio Ghibli</title><link>https://www.ghibli.jp/info/013772/</link><description>&lt;doc fingerprint="536fd5a56c585c00"&gt;
+  &lt;main&gt;&lt;head rend="h2"&gt;ãåãã¡ã¯ã©ãçããããã®å ´é¢åçãæä¾è´ãã¾ã&lt;/head&gt;2023.08.18&lt;p&gt;ç¾å¨ãåå ´å ¬éä¸ã®ãåãã¡ã¯ã©ãçããããã®å ´é¢åç 14æããæ¬æ¥ããæä¾ãããã¾ãã&lt;/p&gt;&lt;p&gt;ããã¾ã§ã®åã¨åæ§ã«ãå¸¸èã®ç¯å²ã§ãèªç±ã«ãä½¿ããã ããã&lt;/p&gt;&lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46251582</guid><pubDate>Sat, 13 Dec 2025 02:56:49 +0000</pubDate></item><item><title>Oliver Sacks fabricated key details in his books</title><link>https://boingboing.net/2025/12/12/oliver-sacks-fabricated-key-details-in-his-books.html</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46251654</guid><pubDate>Sat, 13 Dec 2025 03:12:47 +0000</pubDate></item><item><title>The Coming Need for Formal Specification</title><link>https://benjamincongdon.me/blog/2025/12/12/The-Coming-Need-for-Formal-Specification/</link><description>&lt;doc fingerprint="b66d115f664337c8"&gt;
+  &lt;main&gt;
+    &lt;p&gt;In late 2022, I had a conversation with a senior engineer on the coming problem of “what to do when AI is writing most of the code”. His opinion, which I found striking at the time, was that engineers would transition from writing mostly “implementation” code, to mostly writing tests and specifications.&lt;/p&gt;
+    &lt;p&gt;I remember thinking at the time that this was prescient. With three years of hindsight, it seems like things are trending in a different direction. I thought that the reason that testing and specifications would be useful was that AI agents would be struggling to “grok” coding for quite some time, and that you’d need to have robust specifications such that they could stumble toward correctness.&lt;/p&gt;
+    &lt;p&gt;In reality, AI written tests were one of the first tasks I felt comfortable delegating. Unit tests are squarely in-distribution for what the models have seen on all public open source code. There’s a lot of unit tests in open source code, and they follow predictable patterns. I’d expect that the variance of implementation code – and the requirement for out-of-distribution patterns – is much higher than testing code. The result is that models are now quite good at translating English descriptions into quite crisp test cases.1&lt;/p&gt;
+    &lt;head rend="h2"&gt;System Design&lt;/head&gt;
+    &lt;p&gt;There exists a higher level problem of holistic system behavior verification, though. Let’s take a quick diversion into systems design to see why.&lt;/p&gt;
+    &lt;p&gt;System design happens on multiple scales. You want systems to be robust – both in their runtime, and their ability to iteratively evolve. This nudges towards decomposing systems into distinct components, each of which can be internally complicated but exposes a firm interface boundary that allows you to abstract over this internal complexity.&lt;/p&gt;
+    &lt;p&gt;If we design things well, we can swap out parts of our system without disrupting other parts or harming the top-level description of what the system does. We can also perform top-down changes iteratively – adding new components, and retiring old ones, at each level of description of the system.&lt;/p&gt;
+    &lt;p&gt;This all requires careful thinking of how to build these interfaces and component boundaries in such a way that (1) there is a clean boundary between components and (2) that stringing all the components together actually produces the desired top-level behavior.&lt;/p&gt;
+    &lt;p&gt;To do this effectively, we require maps of various levels of description of the system’s territory. My conjecture is that code is not a good map for this territory.&lt;/p&gt;
+    &lt;p&gt;To be clear, I’ve found a lot of value in throwing out system diagram maps and looking directly at the code territory when debugging issues. However, code-level reasoning is often not the best level of abstraction to use for reasoning about systems. This is for a similar reason that “modeling all the individual molecules of a car” is not a great way to estimate that car’s braking distance.&lt;/p&gt;
+    &lt;p&gt;LLMs have increasingly longer context windows, so one could naively say “just throw all the code in the context and have it work it out”. Perhaps. But this is still just clearly not the most efficient way to reason about large-scale systems.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Formal Verification&lt;/head&gt;
+    &lt;p&gt;The promise of formal verification is that we can construct provably composable maps which still match the ground-level territory. Formal verification of code allows you to specify a system using mathematical proofs, and then exhaustively prove that a system is correct. As an analogy: unit tests are like running an experiment. Each passing test is an assertion that, for the conditions checked, the code is correct. There could still exist some untested input that would demonstrate incorrect behavior. You only need one negative test to show the code is incorrect, but only a provably exhaustive set of inputs would be sufficient to show the code is fully correct. Writing a formal verification of a program is more like writing a proof. Writing a self-consistent proof is sufficient to show that the properties you’ve proven always hold.&lt;/p&gt;
+    &lt;p&gt;I saw Martin Kleppmann’s “Prediction: AI will make formal verification go mainstream” right after I posted “The Decline of the Software Drafter?”, which became the inspiration for this post. Kleppmann’s argument is that, just as the cost of generating code is coming down, so too will the cost of formal verification of code:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;For example, as of 2009, the formally verified seL4 microkernel consisted of 8,700 lines of C code, but proving it correct required 20 person-years and 200,000 lines of Isabelle code – or 23 lines of proof and half a person-day for every single line of implementation. Moreover, there are maybe a few hundred people in the world (wild guess) who know how to write such proofs, since it requires a lot of arcane knowledge about the proof system.&lt;/p&gt;
+      &lt;p&gt;…&lt;/p&gt;
+      &lt;p&gt;If formal verification becomes vastly cheaper, then we can afford to verify much more software. But on top of that, AI also creates a need to formally verify more software: rather than having humans review AI-generated code, I’d much rather have the AI prove to me that the code it has generated is correct. If it can do that, I’ll take AI-generated code over handcrafted code (with all its artisanal bugs) any day!&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;I’ve long been interested in formal verification tools like TLA+ and Rocq (née Coq). I haven’t (yet) been able to justify to myself spending all that much time on them. I think that’s changing: the cost of writing code is coming down dramatically. The cost of reviewing and maintaining it is also coming down, but at a slower rate. I agree with Kleppmann that we need systematic tooling for dealing with this mismatch.&lt;/p&gt;
+    &lt;p&gt;Wishcasting a future world, I would be excited to see something like:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;One starts with a high-level system specification, in English.&lt;/item&gt;
+      &lt;item&gt;This specification is spun out into multiple TLA+ models at various levels of component specificity.&lt;/item&gt;
+      &lt;item&gt;These models would allow us to determine the components that are load-bearing for system correctness.&lt;/item&gt;
+      &lt;item&gt;The most critical set of load-bearing components are implemented with a corresponding formal verification proof, in something like Rocq.&lt;/item&gt;
+      &lt;item&gt;The rest of the system components are still audited by an LLM to ensure they correctly match the behavior of their associated component in the TLA+ spec.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The biggest concern to me related to formal verification is the following two excerpts, first from Kleppmann, and then from Hillel Wayne, a notable proponent of TLA+:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;There are maybe a few hundred people in the world (wild guess) who know how to write such proofs, since it requires a lot of arcane knowledge about the proof system. – Martin Kleppmann&lt;/p&gt;
+      &lt;p&gt;TLA+ is one of the more popular formal specification languages and you can probably fit every TLA+ expert in the world in a large schoolbus. – Hillel Wayne&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;For formal verification to be useful in practice, at least some of the arcane knowledge of its internals will need to be broadly disseminated. Reviewing an AI-generated formal spec of a problem won’t be useful if you don’t have enough knowledge of the proof system to poke holes in what the AI came up with.&lt;/p&gt;
+    &lt;p&gt;I’d argue that undergraduate Computer Science programs should allocate some of their curriculum to formal verification. After all, students should have more time on their hands as they delegate implementation of their homework to AI agents.&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;That is, under current optimization pressures. We’re only a few months past the Sonnet 3.7 and OpenAI o3 models, both of which had a penchant for reward hacking on tests. ↩︎&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46251667</guid><pubDate>Sat, 13 Dec 2025 03:17:18 +0000</pubDate></item><item><title>Google Removes Sci-Hub Domains from U.S. Search Results Due to Dated Court Order</title><link>https://torrentfreak.com/google-removes-sci-hub-domains-from-u-s-search-results-due-to-dated-court-order/</link><description>&lt;doc fingerprint="ba0083d00f8603e0"&gt;
   &lt;main&gt;
     &lt;p&gt;In 2017, American Chemical Society (ACS), a leading source of academic publications in the field of chemistry, won a lawsuit against Sci-Hub and its operator, Alexandra Elbakyan.&lt;/p&gt;
     &lt;p&gt;The ‘Pirate Bay of Science’ had failed to appear at a Virginia federal court, resulting in an easy win for the publisher and a $4.8 million default judgment award for damages.&lt;/p&gt;
