@@ -1,191 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 27 Dec 2025 15:37:25 +0000</lastBuildDate><item><title>Detect memory leaks of C extensions with psutil and psleak</title><link>https://gmpy.dev/blog/2025/psutil-heap-introspection-apis</link><description>&lt;doc fingerprint="acfb4b23a900a2fa"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Memory leaks in Python are often straightforward to diagnose. Just look at RSS, track Python object counts, follow reference graphs. But leaks inside C extension modules are another story. Traditional memory metrics such as RSS and VMS frequently fail to reveal them because Python's memory allocator sits above the platform's native heap (see pymalloc). If something in an extension calls &lt;code&gt;malloc()&lt;/code&gt; without a corresponding
-&lt;code&gt;free()&lt;/code&gt;, that memory often won't show up where you expect it. You have a
-leak, and you don't know.&lt;/p&gt;
-    &lt;p&gt;psutil 7.2.0 introduces two new APIs for C heap introspection, designed specifically to catch these kinds of native leaks. They give you a window directly into the underlying platform allocator (e.g. glibc's malloc), letting you track how much memory the C layer is actually consuming.&lt;/p&gt;
-    &lt;p&gt;These C functions bypass Python entirely. They don't reflect Python object memory, arenas, pools, or anything managed by pymalloc. Instead, they examine the allocator that C extensions actually use. If your RSS is flat but your C heap usage climbs, you now have a way to see it.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Why native heap introspection matters&lt;/head&gt;
-    &lt;p&gt;Many Python projects rely on C extensions: psutil, NumPy, pandas, PIL, lxml, psycopg, PyTorch, custom in-house modules, etc. And even cPython itself, which implements many of its standard library modules in C. If any of these components mishandle memory at the C level, you get a leak that:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Doesn't show up in Python reference counts (sys.getrefcount).&lt;/item&gt;
-      &lt;item&gt;Doesn't show up in tracemalloc module.&lt;/item&gt;
-      &lt;item&gt;Doesn't show up in Python's gc stats.&lt;/item&gt;
-      &lt;item&gt;Often don't show up in RSS, VMS or USS due to allocator caching, especially for small objects. This can happen, for example, when you forget to &lt;code&gt;Py_DECREF&lt;/code&gt;a Python object.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;psutil's new functions solve this by inspecting platform-native allocator state, in a manner similar to Valgrind.&lt;/p&gt;
-    &lt;head rend="h2"&gt;heap_info(): direct allocator statistics&lt;/head&gt;
-    &lt;p&gt;&lt;code&gt;heap_info()&lt;/code&gt; exposes the following metrics:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;heap_used&lt;/code&gt;: total number of bytes currently allocated via&lt;code&gt;malloc()&lt;/code&gt;(small allocations).&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;mmap_used&lt;/code&gt;: total number of bytes currently allocated via&lt;code&gt;mmap()&lt;/code&gt;or via large&lt;code&gt;malloc()&lt;/code&gt;allocations.&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;heap_count&lt;/code&gt;: (Windows only) number of private heaps created via&lt;code&gt;HeapCreate()&lt;/code&gt;.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Example:&lt;/p&gt;
-    &lt;code&gt;&amp;gt;&amp;gt;&amp;gt; import psutil
-&amp;gt;&amp;gt;&amp;gt; psutil.heap_info()
-pheap(heap_used=5177792, mmap_used=819200)
-&lt;/code&gt;
-    &lt;p&gt;Reference for what contributes to each field:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;Platform&lt;/cell&gt;
-        &lt;cell role="head"&gt;Allocation type&lt;/cell&gt;
-        &lt;cell role="head"&gt;Field affected&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;UNIX / Windows&lt;/cell&gt;
-        &lt;cell&gt;small &lt;code&gt;malloc()&lt;/code&gt; ≤128 KB without &lt;code&gt;free()&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;heap_used&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;UNIX / Windows&lt;/cell&gt;
-        &lt;cell&gt;large &lt;code&gt;malloc()&lt;/code&gt; &amp;gt;128 KB without &lt;code&gt;free()&lt;/code&gt;, or &lt;code&gt;mmap()&lt;/code&gt; without &lt;code&gt;munmap()&lt;/code&gt; (UNIX)&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;mmap_used&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Windows&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;HeapAlloc()&lt;/code&gt; without &lt;code&gt;HeapFree()&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;heap_used&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Windows&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;VirtualAlloc()&lt;/code&gt; without &lt;code&gt;VirtualFree()&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;mmap_used&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Windows&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;HeapCreate()&lt;/code&gt; without &lt;code&gt;HeapDestroy()&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;heap_count&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;head rend="h2"&gt;heap_trim(): returning unused heap memory&lt;/head&gt;
-    &lt;p&gt;&lt;code&gt;heap_trim()&lt;/code&gt; provides a cross-platform way to request that the underlying
-allocator free any unused memory it's holding in the heap (typically small
-&lt;code&gt;malloc()&lt;/code&gt; allocations).&lt;/p&gt;
-    &lt;p&gt;In practice, modern allocators rarely comply, so this is not a general-purpose memory-reduction tool and won't meaningfully shrink RSS in real programs. Its primary value is in leak detection tools.&lt;/p&gt;
-    &lt;p&gt;Calling &lt;code&gt;heap_trim()&lt;/code&gt; before taking measurements helps reduce allocator
-noise, giving you a cleaner baseline so that changes in &lt;code&gt;heap_used&lt;/code&gt; come from
-the code you're testing, not from internal allocator caching or fragmentation.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Real-world use: finding a C extension leak&lt;/head&gt;
-    &lt;p&gt;The workflow is simple:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Take a baseline snapshot of the heap.&lt;/item&gt;
-      &lt;item&gt;Call the C extension hundreds of times.&lt;/item&gt;
-      &lt;item&gt;Take another snapshot.&lt;/item&gt;
-      &lt;item&gt;Compare.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;code&gt;import psutil
-
-psutil.heap_trim()  # reduce noise
-
-before = psutil.heap_info()
-for _ in range(200):
-    my_cext_function()
-after = psutil.heap_info()
-
-print("delta heap_used =", after.heap_used - before.heap_used)
-print("delta mmap_used =", after.mmap_used - before.mmap_used)
-&lt;/code&gt;
-    &lt;p&gt;If &lt;code&gt;heap_used&lt;/code&gt; or &lt;code&gt;mmap_used&lt;/code&gt;  values increase consistently, you've found a
-native leak.&lt;/p&gt;
-    &lt;p&gt;To reduce false positives, repeat the test multiple times, increasing the number of calls on each retry. This approach helps distinguish real leaks from random noise or transient allocations.&lt;/p&gt;
-    &lt;head rend="h2"&gt;A new tool: psleak&lt;/head&gt;
-    &lt;p&gt;The strategy described above is exactly what I implemented in a new PyPI package, which I called psleak. It runs the target function repeatedly, trims the allocator before each run, and tracks differences across retries. Memory that grows consistently after several runs is flagged as a leak.&lt;/p&gt;
-    &lt;p&gt;A minimal test suite looks like this:&lt;/p&gt;
-    &lt;code&gt;  from psleak import MemoryLeakTestCase
-
-  class TestLeaks(MemoryLeakTestCase):
-      def test_fun(self):
-          self.execute(some_c_function)
-&lt;/code&gt;
-    &lt;p&gt;If the function leaks memory, the test will fail with a descriptive exception:&lt;/p&gt;
-    &lt;code&gt;psleak.MemoryLeakError: memory kept increasing after 10 runs
-Run # 1: heap=+388160  | uss=+356352  | rss=+327680  | (calls= 200, avg/call=+1940)
-Run # 2: heap=+584848  | uss=+614400  | rss=+491520  | (calls= 300, avg/call=+1949)
-Run # 3: heap=+778320  | uss=+782336  | rss=+819200  | (calls= 400, avg/call=+1945)
-Run # 4: heap=+970512  | uss=+1032192 | rss=+1146880 | (calls= 500, avg/call=+1941)
-Run # 5: heap=+1169024 | uss=+1171456 | rss=+1146880 | (calls= 600, avg/call=+1948)
-Run # 6: heap=+1357360 | uss=+1413120 | rss=+1310720 | (calls= 700, avg/call=+1939)
-Run # 7: heap=+1552336 | uss=+1634304 | rss=+1638400 | (calls= 800, avg/call=+1940)
-Run # 8: heap=+1752032 | uss=+1781760 | rss=+1802240 | (calls= 900, avg/call=+1946)
-Run # 9: heap=+1945056 | uss=+2031616 | rss=+2129920 | (calls=1000, avg/call=+1945)
-Run #10: heap=+2140624 | uss=+2179072 | rss=+2293760 | (calls=1100, avg/call=+1946)
-&lt;/code&gt;
-    &lt;p&gt;Psleak is now part of the psutil test suite, to make sure that the C code does not leak memory. All psutil APIs are tested (see test_memleaks.py), making it a de facto regression-testing tool.&lt;/p&gt;
-    &lt;p&gt;It's worth noting that without inspecting heap metrics, missing calls such as &lt;code&gt;Py_CLEAR&lt;/code&gt; and &lt;code&gt;Py_DECREF&lt;/code&gt; often go unnoticed, because they don't affect RSS,
-VMS, and USS. Something I confirmed from experimenting by commenting them
-out. Monitoring the heap is therefore essential to reliably detect memory
-leaks in Python C extensions.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Under the hood&lt;/head&gt;
-    &lt;p&gt;For those interested in seeing how I did this in terms of code:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Linux: uses glibc's mallinfo2() to report &lt;code&gt;uordblks&lt;/code&gt;(heap allocations) and&lt;code&gt;hblkhd&lt;/code&gt;(mmap-backed blocks).&lt;/item&gt;
-      &lt;item&gt;Windows: enumerates heaps and aggregates &lt;code&gt;HeapAlloc&lt;/code&gt;/&lt;code&gt;VirtualAlloc&lt;/code&gt;usage.&lt;/item&gt;
-      &lt;item&gt;macOS: uses malloc zone statistics.&lt;/item&gt;
-      &lt;item&gt;BSD: uses jemalloc's arena and stats interfaces.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h2"&gt;Summary&lt;/head&gt;
-    &lt;p&gt;psutil 7.2.0 fills a long-standing observability gap: native-level memory leaks in C extensions are now visible directly from Python. You now have a simple method to test C extensions for leaks. This turns psutil into not just a monitoring library, but a practical debugging tool for Python projects that rely on native C extension modules.&lt;/p&gt;
-    &lt;p&gt;To make leak detection practical, I created psleak, a test-regression framework designed to integrate into Python unit tests.&lt;/p&gt;
-    &lt;head rend="h2"&gt;References&lt;/head&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;psleak, the new memory leak testing framework.&lt;/item&gt;
-      &lt;item&gt;psutil PR #2692, the implementation.&lt;/item&gt;
-      &lt;item&gt;psutil issue #1275, the original proposal from 8 years earlier.&lt;/item&gt;
-    &lt;/list&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46376608</guid><pubDate>Wed, 24 Dec 2025 15:53:41 +0000</pubDate></item><item><title>Keystone (YC S25) is hiring engineer #1 to automate coding</title><link>https://www.ycombinator.com/companies/keystone/jobs/J3t9XeM-founding-engineer</link><description>&lt;doc fingerprint="2a70b37c7ecfe438"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Your team's on-call AI engineer&lt;/p&gt;
-    &lt;p&gt;About Keystone&lt;/p&gt;
-    &lt;p&gt;We're building AI-native error monitoring that automatically investigates production issues and generates code fixes. Think Sentry, but built from the ground up for a world where AI can actually understand your codebase, trace through logs, and tell you exactly what broke and how to fix it.&lt;/p&gt;
-    &lt;p&gt;We're starting here and expanding until we're the default tool for building product, period. Our mission is to free engineers from the drudgery of digging through logs, setting up systems, and debugging- so they can focus on understanding users and designing great products.&lt;/p&gt;
-    &lt;p&gt;We're in-person in SoMa, San Francisco. We raised a $5.2M seed from True Ventures, Twenty Two Ventures, Pear VC, and Ritual Capital- plus the founders of YC, Dropbox, Supabase, Eight Sleep, Graphite, Resend, RocketMoney, and more. Early users include teams at the fastest growing startups in the world.&lt;/p&gt;
-    &lt;p&gt;About the Role&lt;/p&gt;
-    &lt;p&gt;You'd be the first engineering hire, working directly with me (the founder) to build the core product. You'll have more ownership and influence over the product, culture, and technical direction than you'd get almost anywhere else.&lt;/p&gt;
-    &lt;p&gt;Example projects:&lt;/p&gt;
-    &lt;p&gt;Who we're looking for&lt;/p&gt;
-    &lt;p&gt;You've been dissatisfied with the quality of every team you've worked on. You're looking for a place where the bar is genuinely high- not aspirationally high, actually high- and you want to build something meaningful alongside people who feel the same way.&lt;/p&gt;
-    &lt;p&gt;We operate through long-form written thinking, first-principles reasoning, and direct feedback. We work long hours, we're in the office together, and we're trying to build something exceptional. If you're optimizing for balance right now, that's completely valid- this isn't the right fit.&lt;/p&gt;
-    &lt;p&gt;You might be a great fit if you:&lt;/p&gt;
-    &lt;p&gt;Stack: TypeScript, React (Next.js), Python, Postgres, Redis, AWS&lt;/p&gt;
-    &lt;p&gt;Comp &amp;amp; benefits: Top-of-market salary + significant equity, full health/dental/vision, all meals covered, equipment budget&lt;/p&gt;
-    &lt;p&gt;To apply: Email founders [at] withkeystone [dot] com with "Keystone Founding Engineer" in the subject line. Tell me one thing you're genuinely proud of having built or accomplished, and why. We will respond to every email with that string in the subject line.&lt;/p&gt;
-    &lt;p&gt;If there appears to be a fit, we'll reach out to schedule 2-3 short technicals. After, we'll schedule an onsite in our office, where you'll work on a small project, discuss ideas, and get a sense for our in-person culture.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46379173</guid><pubDate>Wed, 24 Dec 2025 21:01:05 +0000</pubDate></item><item><title>Clearspace (YC W23) Is Hiring a Founding Network Engineer (VPN and Proxy)</title><link>https://www.ycombinator.com/companies/clearspace/jobs/5LtM86I-founding-network-engineer-at-clearspace</link><description>&lt;doc fingerprint="b792f12e5d21eddd"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Eliminate compulsive phone usage&lt;/p&gt;
-    &lt;p&gt;About Clearspace&lt;/p&gt;
-    &lt;p&gt;Clearspace is building the intentionality layer of the internet. Our mission is to build technology as effective at protecting human attention as social media is at exploiting it (infinite scrolling, short-form feeds, manipulative notifications, etc). Our category defining mobile app has been featured on Huberman Lab, New York Times Wirecutter, NPR Marketplace, Forbes, TBPN.&lt;/p&gt;
-    &lt;p&gt;People that want a better relationship with their devices have nowhere to turn except for willpower. We are building a system allows users to control what their devices see by processing and filtering network traffic against natural language rules.&lt;/p&gt;
-    &lt;p&gt;About The Role&lt;/p&gt;
-    &lt;p&gt;We’re looking for a networking-obsessed engineer to own the VPN + first-hop policy proxy that powers our AI agent. You don’t need to be an IKEv2 expert, we care more about deep networking intuition, debugging skill, and the desire to go all the way down the stack until the truth reveals itself.&lt;/p&gt;
-    &lt;p&gt;You might be a great fit if you’ve built:&lt;/p&gt;
-    &lt;p&gt;What You’ll Build&lt;/p&gt;
-    &lt;p&gt;Qualifications&lt;/p&gt;
-    &lt;p&gt;Nice to Have&lt;/p&gt;
-    &lt;p&gt;Compensation&lt;/p&gt;
-    &lt;p&gt;At Clearspace we help people reduce compulsive phone usage.&lt;/p&gt;
-    &lt;p&gt;We exist to protect people's attention from the exploits of modern technology platforms and make space for the things that matter to them most.&lt;/p&gt;
-    &lt;p&gt;We believe the technology to protect someones attention should be just as sophisticated and effective as the tech that is exploiting it and are building a world-class engineering team to arm the world with a comprehensive attention protection stack.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46385600</guid><pubDate>Thu, 25 Dec 2025 17:01:29 +0000</pubDate></item><item><title>Package managers keep using Git as a database, it never works out</title><link>https://nesbitt.io/2025/12/24/package-managers-keep-using-git-as-a-database.html</link><description>&lt;doc fingerprint="b32422190df047d9"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 27 Dec 2025 16:12:02 +0000</lastBuildDate><item><title>Package managers keep using Git as a database, it never works out</title><link>https://nesbitt.io/2025/12/24/package-managers-keep-using-git-as-a-database.html</link><description>&lt;doc fingerprint="b32422190df047d9"&gt;
   &lt;main&gt;
     &lt;p&gt;Using git as a database is a seductive idea. You get version history for free. Pull requests give you a review workflow. It’s distributed by design. GitHub will host it for free. Everyone already knows how to use it.&lt;/p&gt;
     &lt;p&gt;Package managers keep falling for this. And it keeps not working out.&lt;/p&gt;
@@ -235,71 +49,7 @@ leaks in Python C extensions.&lt;/p&gt;
     &lt;p&gt;If you’re building a package manager and git-as-index seems appealing, look at Cargo, Homebrew, CocoaPods, vcpkg, Go. They all had to build workarounds as they grew, causing pain for users and maintainers. The pull request workflow is nice. The version history is nice. You will hit the same walls they did.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46391514</guid><pubDate>Fri, 26 Dec 2025 12:46:36 +0000</pubDate></item><item><title>LearnixOS</title><link>https://www.learnix-os.com</link><description>&lt;doc fingerprint="7fe43b9d48af5e9f"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;The Learnix Operating System&lt;/head&gt;
-    &lt;p&gt;"If you can't explain it simply, you don't understand it well enough." - Albert Einstein&lt;/p&gt;
-    &lt;p&gt;Hello there!1&lt;/p&gt;
-    &lt;p&gt;In this book we are going to write and learn about operating systems together!&lt;/p&gt;
-    &lt;p&gt;We are going to implement an entire POSIX compliant OS in Rust and not use ANY2 external libraries. All of the thought process, code and implementations will be explained and documented here as well as in this repo which all the code snippets are from.&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;Note: ALL the syntax highlighting of the Rust code is custom and create by me! If you see and bug, please write in the comments or submit an issue.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;head rend="h2"&gt;Base Knowledge&lt;/head&gt;
-    &lt;p&gt;This book will be technical, and will assume a little bit of a programming knowledge background, but not necessarily in rust&lt;/p&gt;
-    &lt;p&gt;If you are not coming from a low level programming knowledge that's fine!&lt;/p&gt;
-    &lt;p&gt;Just make sure you know this stuff or learn it as you read. Also if in any place on this book I take some things for granted, please, open an issue here and let me know so I could explain it better.&lt;/p&gt;
-    &lt;p&gt;Some of the base knowledge that you would need to have:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;
-        &lt;p&gt;Some assembly knowledge. (just understand simple movs, and arithmetic operations, at a very basic level3)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Some knowledge on memory. (what's a pointer, what's an address)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;A knowledge in rust is not that important, but knowing at least one programming language is. I myself have some more learning in Rust, and in this book I will also explain some great features that it has!&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;A lot of motivation to learn and understand because it is a complex subject.&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h2"&gt;Roadmap of this book&lt;/head&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;
-        &lt;p&gt;Compiling a stand alone binary&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Boot loading, Debugging, stages and some legacy stuff&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Important cpu modes and instructions&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Paging, writing our own malloc&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Utilizing the Interrupt Descriptor Table&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;File systems and Disk Drivers&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Thinking in terms of processes&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Writing a shell&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Running our first program! (Which off course will be Doom)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;To be continued (Hopefully virtualization section and loading a vm of other OS)&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46391599</guid><pubDate>Fri, 26 Dec 2025 12:59:56 +0000</pubDate></item><item><title>Show HN: Witr – Explain why a process is running on your Linux system</title><link>https://github.com/pranshuparmar/witr</link><description>&lt;doc fingerprint="471a943f3dafc432"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46391514</guid><pubDate>Fri, 26 Dec 2025 12:46:36 +0000</pubDate></item><item><title>Show HN: Witr – Explain why a process is running on your Linux system</title><link>https://github.com/pranshuparmar/witr</link><description>&lt;doc fingerprint="471a943f3dafc432"&gt;
   &lt;main&gt;
     &lt;list rend="ul"&gt;
       &lt;item&gt;1. Purpose&lt;/item&gt;
@@ -1222,4 +972,147 @@ sharp render -i /path/to/output/gaussians -o /path/to/output/renderings
     &lt;p&gt;Please check out the repository LICENSE before using the provided code and LICENSE_MODEL for the released models.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46401539</guid><pubDate>Sat, 27 Dec 2025 12:58:12 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46401539</guid><pubDate>Sat, 27 Dec 2025 12:58:12 +0000</pubDate></item><item><title>Floor796</title><link>https://floor796.com/</link><guid isPermaLink="false">https://news.ycombinator.com/item?id=46401612</guid><pubDate>Sat, 27 Dec 2025 13:13:00 +0000</pubDate></item><item><title>Show HN: An immutable ostree-based Arch Linux image</title><link>https://github.com/myyc/vyy</link><description>&lt;doc fingerprint="2bdc8915261ab52c"&gt;
+  &lt;main&gt;
+    &lt;p&gt;An ostree-based full fledged Arch Linux distribution, with no package manager. Basically Fedora Silverblue but with CachyOS' Zen4 packages, because we all want that 1% performance improvement.&lt;/p&gt;
+    &lt;p&gt;It's a largely vibe coded attempt at essentially gerrymandering a standard GNOME-based Arch Linux setup into Fedora's immutable system. And yes, it works perfectly in its current state.&lt;/p&gt;
+    &lt;p&gt;This README isn't written by an AI though so you can at least take it at face value.&lt;/p&gt;
+    &lt;p&gt;Warning: This project is work-in-progress and even though it is very usable and stable it might miss some random stuff here and there.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Install Silverblue, or Kinoite, or Bazzite, or whatever&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;code&gt;sudo bootc switch ghcr.io/myyc/vyy-zen4:latest
+&lt;/code&gt;
+    &lt;p&gt;Reboot. &lt;code&gt;bootc upgrade&lt;/code&gt; to update it. The kernel is signed so you can
+enable secure boot after trusting the key.&lt;/p&gt;
+    &lt;code&gt;sudo mokutil --import /usr/share/vyy/secureboot.cer
+&lt;/code&gt;
+    &lt;p&gt;There are no &lt;code&gt;zen3&lt;/code&gt; builds uploaded but you can build one
+yourself.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Install Silverblue, or Kinoite, or Bazzite, or whatever&lt;/item&gt;
+      &lt;item&gt;Run &lt;code&gt;scripts/dev.sh zen3&lt;/code&gt;as root (yes, sorry).&lt;/item&gt;
+      &lt;item&gt;From there, run &lt;code&gt;build-vyy-root.sh zen3&lt;/code&gt;&lt;/item&gt;
+      &lt;item&gt;Commit to your ostree repo, deploy and reboot.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;code&gt;sudo ostree commit --repo=/ostree/repo \
+    --branch=vyy --owner-uid=0 --owner-gid=0 \
+    --subject="vyy YYYYMMDD" \
+    --skip-list=/path/to/vyy/config/ostree-skip-list \
+    /path/to/vyy/work
+sudo ostree admin deploy vyy
+&lt;/code&gt;
+    &lt;p&gt;You will lose out-of-the-box secure boot this way but you can create your own keys. As long as the paths are right the scripts will do it for you.&lt;/p&gt;
+    &lt;p&gt;You could also use &lt;code&gt;scripts/daily-build.sh&lt;/code&gt; and the systemd
+units if you have a server to run this on; edit the placeholders
+first though.&lt;/p&gt;
+    &lt;p&gt;All the scripts default to &lt;code&gt;zen4&lt;/code&gt; but you can launch them with
+&lt;code&gt;zen3&lt;/code&gt; or &lt;code&gt;generic&lt;/code&gt; as arguments. I haven't tested these two, but
+they should work.&lt;/p&gt;
+    &lt;p&gt;The "install Silverblue" part is pretty much what makes this distro solid avoiding most possible sources of human error. Partitioning, encryption (if you want) and the bootloader are Fedora's defaults, which should be more than enough for most people – Silverblue by default configures &lt;code&gt;btrfs&lt;/code&gt; and has native encryption, so hooray.&lt;/p&gt;
+    &lt;p&gt;This is also why you can use this sort of thing on relatively critical devices – I literally developed all of this on the only device I had access too, for work included. It doesn't boot? Roll back and forget.&lt;/p&gt;
+    &lt;p&gt;No package manager. The system is immutable. Want to add stuff? Fork and edit &lt;code&gt;config/packages.conf&lt;/code&gt;. Or use &lt;code&gt;distrobox&lt;/code&gt;. It's included.&lt;/p&gt;
+    &lt;p&gt;The core thing is just a basic pacstrap setup with a bunch of packages added. You can see all of them in &lt;code&gt;confg/packages.txt&lt;/code&gt;.
+The main build script doesn't do much else, besides perhaps
+setting the locale.&lt;/p&gt;
+    &lt;p&gt;Most of the hammering is done by &lt;code&gt;restructure.sh&lt;/code&gt; which is
+invoked by &lt;code&gt;build-vyy-root.sh&lt;/code&gt; so you might as well check that
+too since it runs within a rootful container.&lt;/p&gt;
+    &lt;p&gt;Globally, it does a few things, e.g.:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Building the initramfs with the ostree module (and others)&lt;/item&gt;
+      &lt;item&gt;Moving everything system inside &lt;code&gt;/usr&lt;/code&gt;(including most of /etc)&lt;/item&gt;
+      &lt;item&gt;Ensuring the root is compatible with ostree&lt;/item&gt;
+      &lt;item&gt;Allowing &lt;code&gt;sudo&lt;/code&gt;for wheel users (otherwise you're locked out)&lt;/item&gt;
+      &lt;item&gt;Some sane defaults for &lt;code&gt;pam&lt;/code&gt;(including the fingerprint)&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;So like ... it doesn't actually depend on them yet. The only core one is &lt;code&gt;bootc&lt;/code&gt;. If you want to build locally you don't need it,
+you only need vanilla ostree. You don't even need it if you want
+to update from your own ostree repo.&lt;/p&gt;
+    &lt;p&gt;The other packages are more of a personal convenience. They're the Mullvad CLI, &lt;code&gt;ibus-m17n&lt;/code&gt; which is required for certain
+input methods, and &lt;code&gt;raw-thumbnailer&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;Fuck off&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46401832</guid><pubDate>Sat, 27 Dec 2025 13:47:16 +0000</pubDate></item><item><title>NMH BASIC</title><link>https://t3x.org/nmhbasic/index.html</link><description>&lt;doc fingerprint="b738281b4ea5b2d8"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Download: nmhbas23c.zip (version 1.2, 74KB) | nmhbas25c.zip (version 2.1, 90KB) | man page&lt;/p&gt;
+    &lt;p&gt;This is a small BASIC interpreter that I wrote in the early 1990s. For some reason I think it is one of the coolest programs I have ever written. Maybe because it is just a bit under 5K bytes large and still does something useful. Maybe it is just nostalgia.&lt;/p&gt;
+    &lt;p&gt;One of the more interesting programs I have written in NMH BASIC is a variant of the well-known mine sweeper game that runs in text mode. Not just text mode, actually, but (tele)typewriter mode, as it reprints the playing field after every move.&lt;/p&gt;
+    &lt;p&gt;The screenshots use Viacheslav Slavinsky's excellent GlassTTY font, a TrueType font that perfectly resembles the one used in the DEC VT-220 terminal. The same font, at bigger magnification, is used in the NMH BASIC logo.&lt;/p&gt;
+    &lt;p&gt;What is maybe interesting about the mine sweeper clone is that it uses a stackless floodfill algorithm that stores its state in the playing field itself and needs no dynamic memory at all. I have recently described it in the paper A Stackless Floodfill Automaton (PDF, 34KB). A demo showing an animation of the algorithm is included in the NMH BASIC package.&lt;/p&gt;
+    &lt;p&gt;There are other programs in the package, most of them rather simple, like an implementation of the Hangman game, the (rather pointless) Nim game, a banner printer, a random number generator, etc. NMH BASIC does not have a RNG, so a 15-bit linear feedback shift register is implemented in BASIC to generate pseudo-random numbers.&lt;/p&gt;
+    &lt;p&gt;The first program I have ever written in NMH BASIC was the inevitable prime number sieve. I have no idea how often I have loaded and run it in the past decades - until the Floodfill demo became my new favorite. Here is the code of my first NMH BASIC program (the backslash is the division remainder operator):&lt;/p&gt;
+    &lt;quote&gt;10 REM 'PRINT PRIME NUMBERS' 20 REM 'M = NUMBER OF PRIMES TO PRINT' 100 LET M = 1000 105 DIM Z(M) 110 LET Z(0) = 2 : LET T = 1 : LET P = 1 115 PRINT 2, 120 IF T &amp;gt;= M GOTO 200 130 LET P = P+2 : LET O = 1 140 FOR I = 0 TO T-1 150 IF P\Z(I) = 0 LET O = 0 : LET I = T 160 NEXT 170 IF O = 0 GOTO 120 180 LET Z(T) = P : LET T = T+1 185 PRINT P, 190 GOTO 120 200 END&lt;/quote&gt;
+    &lt;p&gt;I wrote the first version of NMH BASIC in 1994, recycling some parts that I had written in the years 1991..1993. The first version that I wrote in 1994 was a prototype in BASYL-II which I then translated, function by function, to 8086 assembly language. The resulting executable had a size of about 4700bytes and because the token representation that the interpreter uses internally is quite efficient, you could do interesting things with NMH BASIC in as little as 12Kbytes of memory. I had named the interpreter 12K-BASIC initially, but soon learned that others had had that idea before me.&lt;/p&gt;
+    &lt;p&gt;Of course in 1994 memory was already measured in megabytes, so you might say that writing a tiny BASIC interpreter was kind of pointless at that time. It depends I would say; it is better than getting drunk in a bar, and now, almost 30 years later, I still enjoy playing with this little program. So much, in fact, that I decided to translate the original code to T3X/0, so that I can play with it on Unix without having to use an emulator.&lt;/p&gt;
+    &lt;p&gt;All the above versions are included in the package: the original BASYL-II version, the assembly language version, and the new T3X version. You can recompile the T3X version with T3X/0 and the 8086 assembly language version with TASM or MASM. You need to create a COM file or it will not run. A precompiled COM file and Tcode machine executable (as well as a Tcode machine for Unix) are also included in the package.&lt;/p&gt;
+    &lt;p&gt;There is also a simplified version of the interpreter that runs under CP/M. A COM file for CP/M (BASICS.COM) is also included in the archive. The CP/M version currently needs 32K bytes of TPA to run.&lt;/p&gt;
+    &lt;p&gt;The NMH BASIC language contains some interesting (IMHO) hacks to make its implementation simpler.&lt;/p&gt;
+    &lt;p&gt;All variables have either single-character names or names consisting of a character and a digit, like A0, B2, Z9, etc. The expressions A and A0 and A(0) all refer to the same variable. If you do not use A0..A9, you can use A as a 10-slot array A(0) .. A(9). Or you can use A5 in the place of A(5) if you are refering to a fixed slot.&lt;/p&gt;
+    &lt;p&gt;It is getting even weirder. A(10) is the same as B or B0 or B(0). A(22) is equal to C2 or C(2) and, finally, A(259) would be equal to Z(9). So, for instance, if you do not use any Z's, you can use Y as a 20-slot array. In this case the command &lt;code&gt;DIM Y(20)&lt;/code&gt; is really
+a null-operation. It merely serves as a reminder that Y is a 20-slot
+array (and Z should not be used).
+&lt;/p&gt;
+    &lt;p&gt;You could also use Y as a 50-alot array by dimensioning it with &lt;code&gt;DIM Y(50)&lt;/code&gt;. In this case the elements of Z will still be used, but
+40 additional slots will be allocated to integer variable storage,
+so Z becomes a 40-slot array and Y a 50-slot array. It probably
+goes without saying that most programs either use single-character
+variables as 10-slot arrays or dimension Z, if a larger array is
+needed.
+&lt;/p&gt;
+    &lt;p&gt;This also means that &lt;code&gt;DIM Y(50)&lt;/code&gt; and &lt;code&gt;DIM Z(50)&lt;/code&gt; in the same program
+would just allocate 50 integer slots to Z and the last 40 slots of Y would
+overlap with the slots of Z. Having multiple large arrays in the
+same NMH BASIC program requires some hacking, like using Z(0)..Z(99)
+for one array and Z(100)..Z(199) for the other.
+&lt;/p&gt;
+    &lt;p&gt;Note the definition of "large" above. NMH BASIC uses 12Kbytes of memory in total: for integer variables, string variables, program memory, stacks, and the machine code of the interpreter itself! You could probably write a version of this interpreter that would run on a CP/M machine with as little as 16K bytes of transient program area (but I have never done so).&lt;/p&gt;
+    &lt;p&gt;The interpreter performs I/O on "units", where each unit is assigned a file or device when the interpreter is started. NMH BASIC programs cannot open or close any files. They can only redirect input and output to the assigned units. I/O is sequential, i.e. each unit is like a tape drive. The following program prints the data stored on unit #5:&lt;/p&gt;
+    &lt;quote&gt;100 LET X = IOCTL(5, 100) : INPUT #5 110 INPUT A$ : IF ASC(A$) = 255 INPUT #0 : END 120 PRINT A$ : GOTO 110&lt;/quote&gt;
+    &lt;p&gt;The statement &lt;code&gt;INPUT #5&lt;/code&gt; redirects input to unit #5, so from that point
+on all INPUT statements will read from that unit. (Analogously,
+&lt;code&gt;PRINT #5&lt;/code&gt; would redirect output to unit #5.) When a string read from
+a unit contains the value 255 in its first slot, there is no more
+input available from the current input unit. &lt;code&gt;INPUT #0&lt;/code&gt; connects input
+back to the keyboard. Note that &lt;code&gt;PRINT #1&lt;/code&gt; would connect output back
+to the screen.
+&lt;/p&gt;
+    &lt;p&gt;There is an IOCTL function that can perform several "services" on a unit, like rewinding it, appending to it (moving the read/write pointer to the end of the unit), or truncating it (or writing an EOF marker on a tape). The IOCTL call in the above example rewinds the unit.&lt;/p&gt;
+    &lt;p&gt;The maximum length of a line or string is 64 bytes. Reading anything longer, either via INPUT or by entering it at the interpreter prompt, will result in an error. The CR,LF characters that separate lines are not counted.&lt;/p&gt;
+    &lt;p&gt;I have forgotten how other BASIC dialects handle this, but I suspect that NMH BASIC is the odd one out here: in an IF statement the entire rest of the line is executed conditionally. For example&lt;/p&gt;
+    &lt;quote&gt;IF 1 = 1 PRINT 'FOO' : PRINT 'BAR'&lt;/quote&gt;
+    &lt;p&gt;would print both FOO and BAR. There is no THEN or ELSE keyword. The first keyword after the condition of IF starts the conditional part of the IF statement. When the condition in IF is false, the interpreter advances to the next line. An alternative branch is implemented with jump around jumps using GOTO:&lt;/p&gt;
+    &lt;quote&gt;100 IF condition GOTO 130 110 alternative statements 120 GOTO 140 130 consequent statements 140 REM&lt;/quote&gt;
+    &lt;p&gt;Or, if the condition and statements are short:&lt;/p&gt;
+    &lt;quote&gt;100 IF condition statements 110 IF # condition statements&lt;/quote&gt;
+    &lt;p&gt;The # operator implements the logical NOT. It had high precedence in NMH BASIC up to version 1.2, but has very low precedence in NMH BASIC II. Interestingly, this change did not affect any programs in the archive. There is a logical AND, but not a logical OR in IF. If there are multiple conditions separated by commas then the conditional statements will only execute, if all conditions are true. For example, the statement&lt;/p&gt;
+    &lt;quote&gt;IF 0 &amp;lt; C, C &amp;lt; 11 STOP&lt;/quote&gt;
+    &lt;p&gt;will stop program execution, if C is in the range 1..10. To implement a logical OR, multiple IF statemements with the same conditional part (or jumps around jumps) have to be used.&lt;/p&gt;
+    &lt;p&gt;NMH BASIC 1.x listed programs with blanks between all adjacent tokens. NMH BASIC II uses a more compact representation. Either way is merely a characteristic of the LIST routine, though. You can enter a program as&lt;/p&gt;
+    &lt;quote&gt;FOR I=1TO10:PRINT A(I):NEXT&lt;/quote&gt;
+    &lt;p&gt;but the LIST command will print it as&lt;/p&gt;
+    &lt;quote&gt;FOR I = 1 TO 10 : PRINT A ( I ) : NEXT&lt;/quote&gt;
+    &lt;p&gt;in NMH BASIC and as&lt;/p&gt;
+    &lt;quote&gt;FOR I = 1 TO 10 : PRINT A(I) : NEXT&lt;/quote&gt;
+    &lt;p&gt;in NMH BASIC II.&lt;/p&gt;
+    &lt;p&gt;This has the weird side effect that sometimes you can SAVE a program but cannot LOAD it later, because some lines will be shorter than 64 characters when you enter them, but LIST (and hence SAVE) will blow them up to a bigger size.&lt;/p&gt;
+    &lt;p&gt;This is mostly a problem in NMH BASIC 1.x, which inserts blanks between all tokens. For example:&lt;/p&gt;
+    &lt;quote&gt;100 IF ASC(MID$(A$, I, 1)) = ASC('X') LET X = X+1 : GOTO 120 ----+----1----+----2----+----3----+----4----+----5----+----6---| 100 IF ASC( MID$( A$ , I , 1 ) ) = ASC( 'X' ) LET X = X + 1 : GOTO 120&lt;/quote&gt;
+    &lt;p&gt;There is no workaround. When a program cannot be loaded, the only remedy is to edit it with a text editor and fix it, either by removing unnecessary blanks or, even better, by splitting the offending line. E.g.:&lt;/p&gt;
+    &lt;quote&gt;100 LET C = ASC( MID$( A$ , I , 1 ) ) 105 IF C = ASC( 'X' ) LET X = X + 1 : GOTO 120&lt;/quote&gt;
+    &lt;p&gt;Finally, it is a good idea to keep NMH BASIC programs in DOS text format with CR/LF line separators, even on Unix systems, because otherwise the DOS version of the interpreter will refuse to load them.&lt;/p&gt;
+    &lt;p&gt;In December 2024 I changed a few things and pubished a new version of NMH BASIC, which I called, for lack of imagination, NMH BASIC II. The new version changes the precedence of the # (logical NOT) operator from highest to lowest (this was a mistake in the original version!) and uses a more compact and more comprehensible LIST format, which is also used for saving programs. Because some code was simplified in the interpreter at the same time, the new version is one byte smaller than the original version.&lt;/p&gt;
+    &lt;p&gt;Download: nmhbas3_30.zip (version 3.0, 105KB) | man page&lt;/p&gt;
+    &lt;p&gt;Version 3.x of NMH BASIC is an in-progress version that differs from the previous versions in a few points that are described in detail in the manual. Most prominently, the CMPS ("compare strings") function has been replaced with string comparison operators, so, for example,&lt;/p&gt;
+    &lt;quote&gt;IF CMPS(A$, 'FOO') = 0 PRINT 'YEP'&lt;/quote&gt;
+    &lt;p&gt;would now be written as&lt;/p&gt;
+    &lt;quote&gt;IF A$ = 'FOO' PRINT 'YEP'&lt;/quote&gt;
+    &lt;p&gt;Then, NMH BASIC III supports baudot-encoded units. This means that any unit connected to the interpreter can be written to and read from using five-channel baudot-encoding (CCITT-2, US-TTY). So the interpreter can, in theory, save and load programs to/from five-hole paper tape.&lt;/p&gt;
+    &lt;p&gt;The T3X/0 version of the interpreter is currently fully working. There also is a more efficient Z80 version written in assembly language, which is work in slow progress. It currently runs all the example programs, but lacks baudot-encoded units and may still have a few bugs. An 8086 version written in assembly language may appear later.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46401938</guid><pubDate>Sat, 27 Dec 2025 14:05:44 +0000</pubDate></item><item><title>A Century of Noether's Theorem</title><link>https://arxiv.org/abs/1902.01989</link><description>&lt;doc fingerprint="a49c240a54f5908a"&gt;
+  &lt;main&gt;&lt;head rend="h1"&gt;Physics &amp;gt; History and Philosophy of Physics&lt;/head&gt;&lt;p&gt; [Submitted on 6 Feb 2019 (v1), last revised 9 Jul 2019 (this version, v2)]&lt;/p&gt;&lt;head rend="h1"&gt;Title:Colloquium: A Century of Noether's Theorem&lt;/head&gt;View PDF&lt;quote&gt;Abstract:In the summer of 1918, Emmy Noether published the theorem that now bears her name, establishing a profound two-way connection between symmetries and conservation laws. The influence of this insight is pervasive in physics; it underlies all of our theories of the fundamental interactions and gives meaning to conservation laws that elevates them beyond useful empirical rules. Noether's papers, lectures, and personal interactions with students and colleagues drove the development of abstract algebra, establishing her in the pantheon of twentieth-century mathematicians. This essay traces her path from Erlangen through Göttingen to a brief but happy exile at Bryn Mawr College in Pennsylvania, illustrating the importance of "Noether's Theorem" for the way we think today. The text draws on a colloquium presented at Fermilab on 15 August 2018.&lt;/quote&gt;&lt;head rend="h2"&gt;Submission history&lt;/head&gt;From: Chris Quigg [view email]&lt;p&gt;[v1] Wed, 6 Feb 2019 00:51:17 UTC (183 KB)&lt;/p&gt;&lt;p&gt;[v2] Tue, 9 Jul 2019 18:15:15 UTC (183 KB)&lt;/p&gt;&lt;p&gt; Current browse context: &lt;/p&gt;&lt;p&gt;physics.hist-ph&lt;/p&gt;&lt;head rend="h3"&gt;References &amp;amp; Citations&lt;/head&gt;&lt;p&gt; export BibTeX citation Loading... &lt;/p&gt;&lt;head rend="h1"&gt;Bibliographic and Citation Tools&lt;/head&gt;&lt;p&gt; Bibliographic Explorer (What is the Explorer?) &lt;/p&gt;&lt;p&gt; Connected Papers (What is Connected Papers?) &lt;/p&gt;&lt;p&gt; Litmaps (What is Litmaps?) &lt;/p&gt;&lt;p&gt; scite Smart Citations (What are Smart Citations?) &lt;/p&gt;&lt;head rend="h1"&gt;Code, Data and Media Associated with this Article&lt;/head&gt;&lt;p&gt; alphaXiv (What is alphaXiv?) &lt;/p&gt;&lt;p&gt; CatalyzeX Code Finder for Papers (What is CatalyzeX?) &lt;/p&gt;&lt;p&gt; DagsHub (What is DagsHub?) &lt;/p&gt;&lt;p&gt; Gotit.pub (What is GotitPub?) &lt;/p&gt;&lt;p&gt; Hugging Face (What is Huggingface?) &lt;/p&gt;&lt;p&gt; Papers with Code (What is Papers with Code?) &lt;/p&gt;&lt;p&gt; ScienceCast (What is ScienceCast?) &lt;/p&gt;&lt;head rend="h1"&gt;Demos&lt;/head&gt;&lt;head rend="h1"&gt;Recommenders and Search Tools&lt;/head&gt;&lt;p&gt; Influence Flower (What are Influence Flowers?) &lt;/p&gt;&lt;p&gt; CORE Recommender (What is CORE?) &lt;/p&gt;&lt;head rend="h1"&gt;arXivLabs: experimental projects with community collaborators&lt;/head&gt;&lt;p&gt;arXivLabs is a framework that allows collaborators to develop and share new arXiv features directly on our website.&lt;/p&gt;&lt;p&gt;Both individuals and organizations that work with arXivLabs have embraced and accepted our values of openness, community, excellence, and user data privacy. arXiv is committed to these values and only works with partners that adhere to them.&lt;/p&gt;&lt;p&gt;Have an idea for a project that will add value for arXiv's community? Learn more about arXivLabs.&lt;/p&gt;&lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46402611</guid><pubDate>Sat, 27 Dec 2025 15:42:02 +0000</pubDate></item></channel></rss>
