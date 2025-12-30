@@ -1,256 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-12-30T10:44:47.963518+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46422009</id><title>Static Allocation with Zig</title><updated>2025-12-30T10:44:56.495595+00:00</updated><content>&lt;doc fingerprint="3e59ba5f80a316c9"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Over the past few months I've been chipping away at a small Redis-compatible key/value server called &lt;code&gt;kv&lt;/code&gt;. The goal is to have something (mostly) production-ready, while implementing
-only a small subset of commands. The world doesn't necessarily need another key/value store, I'm just interested in
-implementing it in Zig and learning about some new (to me) techniques for systems programming.&lt;/p&gt;
-    &lt;p&gt;One of those techniques is static memory allocation during initialization. The idea here is that all memory is requested and allocated from the OS at startup, and held until termination. I first heard about this while learning about TigerBeetle, and they reference it explicitly in their development style guide dubbed "TigerStyle".&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;All memory must be statically allocated at startup. No memory may be dynamically allocated (or freed and reallocated) after initialization. This avoids unpredictable behavior that can significantly affect performance, and avoids use-after-free. As a second-order effect, it is our experience that this also makes for more efficient, simpler designs that are more performant and easier to maintain and reason about, compared to designs that do not consider all possible memory usage patterns upfront as part of the design.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;Although, this isn't as straightforward as it might sound at first. The first question that comes to mind might be: "How much memory do I allocate?" Of course, the answer depends on the system. If we're writing a server, how many concurrent connections do we allow? How much space is each connection allowed to work with? How much data do we expect to process at any given time? Are there limits in response size? Do we need all the data at once, or can it streamed in some fashion?&lt;/p&gt;
-    &lt;p&gt;These are all questions that depend on the nature of the system and the context in which it will operate. I believe that going through the exercise of answering these questions is ultimately a good thing, as it seems to have a strong possibility of resulting in more stable systems, and forces us to understand the nature of our program at a deeper level.1&lt;/p&gt;
-    &lt;p&gt;On the language front, I feel like Zig is currently the best option out there for doing this with relative ease, considering its design choices around explicit memory allocation and the &lt;code&gt;std.mem.Allocator&lt;/code&gt; interface, which allows
-the standard library to ship with a variety of different allocators.&lt;/p&gt;
-    &lt;p&gt;Let's take a look at how we can manage static allocation in &lt;code&gt;kv&lt;/code&gt;, considering three areas of request handling in
-sequence: connection handling, command parsing, and key/value storage.&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;A lot of this is pretty new to me, and I'm still wrestling with all these concepts. (And learning Zig!) I'm sure there are better ways of handling this stuff. I'm presenting this as one possible implementation completed as a learning exercise. I'll speak more about the trade-offs and where I think it can go further at the end of this post.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;head rend="h2"&gt;Connection Handling&lt;/head&gt;
-    &lt;p&gt;The first thing we have to consider is how data comes into the system, which we'll maintain through the concept of a &lt;code&gt;Connection&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;A connection represents the communication to a particular client that wants to access the key/value store. Since we're using &lt;code&gt;io_uring&lt;/code&gt; for asynchronous I/O, we have to keep some information around through the life-cycle of
-a request, so the kernel can use it. The space for that information is what we'll statically allocate and re-use across
-different connections as they come and go.&lt;/p&gt;
-    &lt;code&gt;const Connection = struct {
-	completion: Completion = undefined,
-	client: posix.socket_t = undefined,
-	
-	recv_buffer: *ByteArray,
-	send_buffer: *ByteArray,
-};
-&lt;/code&gt;
-    &lt;quote&gt;&lt;p&gt;Connections also must maintain something called a "completion". This detail is related to integration with&lt;/p&gt;&lt;code&gt;io_uring&lt;/code&gt;, the full details of which are outside the scope of this post. There are some good resources here and here. I also took some inspiration from TigerBeetle's IO module.&lt;/quote&gt;
-    &lt;p&gt;During initialization, we create three pools: one for the Connection structs themselves, one for receive buffers (requests), and one for send buffers (responses). When a request comes in to the server, a Connection is pulled from a &lt;code&gt;std.heap.MemoryPool&lt;/code&gt;, and then two buffers are associated with that &lt;code&gt;Connection&lt;/code&gt;. The buffers are
-implemented as &lt;code&gt;ByteArray&lt;/code&gt; structs, which are in turn allocated as part of a &lt;code&gt;ByteArrayPool&lt;/code&gt;. The &lt;code&gt;ByteArrayPool&lt;/code&gt;
-is custom and uses a free list to keep track of which buffers are available
-to reserve for a new connection.&lt;/p&gt;
-    &lt;code&gt;const ConnectionPool = struct {
-    const Pool = std.heap.MemoryPoolExtra(Connection, .{ .growable = false });
-
-    recv_buffers: ByteArrayPool,
-    send_buffers: ByteArrayPool,
-
-    connections: Pool,
-
-    fn init(
-        config: Config,
-        gpa: std.mem.Allocator,
-    ) !ConnectionPool {
-        const allocation = config.allocation();
-        const recv_size = allocation.connection_recv_size;
-        const send_size = allocation.connection_send_size;
-
-        const pool = try Pool.initPreheated(gpa, config.connections_max);
-        const recv_buffers = try ByteArrayPool.init(gpa, config.connections_max, recv_size);
-        const send_buffers = try ByteArrayPool.init(gpa, config.connections_max, send_size);
-
-        return .{
-            .recv_buffers = recv_buffers,
-            .send_buffers = send_buffers,
-            .connections = pool,
-        };
-    }
-	
-...
-};
-&lt;/code&gt;
-    &lt;p&gt;At runtime, connections are created and destroyed (marked as available) using these pools and no actual allocation needs to happen. If no &lt;code&gt;Connection&lt;/code&gt; is available in the pool, the request is rejected and the client will have to try again.&lt;/p&gt;
-    &lt;p&gt;This does mean that the server must be configured with an upper limit on the number of connections. Each connection must also have a limit on how much data it can receive and send.&lt;/p&gt;
-    &lt;p&gt;At first this might seem limiting, but in practice, it creates a more robust system. Databases in particular will enforce a limit on the number of active connections for that exact reason! For a backend, networked system like &lt;code&gt;kv&lt;/code&gt;,
-I would say something like 1000 active connections is a pretty reasonable limit. For a public facing system you'd
-likely want more. Of course, this should all be configurable by the user.&lt;/p&gt;
-    &lt;p&gt;The &lt;code&gt;Config&lt;/code&gt; struct given to the &lt;code&gt;ConnectionPool&lt;/code&gt; represents these user-configured options. Note that the &lt;code&gt;Config&lt;/code&gt;
-struct has a method &lt;code&gt;.allocation()&lt;/code&gt; which is computed after the options have been set. In this case,
-the &lt;code&gt;connection_recv_size&lt;/code&gt; and &lt;code&gt;connection_send_size&lt;/code&gt; depend on other options, such as &lt;code&gt;config.key_count&lt;/code&gt; and
-&lt;code&gt;config.key_size_max&lt;/code&gt;. We'll revisit those later.&lt;/p&gt;
-    &lt;p&gt;Now that data can get into the system, the next step is to parse out Redis commands.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Command Parsing&lt;/head&gt;
-    &lt;p&gt;In an attempt to be compatible with Redis (at least a very small subset of it), &lt;code&gt;kv&lt;/code&gt; has to parse incoming commands
-following the Redis serialization protocol ("RESP") format.&lt;/p&gt;
-    &lt;p&gt;Here's an example of an incoming &lt;code&gt;GET key&lt;/code&gt; command.&lt;/p&gt;
-    &lt;code&gt;*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n
-&lt;/code&gt;
-    &lt;p&gt;I won't go into detail on how these commands are structured, the RESP document will do a much better job there. Basically, what we're looking at is "Here's an array with 2 elements. The first element has 3 characters, with the content &lt;code&gt;GET&lt;/code&gt; and the second element has 3 characters, with the contenhttps://github.com/nickmonad/kvt &lt;code&gt;key&lt;/code&gt;."&lt;/p&gt;
-    &lt;p&gt;In order to parse this command, we need to look at the buffer that contains the request data, create some kind of iterator over that buffer, and split each entry on the CRLF &lt;code&gt;\r\n&lt;/code&gt; byte sequence. Here's the signature for &lt;code&gt;parse&lt;/code&gt;,
-the function that does just that.&lt;/p&gt;
-    &lt;code&gt;pub fn parse(config: Config, alloc: std.mem.Allocator, buf: []const u8) !Command
-&lt;/code&gt;
-    &lt;p&gt;The allocator is used to create some book-keeping structure as we parse through the command. We need to create a list of &lt;code&gt;[]const u8&lt;/code&gt; slices that points into the whole buffer and then is given to a command's &lt;code&gt;parse()&lt;/code&gt; function, once
-we know the command. This has the benefit of being a "zero copy" approach to parsing. No request data needs to be copied,
-only pointed to.&lt;/p&gt;
-    &lt;p&gt;Zig's &lt;code&gt;std.heap.FixedBufferAllocator&lt;/code&gt; is perfect for this kind of operation. During initialization, we ask for buffer
-space from a general purpose allocator, and pass it to the &lt;code&gt;FixedBufferAllocator&lt;/code&gt;. This allocator works as "bump" allocator,
-where each internal allocation happens in a linear fashion, up to the amount of available space. The trade-off here is
-that memory allocated within the fixed buffer can't be free'd directly. Instead, the entire buffer is reset after use,
-which simply resets an index back to &lt;code&gt;0&lt;/code&gt;. (Just about as cheap as an operation can get!)&lt;/p&gt;
-    &lt;p&gt;Since our server is single-threaded2 and processes one request at a time, we can re-use this &lt;code&gt;FixedBufferAllocator&lt;/code&gt;
-across every request. After the request is processed, the response is copied to a &lt;code&gt;Writer&lt;/code&gt; object backed by the
-connection's &lt;code&gt;send&lt;/code&gt; buffer and the &lt;code&gt;FixedBufferAllocator&lt;/code&gt; is reset for the next request.&lt;/p&gt;
-    &lt;p&gt;Knowing how much space to give the &lt;code&gt;FixedBufferAllocator&lt;/code&gt; depends again on our system configuration. We need space for
-the &lt;code&gt;ArrayList&lt;/code&gt; of parsed command items, and space for any copied list items that are written back as a response during
-command execution. Parsing must be able to support the largest possible command (a list &lt;code&gt;PUSH&lt;/code&gt; of maximum size/length) and
-copying has to support the largest possible response (again, a maximally sized list).&lt;/p&gt;
-    &lt;p&gt;Copying has the extra consideration that we have to actually store the copied list items, which are duplicated when read from the key/value store. During parsing, we just need to keep slices into the request buffer. For the copied items, we need to keep a list of slices that point to the items, and the items themselves. As long as we give the &lt;code&gt;FixedBufferAllocator&lt;/code&gt; space, we can use it for all these (sub-)allocations.&lt;/p&gt;
-    &lt;code&gt;pub const Runner = struct {
-    config: Config,
-    fba: std.heap.FixedBufferAllocator,
-    kv: *Store,
-
-    pub fn init(config: Config, gpa: std.mem.Allocator, kv: *Store) !Runner {
-        const L = config.list_length_max;
-        const V = config.val_size_max;
-
-        // ArrayList([]const u8) of largest possible command.
-        // "[L/R]PUSH list item1 item2 ... itemL"
-        const parse_cap = (1 + 1 + L);
-        const parse_size: u64 = (parse_cap * @sizeOf([]const u8));
-
-        // ArrayList([]const u8) pointing to duplicated values.
-        const copy_size = (L * @sizeOf([]const u8));
-        const copy_data = (L * V);
-
-        const fba_size: u64 = parse_size + copy_size + copy_data;
-        const buffer = try gpa.alloc(u8, fba_size);
-        const fba = std.heap.FixedBufferAllocator.init(buffer);
-
-        return .{
-            .config = config,
-            .fba = fba,
-            .kv = kv,
-        };
-    }
-...
-};
-&lt;/code&gt;
-    &lt;p&gt;The underlying &lt;code&gt;Store&lt;/code&gt; will use the &lt;code&gt;FixedBufferAllocator&lt;/code&gt; to allocate an &lt;code&gt;ArrayList&lt;/code&gt; of fixed capacity
-(determined by &lt;code&gt;config.list_length_max&lt;/code&gt;) and then use the remaining space in the allocator for the copied data.&lt;/p&gt;
-    &lt;p&gt;Hopefully all is clear so far! Now we can move on to the core of the system: key/value storage.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Key/Value Storage&lt;/head&gt;
-    &lt;p&gt;Perhaps obviously, the fundamental data structure in &lt;code&gt;kv&lt;/code&gt; is a hash map, used to associate user provided keys with
-user provided values.&lt;/p&gt;
-    &lt;p&gt;Without looking too closely at the standard library, if you grab one of the provided hash map implementations, it will accept a &lt;code&gt;std.mem.Allocator&lt;/code&gt; and hold onto the allocator for the lifetime of the map. When a key/value pair
-is added to the map, it will use that same allocator and request the appropriate amount of memory to store that data.
-This won't work for our case though, since we need to control allocation prior to adding any data to the map.&lt;/p&gt;
-    &lt;p&gt;Fortunately, Zig also provides an "unmanaged" version of a hash map. Generally, these unmanaged versions of data structures in the standard library mean that an allocator is not held by the structure itself. It's up to us to provide that allocator when needed. A cool trick we can play with an unmanaged map is ask it to ensure it has enough capacity up front, and then "assume" that capacity during runtime when adding data to it. The hashing and internal details are still handled by the map.&lt;/p&gt;
-    &lt;code&gt;var map: std.StringHashMapUnmanaged(Value) = .empty;
-try map.ensureTotalCapacity(gpa, capacity);
-&lt;/code&gt;
-    &lt;p&gt;The &lt;code&gt;ensure&lt;/code&gt; operation can fail with &lt;code&gt;error.OutOfMemory&lt;/code&gt;, which is OK during initialization. But, assuming this succeeds,
-we no longer need to pass an allocator when we store data in the map.&lt;/p&gt;
-    &lt;code&gt;store.map.putAssumeCapacity(key, value);
-&lt;/code&gt;
-    &lt;p&gt;This could in theory fail, in which case there would an assertion failure. It's ultimately up to us to check against the map's available capacity before calling this function. But, again, no allocation is required.&lt;/p&gt;
-    &lt;p&gt;Since the map itself doesn't do any allocation at runtime, we have to provide space for incoming keys and values. We'll reuse the same &lt;code&gt;ByteArrayPool&lt;/code&gt; implementation that we used for connection buffers. Basically, we have a big space
-allocated for keys and values and the hash map just maintains an association of pointers from keys to values.
-The key/value data isn't literally stored "in the map." The allocation that happens in &lt;code&gt;ensureTotalCapacity&lt;/code&gt; is for
-the internal book-keeping structure of the map, not for the user data.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Navigating the map&lt;/head&gt;
-    &lt;p&gt;At the highest level, the primary challenge with storing keys and values in a statically allocated map is that we could get poor utilization of the allocated space, especially when we need to support keys pointed at lists as values.&lt;/p&gt;
-    &lt;p&gt;To illustrate this, let's say our map is configured to allocate space for 5 keys and 5 values. If each key maps to one value, we get perfect utilization. At the other extreme, if one key maps to a value containing a list of 5 elements, we have to use all the allocated value space for this one key, preventing other keys from using any value space, causing the map to be "biased". The store wouldn't be able to hold any more key/value pairs, even though there is allocated memory "on the table."&lt;/p&gt;
-    &lt;p&gt;Basically, the only way to mitigate this is to make sure there's enough allocated space for every key to hold a list of maximum size. This definitely inflates the amount of space we have to allocate, but the alternative is a system that doesn't support its configured properties. Every key must be able to store a list of maximum size, even if they don't during actual use.&lt;/p&gt;
-    &lt;p&gt;Another issue with static allocation in the context of a map is dealing with map deletions. Our &lt;code&gt;std.StringHashMapUnmanaged&lt;/code&gt; structure uses open-addressing and linear probing to place keys in the map when hash
-collisions occur. Deletions are tricky because they can break the map's ability to know if a key is actually present
-in the map. To handle this, a "tombstone" technique is used to mark a space as logically (but not physically) deleted
-in order to preserve accurate lookups.&lt;/p&gt;
-    &lt;p&gt;There's a lot more to figure out here, but it's my understanding that a map will have to periodically rehash the keys in order to reclaim space if too many tombstones pile up. When this occurs is still a bit of mystery to me. If it occurs when the map needs to grow to accommodate more key/value pairs, we'll never actually trigger that condition in a static context. If it occurs at some other point, based on number of keys compared to capacity, perhaps that could work. Or maybe, it's up to us to call &lt;code&gt;rehash()&lt;/code&gt; whenever it appears there is no space left,
-and try the operation again.&lt;/p&gt;
-    &lt;p&gt;All of this considered, I think a custom map implementation is more appropriate for the context of static allocation. This current implementation proves the concept, but definitely leaves room for improvement!&lt;/p&gt;
-    &lt;head rend="h2"&gt;Revisiting allocation size&lt;/head&gt;
-    &lt;p&gt;Now that we have a method for statically allocating space for these three components (connections, parsing, and storage), we can finally answer the first question: How much space do we allocate?&lt;/p&gt;
-    &lt;p&gt;In this current iteration of &lt;code&gt;kv&lt;/code&gt;, the answer can really only be determined after the fact, once configuration has
-been set and all the allocations have been made. There are five options that can be configured by the user,
-and two derived properties based on those options.&lt;/p&gt;
-    &lt;code&gt;pub const Config = struct {
-    /// Allocation is a calculated set of values (in bytes), based on the given configuration.
-    /// This informs static allocation requested at initialization.
-    pub const Allocation = struct {
-        connection_recv_size: u64,
-        connection_send_size: u64,
-    };
-
-    /// Maximum number of concurrent connections.
-    connections_max: u32,
-
-    /// Key count is the number of possible keys we can store.
-    /// Internally, the store will allocate (key_count * list_length_max) number
-    /// of values, such that each key could support the maximum number of list elements.
-    key_count: u32,
-
-    /// The maximum allowable key size in bytes.
-    key_size_max: u32,
-    /// The maximum allowable value size in bytes.
-    val_size_max: u32,
-
-    /// The maximum allowable length for a list as a value.
-    list_length_max: u32,
-
-    pub fn allocation(config: Config) Allocation {
-		// ... calculate recv and send size ....
-		
-        return .{
-            .connection_recv_size = connection_recv_size,
-            .connection_send_size = connection_send_size,
-        };
-    }
-};
-&lt;/code&gt;
-    &lt;p&gt;The &lt;code&gt;connection_recv_size&lt;/code&gt; and &lt;code&gt;connection_send_size&lt;/code&gt; properties of &lt;code&gt;Allocation&lt;/code&gt; depend on some details of the
-RESP protocol, but is mostly informed by our user configuration. In the interest of wrapping this post up,
-I'll gloss over those details, and encourage you to check out &lt;code&gt;src/config.zig&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;This &lt;code&gt;Config&lt;/code&gt; struct doesn't directly specify every aspect of allocation, but it does provide the basis for it.
-Something not listed in the &lt;code&gt;Config&lt;/code&gt; struct directly is the "list item pool", part of the key/value &lt;code&gt;Store&lt;/code&gt; struct.
-When keys point to lists as values, there is a linked list backing that value in the hash map, and we need a pool of
-structs to assist in the construction and iteration of that linked list.&lt;/p&gt;
-    &lt;p&gt;With some reasonable configuration options set, let's see just how much memory we allocate!&lt;/p&gt;
-    &lt;code&gt;$ zig build run
-config
-  connections_max = 1000
-  key_count       = 1000
-  key_size_max    = 1024
-  val_size_max    = 4096
-  list_length_max = 50
-allocation
-  connection_recv_size = 206299
-  connection_send_size = 205255
-map capacity = 2048, map size = 0, available = 1638
-total_requested_bytes = 748213015
-ready!
-&lt;/code&gt;
-    &lt;p&gt;Everything here is measured in bytes, so we're looking at approximately &lt;code&gt;750 MB&lt;/code&gt; of memory for the given configuration.
-&lt;code&gt;total_requested_bytes&lt;/code&gt; is a feature of Zig's &lt;code&gt;std.heap.DebugAllocator&lt;/code&gt;. The exact number of bytes will be different
-on each run, although it will hover around that value. I think the reason for this is how Zig requests pages of
-memory from the OS. It won't always be the same and the OS is very likely doing some fancy book-keeping of its own.&lt;/p&gt;
-    &lt;p&gt;If you play around with the configuration options and see how &lt;code&gt;total_requested_bytes&lt;/code&gt; changes, it might be
-surprising just how much memory is allocated up-front, before any of it is actually used! For example, if we
-double &lt;code&gt;val_size_max&lt;/code&gt; to &lt;code&gt;8192&lt;/code&gt; and &lt;code&gt;list_length_max&lt;/code&gt; to &lt;code&gt;100&lt;/code&gt;, we're looking at about &lt;code&gt;2.8 GB&lt;/code&gt; of allocated memory.&lt;/p&gt;
-    &lt;p&gt;In the context of modern servers, this isn't a lot, but it can quickly grow as we adjust these parameters. Should we be asking ourselves: Is this inefficient? What if we don't use all that memory?&lt;/p&gt;
-    &lt;p&gt;Like all good engineering decisions, we have to consider them in the context of the problem we're trying to solve, and the guarantees we expect from our systems. With this design, ensuring that each request and each key/value pair can utilize the maximum configured space, seems like a worthy trade-off to make.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Final thoughts&lt;/head&gt;
-    &lt;p&gt;Like most projects, this one took a lot longer than I expected! Trying to incorporate both &lt;code&gt;io_uring&lt;/code&gt; and
-static allocation was something I had never done before, but I'm pretty happy with the result.&lt;/p&gt;
-    &lt;p&gt;I'm looking forward to improving the internal hash map to better fit a static context, consider alternative allocator implementations to improve memory utilization, and incorporate fuzz testing to find the limits of the system.&lt;/p&gt;
-    &lt;p&gt;Checkout the code on GitHub!&lt;/p&gt;
-    &lt;head rend="h3"&gt;Notes&lt;/head&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;
-        &lt;p&gt;At the risk of stating the obvious, these limits can (and likely should) be configured at runtime by the user. These aren't values that have to be set at compile time and enforced upon all users in every context, although some might be. Again, it depends on which part of the system is using the memory. The point is that once the program starts it will allocate memory, but after that, it does not. ↩&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;&lt;p&gt;Going with a single-threaded design simplifies a lot! Even though processing in&lt;/p&gt;&lt;code&gt;kv&lt;/code&gt;is single-threaded, it still enjoys the benefits of I/O concurrency via&lt;code&gt;io_uring&lt;/code&gt;. The kernel handles writing responses back out to clients and waiting for that operation to complete, so we don't have to worry (as much) about slow clients. ↩&lt;/item&gt;
-    &lt;/list&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://nickmonad.blog/2025/static-allocation-with-zig-kv/"/><published>2025-12-29T16:07:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46422412</id><title>GOG is getting acquired by its original co-founder</title><updated>2025-12-30T10:44:56.377531+00:00</updated><content>&lt;doc fingerprint="3a2c3075866c2c55"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2025-12-30T11:10:51.415467+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46422412</id><title>GOG is getting acquired by its original co-founder</title><updated>2025-12-30T11:11:01.994347+00:00</updated><content>&lt;doc fingerprint="3a2c3075866c2c55"&gt;
   &lt;main&gt;
     &lt;p&gt;Hey everyone, GOG Team here.&lt;/p&gt;
     &lt;p&gt;Today, Michał Kiciński, one of the co-founders of CD PROJEKT, and the co-founder of GOG, has acquired GOG from CD PROJEKT.&lt;/p&gt;
@@ -296,7 +45,7 @@ static allocation was something I had never done before, but I'm pretty happy wi
     &lt;p&gt;CD PROJEKT RED games will continue to be available on GOG, and upcoming titles from the studio will also be released on the platform.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.gog.com/blog/gog-is-getting-acquired-by-its-original-co-founder-what-it-means-for-you/"/><published>2025-12-29T16:43:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46423290</id><title>Tesla's 4680 battery supply chain collapses as partner writes down deal by 99%</title><updated>2025-12-30T10:44:56.280077+00:00</updated><content>&lt;doc fingerprint="1e8801caa8a7ffb"&gt;
+&lt;/doc&gt;</content><link href="https://www.gog.com/blog/gog-is-getting-acquired-by-its-original-co-founder-what-it-means-for-you/"/><published>2025-12-29T16:43:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46423290</id><title>Tesla's 4680 battery supply chain collapses as partner writes down deal by 99%</title><updated>2025-12-30T11:11:01.900838+00:00</updated><content>&lt;doc fingerprint="1e8801caa8a7ffb"&gt;
   &lt;main&gt;
     &lt;p&gt;A major link in Tesla’s 4680 battery supply chain has just snapped. South Korean battery material supplier L&amp;amp;F Co. announced today that the value of its massive supply deal with Tesla has been slashed by over 99%, signaling a catastrophic drop in demand for the automaker’s in-house battery cells.&lt;/p&gt;
     &lt;p&gt;This is arguably the strongest evidence yet that Tesla’s 4680 program, and the vehicle that relies on it, the Cybertruck, is in serious trouble.&lt;/p&gt;
@@ -341,7 +90,7 @@ static allocation was something I had never done before, but I'm pretty happy wi
     &lt;p&gt;FTC: We use income earning auto affiliate links. More.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://electrek.co/2025/12/29/tesla-4680-battery-supply-chain-collapses-partner-writes-down-dea/"/><published>2025-12-29T17:57:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46424200</id><title>AI is forcing us to write good code</title><updated>2025-12-30T10:44:55.988730+00:00</updated><content>&lt;doc fingerprint="9f43dc562fa512f5"&gt;
+&lt;/doc&gt;</content><link href="https://electrek.co/2025/12/29/tesla-4680-battery-supply-chain-collapses-partner-writes-down-dea/"/><published>2025-12-29T17:57:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46424200</id><title>AI is forcing us to write good code</title><updated>2025-12-30T11:11:01.316849+00:00</updated><content>&lt;doc fingerprint="9f43dc562fa512f5"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;AI Is Forcing Us To Write Good Code&lt;/head&gt;
     &lt;head rend="h3"&gt;When Best Practices Are Best&lt;/head&gt;
@@ -411,7 +160,7 @@ static allocation was something I had never done before, but I'm pretty happy wi
     &lt;p&gt;When we run tests in CI/CD, after the PR is approved, we run them without caching just to ensure there wasn’t a subtle assumption violated by the cache. It also double-checks that we’re still talking to all of our 3rd-party integrations correctly.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://bits.logic.inc/p/ai-is-forcing-us-to-write-good-code"/><published>2025-12-29T19:11:26+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46424233</id><title>The future of software development is software developers</title><updated>2025-12-30T10:44:55.893814+00:00</updated><content>&lt;doc fingerprint="3a4391bbd1b90a1f"&gt;
+&lt;/doc&gt;</content><link href="https://bits.logic.inc/p/ai-is-forcing-us-to-write-good-code"/><published>2025-12-29T19:11:26+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46424233</id><title>The future of software development is software developers</title><updated>2025-12-30T11:11:01.215164+00:00</updated><content>&lt;doc fingerprint="3a4391bbd1b90a1f"&gt;
   &lt;main&gt;
     &lt;p&gt;I’ve been a computer programmer all-told for 43 years. That’s more than half the entire history of electronic programmable computers.&lt;/p&gt;
     &lt;p&gt;In that time, I’ve seen a lot of things change. But I’ve also seen some things stay pretty much exactly the same.&lt;/p&gt;
@@ -453,7 +202,7 @@ static allocation was something I had never done before, but I'm pretty happy wi
     &lt;p&gt;And then maybe drop me a line if you’re interested in skilling them up in the technical practices that can dramatically shrink delivery lead times while improving reliability and reducing the cost of change, with or without “AI”. That’s a WIN-WIN-WIN.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://codemanship.wordpress.com/2025/11/25/the-future-of-software-development-is-software-developers/"/><published>2025-12-29T19:14:17+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46424460</id><title>When someone says they hate your product</title><updated>2025-12-30T10:44:55.665188+00:00</updated><content>&lt;doc fingerprint="2b1392cbba67bdad"&gt;
+&lt;/doc&gt;</content><link href="https://codemanship.wordpress.com/2025/11/25/the-future-of-software-development-is-software-developers/"/><published>2025-12-29T19:14:17+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46424460</id><title>When someone says they hate your product</title><updated>2025-12-30T11:11:01.018952+00:00</updated><content>&lt;doc fingerprint="2b1392cbba67bdad"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;When someone says they hate your product with a burning passion&lt;/head&gt;
     &lt;head rend="h3"&gt;What CodeRabbit did, and what to do instead&lt;/head&gt;
@@ -522,7 +271,7 @@ static allocation was something I had never done before, but I'm pretty happy wi
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.getflack.com/p/responding-to-negative-feedback"/><published>2025-12-29T19:30:40+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46425198</id><title>Google is dead. Where do we go now?</title><updated>2025-12-30T10:44:55.573011+00:00</updated><content/><link href="https://www.circusscientist.com/2025/12/29/google-is-dead-where-do-we-go-now/"/><published>2025-12-29T20:29:26+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46426534</id><title>ManusAI Joins Meta</title><updated>2025-12-30T10:44:54.166089+00:00</updated><content>&lt;doc fingerprint="107810b26991a538"&gt;
+&lt;/doc&gt;</content><link href="https://www.getflack.com/p/responding-to-negative-feedback"/><published>2025-12-29T19:30:40+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46425198</id><title>Google is dead. Where do we go now?</title><updated>2025-12-30T11:11:00.943763+00:00</updated><content/><link href="https://www.circusscientist.com/2025/12/29/google-is-dead-where-do-we-go-now/"/><published>2025-12-29T20:29:26+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46426534</id><title>ManusAI Joins Meta</title><updated>2025-12-30T11:10:59.247817+00:00</updated><content>&lt;doc fingerprint="107810b26991a538"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Manus Joins Meta for Next Era of Innovation&lt;/head&gt;
     &lt;p&gt;The news is out, and it's big: Manus is joining Meta.&lt;/p&gt;
@@ -534,7 +283,7 @@ static allocation was something I had never done before, but I'm pretty happy wi
     &lt;p&gt;“Joining Meta allows us to build on a stronger, more sustainable foundation without changing how Manus works or how decisions are made,” said Xiao Hong, CEO of Manus. “We’re excited about what the future holds with Meta and Manus working together and we will continue to iterate the product and serve users that have defined Manus from the beginning.”&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://manus.im/blog/manus-joins-meta-for-next-era-of-innovation"/><published>2025-12-29T22:24:22+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46426624</id><title>Show HN: Stop Claude Code from forgetting everything</title><updated>2025-12-30T10:44:53.808738+00:00</updated><content>&lt;doc fingerprint="aa6857fc6a9dbe21"&gt;
+&lt;/doc&gt;</content><link href="https://manus.im/blog/manus-joins-meta-for-next-era-of-innovation"/><published>2025-12-29T22:24:22+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46426624</id><title>Show HN: Stop Claude Code from forgetting everything</title><updated>2025-12-30T11:10:58.709536+00:00</updated><content>&lt;doc fingerprint="aa6857fc6a9dbe21"&gt;
   &lt;main&gt;
     &lt;p&gt;Get smarter alongside your AI.&lt;/p&gt;
     &lt;p&gt;Your intelligence shouldn't reset every conversation. Ensue is a persistent knowledge tree that grows with you - what you learn today enriches tomorrow's reasoning.&lt;/p&gt;
@@ -581,7 +330,7 @@ export ENSUE_READONLY=true&lt;/code&gt;
     &lt;p&gt;Docs · Dashboard · Homepage · API: &lt;code&gt;https://api.ensue-network.ai&lt;/code&gt;&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/mutable-state-inc/ensue-skill"/><published>2025-12-29T22:30:25+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46427376</id><title>Parsing Advances</title><updated>2025-12-30T10:44:53.711598+00:00</updated><content>&lt;doc fingerprint="7fa4da19ee2f93dd"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/mutable-state-inc/ensue-skill"/><published>2025-12-29T22:30:25+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46427376</id><title>Parsing Advances</title><updated>2025-12-30T11:10:58.654277+00:00</updated><content>&lt;doc fingerprint="7fa4da19ee2f93dd"&gt;
   &lt;main&gt;
     &lt;p&gt;I find myself writing yet another toy parser, as one does during a Christmas break. It roughly follows Resilient LL Parsing Tutorial. Not because I need resilience, but mostly because I find producing a syntax tree and a collection of diagnostics a more natural fit for the problem than bailing out on the first error.&lt;/p&gt;
     &lt;p&gt;One practical pitfall with the approach is infinite loops/recursion. Resilience sometimes means not consuming a token, and, if you do that in a loop or a Pratt recursive call, you’ll get yourself an annoying to debug error:&lt;/p&gt;
@@ -596,7 +345,7 @@ export ENSUE_READONLY=true&lt;/code&gt;
     &lt;p&gt;And here is the buggy function that lead to the error at the start of the article:&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://matklad.github.io/2025/12/28/parsing-advances.html"/><published>2025-12-29T23:29:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46427582</id><title>I migrated to an almost all-EU stack and saved 500€ per year</title><updated>2025-12-30T10:44:52.846450+00:00</updated><content>&lt;doc fingerprint="3d410656abb537ed"&gt;
+&lt;/doc&gt;</content><link href="https://matklad.github.io/2025/12/28/parsing-advances.html"/><published>2025-12-29T23:29:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46427582</id><title>I migrated to an almost all-EU stack and saved 500€ per year</title><updated>2025-12-30T11:10:57.814878+00:00</updated><content>&lt;doc fingerprint="3d410656abb537ed"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Bye Bye Big Tech: How I Migrated to an almost All-EU Stack (and saved 500€ per year)&lt;/head&gt;
     &lt;head rend="h3"&gt;“Bye bye bye.” It took some time, and a serious amount of research, but I have finally crossed the finish line. I have officially migrated my digital life to pure, EU-hosted solutions.&lt;/head&gt;
@@ -694,7 +443,7 @@ export ENSUE_READONLY=true&lt;/code&gt;
     &lt;p&gt;If you’ve been on the fence about migrating to EU-hosted solutions, take the leap. It’s worth it.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.zeitgeistofbytes.com/p/bye-bye-big-tech-how-i-migrated-to"/><published>2025-12-29T23:50:06+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46427586</id><title>Stranger Things creator says turn off "garbage" settings</title><updated>2025-12-30T10:44:52.644579+00:00</updated><content>&lt;doc fingerprint="7c689f7a39484e6b"&gt;
+&lt;/doc&gt;</content><link href="https://www.zeitgeistofbytes.com/p/bye-bye-big-tech-how-i-migrated-to"/><published>2025-12-29T23:50:06+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46427586</id><title>Stranger Things creator says turn off "garbage" settings</title><updated>2025-12-30T11:10:57.320899+00:00</updated><content>&lt;doc fingerprint="7c689f7a39484e6b"&gt;
   &lt;main&gt;
     &lt;p&gt;Stranger Things creator Ross Duffer offered a piece of advice to viewers who plan on watching the season 5 premiere.&lt;/p&gt;
     &lt;p&gt;On Instagram, Duffer guided fans through their TV settings so they could watch the new season of Stranger Things the way it was meant to be seen. He stated, "A little PSA before you watch tonight. I want to make sure that your TVs are set up properly." He proceeded to tell his followers to turn off all their settings, especially dynamic contrast, super resolution, edge enhancer, and color filter. He even described those features as "garbage."&lt;/p&gt;
@@ -727,7 +476,7 @@ export ENSUE_READONLY=true&lt;/code&gt;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://screenrant.com/stranger-things-creator-turn-off-settings-premiere/"/><published>2025-12-29T23:50:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46427920</id><title>MongoDB Server Security Update, December 2025</title><updated>2025-12-30T10:44:52.339833+00:00</updated><content>&lt;doc fingerprint="a4e75956e81f6bca"&gt;
+&lt;/doc&gt;</content><link href="https://screenrant.com/stranger-things-creator-turn-off-settings-premiere/"/><published>2025-12-29T23:50:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46427920</id><title>MongoDB Server Security Update, December 2025</title><updated>2025-12-30T11:10:57.217855+00:00</updated><content>&lt;doc fingerprint="a4e75956e81f6bca"&gt;
   &lt;main&gt;
     &lt;p&gt;At MongoDB, protecting our customers’ data is our highest priority. On December 12, 2025, the MongoDB Security Engineering team identified a security vulnerability, described in CVE-2025-14847, which impacts MongoDB Server. Within the security community, this vulnerability is informally referred to as “Mongobleed.” This blog post outlines the situation, our immediate response, and the key insights we’ve gathered so far. Security is an ongoing responsibility in modern software development for both software producers and consumers, and maintaining trust depends on how issues are identified, addressed, and communicated.&lt;/p&gt;
     &lt;p&gt;This patched security vulnerability in the MongoDB Server products (Community and Enterprise) is not a breach or compromise of MongoDB, MongoDB Atlas (our managed MongoDB Server offering), or our systems. To maintain the highest levels of security, customers and users are advised to use the latest versions of MongoDB’s software that have been updated to address this vulnerability.&lt;/p&gt;
@@ -766,7 +515,7 @@ export ENSUE_READONLY=true&lt;/code&gt;
     &lt;p&gt;– Jim Scharf, Chief Technology Officer, MongoDB&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.mongodb.com/company/blog/news/mongodb-server-security-update-december-2025"/><published>2025-12-30T00:23:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46428154</id><title>Outside, Dungeon, Town: Integrating the Three Places in Videogames (2024)</title><updated>2025-12-30T10:44:51.601451+00:00</updated><content>&lt;doc fingerprint="3c2214be1a840251"&gt;
+&lt;/doc&gt;</content><link href="https://www.mongodb.com/company/blog/news/mongodb-server-security-update-december-2025"/><published>2025-12-30T00:23:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46428154</id><title>Outside, Dungeon, Town: Integrating the Three Places in Videogames (2024)</title><updated>2025-12-30T11:10:56.418632+00:00</updated><content>&lt;doc fingerprint="3c2214be1a840251"&gt;
   &lt;main&gt;
     &lt;p&gt;Videogames, at least the kind I’m talking about (RPGs, adventure kinds of somewhat narrative videogames, Zelda games, Elden Ring, etc), have essentially three “places”:&lt;/p&gt;
     &lt;list rend="ol"&gt;
@@ -786,7 +535,7 @@ export ENSUE_READONLY=true&lt;/code&gt;
     &lt;p&gt;Videogames, especially the higher budget games, have a tendency towards being conservative: making sure that everyone understands exactly what is happening at all times. I think this is a valid thing to care about, but I also think that, like all things, it’s a balancing act, and I think too many games have been falling on the too-conservative part of the spectrum.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://keithburgun.net/outside-dungeon-town-integrating-the-three-places-in-videogames/"/><published>2025-12-30T00:54:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46428206</id><title>100x (YC S22) Is Hiring a Front End Engineer</title><updated>2025-12-30T10:44:51.183019+00:00</updated><content>&lt;doc fingerprint="bdbb174c5dac2469"&gt;
+&lt;/doc&gt;</content><link href="https://keithburgun.net/outside-dungeon-town-integrating-the-three-places-in-videogames/"/><published>2025-12-30T00:54:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46428206</id><title>100x (YC S22) Is Hiring a Front End Engineer</title><updated>2025-12-30T11:10:56.308957+00:00</updated><content>&lt;doc fingerprint="bdbb174c5dac2469"&gt;
   &lt;main&gt;
     &lt;div&gt;
       &lt;p&gt;Location: Bangalore, India (Koramangala) Compensation: Competitive Salary + Significant Equity (YC Standard) Founders: Shardul Lavekar (ex-Airtel AI, ex-Ola) &amp;amp; Parth Mudgal (ex-Flipkart, ex-Ola)&lt;/p&gt;
@@ -817,7 +566,7 @@ export ENSUE_READONLY=true&lt;/code&gt;
     &lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://news.ycombinator.com/item?id=46428206"/><published>2025-12-30T01:00:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46428496</id><title>Hacking Washing Machines [video]</title><updated>2025-12-30T10:44:50.131227+00:00</updated><content>&lt;doc fingerprint="b41e325c1ac906ec"&gt;
+&lt;/doc&gt;</content><link href="https://news.ycombinator.com/item?id=46428206"/><published>2025-12-30T01:00:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46428496</id><title>Hacking Washing Machines [video]</title><updated>2025-12-30T11:10:54.352063+00:00</updated><content>&lt;doc fingerprint="b41e325c1ac906ec"&gt;
   &lt;main&gt;
     &lt;p&gt;Severin von Wnuck-Lipinski and Hajo Noerenberg&lt;/p&gt;
     &lt;p&gt;Almost everyone has a household appliance at home, whether it's a washing machine, dishwasher, or dryer. Despite their ubiquity, little is publicly documented about how these devices actually work or how their internal components communicate. This talk takes a closer look at proprietary bus systems, hidden diagnostic interfaces, and approaches to cloud-less integration of appliances from two well-known manufacturers into modern home automation systems.&lt;/p&gt;
@@ -832,12 +581,252 @@ export ENSUE_READONLY=true&lt;/code&gt;
     &lt;p&gt;Please look for "audio tracks" in your desktop video player.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://media.ccc.de/v/39c3-hacking-washing-machines"/><published>2025-12-30T01:40:49+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46431028</id><title>Go Away Python</title><updated>2025-12-30T10:44:49.527246+00:00</updated><content>&lt;doc fingerprint="5f7ec79370d86d1d"&gt;
+&lt;/doc&gt;</content><link href="https://media.ccc.de/v/39c3-hacking-washing-machines"/><published>2025-12-30T01:40:49+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46430558</id><title>Charm Ruby – Glamorous Terminal Libraries for Ruby</title><updated>2025-12-30T11:10:54.116063+00:00</updated><content>&lt;doc fingerprint="45ce1477af0f3686"&gt;
+  &lt;main&gt;
+    &lt;head rend="h4"&gt;Bubbletea&lt;/head&gt;
+    &lt;p&gt;Build terminal UIs from the future, today.&lt;/p&gt;
+    &lt;p&gt;A powerful TUI framework using the Elm Architecture. Handle keyboard, mouse, and window events with commands for side effects.&lt;/p&gt;
+    &lt;code&gt;gem "bubbletea"&lt;/code&gt;
+    &lt;code&gt;
+ ██████╗██╗  ██╗ █████╗ ██████╗ ███╗   ███╗
+██╔════╝██║  ██║██╔══██╗██╔══██╗████╗ ████║
+██║     ███████║███████║██████╔╝██╔████╔██║
+██║     ██╔══██║██╔══██║██╔══██╗██║╚██╔╝██║
+╚██████╗██║  ██║██║  ██║██║  ██║██║ ╚═╝ ██║
+       ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝  RUBY
+&lt;/code&gt;
+    &lt;p&gt; Ruby bindings and ports of the beloved Charm terminal libraries.&lt;lb/&gt; Build glamorous TUIs, style terminal output, create beautiful forms,&lt;lb/&gt; and make your Ruby CLIs sparkle. &lt;/p&gt;
+    &lt;code&gt;gem install bubbletea lipgloss bubbles glamour&lt;/code&gt;
+    &lt;p&gt;Build terminal UIs from the future, today.&lt;/p&gt;
+    &lt;p&gt;A powerful TUI framework using the Elm Architecture. Handle keyboard, mouse, and window events with commands for side effects.&lt;/p&gt;
+    &lt;code&gt;gem "bubbletea"&lt;/code&gt;
+    &lt;p&gt;The Bubble Tea component toolkit.&lt;/p&gt;
+    &lt;p&gt;Pre-built components: Spinner, Progress, Timer, TextInput, TextArea, Viewport, List, Table, FilePicker, and more.&lt;/p&gt;
+    &lt;code&gt;gem "bubbles"&lt;/code&gt;
+    &lt;p&gt;Track clickable regions in terminal UIs.&lt;/p&gt;
+    &lt;p&gt;Mark zones with IDs, check mouse coordinates, and handle click events in your Bubble Tea applications.&lt;/p&gt;
+    &lt;code&gt;gem "bubblezone"&lt;/code&gt;
+    &lt;p&gt;Your terminal style and layout toolkit.&lt;/p&gt;
+    &lt;p&gt;Borders, padding, margins, colors (hex, ANSI, adaptive), tables, lists, trees, and layout utilities.&lt;/p&gt;
+    &lt;code&gt;gem "lipgloss"&lt;/code&gt;
+    &lt;p&gt;The stylesheet-driven markdown renderer.&lt;/p&gt;
+    &lt;p&gt;Render markdown in your terminal with built-in themes (dark, light, dracula), custom styles via DSL, and emoji support.&lt;/p&gt;
+    &lt;code&gt;gem "glamour"&lt;/code&gt;
+    &lt;p&gt;Terminal charts for beautiful data viz.&lt;/p&gt;
+    &lt;p&gt;Sparkline, Barchart, LineChart, WaveLineChart, StreamLineChart (real-time), and TimeSeriesLineChart.&lt;/p&gt;
+    &lt;code&gt;gem "ntcharts"&lt;/code&gt;
+    &lt;p&gt;Simple, powerful forms in the terminal.&lt;/p&gt;
+    &lt;p&gt;Input, Text, Select, MultiSelect, Confirm, Note, Spinner. Built-in validation, themes, and a block-based DSL.&lt;/p&gt;
+    &lt;code&gt;gem "huh", github: "marcoroth/huh-ruby"&lt;/code&gt;
+    &lt;p&gt;A tool for glamorous shell scripts.&lt;/p&gt;
+    &lt;p&gt;Ruby wrapper with idiomatic API: input, write, choose, filter, confirm, file, pager, spin, style, format. Bundles the gum binary.&lt;/p&gt;
+    &lt;code&gt;gem "gum"&lt;/code&gt;
+    &lt;p&gt;A physics-based animation library.&lt;/p&gt;
+    &lt;p&gt;Damped harmonic oscillator (Spring), projectile motion, Point &amp;amp; Vector math, and frame rate helpers for smooth UI animations.&lt;/p&gt;
+    &lt;code&gt;gem "harmonica"&lt;/code&gt;
+    &lt;p&gt;Add the gems you need to your Gemfile:&lt;/p&gt;
+    &lt;code&gt;# Gemfile
+
+# Core TUI framework
+gem "bubbletea"
+
+# Styling
+gem "lipgloss"
+
+# Components
+gem "bubbles"
+
+# Markdown rendering
+gem "glamour"
+
+# Shell scripts
+gem "gum"
+
+# Animations
+gem "harmonica"
+
+# Charts
+gem "ntcharts"
+
+# Mouse tracking
+gem "bubblezone"&lt;/code&gt;
+    &lt;p&gt;A simple Bubbletea app with Lipgloss styling:&lt;/p&gt;
+    &lt;code&gt;require "bubbletea"
+require "lipgloss"
+
+class HelloWorld
+  include Bubbletea::Model
+
+  def initialize
+    @style = Lipgloss::Style.new
+      .border(:rounded)
+      .border_foreground("#7D56F4")
+      .padding(1, 2)
+  end
+
+  def init = [self, nil]
+
+  def update(message)
+    case message
+    when Bubbletea::KeyMessage
+      return [self, Bubbletea.quit] if message.to_s == "q"
+    end
+
+    [self, nil]
+  end
+
+  def view
+    @style.render("Hello, Charm Ruby!\n\nPress q to quit")
+  end
+end
+
+Bubbletea.run(HelloWorld.new)&lt;/code&gt;
+    &lt;code&gt;require "bubbletea"
+require "lipgloss"
+
+class Counter
+  include Bubbletea::Model
+
+  def initialize
+    @count = 0
+    @style = Lipgloss::Style.new
+      .bold(true)
+      .foreground("#FF6B6B")
+  end
+
+  def update(message)
+    case message
+    when Bubbletea::KeyMessage
+      case message.to_s
+      when "q", "ctrl+c"
+        return [self, Bubbletea.quit]
+      when "up" then @count += 1
+      when "down" then @count -= 1
+      end
+    end
+
+    [self, nil]
+  end
+
+  def view
+    @style.render("Count: #{@count}\n\nPress q to quit")
+  end
+end
+
+Bubbletea.run(Counter.new)&lt;/code&gt;
+    &lt;code&gt;require "bubbletea"
+require "bubbles"
+
+class LoadingApp
+  include Bubbletea::Model
+
+  def initialize
+    @spinner = Bubbles::Spinner.new
+  end
+
+  def init
+    [self, @spinner.tick]
+  end
+
+  def update(message)
+    case message
+    when Bubbletea::KeyMessage
+      case message.to_s
+      when "q", "ctrl+c"
+        return [self, Bubbletea.quit]
+      end
+    end
+
+    @spinner, command = @spinner.update(message)
+
+    [self, command]
+  end
+
+  def view
+    "#{@spinner.view} Loading..."
+  end
+end
+
+Bubbletea.run(LoadingApp.new)&lt;/code&gt;
+    &lt;code&gt;require "huh"
+
+form = Huh.form(
+  Huh.group(
+    Huh.input
+      .key("name")
+      .title("What's your name?")
+      .placeholder("Enter name..."),
+
+    Huh.select
+      .key("color")
+      .title("Favorite color?")
+      .options(*Huh.options(
+        "Red", "Green", "Blue"
+      ))
+  )
+).with_theme(Huh::Themes.charm)
+
+form.run
+
+puts "Hello, #{form["name"]}!"&lt;/code&gt;
+    &lt;code&gt;require "lipgloss"
+
+headers = ["Name", "Language", "Stars"]
+
+rows = [
+  ["bubbletea", "Ruby", "✨"],
+  ["lipgloss", "Ruby", "💄"],
+  ["glamour", "Ruby", "✨"]
+]
+
+table = Lipgloss::Table.new
+  .headers(headers)
+  .rows(rows)
+  .border(:rounded)
+
+puts table.render&lt;/code&gt;
+    &lt;code&gt;require "glamour"
+
+markdown = &amp;lt;&amp;lt;~MD
+  # Hello Glamour :sparkles:
+
+  This is **bold** and *italic*.
+
+  - Item one
+  - Item two
+  - Item three
+
+  ```ruby
+  puts "Hello, World!"
+  ```
+MD
+
+puts Glamour.render(markdown,
+  style: "dark",
+  width: 80,
+  emoji: true
+)&lt;/code&gt;
+    &lt;code&gt;require "ntcharts"
+
+chart = Ntcharts::Streamlinechart.new(60, 12)
+
+loop do
+  chart.push(Math.sin(Time.now.to_f) * 4 + 5)
+
+  print "\e[H\e[2J"
+  puts chart.render
+  sleep 0.1
+end&lt;/code&gt;
+    &lt;p&gt;These Ruby gems are ports and bindings of the original Go libraries from Charm. They bring the same elegant APIs and glamorous terminal experiences to Ruby developers.&lt;/p&gt;
+    &lt;p&gt;Some gems use native C extensions that link to compiled Go shared libraries, while others are pure Ruby implementations.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://charm-ruby.dev/"/><published>2025-12-30T07:36:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46431028</id><title>Go Away Python</title><updated>2025-12-30T11:10:53.423336+00:00</updated><content>&lt;doc fingerprint="5f7ec79370d86d1d"&gt;
   &lt;main&gt;
     &lt;p&gt;lorentz app blog experiments&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://lorentz.app/blog-item.html?id=go-shebang"/><published>2025-12-30T08:50:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46431049</id><title>You Need to Ditch VS Code</title><updated>2025-12-30T10:44:49.184363+00:00</updated><content>&lt;doc fingerprint="5f9ae41553b07b90"&gt;
+&lt;/doc&gt;</content><link href="https://lorentz.app/blog-item.html?id=go-shebang"/><published>2025-12-30T08:50:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46431049</id><title>You Need to Ditch VS Code</title><updated>2025-12-30T11:10:53.186676+00:00</updated><content>&lt;doc fingerprint="5f9ae41553b07b90"&gt;
   &lt;main&gt;
     &lt;head rend="h2"&gt;Why You Need To Ditch VS Code To Be a Better Programmer&lt;/head&gt;
     &lt;p&gt;Categories: [Terminal], [Programming]&lt;/p&gt;
@@ -941,12 +930,12 @@ export ENSUE_READONLY=true&lt;/code&gt;
     &lt;p&gt;Happy coding, J.R.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://jrswab.com/blog/ditch-vs-code"/><published>2025-12-30T08:53:40+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46431453</id><title>HSBC blocks its app due to F-Droid-installed Bitwarden</title><updated>2025-12-30T10:44:48.505026+00:00</updated><content>&lt;doc fingerprint="f8eb8f2f2d953eed"&gt;
+&lt;/doc&gt;</content><link href="https://jrswab.com/blog/ditch-vs-code"/><published>2025-12-30T08:53:40+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46431453</id><title>HSBC blocks its app due to F-Droid-installed Bitwarden</title><updated>2025-12-30T11:10:52.250723+00:00</updated><content>&lt;doc fingerprint="f8eb8f2f2d953eed"&gt;
   &lt;main&gt;
     &lt;p&gt;To use the Mastodon web application, please enable JavaScript. Alternatively, try one of the native apps for Mastodon for your platform.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://mastodon.neilzone.co.uk/@neil/115807834298031971"/><published>2025-12-30T09:57:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46431560</id><title>Netflix: Open Content</title><updated>2025-12-30T10:44:48.296377+00:00</updated><content>&lt;doc fingerprint="235793111fd515b3"&gt;
+&lt;/doc&gt;</content><link href="https://mastodon.neilzone.co.uk/@neil/115807834298031971"/><published>2025-12-30T09:57:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46431560</id><title>Netflix: Open Content</title><updated>2025-12-30T11:10:52.001644+00:00</updated><content>&lt;doc fingerprint="235793111fd515b3"&gt;
   &lt;main&gt;
     &lt;p&gt;At Netflix, we are always exploring ways to make our content look and sound even better. To provide a common reference for prototyping bleeding-edge technologies within entertainment, technology and academic circles without compromising the security of our original and licensed programming, we've developed test titles oriented around documentary, live action, and animation.&lt;/p&gt;
     &lt;p&gt;Many open source assets are available from each project listed below. Our hope is this will encourage more experimentation, learning, and discovery that will benefit the whole industry. Many of these titles are also streaming on Netflix and are best enjoyed with any HDR configured device with your Premium subscription.&lt;/p&gt;
