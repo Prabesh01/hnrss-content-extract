@@ -1,81 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-01-02T14:11:40.055193+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46458302</id><title>Can Bundler be as fast as uv?</title><updated>2026-01-02T14:11:49.363372+00:00</updated><content>&lt;doc fingerprint="7685981e496335d9"&gt;
-  &lt;main&gt;&lt;head rend="h1"&gt;Can Bundler Be as Fast as uv?&lt;/head&gt;Dec 29, 2025 @ 12:26 pm&lt;p&gt;At RailsWorld earlier this year, I got nerd sniped by someone. They asked “why can’t Bundler be as fast as uv?” Immediately my inner voice said “YA, WHY CAN’T IT BE AS FAST AS UV????”&lt;/p&gt;&lt;p&gt;My inner voice likes to shout at me, especially when someone asks a question so obvious I should have thought of it myself. Since then I’ve been thinking about and investigating this problem, going so far as to give a presentation at XO Ruby Portland about Bundler performance. I firmly believe the answer is “Bundler can be as fast as uv” (where “as fast” has a margin of error lol).&lt;/p&gt;&lt;p&gt;Fortunately, Andrew Nesbitt recently wrote a post called “How uv got so fast”, and I thought I would take this opportunity to review some of the highlights of the post and how techniques applied in uv can (or can’t) be applied to Bundler / RubyGems. I’d also like to discuss some of the existing bottlenecks in Bundler and what we can do to fix them.&lt;/p&gt;&lt;p&gt;If you haven’t read Andrew’s post, I highly recommend giving it a read. I’m going to quote some parts of the post and try to reframe them with RubyGems / Bundler in mind.&lt;/p&gt;&lt;head rend="h2"&gt;Rewrite in Rust?&lt;/head&gt;&lt;p&gt;Andrew opens the post talking about rewriting in Rust:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;uv installs packages faster than pip by an order of magnitude. The usual explanation is âitâs written in Rust.â Thatâs true, but it doesnât explain much. Plenty of tools are written in Rust without being notably fast. The interesting question is what design decisions made the difference.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;This is such a good quote. I’m going to address “rewrite in Rust” a bit later in the post. But suffice to say, I think if we eliminate bottlenecks in Bundler such that the only viable option for performance improvements is to “rewrite in Rust”, then I’ll call it a success. I think rewrites give developers the freedom to “think outside the box”, and try techniques they might not have tried. In the case of &lt;code&gt;uv&lt;/code&gt;, I think it gave the developers a good way to say “if we don’t have to worry about backwards compatibility, what could we achieve?”.&lt;/p&gt;&lt;p&gt;I suspect it would be possible to write a uv in Python (PyUv?) that approaches the speeds of uv, and in fact much of the blog post goes on to talk about performance improvements that aren’t related to Rust.&lt;/p&gt;&lt;head rend="h2"&gt;Installing code without eval’ing&lt;/head&gt;&lt;quote&gt;&lt;p&gt;pipâs slowness isnât a failure of implementation. For years, Python packaging required executing code to find out what a package needed.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;I didn’t know this about Python packages, and it doesn’t really apply to Ruby Gems so I’m mostly going to skip this section.&lt;/p&gt;&lt;p&gt;Ruby Gems are tar files, and one of the files in the tar file is a YAML representation of the GemSpec. This YAML file declares all dependencies for the Gem, so RubyGems can know, without evaling anything, what dependencies it needs to install before it can install any particular Gem. Additionally, RubyGems.org provides an API for asking about dependency information, which is actually the normal way of getting dependency info (again, no &lt;code&gt;eval&lt;/code&gt; required).&lt;/p&gt;&lt;p&gt;There’s only one other thing from this section I’d like to quote:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;PEP 658 (2022) put package metadata directly in the Simple Repository API, so resolvers could fetch dependency information without downloading wheels at all.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;Fortunately RubyGems.org already provides the same information about gems.&lt;/p&gt;&lt;p&gt;Reading through the number of PEPs required as well as the amount of time it took to get the standards in place was very eye opening for me. I can’t help but applaud folks in the Python community for doing this. It seems like a mountain of work, and they should really be proud of themselves.&lt;/p&gt;&lt;head rend="h2"&gt;What uv drops&lt;/head&gt;&lt;p&gt;I’m mostly going to skip this section except for one point:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Ignoring requires-python upper bounds. When a package says it requires python&amp;lt;4.0, uv ignores the upper bound and only checks the lower. This reduces resolver backtracking dramatically since upper bounds are almost always wrong. Packages declare python&amp;lt;4.0 because they havenât tested on Python 4, not because theyâll actually break. The constraint is defensive, not predictive.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;I think this is very very interesting. I don’t know how much time Bundler spends on doing “required Ruby version” bounds checking, but it feels like if uv can do it, so can we.&lt;/p&gt;&lt;head rend="h2"&gt;Optimizations that donât need Rust&lt;/head&gt;&lt;p&gt;I really love that Andrew pointed out optimizations that could be made that don’t involve Rust. There are three points in this section that I want to pull out:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Parallel downloads. pip downloads packages one at a time. uv downloads many at once. Any language can do this.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;This is absolutely true, and is a place where Bundler could improve. Bundler currently has a problem when it comes to parallel downloads, and needs a small architectural change as a fix.&lt;/p&gt;&lt;p&gt;The first problem is that Bundler tightly couples installing a gem with downloading the gem. You can read the installation code here, but I’ll summarize the method in question below:&lt;/p&gt;&lt;code&gt;def install
-  path = fetch_gem_if_not_cached
-  Bundler::RubyGemsGemInstaller.install path, dest
-end
-&lt;/code&gt;&lt;p&gt;The problem with this method is that it inextricably links downloading the gem with installing it. This is a problem because we could be downloading gems while installing other gems, but we’re forced to wait because the installation method couples the two operations. Downloading gems can trivially be done in parallel since the &lt;code&gt;.gem&lt;/code&gt; files are just archives that can be fetched independently.&lt;/p&gt;&lt;p&gt;The second problem is the queuing system in the installation code. After gem resolution is complete, and Bundler knows what gems need to be installed, it queues them up for installation. You can find the queueing code here. The code takes some effort to understand. Basically it allows gems to be installed in parallel, but only gems that have already had their dependencies installed.&lt;/p&gt;&lt;p&gt;So for example, if you have a dependency tree like “gem &lt;code&gt;a&lt;/code&gt; depends on gem &lt;code&gt;b&lt;/code&gt; which depends on gem &lt;code&gt;c&lt;/code&gt;” (&lt;code&gt;a -&amp;gt; b -&amp;gt; c&lt;/code&gt;), then no gems will be installed (or downloaded) in parallel.&lt;/p&gt;&lt;p&gt;To demonstrate this problem in an easy-to-understand way, I built a slow Gem server. It generates a dependency tree of &lt;code&gt;a -&amp;gt; b -&amp;gt; c&lt;/code&gt; (&lt;code&gt;a&lt;/code&gt; depends on &lt;code&gt;b&lt;/code&gt;, &lt;code&gt;b&lt;/code&gt; depends on &lt;code&gt;c&lt;/code&gt;), then starts a Gem server.
-The Gem server takes 3 seconds to return any Gem, so if we point Bundler at this Gem server and then profile Bundler, we can see the impact of the queueing system and download scheme.&lt;/p&gt;&lt;p&gt;In my test app, I have the following Gemfile:&lt;/p&gt;&lt;code&gt;source "http://localhost:9292"
-
-gem "a"
-&lt;/code&gt;&lt;p&gt;If we profile Bundle install with Vernier, we can see the following swim lanes in the marker chart:&lt;/p&gt;&lt;p&gt;The above chart is showing that we get no parallelism during installation. We spend 3 seconds downloading the &lt;code&gt;c&lt;/code&gt; gem, then we install it.
-Then we spend 3 seconds downloading the &lt;code&gt;b&lt;/code&gt; gem, then we install it.
-Finally we spend 3 seconds downloading the &lt;code&gt;a&lt;/code&gt; gem, and we install it.&lt;/p&gt;&lt;p&gt;Timing the &lt;code&gt;bundle install&lt;/code&gt; process shows we take over 9 seconds to install (3 seconds per gem):&lt;/p&gt;&lt;code&gt;&amp;gt; rm -rf x; rm -f Gemfile.lock; time GEM_PATH=(pwd)/x GEM_HOME=(pwd)/x bundle install
-Fetching gem metadata from http://localhost:9292/...
-Resolving dependencies...
-Fetching c 1.0.0
-Installing c 1.0.0
-Fetching b 1.0.0
-Installing b 1.0.0
-Fetching a 1.0.0
-Installing a 1.0.0
-Bundle complete! 1 Gemfile dependency, 3 gems now installed.
-Use `bundle info [gemname]` to see where a bundled gem is installed.
-
-________________________________________________________
-Executed in   11.80 secs      fish           external
-   usr time  341.62 millis  231.00 micros  341.38 millis
-   sys time  223.20 millis  712.00 micros  222.49 millis
-&lt;/code&gt;&lt;p&gt;Contrast this with a Gemfile containing &lt;code&gt;d&lt;/code&gt;, &lt;code&gt;e&lt;/code&gt;, and &lt;code&gt;f&lt;/code&gt;, which have no dependencies, but still take 3 seconds to download:&lt;/p&gt;&lt;code&gt;source "http://localhost:9292"
-
-gem "d"
-gem "e"
-gem "f"
-&lt;/code&gt;&lt;p&gt;Timing &lt;code&gt;bundle install&lt;/code&gt; for the above Gemfile shows it takes about 4 seconds:&lt;/p&gt;&lt;code&gt;&amp;gt; rm -rf x; rm -f Gemfile.lock; time GEM_PATH=(pwd)/x GEM_HOME=(pwd)/x bundle install
-Fetching gem metadata from http://localhost:9292/.
-Resolving dependencies...
-Fetching d 1.0.0
-Fetching e 1.0.0
-Fetching f 1.0.0
-Installing e 1.0.0
-Installing f 1.0.0
-Installing d 1.0.0
-Bundle complete! 3 Gemfile dependencies, 3 gems now installed.
-Use `bundle info [gemname]` to see where a bundled gem is installed.
-
-________________________________________________________
-Executed in    4.14 secs      fish           external
-   usr time  374.04 millis    0.38 millis  373.66 millis
-   sys time  368.90 millis    1.09 millis  367.81 millis
-&lt;/code&gt;&lt;p&gt;We were able to install the same number of gems in a fraction of the time. This is because Bundler is able to download siblings in the dependency tree in parallel, but unable to handle other relationships.&lt;/p&gt;&lt;p&gt;There is actually a good reason that Bundler insists dependencies are installed before the gems themselves: native extensions. When installing native extensions, the installation process must run Ruby code (the &lt;code&gt;extconf.rb&lt;/code&gt; file).
-Since the &lt;code&gt;extconf.rb&lt;/code&gt; could require dependencies be installed in order to run, we must install dependencies first.
-For example &lt;code&gt;nokogiri&lt;/code&gt; depends on &lt;code&gt;mini_portile2&lt;/code&gt;, but &lt;code&gt;mini_portile2&lt;/code&gt; is only used during the installation process, so it needs to be installed before &lt;code&gt;nokogiri&lt;/code&gt; can be compiled and installed.&lt;/p&gt;&lt;p&gt;However, if we were to decouple downloading from installation it would be possible for us to maintain the “dependencies are installed first” business requirement but speed up installation. In the &lt;code&gt;a -&amp;gt; b -&amp;gt; c&lt;/code&gt; case, we could have been downloading gems &lt;code&gt;a&lt;/code&gt; and &lt;code&gt;b&lt;/code&gt; at the same time as gem &lt;code&gt;c&lt;/code&gt; (or even while waiting on &lt;code&gt;c&lt;/code&gt; to be installed).&lt;/p&gt;&lt;p&gt;Additionally, pure Ruby gems don’t need to execute any code on installation. If we knew that we were installing a pure Ruby gem, it would be possible to relax the “dependencies are installed first” business requirement and get even more performance increases. The above &lt;code&gt;a -&amp;gt; b -&amp;gt; c&lt;/code&gt; case could install all three gems in parallel since none of them execute Ruby code during installation.&lt;/p&gt;&lt;p&gt;I would propose we split installation in to 4 discrete steps:&lt;/p&gt;&lt;list rend="ol"&gt;&lt;item&gt;Download the gem&lt;/item&gt;&lt;item&gt;Unpack the gem&lt;/item&gt;&lt;item&gt;Compile the gem&lt;/item&gt;&lt;item&gt;Install the gem&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Downloading and unpacking can be done trivially in parallel. We should unpack the gem to a temporary folder so that if the process crashes or the machine loses power, the user isn’t stuck with a half-installed gem. After we unpack the gem, we can discover whether the gem is a native extension or not. If it’s not a native extension, we “install” the gem simply by moving the temporary folder to the “correct” location. This step could even be a “hard link” step as discussed in the next point.&lt;/p&gt;&lt;p&gt;If we discover that the gem is a native extension, then we can “pause” installation of that gem until its dependencies are installed, then resume (by compiling) at an appropriate time.&lt;/p&gt;&lt;p&gt;Side note: &lt;code&gt;gel&lt;/code&gt;, a Bundler alternative, works mostly in this manner today.
-Here is a timing of the &lt;code&gt;a -&amp;gt; b -&amp;gt; c&lt;/code&gt; case from above:&lt;/p&gt;&lt;code&gt;&amp;gt; rm -f Gemfile.lock; time gel install
-Fetching sources....
-Resolving dependencies...
-Writing lockfile to /Users/aaron/git/gemserver/app/Gemfile.lock
-Installing c (1.0.0) 
-Installing a (1.0.0)
-Installing b (1.0.0)
-Installed 3 gems  
-
-________________________________________________________
-Executed in    4.07 secs      fish           external
-   usr time  289.22 millis    0.32 millis  288.91 millis
-   sys time  347.04 millis    1.36 millis  345.68 millis
-&lt;/code&gt;&lt;p&gt;Lets move on to the next point:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Global cache with hardlinks. pip copies packages into each virtual environment. uv keeps one copy globally and uses hardlinks&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;I think this is a great idea, but I’d actually like to split the idea in two. First, RubyGems and Bundler should have a combined, global cache, full stop. I think that global cache should be in &lt;code&gt;$XDG_CACHE_HOME&lt;/code&gt;, and we should store &lt;code&gt;.gem&lt;/code&gt; files there when they are downloaded.&lt;/p&gt;&lt;p&gt;Currently, both Bundler and RubyGems will use a Ruby version specific cache folder. In other words, if you do &lt;code&gt;gem install rails&lt;/code&gt; on two different versions of Ruby, you get two copies of Rails and all its dependencies.&lt;/p&gt;&lt;p&gt;Interestingly, there is an open ticket to implement this, it just needs to be done.&lt;/p&gt;&lt;p&gt;The second point is hardlinking on installation. The idea here is that rather than unpacking the gem multiple times, once per Ruby version, we simply unpack once and then hard link per Ruby version. I like this idea, but I think it should be implemented after some technical debt is paid: namely implementing a global cache and unifying Bundler / RubyGems code paths.&lt;/p&gt;&lt;p&gt;On to the next point:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;PubGrub resolver&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;Actually Bundler already uses a Ruby implementation of the PubGrub resolver. You can see it here. Unfortunately, RubyGems still uses the molinillo resolver.&lt;/p&gt;&lt;p&gt;In other words you use a different resolver depending on whether you do &lt;code&gt;gem install&lt;/code&gt; or &lt;code&gt;bundle install&lt;/code&gt;.
-I don’t really think this is a big deal since the vast majority of users will be doing &lt;code&gt;bundle install&lt;/code&gt; most of time.
-However, I do think this discrepancy is some technical debt that should be addressed, and I think this should be addressed via unification of RubyGems and Bundler codebases (today they both live in the same repository, but the code isn’t necessarily combined).&lt;/p&gt;&lt;p&gt;Lets move on to the next section of Andrew’s post:&lt;/p&gt;&lt;head rend="h2"&gt;Where Rust actually matters&lt;/head&gt;&lt;p&gt;Andrew first mentions “Zero-copy deserialization”. This is of course an important technique, but I’m not 100% sure where we would utilize it in RubyGems / Bundler. I think that today we parse the YAML spec on installation, and that could be a target. But I also think we could install most gems without looking at the YAML gemspec at all.&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Thread-level parallelism. Pythonâs GIL forces parallel work into separate processes, with IPC overhead and data copying.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;This is an interesting point. I’m not sure what work pip needed to do in separate processes. Installing a pure Ruby, Ruby Gem is mostly an IO bound task, with some ZLIB mixed in. Both of these things (IO and ZLIB processing) release Ruby’s GVL, so it’s possible for us to do things truly in parallel. I imagine this is similar for Python / pip, but I really have no idea.&lt;/p&gt;&lt;p&gt;Given the stated challenges with Python’s GIL, you might wonder whether Ruby’s GVL presents similar parallelism problems for Bundler. I don’t think so, and in fact I think Ruby’s GVL gets kind of a bad rap. It prevents us from running CPU bound Ruby code in parallel. Ractors address this, and Bundler could possibly leverage them in the future, but since installing Gems is mostly an IO bound task I’m not sure what the advantage would be (possibly the version solver, but I’m not sure what can be parallelized in there). The GVL does allow us to run IO bound work in parallel with CPU bound Ruby code. CPU bound native extensions are allowed to release the GVL, allowing Ruby code to run in parallel with the native extension’s CPU bound code.&lt;/p&gt;&lt;p&gt;In other words, Ruby’s GVL allows us to safely run work in parallel. That said, the GVL can work against us because releasing and acquiring the GVL takes time.&lt;/p&gt;&lt;p&gt;If you have a system call that is very fast, releasing and acquiring the GVL could end up being a large percentage of that call. For example, if you do &lt;code&gt;File.binwrite(file, buffer)&lt;/code&gt;, and the buffer is very small, you could encounter a situation where GVL book keeping is the majority of the time.
-A bummer is that Ruby Gem packages usually contain lots of very small files, so this problem could be impacting us.
-The good news is that this problem can be solved in Ruby itself, and indeed some work is being done on it today.&lt;/p&gt;&lt;quote&gt;&lt;p&gt;No interpreter startup. Every time pip spawns a subprocess, it pays Pythonâs startup cost.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;Obviously Ruby has this same problem. That said, we only start Ruby subprocesses when installing native extensions. I think native extensions make up the minority of gems installed, and even when installing a native extension, it isn’t Ruby startup that is the bottleneck. Usually the bottleneck is compilation / linking time (as we’ll see in the next post).&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Compact version representation. uv packs versions into u64 integers where possible, making comparison and hashing fast.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;This is a cool optimization, but I don’t think it’s actually Rust specific. Comparing integers is much faster than comparing version objects. The idea is that you take a version number, say &lt;code&gt;1.0.0&lt;/code&gt;, and then pack each part of the version in to a single integer.
-For example, we could represent &lt;code&gt;1.0.0&lt;/code&gt; as &lt;code&gt;0x0001_0000_0000_0000&lt;/code&gt; and &lt;code&gt;1.1.0&lt;/code&gt; as &lt;code&gt;0x0001_0001_0000_0000&lt;/code&gt;, etc.&lt;/p&gt;&lt;p&gt;It should be possible to use this trick in Ruby and encode versions to integer immediates, which would unlock performance in the resolver. Rust has an advantage here - compiled native code comparing u64s will always be faster than Ruby, even with immediates. However, I would bet that with the YJIT or ZJIT in play, this gap could be closed enough that no end user would notice the difference between a Rust or Ruby implementation of Bundler.&lt;/p&gt;&lt;p&gt;I started refactoring the &lt;code&gt;Gem::Version&lt;/code&gt; object so that we might start doing this, but we ended up reverting it because of backwards compatibility (I am jealous of &lt;code&gt;uv&lt;/code&gt; in that regard).
-I think the right way to do this is to refactor the solver entry point and ensure all version requirements are encoded as integer immediates before entering the solver.
-We could keep the &lt;code&gt;Gem::Version&lt;/code&gt; API as “user facing” and design a more internal API that the solver uses.
-I am very interested in reading the version encoding scheme in uv.
-My intuition is that minor numbers tend to get larger than major numbers, so would minor numbers have more dedicated bits?
-Would it even matter with 64 bits?&lt;/p&gt;&lt;head rend="h2"&gt;Wrapping this up&lt;/head&gt;&lt;p&gt;I’m going to quote Andrew’s last 2 paragraphs:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;uv is fast because of what it doesnât do, not because of what language itâs written in. The standards work of PEP 518, 517, 621, and 658 made fast package management possible. Dropping eggs, pip.conf, and permissive parsing made it achievable. Rust makes it a bit faster still.&lt;/p&gt;&lt;p&gt;pip could implement parallel downloads, global caching, and metadata-only resolution tomorrow. It doesnât, largely because backwards compatibility with fifteen years of edge cases takes precedence. But it means pip will always be slower than a tool that starts fresh with modern assumptions.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;I think these are very good points. The difference is that in RubyGems and Bundler, we already have the infrastructure in place for writing a “fast as uv” package manager. The difficult part is dealing with backwards compatibility, and navigating two legacy codebases. I think this is the real advantage the uv developers had. That said, I am very optimistic that we could “repair the plane mid-flight” so to speak, and have the best of both worlds: backwards compatibility and speed.&lt;/p&gt;&lt;p&gt;I mentioned at the top of the post I would address “rewrite it in Rust”, and I think Andrew’s own quote mostly does that for me. I think we could have 99% of the performance improvements while still maintaining a Ruby codebase. Of course if we rewrote it in Rust, you could squeeze an extra 1% out, but would it be worthwhile? I don’t think so.&lt;/p&gt;&lt;p&gt;I have a lot more to say about this topic, and I feel like this post is getting kind of long, so I’m going to end it here. Please look out for part 2, which I’m tentatively calling “What makes Bundler / RubyGems slow?” This post was very “can we make RubyGems / Bundler do what uv does?” (the answer is “yes”). In part 2 I want to get more hands-on by discussing how to profile Bundler and RubyGems, what specifically makes them slow in the real world, and what we can do about it.&lt;/p&gt;&lt;p&gt;I want to end this post by saying “thank you” to Andrew for writing such a great post about how uv got so fast.&lt;/p&gt;&lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://tenderlovemaking.com/2025/12/29/can-bundler-be-as-fast-as-uv/"/><published>2026-01-01T21:37:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46458624</id><title>WebAssembly as a Python Extension Platform</title><updated>2026-01-02T14:11:49.220908+00:00</updated><content>&lt;doc fingerprint="8c4b9a15de87b2c0"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-01-02T14:42:46.624066+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46458624</id><title>WebAssembly as a Python Extension Platform</title><updated>2026-01-02T14:42:57.320974+00:00</updated><content>&lt;doc fingerprint="8c4b9a15de87b2c0"&gt;
   &lt;main&gt;
     &lt;p&gt; nullprogram.com/blog/2026/01/01/ &lt;/p&gt;
     &lt;p&gt; (The author is currently open to employment opportunities in the United States.) &lt;/p&gt;
@@ -443,7 +367,7 @@ future self), who already has the &lt;code&gt;key&lt;/code&gt;:&lt;/p&gt;
     &lt;p&gt;While I have a few reservations about wasmtime-py, it fascinates me how well this all works. It’s been my hammer in search of a nail for some time now.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://nullprogram.com/blog/2026/01/01/"/><published>2026-01-01T22:09:16+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46460319</id><title>Why users cannot create Issues directly</title><updated>2026-01-02T14:11:48.692672+00:00</updated><content>&lt;doc fingerprint="d3525efe9c762c38"&gt;
+&lt;/doc&gt;</content><link href="https://nullprogram.com/blog/2026/01/01/"/><published>2026-01-01T22:09:16+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46460319</id><title>Why users cannot create Issues directly</title><updated>2026-01-02T14:42:56.626545+00:00</updated><content>&lt;doc fingerprint="d3525efe9c762c38"&gt;
   &lt;main&gt;
     &lt;list rend="ul"&gt;
       &lt;item&gt; Notifications &lt;tool-tip&gt;You must be signed in to change notification settings&lt;/tool-tip&gt;&lt;/item&gt;
@@ -457,7 +381,7 @@ future self), who already has the &lt;code&gt;key&lt;/code&gt;:&lt;/p&gt;
     &lt;p&gt;For more details, see our CONTRIBUTING.md.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/ghostty-org/ghostty/issues/3558"/><published>2026-01-02T01:24:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46460440</id><title>Happy Public Domain Day 2026</title><updated>2026-01-02T14:11:48.226731+00:00</updated><content>&lt;doc fingerprint="3081d05f80b58200"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/ghostty-org/ghostty/issues/3558"/><published>2026-01-02T01:24:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46460440</id><title>Happy Public Domain Day 2026</title><updated>2026-01-02T14:42:56.097877+00:00</updated><content>&lt;doc fingerprint="3081d05f80b58200"&gt;
   &lt;main&gt;
     &lt;p&gt;The calendar turns, and once again a lively procession of books, images, films, and music leaves copyright behind and steps into the ever-growing public domain! On this year's Public Domain Day (which falls each January 1st) we welcome, in lots of countries around the world, the words of Wallace Stevens, Thomas Mann, Hannah Arendt, and Albert Einstein, and in the US a bevy of brilliant books including William Faulkner’s As I Lay Dying, Langston Hughes’ Not Without Laughter, Agatha Christie’s The Murder at the Vicarage, and, in their original German, Robert Musil’s The Man Without Qualities and Hermann Hesse’s Narcissus and Goldmund.&lt;/p&gt;
     &lt;p&gt;Due to differing copyright laws around the world, there is no one single public domain, but there are three main types of copyright term for historical works which cover most cases. For these three systems, newly entering the public domain today are:&lt;/p&gt;
@@ -547,7 +471,7 @@ future self), who already has the &lt;code&gt;key&lt;/code&gt;:&lt;/p&gt;
     &lt;p&gt;Works at Project Gutenberg&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://publicdomainreview.org/blog/2026/01/public-domain-day-2026/"/><published>2026-01-02T01:42:16+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46460676</id><title>Marmot – A distributed SQLite server with MySQL wire compatible interface</title><updated>2026-01-02T14:11:47.985681+00:00</updated><content>&lt;doc fingerprint="7bd207d0da0bb8c"&gt;
+&lt;/doc&gt;</content><link href="https://publicdomainreview.org/blog/2026/01/public-domain-day-2026/"/><published>2026-01-02T01:42:16+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46460676</id><title>Marmot – A distributed SQLite server with MySQL wire compatible interface</title><updated>2026-01-02T14:42:55.338856+00:00</updated><content>&lt;doc fingerprint="7bd207d0da0bb8c"&gt;
   &lt;main&gt;
     &lt;p&gt;Marmot v2 is a leaderless, distributed SQLite replication system built on a gossip-based protocol with distributed transactions and eventual consistency.&lt;/p&gt;
     &lt;p&gt;Key Features:&lt;/p&gt;
@@ -1738,7 +1662,7 @@ scrape_configs:
     &lt;p&gt;Since Marmot uses SQLite with WAL mode, you can safely snapshot the data directory during operation.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/maxpert/marmot"/><published>2026-01-02T02:21:57+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46462108</id><title>FreeBSD: Home NAS, part 1 – configuring ZFS mirror (RAID1)</title><updated>2026-01-02T14:11:47.599375+00:00</updated><content>&lt;doc fingerprint="1e35285ba76e8ee5"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/maxpert/marmot"/><published>2026-01-02T02:21:57+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46462108</id><title>FreeBSD: Home NAS, part 1 – configuring ZFS mirror (RAID1)</title><updated>2026-01-02T14:42:54.701429+00:00</updated><content>&lt;doc fingerprint="1e35285ba76e8ee5"&gt;
   &lt;main&gt;
     &lt;p&gt;I have an idea to set up a home NAS on FreeBSD.&lt;/p&gt;
     &lt;p&gt;For this purpose, I bought a Lenovo ThinkCentre M720s SFF – it’s quiet, compact, and offers the possibility to install 2 SATA III SSDs plus a separate M.2 slot for an NVMe SSD.&lt;/p&gt;
@@ -1908,7 +1832,7 @@ scrape_configs:
     &lt;p&gt;For a Web UI, you could try Seafile or FileBrowser.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://rtfm.co.ua/en/freebsd-home-nas-part-1-configuring-zfs-mirror-raid1/"/><published>2026-01-02T06:48:32+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46462592</id><title>Round the tree, yes, but not round the squirrel</title><updated>2026-01-02T14:11:47.097004+00:00</updated><content>&lt;doc fingerprint="f75c93007bda195e"&gt;
+&lt;/doc&gt;</content><link href="https://rtfm.co.ua/en/freebsd-home-nas-part-1-configuring-zfs-mirror-raid1/"/><published>2026-01-02T06:48:32+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46462592</id><title>Round the tree, yes, but not round the squirrel</title><updated>2026-01-02T14:42:54.140542+00:00</updated><content>&lt;doc fingerprint="f75c93007bda195e"&gt;
   &lt;main&gt;
     &lt;quote&gt;
       &lt;p&gt;‘I had quite a bit of fun playing hide-and-seek with a squirrel,’ he said. ‘You know that little round glade with a lone birch in the centre? It was on this tree that a squirrel was hiding from me. As I emerged from a thicket, I saw its snout and two bright little eyes peeping from behind the trunk. I wanted to see the little animal, so I started circling round along the edge of the glade, mindful of keeping the distance in order not to scare it. I did four rounds, but the little cheat kept backing away from me, eyeing me suspiciously from behind the tree. Try as I did, I just could not see its back.’&lt;/p&gt;
@@ -1927,140 +1851,7 @@ scrape_configs:
     &lt;p&gt;— Yakov Perelman, Mathematics Can Be Fun, 1927&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.futilitycloset.com/2026/01/02/round-and-round/"/><published>2026-01-02T08:16:21+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46462702</id><title>Standard Ebooks: Public Domain Day 2026 in Literature</title><updated>2026-01-02T14:11:46.728213+00:00</updated><content/><link href="https://standardebooks.org/blog/public-domain-day-2026"/><published>2026-01-02T08:40:41+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46462719</id><title>Going immutable on macOS, using Nix-Darwin</title><updated>2026-01-02T14:11:46.191533+00:00</updated><content>&lt;doc fingerprint="2a945a3cf7adab95"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Going immutable on macOS&lt;/head&gt;
-    &lt;p&gt;· 8 min read&lt;/p&gt;
-    &lt;p&gt;With no surprise the end of one year marks the start of the next.&lt;lb/&gt; And the beginning of a year is always synonymous with… a fresh macOS system!&lt;/p&gt;
-    &lt;p&gt;But managing a good working environment on macOS has long been a game of “hope for the best.” We’ve all been there: a &lt;code&gt;curl | sh&lt;/code&gt; here, a manual &lt;code&gt;brew install&lt;/code&gt; there, and six months later, you’re staring at a broken &lt;code&gt;PATH&lt;/code&gt; and a Python environment that seems to have developed its own consciousness.&lt;/p&gt;
-    &lt;p&gt;I’ve spent a lot of time recently moving my entire workflow into a declarative system using nix. From my zsh setup to my odin toolchain, here is why the transition from the imperative world of Homebrew to the immutable world of nix-darwin has been both a revelation and a fight.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The problem to solve: imperative rot #&lt;/head&gt;
-    &lt;p&gt;Homebrew is great.&lt;lb/&gt; From the Linux world, it was the perfect missing package manager for macOS at first, promoted by a lot of developers, and it (mostly) works. But Homebrew has a problem: it is imperative.&lt;/p&gt;
-    &lt;p&gt;When you run &lt;code&gt;brew install&lt;/code&gt; you are changing the state of your machine in a way that is difficult to reverse or replicate exactly.&lt;lb/&gt; As an example, if I set up a new Mac today, &lt;code&gt;brew install neovim&lt;/code&gt; might give me version 0.10. However, if I do it six months from now, the version might changed and I had to reconfigure some components because of that change. The consequence is me, spending a few hours debugging my environment instead of writing code.&lt;/p&gt;
-    &lt;p&gt;A solution to that is postfix every brew package by its version, but this is not possible for every package.&lt;/p&gt;
-    &lt;p&gt;Another solution is system immutability and the Nix store.&lt;/p&gt;
-    &lt;head rend="h2"&gt;System immutablility, and the Nix store #&lt;/head&gt;
-    &lt;p&gt;Nix approaches the problem from a functional programming perspective.&lt;lb/&gt; Your system is not a collection of side effects, but a pure function of your configuration.&lt;/p&gt;
-    &lt;p&gt;This allows different strong points like:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;reproducibility: Every package lives in &lt;code&gt;/nix/store&lt;/code&gt;with a unique hash. This means I can have three different versions of the Odin compiler side-by-side, and they will never see each other, or even mess up with the different versions.&lt;/item&gt;
-      &lt;item&gt;rollbacks: If a system update breaks my shell, I don’t panic. I just boot into a previous generation. The previous state of my system is still sitting in the store, untouched.&lt;/item&gt;
-      &lt;item&gt;flakes: Using &lt;code&gt;flake.lock&lt;/code&gt;, I pin my setup to specific git commits. If it works on my laptop then it will work on yours. Period.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Rollbacks on macOS exist, and are great to go back to a previous version “that works”.&lt;lb/&gt; As an example, to list all my previous generations, I can do:&lt;/p&gt;
-    &lt;code&gt;&amp;gt; sudo nix-env --list-generations -p /nix/var/nix/profiles/system
-   1   2025-12-28 01:21:38
-   2   2025-12-28 01:33:47
-   3   2025-12-28 09:34:27
-   4   2025-12-28 09:43:15
-   5   2025-12-28 11:00:49
-   6   2025-12-28 11:10:12
-   7   2025-12-28 11:19:03
-   ...
-&lt;/code&gt;
-    &lt;p&gt;Each generation is also stored in a read-only specific volume on your system, which prevents accidental mutability of your packages.&lt;/p&gt;
-    &lt;p&gt;On macOS &lt;code&gt;nix-darwin&lt;/code&gt; allows me to modify everything, from Finder settings to the Dock, or the Trackpad.&lt;/p&gt;
-    &lt;p&gt;As an example, this is a part of my setup:&lt;/p&gt;
-    &lt;code&gt;...
-configuration = { pkgs, ... }: {
-    # Firewall settings
-    networking.applicationFirewall = {
-        enable = true;
-        enableStealthMode = true;
-        allowSigned = true;
-        allowSignedApp = true;
-    };
-
-    system.defaults = {
-        CustomUserPreferences = {
-          # Disable siri
-          "com.apple.Siri" = {
-            "UAProfileCheckingStatus" = 0;
-            "siriEnabled" = 0;
-          };
-          # Disable personalized ads 
-          "com.apple.AdLib" = {
-            allowApplePersonalizedAdvertising = false;
-          };
-        };
-
-        # Show battery percentage in the menu bar
-        controlcenter.BatteryShowPercentage = true;
-
-        # Allow touch to click
-        trackpad.Clicking = true;
-
-        # Hide the dock after a small delay of inactivity
-        dock.autohide = true;
-        dock.autohide-delay = 0.25;
-
-        ...
-    };
-}
-&lt;/code&gt;
-    &lt;p&gt;And all those settings are documented in the official nix-darwin manual here.&lt;/p&gt;
-    &lt;head rend="h3"&gt;The Nix flake #&lt;/head&gt;
-    &lt;p&gt;Before diving into the pros and cons of Nix, we need to address the engine under the hood: The Nix Flake.&lt;/p&gt;
-    &lt;p&gt;In the traditional Nix world, things were a bit loose.&lt;lb/&gt; You had “channels”, but “channels” that could change behind your back… and we don’t want to get back to mutable systems.&lt;lb/&gt; Nix flakes fixed this by introducing a strictly defined structure.&lt;/p&gt;
-    &lt;p&gt;Every Flake has a &lt;code&gt;flake.nix&lt;/code&gt; (the blueprint) and a &lt;code&gt;flake.lock&lt;/code&gt; (the time capsule).&lt;/p&gt;
-    &lt;p&gt;The lockfile is actually the secret sauce.&lt;lb/&gt; It records the exact git commit of every dependency. When I build my system, I’m not just asking for “the latest version of the Odin programming language”, but for the exact version of Odin that existed at a specific moment in history.&lt;/p&gt;
-    &lt;p&gt;So, when you run &lt;code&gt;darwin-rebuild switch --flake .&lt;/code&gt; to update your system (depending on configuration changes), Nix will look first at the lockfile.
-If the lockfile says you are using &lt;code&gt;nixpkgs&lt;/code&gt; from October 12th at 10:45 PM, that is exactly what it fetches.
-Nix doesn’t matter if you are on a new MacBook or an old iMac. If the lockfile is the same, then the resulting environment will be identical to your previous setup.&lt;/p&gt;
-    &lt;p&gt;This turns system administration into a pure function: the same inputs always produce the same result.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The “get and forget” workflow #&lt;/head&gt;
-    &lt;p&gt;One of the most liberating features is the “ephemeral shell” provided by Nix.&lt;lb/&gt; Imagine you need to test a script against &lt;code&gt;Python 3.15&lt;/code&gt;, but you don’t want to install a pre-release version globally and risk breaking your system tools…&lt;/p&gt;
-    &lt;p&gt;With Nix, you run:&lt;/p&gt;
-    &lt;code&gt;nix shell nixpkgs#python314
-&lt;/code&gt;
-    &lt;p&gt;Suddenly, &lt;code&gt;python --version&lt;/code&gt; returns 3.14.
-You run your tests, you exit the shell, and it’s gone.&lt;/p&gt;
-    &lt;p&gt;No leftovers, no site-packages conflicts, no trace. It is the ultimate “get and forget” utility, without messing up your system.&lt;/p&gt;
-    &lt;p&gt;However be careful as “ephemeral” does not mean “sandboxed” or “isolated” in this context! A common misconception is that &lt;code&gt;nix shell&lt;/code&gt; is like a Docker container or a VM, but it is not as &lt;code&gt;nix shell&lt;/code&gt; only isolated the environment variables, and is still running directly on the darwin kernel.&lt;/p&gt;
-    &lt;head rend="h2"&gt; The learning &lt;del rend="overstrike"&gt;curve&lt;/del&gt; cliff # &lt;/head&gt;
-    &lt;p&gt;Is this configuration exempt from defaults? Absolutely not.&lt;lb/&gt; In fact, its biggest “default” is one of the most significant pain points in modern software: it arrives wrapped in complicated concepts and dense foundations.&lt;/p&gt;
-    &lt;p&gt;The learning curve for Nix is actually not a curve, but a vertical cliff face.&lt;/p&gt;
-    &lt;p&gt;Unlike Homebrew, where you just type a command and forget it, Nix requires you to learn a domain-specific language called… &lt;code&gt;Nix&lt;/code&gt; (I know, it is confusing). You have to understand how symbolic links work on macOS, how the Nix daemon interacts with Apple’s read-only system volume, and why your applications don’t magically appear in Spotlight.&lt;/p&gt;
-    &lt;p&gt;For instance, getting GUI apps to show up in the Applications folder requires “trampoline” binaries or custom activation scripts using &lt;code&gt;mkalias&lt;/code&gt;.&lt;lb/&gt; After a few minutes debugging and scrolling forums it works great, but many users will simply stop there and walking away with the mistaken impression that &lt;code&gt;nix-darwin&lt;/code&gt; is an immature project, rather than a deeply powerful one.&lt;/p&gt;
-    &lt;p&gt;The documentation is great, but maybe not well arranged.&lt;lb/&gt; As an example, this is the manual to write your own &lt;code&gt;flake.nix&lt;/code&gt;: https://nix-darwin.github.io/nix-darwin/manual/.
-You can be lost very easily in the manual if you do not know what you are looking for…&lt;/p&gt;
-    &lt;head rend="h2"&gt;The hybrid reality #&lt;/head&gt;
-    &lt;p&gt;Despite my love for Nix, it isn’t perfect for everything. macOS GUI applications like Thunderbird, Firefox, or CrossOver, often fight against the read-only nature of the Nix store.&lt;lb/&gt; Those software expect to self-update and live in &lt;code&gt;/Applications&lt;/code&gt; on your system.&lt;/p&gt;
-    &lt;p&gt;I found the sane path to be an hybrid approach: I use &lt;code&gt;nix-darwin&lt;/code&gt; to manage my critical state (compilers, LSPs, shell aliases), and use the homebrew module inside my Nix config to handle the big GUI pieces. It looks like this:&lt;/p&gt;
-    &lt;code&gt;// file: brew.nix
-homebrew = {
-  enable = true;
-  casks = [ 
-    "firefox" 
-    "thunderbird" 
-    "crossover" 
-  ];
-};
-&lt;/code&gt;
-    &lt;p&gt;That’s it! And using this, I am sure Nix will use &lt;code&gt;brew&lt;/code&gt; to install those software on my system, as I did manually with my &lt;code&gt;brew install&lt;/code&gt; scripts.&lt;/p&gt;
-    &lt;p&gt;This gives me the best of both worlds: Homebrew handles the macOS-specific integration, but Nix still “records” that they should exist in my declarative blueprint.&lt;/p&gt;
-    &lt;head rend="h2"&gt;How to start #&lt;/head&gt;
-    &lt;p&gt;If you want to move away from “hope-based” configuration:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;
-        &lt;p&gt;install the Determinate Nix Installer: it handles the messy macOS multi-user setup for you.&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;&lt;p&gt;initialize a Flake and&lt;/p&gt;&lt;code&gt;home-manager&lt;/code&gt;: Create a&lt;code&gt;flake.nix&lt;/code&gt;and a&lt;code&gt;home.nix&lt;/code&gt;for your home-manager instance.&lt;/item&gt;
-      &lt;item&gt;&lt;p&gt;think “modularity”, like keeping your system settings in&lt;/p&gt;&lt;code&gt;system.nix&lt;/code&gt;, your dev tools in&lt;code&gt;dev.nix&lt;/code&gt;, and your GUI apps in&lt;code&gt;brew.nix&lt;/code&gt;.&lt;/item&gt;
-      &lt;item&gt;&lt;p&gt;version everything and commit your&lt;/p&gt;&lt;code&gt;flake.lock&lt;/code&gt;! It is the source of truth for your system.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;If you are curious I’ve documented my current setup, including my security hardening (firewall, stealth mode, etc.) here: k0pernicus/dotfiles/nix-darwin-config.&lt;/p&gt;
-    &lt;p&gt;Keep in mind this configuration is personal, and might not be interesting (and certainly not useful) for everyone.&lt;/p&gt;
-    &lt;p&gt;A few links that helped me to make a first setup version for my mac:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;https://nixcademy.com/posts/nix-on-macos/&lt;/item&gt;
-      &lt;item&gt;https://dreamsofcode.io/blog/nix-darwin-my-favorite-package-manager-for-macos&lt;/item&gt;
-      &lt;item&gt;https://github.com/torgeir/nix-darwin&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;It’s more work upfront, certainly. But there is a profound peace of mind in knowing that your system is defined by code, not by a history of forgotten terminal commands.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://carette.xyz/posts/going_immutable_macos/"/><published>2026-01-02T08:42:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46463315</id><title>HPV vaccination reduces oncogenic HPV16/18 prevalence from 16% to &lt;1% in Denmark</title><updated>2026-01-02T14:11:45.888244+00:00</updated><content/><link href="https://www.eurosurveillance.org/content/10.2807/1560-7917.ES.2025.30.27.2400820"/><published>2026-01-02T10:10:46+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46463407</id><title>One Number I Trust: Plain-Text Accounting for a Multi-Currency Household</title><updated>2026-01-02T14:11:45.514497+00:00</updated><content>&lt;doc fingerprint="2f08811d87a33d15"&gt;
+&lt;/doc&gt;</content><link href="https://www.futilitycloset.com/2026/01/02/round-and-round/"/><published>2026-01-02T08:16:21+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46462702</id><title>Standard Ebooks: Public Domain Day 2026 in Literature</title><updated>2026-01-02T14:42:53.591256+00:00</updated><content/><link href="https://standardebooks.org/blog/public-domain-day-2026"/><published>2026-01-02T08:40:41+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46463315</id><title>HPV vaccination reduces oncogenic HPV16/18 prevalence from 16% to &lt;1% in Denmark</title><updated>2026-01-02T14:42:53.520604+00:00</updated><content/><link href="https://www.eurosurveillance.org/content/10.2807/1560-7917.ES.2025.30.27.2400820"/><published>2026-01-02T10:10:46+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46463407</id><title>One Number I Trust: Plain-Text Accounting for a Multi-Currency Household</title><updated>2026-01-02T14:42:53.248357+00:00</updated><content>&lt;doc fingerprint="2f08811d87a33d15"&gt;
   &lt;main&gt;
     &lt;p&gt;Two people. Eighteen accounts spanning checking, savings, credit cards, investments. Three currencies. Twenty minutes of work every week.&lt;/p&gt;
     &lt;p&gt;One net worth number I actually trust.&lt;/p&gt;
@@ -2628,7 +2419,7 @@ plugin "beancount_reds_plugins.rename_accounts.rename_accounts" "{
     &lt;p&gt;Each chapter here could be its own post, so if you want me to go deeper on imports, investments, or the multi-person setup, let me know!&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://lalitm.com/post/one-number-i-trust/"/><published>2026-01-02T10:25:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46463600</id><title>2025 Letter</title><updated>2026-01-02T14:11:44.772488+00:00</updated><content>&lt;doc fingerprint="bf3891178fc5067d"&gt;
+&lt;/doc&gt;</content><link href="https://lalitm.com/post/one-number-i-trust/"/><published>2026-01-02T10:25:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46463600</id><title>2025 Letter</title><updated>2026-01-02T14:42:52.783948+00:00</updated><content>&lt;doc fingerprint="bf3891178fc5067d"&gt;
   &lt;main&gt;
     &lt;p&gt;(This piece is my year in review; I skipped a letter last year)&lt;/p&gt;
     &lt;p&gt;One way that Silicon Valley and the Communist Party resemble each other is that both are serious, self-serious, and indeed, completely humorless.&lt;/p&gt;
@@ -2803,7 +2594,7 @@ plugin "beancount_reds_plugins.rename_accounts.rename_accounts" "{
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://danwang.co/"/><published>2026-01-02T11:01:29+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46463635</id><title>A small collection of text-only websites</title><updated>2026-01-02T14:11:44.213597+00:00</updated><content>&lt;doc fingerprint="7e820a171fb48bd7"&gt;
+&lt;/doc&gt;</content><link href="https://danwang.co/"/><published>2026-01-02T11:01:29+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46463635</id><title>A small collection of text-only websites</title><updated>2026-01-02T14:42:51.794755+00:00</updated><content>&lt;doc fingerprint="7e820a171fb48bd7"&gt;
   &lt;main&gt;
     &lt;p&gt;A couple of years ago, I started serving my blog posts as plain text. Add &lt;code&gt;.txt&lt;/code&gt; to the end of any URl and get a deliciously lo-fi, UTF-8, mono[chrome|space] alternative.&lt;/p&gt;
     &lt;p&gt;Here's this post in plain text - https://shkspr.mobi/blog/2025/12/a-small-collection-of-text-only-websites.txt&lt;/p&gt;
@@ -2823,7 +2614,7 @@ plugin "beancount_reds_plugins.rename_accounts.rename_accounts" "{
     &lt;p&gt;Emoji are fine though; emoji are cool.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://shkspr.mobi/blog/2025/12/a-small-collection-of-text-only-websites/"/><published>2026-01-02T11:06:29+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46463644</id><title>10 years of personal finances in plain text files</title><updated>2026-01-02T14:11:43.830472+00:00</updated><content>&lt;doc fingerprint="5e2f81978ba66636"&gt;
+&lt;/doc&gt;</content><link href="https://shkspr.mobi/blog/2025/12/a-small-collection-of-text-only-websites/"/><published>2026-01-02T11:06:29+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46463644</id><title>10 years of personal finances in plain text files</title><updated>2026-01-02T14:42:51.640730+00:00</updated><content>&lt;doc fingerprint="5e2f81978ba66636"&gt;
   &lt;main&gt;
     &lt;p&gt;January 2026 will mark 10 years since I started storing my personal finances in plain text files using Beancount. Since January 2016, I've taken out about 30-45 minutes every single month to download my monthly bank statements and import them into my Beancount ledger.&lt;/p&gt;
     &lt;p&gt;There's a lot to talk about here, but let's start with some fun numbers!&lt;/p&gt;
@@ -2908,7 +2699,7 @@ would be an issue for Beancount, but just for the sake of readability.&lt;/p&gt;
     &lt;p&gt;Perhaps the nicest bit about all this is that this data is sitting on my own machine, not in some data center somewhere else. All of it is in plain text files that I can open up in my editor, and analyze using the tools that the Beancount ecosystem gives me. All of it will outlive any app or service, and that, I feel, is why plaintext accounting is so powerful.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://sgoel.dev/posts/10-years-of-personal-finances-in-plain-text-files/"/><published>2026-01-02T11:07:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46463992</id><title>Show HN: I built a clipboard tool to strip/keep specific formatting like Italics</title><updated>2026-01-02T14:11:43.450234+00:00</updated><content>&lt;doc fingerprint="7410077e1d297e98"&gt;
+&lt;/doc&gt;</content><link href="https://sgoel.dev/posts/10-years-of-personal-finances-in-plain-text-files/"/><published>2026-01-02T11:07:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46463992</id><title>Show HN: I built a clipboard tool to strip/keep specific formatting like Italics</title><updated>2026-01-02T14:42:51.174717+00:00</updated><content>&lt;doc fingerprint="7410077e1d297e98"&gt;
   &lt;main&gt;
     &lt;p&gt;🎉 New Year Sale: Get Lifetime Access for just $14.50 (50% OFF) →&lt;/p&gt;
     &lt;p&gt;CustomPaste is a powerful Windows utility that automatically cleans, formats, and transforms your clipboard text as you paste. Create reusable 'recipes' and let `Ctrl+V` finally do the work you want it to.&lt;/p&gt;
@@ -2962,13 +2753,299 @@ would be an issue for Beancount, but just for the sake of readability.&lt;/p&gt;
     &lt;p&gt;Just the good stuff. No spam. Unsubscribe anytime.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://custompaste.com"/><published>2026-01-02T12:07:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46464133</id><title>Show HN: Dealta – A game-theoretic decentralized trading protocol</title><updated>2026-01-02T14:11:43.233969+00:00</updated><content>&lt;doc fingerprint="eb7ad05e09566404"&gt;
+&lt;/doc&gt;</content><link href="https://custompaste.com"/><published>2026-01-02T12:07:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46464120</id><title>Assorted Less(1) Tips</title><updated>2026-01-02T14:42:50.635431+00:00</updated><content>&lt;doc fingerprint="3748813362a61f93"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Assorted less(1) tips&lt;/head&gt;
+    &lt;p&gt; In a recent discussion on Reddit I shared a number of tips about the common utility &lt;code&gt;less(1)&lt;/code&gt;
+that others found helpful
+so I figured I'd aggregate some of those tips here.
+&lt;/p&gt;
+    &lt;head rend="h3"&gt;Operating on multiple files&lt;/head&gt;
+    &lt;p&gt; While most folks invoke &lt;code&gt;less&lt;/code&gt;
+at the tail of a pipeline like
+
+
+you can directly provide one or more files to open
+
+&lt;/p&gt;
+    &lt;head rend="h3"&gt;Adding files after starting&lt;/head&gt;
+    &lt;p&gt; When reading a document, sometimes you want to view another file, adding it to the file list. Perhaps while reading some C source code you want to also look over the corresponding header-file. You can add that header-file to the argument list with &lt;code&gt;:e file.h&lt;/code&gt;
+&lt;/p&gt;
+    &lt;head rend="h3"&gt;Navigating multiple files&lt;/head&gt;
+    &lt;p&gt; You can navigate between multiple files using &lt;code&gt;:n&lt;/code&gt;
+to go to the next file in the argument-list, and
+&lt;code&gt;:p&lt;/code&gt;
+for the previous file.
+You can also use
+&lt;code&gt;:x&lt;/code&gt;
+to rewind to the first file in the argument-list
+similar to how
+&lt;code&gt;:rewind&lt;/code&gt;
+behaves in
+&lt;code&gt;vi&lt;/code&gt;/&lt;code&gt;vim&lt;/code&gt;.
+&lt;/p&gt;
+    &lt;head rend="h3"&gt;Removing files after starting&lt;/head&gt;
+    &lt;p&gt; While I rarely feel the need to, if you have finished with a file and want to keep your argument list clean, you can use &lt;code&gt;:d&lt;/code&gt;
+to delete the current file from the argument-list.
+&lt;/p&gt;
+    &lt;head rend="h2"&gt;Navigating&lt;/head&gt;
+    &lt;head rend="h3"&gt;Jumping to a particular line-number&lt;/head&gt;
+    &lt;p&gt; Use &lt;code&gt;Â«countÂ»G&lt;/code&gt;
+to jump to a particular line-number.
+So using
+&lt;code&gt;3141G&lt;/code&gt;
+will jump to line 3141.
+It helps to display
+line numbers.
+&lt;/p&gt;
+    &lt;head rend="h3"&gt;Jumping to a particular percentage-offset&lt;/head&gt;
+    &lt;p&gt; Similarly, using &lt;code&gt;Â«countÂ»%&lt;/code&gt;
+jumps to that percentage-offset of the file.
+So if you want to go to Â¾
+of the way through the file, you can type
+&lt;code&gt;75%&lt;/code&gt;
+to jump right there.
+&lt;/p&gt;
+    &lt;head rend="h3"&gt;Searching&lt;/head&gt;
+    &lt;p&gt; While many folks know you can search forward with &lt;code&gt;/Â«patternÂ»&lt;/code&gt;
+and some people know you can use
+&lt;code&gt;?Â«patternÂ»&lt;/code&gt;
+to search backwards,
+or use
+&lt;code&gt;n&lt;/code&gt;/&lt;code&gt;N&lt;/code&gt;
+to search again for the next/previous match,
+&lt;code&gt;less&lt;/code&gt;
+provides modifiers you can specify
+before the pattern to modify its behavior:
+&lt;/p&gt;
+    &lt;list rend="dl"&gt;
+      &lt;item rend="dt-1"&gt;
+        &lt;code&gt;!&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item rend="dd-1"&gt;Find the next line that doesn't match the pattern&lt;/item&gt;
+      &lt;item rend="dt-2"&gt;
+        &lt;code&gt;*&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item rend="dd-2"&gt;search across multiple files, starting from the current location in the current file&lt;/item&gt;
+      &lt;item rend="dt-3"&gt;
+        &lt;code&gt;@&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item rend="dd-3"&gt;rewind to the first file and search from there&lt;/item&gt;
+      &lt;item rend="dt-4"&gt;
+        &lt;code&gt;@*&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item rend="dd-4"&gt;rewind to the first file and search from there across multiple files&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt; Thus you would use &lt;code&gt;/@*Â«patternÂ»&lt;/code&gt;
+to search for "pattern"
+starting with the first file.
+&lt;/p&gt;
+    &lt;head rend="h2"&gt;Filtering lines&lt;/head&gt;
+    &lt;p&gt; Using &lt;code&gt;&amp;amp;&lt;/code&gt;
+lets you specify a pattern
+and filter the displayed lines
+to only those matching the pattern,
+much like an internal
+&lt;code&gt;grep&lt;/code&gt;
+command.
+If you modify it with
+&lt;code&gt;!&lt;/code&gt;,
+so it will display only those lines that do
+not match
+the pattern, like
+&lt;code&gt;&amp;amp;!Â«patternÂ»&lt;/code&gt;.
+I find this particularly helpful for browsing log-files.
+&lt;/p&gt;
+    &lt;head rend="h2"&gt;Bookmarking&lt;/head&gt;
+    &lt;p&gt; You can bookmark points in a file with &lt;code&gt;m&lt;/code&gt;
+followed by a letter,
+then jump back to that bookmark with
+&lt;code&gt;'&lt;/code&gt;
+followed by the same letter.
+These apply globally across all open files,
+so if you
+&lt;code&gt;ma&lt;/code&gt;
+in the third file,
+then navigate away to other files,
+using
+&lt;code&gt;'a&lt;/code&gt;
+will take you back to the marked location
+in that third file.
+I use marks most when reading man-pages,
+dropping one mark at the
+OPTIONS
+section such as
+&lt;code&gt;mo&lt;/code&gt;,
+and another at the
+EXAMPLES
+section,
+such as
+&lt;code&gt;me&lt;/code&gt;,
+then bounce back and forth between them with
+&lt;code&gt;'o&lt;/code&gt;
+and
+&lt;code&gt;'e&lt;/code&gt;.
+While you can use any of
+the 26 lowercase or uppercase letters
+(for a total of 52 marks),
+I rarely use more than two or three
+either in alphabetical order
+("a", "b", "c"),
+or assigning mnemonics like in the
+&lt;code&gt;man&lt;/code&gt;-page example above.
+&lt;/p&gt;
+    &lt;head rend="h3"&gt;Bracket matching&lt;/head&gt;
+    &lt;p&gt; If the first line on the screen contains a &lt;code&gt;(&lt;/code&gt;,
+&lt;code&gt;[&lt;/code&gt;,
+or
+&lt;code&gt;{&lt;/code&gt;,
+typing that character
+will jump to the matching/closing character,
+putting it on the bottom line of the screen.
+Similarly, if a closing
+&lt;code&gt;)&lt;/code&gt;,
+&lt;code&gt;]&lt;/code&gt;,
+or
+&lt;code&gt;}&lt;/code&gt;,
+character appears on the last line,
+typing that closing character
+will jump to the matching/opening character,
+putting it at the top of the screen.
+I find it a little disorienting
+if they fall &lt;code&gt;less&lt;/code&gt; than a screen-height apart
+because what feels like a forward motion
+to find the next matching close-bracket
+might actually result in shifting the screen
+down
+rather than
+up
+which feels backwards.
+&lt;/p&gt;
+    &lt;p&gt; While I don't use it much, you can also specify match-pairs using &lt;code&gt;alt+ctrl+f&lt;/code&gt;
+or
+&lt;code&gt;alt+ctrl+b&lt;/code&gt;
+followed by the opening/closing pair of characters
+such as
+&lt;code&gt;alt+ctrl+f&amp;lt;&amp;gt;&lt;/code&gt;
+to define a "&amp;lt;"â¦"&amp;gt;" pair
+and jump between them
+in a manner similar to the
+&lt;code&gt;(&lt;/code&gt;/&lt;code&gt;)&lt;/code&gt;,
+&lt;code&gt;[&lt;/code&gt;/&lt;code&gt;]&lt;/code&gt;,
+and
+&lt;code&gt;{&lt;/code&gt;/&lt;code&gt;)&lt;/code&gt;
+motions.
+&lt;/p&gt;
+    &lt;head rend="h2"&gt;Toggling options without restarting&lt;/head&gt;
+    &lt;p&gt; While the &lt;code&gt;man&lt;/code&gt;-page
+documents many flags you can pass
+on the command-line,
+you can also toggle boolean options from inside
+&lt;code&gt;less&lt;/code&gt;.
+I find this particularly helpful
+when I've fed the output of a long-running process to
+&lt;code&gt;less&lt;/code&gt;
+and don't want to re-run it
+because it will take a long time.
+Instead of quitting,
+you can type a literal
+&lt;code&gt;-&lt;/code&gt;
+followed by the option you want to change.
+I most commonly want to toggle word-wrap for long lines,
+so instead of quitting and adding
+&lt;code&gt;-S&lt;/code&gt;
+at the end of my pipeline,
+I can type
+&lt;code&gt;-S&lt;/code&gt;
+directly in
+&lt;code&gt;less&lt;/code&gt;.
+Options I commonly toggle:
+&lt;/p&gt;
+    &lt;list rend="dl"&gt;
+      &lt;item rend="dt-1"&gt;
+        &lt;code&gt;-S&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item rend="dd-1"&gt;word-wrap (mnemonic "splitting long lines")&lt;/item&gt;
+      &lt;item rend="dt-2"&gt;
+        &lt;code&gt;-G&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item rend="dd-2"&gt;search-highlighting&lt;/item&gt;
+      &lt;item rend="dt-3"&gt;&lt;code&gt;-i&lt;/code&gt;/&lt;code&gt;-I&lt;/code&gt;&lt;/item&gt;
+      &lt;item rend="dd-3"&gt;smart-case/case-sensitivity for searches&lt;/item&gt;
+      &lt;item rend="dt-4"&gt;
+        &lt;code&gt;-R&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item rend="dd-4"&gt;ANSI-color escaping&lt;/item&gt;
+      &lt;item rend="dt-5"&gt;&lt;code&gt;-N&lt;/code&gt;/&lt;code&gt;-n&lt;/code&gt;&lt;/item&gt;
+      &lt;item rend="dd-5"&gt;show/hide line-numbers&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;Running external commands&lt;/head&gt;
+    &lt;p&gt; The &lt;code&gt;!&lt;/code&gt;
+lets you invoke an external command.
+I don't do this often,
+but occasionally I want some simple reference
+like the current date
+(&lt;code&gt;!date&lt;/code&gt;)
+or to do some simple math
+(&lt;code&gt;!bc&lt;/code&gt;).
+&lt;/p&gt;
+    &lt;head rend="h2"&gt;Default options with &lt;code&gt;$LESS&lt;/code&gt;
+&lt;/head&gt;
+    &lt;p&gt; You might find yourself regularly setting a common group of options so you can put those in your environment (usually in your shell startup file like &lt;code&gt;~/.bashrc&lt;/code&gt;)
+like
+&lt;code&gt;LESS="-RNe"&lt;/code&gt;
+if you want to
+show ANSI colors,
+show line-numbers,
+and exit automatically when you reach the end of the file.
+&lt;/p&gt;
+    &lt;head rend="h2"&gt;Other misc&lt;/head&gt;
+    &lt;p&gt;&lt;code&gt;less&lt;/code&gt;
+has a few other corners that I've never really used,
+but figured I'd document here:
+&lt;/p&gt;
+    &lt;head rend="h3"&gt;Tags&lt;/head&gt;
+    &lt;p&gt; While I've used tags in &lt;code&gt;vi&lt;/code&gt;/&lt;code&gt;vim&lt;/code&gt;
+to easily jump between definitions.
+However, even though
+&lt;code&gt;less&lt;/code&gt;
+provides support for tags generated by
+&lt;code&gt;ctags&lt;/code&gt;.
+I've never found cause to use them.
+&lt;/p&gt;
+    &lt;head rend="h3"&gt;Editing the current document&lt;/head&gt;
+    &lt;p&gt; The &lt;code&gt;v&lt;/code&gt;
+command will open your
+&lt;code&gt;$VISUAL&lt;/code&gt;
+editor on the current document.
+&lt;/p&gt;
+    &lt;head rend="h3"&gt;"Log" output&lt;/head&gt;
+    &lt;p&gt;&lt;code&gt;less&lt;/code&gt;
+lets you redirect the output
+it has gathered from
+stdin
+to a file using the
+&lt;code&gt;o&lt;/code&gt;
+command
+(or the
+&lt;code&gt;O&lt;/code&gt;
+command to overwrite an existing file).
+This might come in handy because
+&lt;code&gt;less&lt;/code&gt;
+won't let you
+edit stdin
+in an external editor
+but you can write it directly to a file.
+&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://blog.thechases.com/posts/assorted-less-tips/"/><published>2026-01-02T12:29:23+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46464133</id><title>Show HN: Dealta – A game-theoretic decentralized trading protocol</title><updated>2026-01-02T14:42:49.997689+00:00</updated><content>&lt;doc fingerprint="eb7ad05e09566404"&gt;
   &lt;main&gt;
     &lt;p&gt;We read every piece of feedback, and take your input very seriously.&lt;/p&gt;
     &lt;p&gt;To see all available qualifiers, see our documentation.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/orgs/Dealta-Foundation/repositories"/><published>2026-01-02T12:31:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46464235</id><title>FracturedJson</title><updated>2026-01-02T14:11:42.898844+00:00</updated><content>&lt;doc fingerprint="767075204fb04a98"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/orgs/Dealta-Foundation/repositories"/><published>2026-01-02T12:31:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46464235</id><title>FracturedJson</title><updated>2026-01-02T14:42:49.454688+00:00</updated><content>&lt;doc fingerprint="767075204fb04a98"&gt;
   &lt;main&gt;
     &lt;list rend="ul"&gt;
       &lt;item&gt; Notifications &lt;tool-tip&gt;You must be signed in to change notification settings&lt;/tool-tip&gt;&lt;/item&gt;
@@ -3164,7 +3241,7 @@ would be an issue for Beancount, but just for the sake of readability.&lt;/p&gt;
     &lt;p&gt;If you have any questions, comments, requests, advice, or whatever, feel free to check out the discussions area.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/j-brooke/FracturedJson/wiki"/><published>2026-01-02T12:46:31+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46464426</id><title>39th Chaos Communication Congress Videos</title><updated>2026-01-02T14:11:41.310726+00:00</updated><content>&lt;doc fingerprint="8c511ca995f789c6"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/j-brooke/FracturedJson/wiki"/><published>2026-01-02T12:46:31+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46464426</id><title>39th Chaos Communication Congress Videos</title><updated>2026-01-02T14:42:47.602695+00:00</updated><content>&lt;doc fingerprint="8c511ca995f789c6"&gt;
   &lt;main&gt;
     &lt;div&gt;
       &lt;div&gt;
@@ -3410,10 +3487,67 @@ would be an issue for Beancount, but just for the sake of readability.&lt;/p&gt;
     &lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://media.ccc.de/b/congress/2025"/><published>2026-01-02T13:17:06+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46464529</id><title>OfferGridAI – side-by-side comparison of real estate offers from PDFs</title><updated>2026-01-02T14:11:40.692733+00:00</updated><content>&lt;doc fingerprint="18e768b1a2595ce1"&gt;
+&lt;/doc&gt;</content><link href="https://media.ccc.de/b/congress/2025"/><published>2026-01-02T13:17:06+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46464529</id><title>Show HN: OfferGridAI – side-by-side comparison of real estate offers from PDFs</title><updated>2026-01-02T14:42:47.298462+00:00</updated><content>&lt;doc fingerprint="18e768b1a2595ce1"&gt;
   &lt;main&gt;&lt;p&gt;Upload your purchase offers and let AI extract price, financing, contingencies, and closing timelines. Get a side-by-side comparison grid with risk scores, ready to share with your seller.&lt;/p&gt;&lt;p&gt;✓ First property analysis free ✓ No credit card required ✓ Results in under 2 minutes&lt;/p&gt;&lt;table&gt;&lt;row span="4"&gt;&lt;cell role="head"&gt;Term&lt;/cell&gt;&lt;cell role="head"&gt;Offer A (Johnson)&lt;/cell&gt;&lt;cell role="head"&gt;Offer B (Smith)&lt;/cell&gt;&lt;cell role="head"&gt;Offer C (Garcia)&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Purchase Price&lt;/cell&gt;&lt;cell&gt;$875,000&lt;/cell&gt;&lt;cell&gt;$850,000&lt;/cell&gt;&lt;cell&gt;$862,500&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Down Payment&lt;/cell&gt;&lt;cell&gt;25% ($218,750)&lt;/cell&gt;&lt;cell&gt;20% ($170,000)&lt;/cell&gt;&lt;cell&gt;10% ($86,250)&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Financing&lt;/cell&gt;&lt;cell&gt;Conventional&lt;/cell&gt;&lt;cell&gt;Conventional&lt;/cell&gt;&lt;cell&gt;FHA&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Earnest Money&lt;/cell&gt;&lt;cell&gt;$25,000 (2.9%)&lt;/cell&gt;&lt;cell&gt;$17,000 (2.0%)&lt;/cell&gt;&lt;cell&gt;$8,625 (1.0%)&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Contingencies&lt;/cell&gt;&lt;cell&gt;Inspection only&lt;/cell&gt;&lt;cell&gt;Inspection + Appraisal&lt;/cell&gt;&lt;cell&gt;Full contingencies&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Closing Date&lt;/cell&gt;&lt;cell&gt;21 days&lt;/cell&gt;&lt;cell&gt;30 days&lt;/cell&gt;&lt;cell&gt;45 days&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Net to Seller&lt;/cell&gt;&lt;cell&gt;$871,250&lt;/cell&gt;&lt;cell&gt;$841,500&lt;/cell&gt;&lt;cell&gt;$845,125&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Risk Score&lt;/cell&gt;&lt;cell&gt;Low Risk&lt;/cell&gt;&lt;cell&gt;Medium Risk&lt;/cell&gt;&lt;cell&gt;Higher Risk&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;When multiple offers come in, you're racing the clock. Manual comparison is tedious, error-prone, and takes time you don't have.&lt;/p&gt;&lt;p&gt;Average time to manually compare 5+ offers&lt;/p&gt;&lt;p&gt;Pages per offer to review and extract terms&lt;/p&gt;&lt;p&gt;Typical deadline to present to sellers&lt;/p&gt;&lt;p&gt;Upload all your offer PDFs at once. Our AI extracts every term, calculates risk scores, and generates a professional comparison grid in under 2 minutes.&lt;/p&gt;&lt;p&gt;No manual data entry. No spreadsheet formulas. Just upload and go.&lt;/p&gt;&lt;p&gt;Drag and drop up to 10 purchase offer documents at once. We support PDF, DOC, DOCX, and TXT files.&lt;/p&gt;&lt;p&gt;Our AI reads every page and extracts price, financing, contingencies, closing dates, earnest money, and more.&lt;/p&gt;&lt;p&gt;Get a clean comparison grid with risk scores. Export to PDF and share with your seller.&lt;/p&gt;&lt;p&gt;Our AI is trained to find and extract the terms that matter most to your sellers&lt;/p&gt;&lt;p&gt;Total offer amount plus any price escalation clauses or caps.&lt;/p&gt;&lt;p&gt;Cash, conventional, FHA, VA, or other loan types with pre-approval status.&lt;/p&gt;&lt;p&gt;Amount and percentage, plus earnest money deposit details.&lt;/p&gt;&lt;p&gt;Inspection, appraisal, financing, and sale contingencies with timeframes.&lt;/p&gt;&lt;p&gt;Proposed closing date, possession date, and any flexibility notes.&lt;/p&gt;&lt;p&gt;Seller concessions, home warranty requests, included items, and personal property.&lt;/p&gt;&lt;p&gt;Each offer gets a risk score based on financing type, contingencies, timeline, and buyer qualification. Quickly identify the strongest offers at a glance.&lt;/p&gt;&lt;p&gt;Agents are closing deals faster with OfferGridAI&lt;/p&gt;&lt;p&gt;"Had 8 offers on a hot listing. OfferGridAI extracted everything in 90 seconds. My seller loved the clean comparison sheet."&lt;/p&gt;&lt;p&gt;"The risk scores are brilliant. Helped my seller see why a slightly lower cash offer was actually stronger than a higher financed offer."&lt;/p&gt;&lt;p&gt;"I just send my sellers the PDF export. Clean, professional, and easy to review. No more messy spreadsheets or back-and-forth emails."&lt;/p&gt;&lt;p&gt;Pay per property or go unlimited with a monthly subscription&lt;/p&gt;&lt;p&gt;Compare up to 10 offers per property&lt;/p&gt;&lt;p&gt;Unlimited properties &amp;amp; comparisons&lt;/p&gt;&lt;p&gt;🎁 First property analysis is free. No credit card required&lt;/p&gt;&lt;p&gt;We support PDF, DOC, DOCX, and TXT files. Most purchase agreement contracts are PDFs, which work perfectly. Our AI can handle scanned documents with OCR as well.&lt;/p&gt;&lt;p&gt;Our AI is highly accurate with standard purchase agreements. We recommend a quick review of extracted data before sharing with sellers. If any data is incorrect, you can re-upload the document or manually edit values.&lt;/p&gt;&lt;p&gt;Yes. We use industry-standard encryption for all data in transit and at rest. Your offer documents are processed securely and we never share your data with third parties. You can delete your data at any time.&lt;/p&gt;&lt;p&gt;Absolutely! Export your comparison to a clean, professional PDF and share it with your seller via email or any method you prefer.&lt;/p&gt;&lt;p&gt;No problem! You can add additional offers to any existing property at any time. Just upload the new documents and they'll be added to your comparison grid automatically.&lt;/p&gt;&lt;p&gt;Our proprietary AI model analyzes dozens of data points from each offer to assess the likelihood of a successful close. The score considers financing strength, contingency risk, timeline factors, and buyer qualification indicators. Higher scores indicate stronger offers with fewer deal-breaking risks.&lt;/p&gt;&lt;p&gt;Stop building spreadsheets by hand. Let AI do the heavy lifting so you can focus on what matters... advising your sellers and winning listings.&lt;/p&gt;Compare Your First Property Free&lt;p&gt;No credit card required • First property free • Setup in 60 seconds&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://offergridai.com"/><published>2026-01-02T13:29:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46464670</id><title>Windows 11 surges among PC gamers on Steam as Linux stalls</title><updated>2026-01-02T14:11:40.477789+00:00</updated><content>&lt;doc fingerprint="1c902dbf890634c6"&gt;
+&lt;/doc&gt;</content><link href="https://offergridai.com"/><published>2026-01-02T13:29:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46464652</id><title>TIL: Parental Controls Aren't for Parents</title><updated>2026-01-02T14:42:47.234685+00:00</updated><content>&lt;doc fingerprint="2d2910b749eaf77e"&gt;
+  &lt;main&gt;
+    &lt;p&gt;A few days ago, I found that a grown man had been texting my twelve-year-old son on his "kid-safe" Gabb phone. The man got my son's number through a children's book chat on an app called GroupMe. Thankfully my wife and I discovered the situation and intervened before anything bad happened; but still it was sickening to discover that on Christmas morning, while our family was unwrapping presents next to the tree, some creep had been texting my son: "What did you get? Send pictures."&lt;/p&gt;
+    &lt;p&gt;How could we have let this happen? How could we be such careless parents?&lt;/p&gt;
+    &lt;p&gt;But wait . . . hadn't we done what we were supposed to do? We bought the "kid-safe" phone. And we confirmed GroupMe was on the Gabb "approved apps" list, which, as I understand it, offers "no social media or high-risk options." We did the safe things, right?&lt;/p&gt;
+    &lt;p&gt;Maybe not. Turns out Gabb's own blog appears to include GroupMe on a list of seven apps with dangerous chat features, describing it as an app that "opens the door to potential dangers." We were apparently supposed to find that warning ourselves, somewhere among Gabb's 572 blog posts:&lt;/p&gt;
+    &lt;code&gt;$ curl -s \
+  https://gabb.com/post-sitemap.xml \
+  | grep -oE 'https://gabb\.com/blog/[^&amp;lt;]+' \
+  | sort -u \
+  | wc -l \
+  | xargs -I{} echo "{} blog posts as of $(date '+%B %d, %Y')"
+
+572 blog posts as of January 02, 2026&lt;/code&gt;
+    &lt;p&gt;But if GroupMe "opens the door" to danger, why did Gabb put it on their "approved apps" list? When I revisited the site, I noticed a small message beneath GroupMe mentioning Communication with Strangers. I hovered over it with my mouse pointer, and a tooltip appeared: "Allows contact and communication with people the child may not know."&lt;/p&gt;
+    &lt;p&gt;So it allows communication with strangers, but it's not "high-risk?" The approved list isn't looking so safe. The approved list is apparently a catalog of risks I'm supposed to decipher by filtering through 838 apps and hovering my mouse pointer around to see tooltips:&lt;/p&gt;
+    &lt;code&gt;$ for cat in \
+  existing_apps \
+  unapproved_apps \
+  unmet_criteria_apps \
+  music_apps; do
+  count=$(curl -s "https://gabb.com/app-guide/" \
+    | grep -o "${cat} = \[.*\]" \
+    | head -1 \
+    | sed "s/${cat} = \[//" \
+    | sed "s/\]//" \
+    | tr ',' '\n' \
+    | sed "s/'//g" \
+    | sed 's/^ *//' \
+    | sort -u \
+    | wc -l \
+    | tr -d ' ')
+  echo "$count $cat"
+done &amp;amp;&amp;amp; echo "...as of $(date '+%B %d, %Y')"
+
+586 existing_apps
+60 unapproved_apps
+170 unmet_criteria_apps
+22 music_apps
+...as of January 02, 2026&lt;/code&gt;
+    &lt;p&gt;Whatever the reason for this complexity, I don't feel in control.&lt;/p&gt;
+    &lt;p&gt;And Gabb isn't alone in making me feel like this. It seems like many companies selling tech to families operate in the same way: market safety, deliver complexity, and leave parents to figure it out.&lt;/p&gt;
+    &lt;p&gt;Take the Nintendo Switch my son unwrapped between those creepy texts. To set it up, I had to:&lt;/p&gt;
+    &lt;p&gt;Only to discover that there's no clear option to block internet access, no clear way to disable downloads from the Nintendo eShop, and no easy way to make this thing function like an old-school Game Boy and just let a kid have fun with a game cartridge. But that's just nostalgia talking. Nobody wants that anymore. Apparently.&lt;/p&gt;
+    &lt;p&gt;Because next comes Minecraft. Ah, Minecraft. The game every middle-schooler on earth apparently needs to survive. To let my son play with his friends:&lt;/p&gt;
+    &lt;p&gt;Now, I did my best to configure these settings. I really did. But xbox.com alone includes twenty-nine confusingly overlapping settings related to chat, friends, and communication. Twenty-nine.&lt;/p&gt;
+    &lt;p&gt;And when I finally—finally—tried to test online play, Minecraft told me I would need to loosen the parental controls (it did not say which) and create a Nintendo Switch Online account for my son.&lt;/p&gt;
+    &lt;p&gt;Nintendo Switch Online (not really another account, mind you, but a membership) involves a recurring fee. It also unlocks access to the Nintendo eShop, which I cannot disable. I can set his eShop spending limit to zero, sure. But I can't block free downloads. So to let my son play online Minecraft with his friends, I have to open him up to an unrelated store full of content I can't possibly evaluate. That's the deal. Take it or leave it.&lt;/p&gt;
+    &lt;p&gt;I assume some marketing person at Nintendo, probably sitting in a conference room in Kyoto, surrounded by whiteboards covered in arrows and cartoon stick figures, has this entire process mapped out as a "customer journey." And by Step 17, the journey is supposed to be over. You're supposed to be so beaten down, so utterly depleted of will, that you just cave. You sign up for Nintendo Online. You disable a bunch of parental controls you don't really understand. You let your kid play his damn game. You become the ideal customer.&lt;/p&gt;
+    &lt;p&gt;But I didn't cave. Instead, somewhere on the threshold of Customer Journey Step 18, I found myself gripping the Switch with both hands and imagining, quite vividly, what it would feel like to lift the Switch up, and bring it down over my knee. I could almost hear the crack. Could almost see that OLED display splintering into a thousand pieces. The little Joy-Cons skittering across the floor. My son's face. My wife's face. The stunned silence.&lt;/p&gt;
+    &lt;p&gt;I did not break the Switch.&lt;/p&gt;
+    &lt;p&gt;What I did was announce, in a voice louder than necessary, that nobody was to ask me about anything Minecraft-related on the Nintendo Switch for a minimum of two weeks. My son could play Zelda: Breath of the Wild instead, which, thank you, developers, thank you from the bottom of my heart, doesn't appear to involve any mandatory online anything whatsoever.&lt;/p&gt;
+    &lt;p&gt;Here's what I want: an off switch. A single setting that says "this child cannot go online, communicate with strangers, spend money, or download anything without my explicit permission." Instead I get a maze, complex enough that when something goes wrong, I'm at fault for a tooltip I didn't hover over, a blog post I didn't read, a submenu I didn't find. Maybe that's by design. Maybe it's neglect. I don't know.&lt;/p&gt;
+    &lt;p&gt;What I know is this. My son just wants to play video games and talk to his friends. I just want to keep him safe. Somewhere between those two things, I'm supposed to become an expert in the convoluted parental control schemes of Gabb, Nintendo, Microsoft, and Xbox, while a stranger's Christmas morning texts sit in my son's phone history.&lt;/p&gt;
+    &lt;p&gt;Parental controls shouldn't be this hard.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://beasthacker.com/til/parental-controls-arent-for-parents.html"/><published>2026-01-02T13:42:37+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46464670</id><title>Windows 11 surges among PC gamers on Steam as Linux stalls</title><updated>2026-01-02T14:42:47.056054+00:00</updated><content>&lt;doc fingerprint="1c902dbf890634c6"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Windows 11 surges among PC gamers on Steam as Linux stalls — the open-source OS mildly loses momentum after a brief uptick&lt;/head&gt;
     &lt;p&gt;Windows 11 posts some of its biggest Steam gains yet in December, as Linux cools slightly following an increase seen just one month earlier.&lt;/p&gt;
