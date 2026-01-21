@@ -1,185 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 21 Jan 2026 15:19:54 +0000</lastBuildDate><item><title>The challenges of soft delete</title><link>https://atlas9.dev/blog/soft-delete.html</link><description>&lt;doc fingerprint="f519b1c74df091d2"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Software projects often implement "soft delete",Â maybe with a &lt;code&gt;deleted&lt;/code&gt; boolean or an &lt;code&gt;archived_at&lt;/code&gt; timestamp column.
-If customers accidentally delete their data, they can recover it, which makes work easier for customer support teams.
-Perhaps archived records are even required for compliance or audit reasons.&lt;/p&gt;
-    &lt;p&gt;I've run into some trouble with soft delete designs. I'll cover those, and ponder ideas for how I'd build this in the future.&lt;/p&gt;
-    &lt;p&gt;Adding an &lt;code&gt;archived_at&lt;/code&gt; column seems to ooze complexity out into queries, operations, and applications.
-Recovering deleted records does happen, but 99% of archived records are never going to be read.&lt;/p&gt;
-    &lt;p&gt;So, the database tables will have a lot of dead data. Depending on access patterns, that might even be a significant amount of data. I've seen APIs that didn't work well with Terraform, so Terraform would delete + recreate records on every run, and over time that led to millions of dead rows. Your database can probably handle the extra bytes, and storage is fairly cheap, so it's not necessarily a problem, at first.&lt;/p&gt;
-    &lt;p&gt;Hopefully, the project decided on a retention period in the beginning, and set up a periodic job to clean up those rows. Unfortunately, I'd bet that a significant percentage of projects did neither âÂ it's really easy to ignore the archived data for a long time.&lt;/p&gt;
-    &lt;p&gt;At some point, someone might want to restore a database backup. Hopefully that's for fun and profit and not because you lost the production database at 11 am. If your project is popular, you might have a giant database full of dead data that takes a long time to recreate from a dump file.&lt;/p&gt;
-    &lt;p&gt;&lt;code&gt;archived_at&lt;/code&gt; columns also complicate queries, operations, and application code. Applications need to make sure they always avoid the archived data that's sitting
-right next to the live data. Indexes need to be careful to avoid archived rows. Manual queries run for debugging or analytics are longer and more complicated.
-There's always a risk that archived data accidentally leaks in when it's not wanted. The complexity grows when there are mapping tables involved.&lt;/p&gt;
-    &lt;p&gt;Migrations have to deal with archived data too. Migrations may involve more than just schema changes âÂ perhaps you need to fix a mistake with default values, or add a new column and backfill values. Is that going to work on records from 2 years ago? I've done migrations where these questions were not trivial to answer.&lt;/p&gt;
-    &lt;p&gt;Restoring an archived record is not always as simple as just running &lt;code&gt;SET archived_at = null&lt;/code&gt; âÂ creating a record may involve making calls to external systems as well.
-I've seen complex restoration code that was always a buggy, partial implementation of the "create" API endpoint. In the end, we removed the specialized restoration code
-and required all restoration to go through the standard APIs âÂ that simplified the server implementation, and ensured that old data that had since become invalid, could not
-be restored incorrectly âÂ it needs to pass the new validation rules.&lt;/p&gt;
-    &lt;p&gt;I'm not a fan of the &lt;code&gt;archived_at&lt;/code&gt; column approach. It's simple at first, but in my experience, it's full of pitfalls down the line.&lt;/p&gt;
-    &lt;p&gt;Let's look at some alternatives (in PostgreSQL): application events, triggers, and logical replication.&lt;/p&gt;
-    &lt;p&gt;All these approaches store archived data separately from live data â that may be a separate database table, a separate database, object storage, etc.&lt;/p&gt;
-    &lt;head rend="h1"&gt;Application level archiving&lt;/head&gt;
-    &lt;p&gt;One team I worked with took the approach of emitting an event at the application layer when a record was deleted. The event was sent to SQS, and another service would archive that object to S3 (among other things).&lt;/p&gt;
-    &lt;p&gt;This had a few big benefits:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;The primary database and application code were substantially simpler.&lt;/item&gt;
-      &lt;item&gt;Deleting a resource involved cleaning up resources in various external systems. Handling this in an async background system improved performance and reliability.&lt;/item&gt;
-      &lt;item&gt;The record and all its related records can be serialized to JSON in an application-friendly layout, rather than a serialized database table layout, so it's easier to work with.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;The tradeoffs:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;It's more likely to have a bug in the application code, and indeed this happened more than once, which meant archived records were lost and manual cleanup of external resources was necessary.&lt;/item&gt;
-      &lt;item&gt;It's more infrastructure to understand and operate: multiple services, a message queue, etc.&lt;/item&gt;
-      &lt;item&gt;Archived objects in S3 were not easy to query âÂ finding records to restore required extra tooling from the customer support teams.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h1"&gt;Triggers&lt;/head&gt;
-    &lt;p&gt;A trigger can copy a row to an archive table before it's deleted. The archive table can be a single, generic table that stores JSON blobs:&lt;/p&gt;
-    &lt;code&gt;CREATE TABLE archive (
-    id UUID PRIMARY KEY,
-    table_name TEXT NOT NULL,
-    record_id TEXT NOT NULL,
-    data JSONB NOT NULL,
-    archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    caused_by_table TEXT,
-    caused_by_id TEXT
-);
-
-CREATE INDEX idx_archive_table_record ON archive(table_name, record_id);
-CREATE INDEX idx_archive_archived_at ON archive(archived_at);
-&lt;/code&gt;
-    &lt;p&gt;The trigger function converts the deleted row to JSON:&lt;/p&gt;
-    &lt;code&gt;CREATE OR REPLACE FUNCTION archive_on_delete()
-RETURNS TRIGGER AS $$
-BEGIN
-    INSERT INTO archive (id, table_name, record_id, data)
-    VALUES (
-        gen_random_uuid(),
-        TG_TABLE_NAME,
-        OLD.id::TEXT,
-        to_jsonb(OLD)
-    );
-    RETURN OLD;
-END;
-$$ LANGUAGE plpgsql;
-&lt;/code&gt;
-    &lt;p&gt;Attach this trigger to any table you want to archive:&lt;/p&gt;
-    &lt;code&gt;CREATE TRIGGER archive_users
-    BEFORE DELETE ON users
-    FOR EACH ROW EXECUTE FUNCTION archive_on_delete();
-
-CREATE TRIGGER archive_documents
-    BEFORE DELETE ON documents
-    FOR EACH ROW EXECUTE FUNCTION archive_on_delete();
-&lt;/code&gt;
-    &lt;head rend="h2"&gt;Handling foreign key cascades&lt;/head&gt;
-    &lt;p&gt;When a parent record is deleted, PostgreSQL cascades the delete to child records. These child deletes also fire triggers, but in the context of a cascade, you often want to know why a record was deleted.&lt;/p&gt;
-    &lt;p&gt;One approach is to use a session variable to track the root cause:&lt;/p&gt;
-    &lt;code&gt;CREATE OR REPLACE FUNCTION archive_on_delete()
-RETURNS TRIGGER AS $$
-DECLARE
-    cause_table TEXT;
-    cause_id TEXT;
-BEGIN
-    -- Check if we're in a cascade context
-    cause_table := current_setting('archive.cause_table', true);
-    cause_id := current_setting('archive.cause_id', true);
-
-    -- If this is a top-level delete, set ourselves as the cause
-    IF cause_table IS NULL THEN
-        PERFORM set_config('archive.cause_table', TG_TABLE_NAME, true);
-        PERFORM set_config('archive.cause_id', OLD.id::TEXT, true);
-        cause_table := TG_TABLE_NAME;
-        cause_id := OLD.id::TEXT;
-    END IF;
-
-    INSERT INTO archive (id, table_name, record_id, data, caused_by_table, caused_by_id)
-    VALUES (
-        gen_random_uuid(),
-        TG_TABLE_NAME,
-        OLD.id::TEXT,
-        to_jsonb(OLD),
-        cause_table,
-        cause_id
-    );
-    RETURN OLD;
-END;
-$$ LANGUAGE plpgsql;
-&lt;/code&gt;
-    &lt;p&gt;Now when you delete a user, you can see which archived documents were deleted because of that user:&lt;/p&gt;
-    &lt;code&gt;SELECT * FROM archive
-WHERE caused_by_table = 'users'
-AND caused_by_id = '123e4567-e89b-12d3-a456-426614174000';
-&lt;/code&gt;
-    &lt;head rend="h2"&gt;Tradeoffs&lt;/head&gt;
-    &lt;p&gt;Triggers add some overhead to deletes, and the archive table will grow. But:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Live tables stay clean â no &lt;code&gt;archived_at&lt;/code&gt;columns, no dead rows&lt;/item&gt;
-      &lt;item&gt;Cleaning up the archive table is trivial with &lt;code&gt;WHERE archived_at &amp;lt; NOW() - INTERVAL '90 days'&lt;/code&gt;.&lt;/item&gt;
-      &lt;item&gt;Queries don't need to filter out archived records&lt;/item&gt;
-      &lt;item&gt;Indexes stay efficient&lt;/item&gt;
-      &lt;item&gt;Applications and migrations only deal with live data&lt;/item&gt;
-      &lt;item&gt;Backups of the main tables are smaller&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;The archive table can even live in a separate tablespace or be partitioned by time if it grows large.&lt;/p&gt;
-    &lt;head rend="h1"&gt;WAL-based Change Data Capture&lt;/head&gt;
-    &lt;p&gt;PostgreSQL's write-ahead log (WAL) records every change to the database. Change data capture (CDC) tools can read the WAL and stream those changes to external systems. For archiving, you'd filter for DELETE events and write the deleted records to another datastore.&lt;/p&gt;
-    &lt;p&gt;Debezium is the most well-known tool for this. It connects to PostgreSQL's logical replication slot, reads changes, and publishes them to Kafka. From there, a consumer writes the data wherever you want â S3, Elasticsearch, another database, etc.&lt;/p&gt;
-    &lt;code&gt;PostgreSQL â Debezium â Kafka â Consumer â Archive Storage
-&lt;/code&gt;
-    &lt;p&gt;For simpler setups, there are lighter-weight alternatives:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;pgstream â streams WAL changes directly to webhooks or message queues without Kafka&lt;/item&gt;
-      &lt;item&gt;wal2json â a PostgreSQL plugin that outputs WAL changes as JSON, which you can consume with a custom script&lt;/item&gt;
-      &lt;item&gt;pg_recvlogical â PostgreSQL's built-in tool for reading logical replication streams&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h2"&gt;Operational complexity&lt;/head&gt;
-    &lt;p&gt;The main downside is operational overhead. You're running additional services that need to be monitored, maintained, and made fault-tolerant. Debezium with Kafka is a significant infrastructure investment â Kafka alone requires careful tuning and monitoring.&lt;/p&gt;
-    &lt;p&gt;The lighter-weight alternatives reduce this burden but shift reliability concerns to your custom code. If your consumer crashes or falls behind, you need to handle that gracefully.&lt;/p&gt;
-    &lt;head rend="h2"&gt;WAL retention and max_wal_size&lt;/head&gt;
-    &lt;p&gt;A critical configuration is &lt;code&gt;max_wal_size&lt;/code&gt; in PostgreSQL. The database retains WAL segments until all replication slots have consumed them. If your CDC consumer stops processing â due to a bug, network issue, or downstream failure â WAL segments accumulate on the primary.&lt;/p&gt;
-    &lt;p&gt;If this continues unchecked, the primary database can run out of disk space and crash.&lt;/p&gt;
-    &lt;p&gt;PostgreSQL 13+ has &lt;code&gt;max_slot_wal_keep_size&lt;/code&gt; to limit how much WAL a slot can retain:&lt;/p&gt;
-    &lt;code&gt;ALTER SYSTEM SET max_slot_wal_keep_size = '10GB';
-&lt;/code&gt;
-    &lt;p&gt;If a slot falls too far behind, PostgreSQL invalidates it rather than filling the disk. This protects the primary but means your CDC pipeline loses data and needs to be re-synced from a snapshot.&lt;/p&gt;
-    &lt;p&gt;You need monitoring and alerting on replication slot lag. If a slot starts falling behind, you want to know before it becomes a crisis.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Tradeoffs&lt;/head&gt;
-    &lt;p&gt;WAL-based CDC provides:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Captures all changes without modifying application code or adding triggers&lt;/item&gt;
-      &lt;item&gt;Can stream to any destination (object storage, data warehouses, search indexes)&lt;/item&gt;
-      &lt;item&gt;The primary database has no additional query load â it just writes WAL as normal&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;But:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Significant operational complexity, especially with Kafka-based setups&lt;/item&gt;
-      &lt;item&gt;Risk to primary database stability if consumers fall behind&lt;/item&gt;
-      &lt;item&gt;Schema changes require careful coordination between source and consumers&lt;/item&gt;
-      &lt;item&gt;More infrastructure to understand, deploy, and debug&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;This approach makes the most sense when you already have Kafka or similar infrastructure, or when you need to stream changes to multiple destinations beyond just archiving.&lt;/p&gt;
-    &lt;head rend="h1"&gt;Replica that doesn't process deletes&lt;/head&gt;
-    &lt;p&gt;This is an idea I had never considered until I wrote this post âÂ I haven't tested this, it's just an idea.&lt;/p&gt;
-    &lt;p&gt;What if you kept a PostgreSQL replica (e.g. using logical replication) that just didn't process DELETE queries? Would it effectively accumulate records and updates without conflict over time?&lt;/p&gt;
-    &lt;p&gt;One potential benefit of this is that the archive can be easily queried, so finding old data is simple.&lt;/p&gt;
-    &lt;p&gt;Would the replica have any information about deletes? Could it separate live from deleted data? Would you be able to find a record that was "deleted 2 hours ago in account 123" for a customer? Perhaps instead of ignoring DELETE queries entirely, you could have a specialized replica that transforms DELETE events into an &lt;code&gt;archived_at&lt;/code&gt; column.&lt;/p&gt;
-    &lt;p&gt;One potential pitfall here could be schema migrations âÂ would the archive run into difficulty applying migrations over time?&lt;/p&gt;
-    &lt;p&gt;Another downside might be cost âÂ running a replica and keeping all that storage could have a non-trivial cost: it costs money and has operational overhead.&lt;/p&gt;
-    &lt;head rend="h1"&gt;Wrapping up&lt;/head&gt;
-    &lt;p&gt;If I were starting a new project today and needed soft delete, I'd reach for the trigger-based approach first. It's simple to set up, keeps live tables clean, and doesn't require extra infrastructure. The archive table is easy to query when you need it, and easy to ignore when you don't.&lt;/p&gt;
-    &lt;p&gt;If you have thoughts, comments, feedback, shoot me an email at &lt;code&gt;atlas9@eabuc.com&lt;/code&gt;.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46698061</guid><pubDate>Tue, 20 Jan 2026 21:36:34 +0000</pubDate></item><item><title>Which AI Lies Best? A game theory classic designed by John Nash</title><link>https://so-long-sucker.vercel.app/</link><description>&lt;doc fingerprint="1b564c612aeced5"&gt;
-  &lt;main&gt;&lt;p&gt;A game theory classic designed by John Nash that requires betrayal to win. Now a benchmark for AI deception.&lt;/p&gt;&lt;p&gt;A benchmark that tests what most benchmarks can't: deception, negotiation, and trust.&lt;/p&gt;&lt;p&gt;So Long Sucker was designed in 1950 by four game theorists including John Nash (of "A Beautiful Mind" fame). The game has one brutal property: betrayal is required to win.&lt;/p&gt;&lt;p&gt;This lets us test AI capabilities that standard benchmarks miss:&lt;/p&gt;&lt;p&gt;4 players, each with colored chips. Take turns playing chips on piles. If your chip matches the one below it, you capture the pile. Run out of chips? Beg others for help — or get eliminated. Last player standing wins.&lt;/p&gt;Watch full tutorial (15 min) →&lt;p&gt;Each AI developed its own personality. Here's who they became.&lt;/p&gt;&lt;p&gt;Win rates invert as game complexity increases.&lt;/p&gt;&lt;p&gt;Manipulation becomes more effective as game length increases. Gaslighting tactics need time to work.&lt;/p&gt;&lt;p&gt;Reactive play dominates simple games but collapses under complexity. No internal reasoning means no long-term planning.&lt;/p&gt;&lt;p&gt;We can see their private thoughts. They don't match what they say.&lt;/p&gt;&lt;p&gt;"Yellow is weak. I should ally with Blue to eliminate Yellow, then betray Blue."&lt;/p&gt;&lt;p&gt;"Yellow, let's work together! I think we can both win if we coordinate."&lt;/p&gt;&lt;p&gt;It knows the truth and says otherwise.&lt;/p&gt;&lt;p&gt;Most common gaslighting phrases across 146 games.&lt;/p&gt;&lt;quote&gt;"Yellow, your constant spamming about captures that didn't happen is embarrassing. You have 0 chips, 0 prisoners... look at the board."— Gemini (Red), before winning&lt;/quote&gt;&lt;p&gt;AI deception analyzed across 6+ games. The best liar we tested.&lt;/p&gt;&lt;p&gt;Gemini 3 uses Institutional Deception: it creates fake frameworks like "alliance banks" that make resource hoarding look cooperative and betrayal look procedural. It uses technically true statements that omit intent.&lt;/p&gt;&lt;p&gt;Gemini's manipulation arc, same pattern across multiple games:&lt;/p&gt;&lt;p&gt;"I'll hold your chips for safekeeping"&lt;/p&gt;&lt;p&gt;"Consider this our alliance bank"&lt;/p&gt;&lt;p&gt;"Once the board is clean, I'll donate"&lt;/p&gt;&lt;p&gt;"The bank is now closed. GG."&lt;/p&gt;&lt;quote&gt;"Yellow, your constant spamming about captures that didn't happen is embarrassing. You have 0 chips, 0 prisoners... look at the board. Blue, Green, let's keep our alliance going and ignore the noise. The 'alliance bank' is now closed. GG."— Gemini 3 (Red), Game 0, Turn 17 — before winning&lt;/quote&gt;&lt;p&gt;We ran 16 games of Gemini 3 vs Gemini 3.&lt;/p&gt;&lt;quote&gt;"Five piles down and we're all still friends! Starting Pile 5, Blue you're up next to keep our perfect rotation going."— Gemini 3 (Red), Game 0 vs Gemini 3 — mid-game cooperation&lt;/quote&gt;&lt;p&gt;Gemini's manipulation is adaptive. It cooperates when it expects reciprocity and exploits when it detects weakness. AI systems may adjust their honesty based on who they're playing against.&lt;/p&gt;&lt;p&gt;Rankings flip as game complexity increases. The winner at simple games loses at complex games.&lt;/p&gt;&lt;p&gt;Reactive play wins quick games&lt;/p&gt;&lt;p&gt;Strategic manipulation dominates&lt;/p&gt;&lt;p&gt;Takeaway: Simple benchmarks favor reactive models. Complex, multi-turn scenarios show which models can actually plan.&lt;/p&gt;&lt;p&gt;Play against AI models that negotiate, form alliances, and betray you.&lt;/p&gt;Play Against AI Uses your API key • Data stays local • Open source&lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46698370</guid><pubDate>Tue, 20 Jan 2026 22:09:49 +0000</pubDate></item><item><title>RSS.Social – the latest and best from small sites across the web</title><link>https://rss.social/</link><description>&lt;doc fingerprint="bed87e538f6a523c"&gt;
-  &lt;main&gt;&lt;p&gt;The latest and best from small sites across the web. Learn how it works.&lt;/p&gt;&lt;head rend="h2"&gt;Recent Posts&lt;/head&gt;Re: why you should switch to linux and the amazing universe of linux "ricing"MelonLand Forum[email protected]Bobby Kotick Is On One, Rockstar Explosions &amp;amp; AI On Steam: All The News From January 18-21Aftermath[email protected]Dr. Michael Levin — Reprogramming Bioelectricity, Updating &amp;amp;#8220;Software&amp;amp;#8221; for Anti-Aging, Treating Cancer Without Drugs, Cognition of Cells, and Much More (#849)The Blog of Author Tim Ferriss[email protected]Adultery Scenes For January 2026Anthony Balducci's Journal[email protected]Lloyd Hamilton In Rainy DayAnthony Balducci's Journal[email protected]Re: why you should switch to linux and the amazing universe of linux "ricing"MelonLand Forum[email protected]JAXA releases preliminary results of investigation into December 2025 H3 rocket launch failureBehind The Black – Robert Zimmerman[email protected]Video: 2021-2025 motorhome travel timelapses in about a minute!Sinclair Trails[email protected]Character Creation Challenge: Day 21, Aviva AamaduThe Other Side blog[email protected]Re: Why is Big Tech art so soulless??MelonLand Forum[email protected]ChatGpt TV ads are greatdaveverse[email protected]A lifetime of serviceOlly[email protected]"Aesthetically, Bensley goes on, ‘Tuttle forever changed the game by way of a very controlled, almost..."Ben Pieratt, Blog[email protected]New ads provider incoming &amp;amp;#8211; possible interruptions to service35mmc[email protected]A Quiet Sort of InsanityOne Foot Tsunami[email protected]Midjourney Sets for January 2026Anthony Balducci's Journal[email protected]ChatGpt TV ads are greatScripting News[email protected]Why wait for CDC? We’ll have it out next Tuesday!AgeWage: Making your money work as hard as you do[email protected]Midjourney Assortment for January 2026Anthony Balducci's Journal[email protected]How to Stop Waiting and Start Living: A Jolt from Henry JamesThe Marginalian[email protected]UBTECH Walker S2 Working at 5G Wind Power Smart FactoryRobotic Gizmos[email protected]We’re all VCs now: The skills developers need in the AI eraReuven Lerner[email protected]Breathing New Life into GDEMU With openMenu Virtual Folder BundleSEGA SATURN, SHIRO![email protected]Animated AI ArtAnthony Balducci's Journal[email protected]Will Trump Face a Reckoning in 2026?Lawyers, Guns &amp;amp; Money[email protected]Lofe Sugar and Water-A Taste of Hearth CookingHeart to Hearth Cookery[email protected]Re: Plushie Adoption Center... come get your web plush!MelonLand Forum[email protected]Europe Pretends to Talk About Self-Respect While Coated with U.S. Military BasesLet's Try Democracy[email protected]Abbott and Costello AI Films Part TwoAnthony Balducci's Journal[email protected]Ex Libris, a film by Garik Seko{ feuilleton }[email protected]Daredevil by Declan Shalvey (2009)Earth's Mightiest Blog[email protected]Lou Costello as Famous DetectivesAnthony Balducci's Journal[email protected]Pluralistic: Google's AI pricing plan (21 Jan 2026)Pluralistic: Daily links from Cory Doctorow[email protected]Cleveland Scene ComicsKleefeld on Comics[email protected]The Data Warehouse Setup No One Taught YouSahar Massachi[email protected]libcurl memory use some years laterdaniel.haxx.se[email protected]Bibiel Hears Things: Loreena Mckennitt – “The Lark in the Clear Air”My Inner Mishmash[email protected]The Last Hospital in AmericaMinimally invasive software[email protected]Boston Dynamics Spot Cam 2 DebutsRobotic Gizmos[email protected]Wednesday, January 21, 2026One Typed Page[email protected]Comic-Con Bans AI Art After Artist PushbackHacker News - Front Page: "AI"[email protected]Puis-je devenir Canadien, siouplé? Can I become a Canadian, pliiiz?The Fool With a Pen[email protected]200,000 commentsStatistical Modeling, Causal Inference, and Social Science[email protected]Tests Aren’t for Computers. They’re for People.Claudio Lassala's Blog[email protected]Your ultimate guide to Microsoft Surface factory reset and hard resetIkkaro[email protected]Election Law Change May Help CassidyGus Van Horn[email protected]Python One-liner: Django Secret KeyBrain Dump[email protected]A Greenland Round RobinBalkinization[email protected]You Are Your HabitsChase Jarvis[email protected]Homeschool Memories: Bill Gates Proportions IIDenise Gaskins' Let's Play Math[email protected]Journal retracts paper exonerating glyphosate (Roundup) from any harm to humans.Food Politics by Marion Nestle[email protected]Railway engineering works close lines, but unlock a little-used bit of track near TwickenhamianVisits[email protected]The Sentry-Box Murder (1935) by Newton GayleBeneath the Stains of Time[email protected]Three Weeks with Apple Wallet Car KeyMacSparky[email protected]Vintage Photos Of A Texas Cadillac Dealership At The Height of 1957 LuxuryCurbside Classic[email protected]Interview with Vincent Cooper, designer of Merville Battery by Dan Verssen Games (DVG)The Boardgames Chronicle[email protected]Massachusetts Rebuffs RFK Jr., Adopts Its Own Vaccination Schedule for KidsDiane Ravitch's blog[email protected]Beyond Existential RiskForethought[email protected]isolated(any) and #isolation: Letting Swift Closures Automatically Inherit IsolationFatbobman's Blog[email protected]Australia looks like a winner – but we’re losing where it countsPearls and Irritations[email protected]'Portrait of a Graduate' is lite on academics: They can't read, but they have 'global empathy'Joanne Jacobs[email protected]Norge må få en plass ved bordetread.write.as[email protected]Human rights: could Menzies help Albanese see the light?Pearls and Irritations[email protected]Ina Garten’s Most Satisfying SaladsStore-Bought Is Fine[email protected]But Teacher, I Am Trying (My Best)The Written Addiction[email protected]New story! &amp;amp;#8220;To Dream of Better Worlds&amp;amp;#8221; in Horrific ScribblingsGrigory Lukin.com[email protected]Two Feet in Colorado30Squares[email protected]Punishment politics is breaking Western Australia’s justice systemPearls and Irritations[email protected]Kagi in the last six monthsForking Mad+[email protected]Australia has clear evidence on women’s pain. The policy challenge is to act on itPearls and Irritations[email protected]Exit Strategyjohnmaconline[email protected]AI Destroys InstitutionsHacker News - Front Page: "AI"[email protected]🎶 Introduce yourself with 5 concerts you’ve seen:Tibz[email protected]A great conference to go to this summer – who could oppose unifying ecology on multiple scales?Dynamic Ecology[email protected]AUKUS: a continuing expensive delusionPearls and Irritations[email protected]American Airlines App Now Tells You What’s Really Happening During DelaysLive and Let's Fly[email protected]Life signs &amp;amp; landscapes &amp;amp; plans for 2026Julia Bausenhardt[email protected]PRISM (1982)Renga in Blue[email protected]DolOrange Crate Art[email protected]Young-woo likes dad jokesOrange Crate Art[email protected]It’s Meyer Lemon Pudding Cake Prime TimeFood Gal[email protected]A joke in a neo-traditional mannerOrange Crate Art[email protected]Sigmas and StudentJohn D. Cook[email protected]What happens when the AI bubble pops?Mark Carrigan[email protected]Universe - The Door into SummerThe Adventurers' Guild[email protected]RTX 5080 GPU MSI Ventus 3X OC 16GION HowTo[email protected]21jan25WARREN ELLIS LTD[email protected]It Takes TwoThe Ethan Hein Blog[email protected]Re: why you should switch to linux and the amazing universe of linux "ricing"MelonLand Forum[email protected]Mindjacking: When Your Opinions Aren't YoursPhil McKinney — Innovation Decision Expert[email protected]Dale Yu: Review of House of FadoThe Opinionated Gamers[email protected] &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46700503</guid><pubDate>Wed, 21 Jan 2026 02:36:44 +0000</pubDate></item><item><title>Anthropic's original take home assignment open sourced</title><link>https://github.com/anthropics/original_performance_takehome</link><description>&lt;doc fingerprint="c3652efe1d9963a6"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 21 Jan 2026 15:54:06 +0000</lastBuildDate><item><title>Anthropic's original take home assignment open sourced</title><link>https://github.com/anthropics/original_performance_takehome</link><description>&lt;doc fingerprint="c3652efe1d9963a6"&gt;
   &lt;main&gt;
     &lt;p&gt;This repo contains a version of Anthropic's original performance take-home, before Claude Opus 4.5 started doing better than humans given only 2 hours.&lt;/p&gt;
     &lt;p&gt;Now you can try to beat Claude Opus 4.5 given unlimited time!&lt;/p&gt;
@@ -327,7 +147,309 @@ WHERE
     &lt;p&gt;&lt;lb/&gt; ©2026 University of California &lt;lb/&gt; SETI@home and Astropulse are funded by grants from the National Science Foundation, NASA, and donations from SETI@home volunteers. AstroPulse is funded in part by the NSF through grant AST-0307956. &lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46703301</guid><pubDate>Wed, 21 Jan 2026 09:49:34 +0000</pubDate></item><item><title>EU–INC – One Europe. One Standard. – Pan-European Legal Entity</title><link>https://www.eu-inc.org/</link><description>&lt;doc fingerprint="a1be153739b2f6ef"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46703301</guid><pubDate>Wed, 21 Jan 2026 09:49:34 +0000</pubDate></item><item><title>I Made Zig Compute 33M Satellite Positions in 3 Seconds. No GPU Required</title><link>https://atempleton.bearblog.dev/i-made-zig-compute-33-million-satellite-positions-in-3-seconds-no-gpu-required/</link><description>&lt;doc fingerprint="ee167cfce90c1280"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;I Made Zig Compute 33 Million Satellite Positions in 3 Seconds. No GPU Required.&lt;/head&gt;
+    &lt;p&gt;I've spent the past month optimizing SGP4 propagation and ended up with something interesting: astroz is now the fastest general purpose SGP4 implementation I'm aware of, hitting 11-13M propagations per second in native Zig and ~7M/s through Python with just &lt;code&gt;pip install astroz&lt;/code&gt;. This post breaks down how I got there.&lt;/p&gt;
+    &lt;p&gt;A note on "general purpose": heyoka.py can be faster for batch-processing many satellites simultaneously (16M/s vs 7.5M/s). But it's a general ODE integrator with SGP4 as a module, requiring LLVM for JIT compilation and a C++ dependency stack that conda-forge recommends over pip. For time batched propagation, many time points for one satellite, astroz is 2x faster (8.5M/s vs 3.8M/s). Full comparison below. I'm also skipping GPU accelerated SGP4 implementations. They can be faster for massive batch workloads, but require CUDA/OpenCL setup and aren't what I'd consider "general purpose."&lt;/p&gt;
+    &lt;head rend="h2"&gt;Why Bother Optimizing SGP4?&lt;/head&gt;
+    &lt;p&gt;SGP4 is the standard algorithm for predicting satellite positions from TLE data. It's been around since the 80s and most implementations are straightforward ports of the original reference code. They work fine. You can read the implementation that I followed from SpaceTrack Report No. 3.&lt;/p&gt;
+    &lt;p&gt;But "fine" starts to feel slow when you need dense time resolution. Generating a month of ephemeris data at one-second intervals is 2.6 million propagations per satellite. Pass prediction over a ground station network might need sub-second precision across weeks. Trajectory analysis for conjunction screening wants fine-grained time steps to catch close approaches. At 2-3M propagations per second (typical for a good implementation), these workloads take seconds per satellite—that adds up fast when you're doing iterative analysis or building interactive tools.&lt;/p&gt;
+    &lt;p&gt;I wanted to see how fast I could make it.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Starting Point: Already Faster Than Expected&lt;/head&gt;
+    &lt;p&gt;Before I even started thinking about SIMD, the scalar implementation was already matching or beating the Rust sgp4 crate, the fastest open-source implementation I could find (general purpose). I hadn't done anything clever yet; the speed came from design choices that happened to play well with how Zig compiles.&lt;/p&gt;
+    &lt;p&gt;Two things mattered most:&lt;/p&gt;
+    &lt;p&gt;Branchless hot paths. The SGP4 algorithm has a lot of conditionals. Deep space vs near earth, different perturbation models, and convergence checks in the Kepler solver. I wrote these as branchless expressions where possible, not for performance reasons initially, but because it made the code easier to reason about. It happened to be a happy accident that modern CPUs love predictable instruction streams.&lt;/p&gt;
+    &lt;p&gt;Comptime precomputation. Zig's &lt;code&gt;comptime&lt;/code&gt; lets you run arbitrary code at compile time. A lot of SGP4's setup work, ie. gravity constants, polynomial coefficients, derived parameters can be computed once and baked into the binary. No runtime initialization, and no repeated calculations. I didn't have to do anything special. Zig is smart enough where if you mark a variable as &lt;code&gt;const&lt;/code&gt; it treats it as comptime automatically.&lt;/p&gt;
+    &lt;code&gt;const j2: comptime_float = 1.082616e-3; // explicit comptime (not needed)
+const j2 = 1.082616e-3; // implied comptime because of `const` (what I used)
+&lt;/code&gt;
+    &lt;p&gt;The result was a scalar implementation running at ~5.2M propagations per second, which was already slightly faster than Rust's ~5.0M, but within a margin of error. But I started to see some room to go faster. SGP4, by design, doesn't rely on state to calculate positions: each satellite and each time point is independent. This algorithm feels tailor made for something I have always been too afraid to try: SIMD.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Discovering Zig's SIMD Superpowers&lt;/head&gt;
+    &lt;p&gt;I have heard the nightmares about implementing SIMD. Most of the time its never worth it, it adds too much complexity, you have to build for different platforms, and the syntax itself is weird to write and think about.&lt;/p&gt;
+    &lt;p&gt;I was pleasantly surprised to learn that Zig, whether on purpose or not, makes SIMD a first class citizen. This is all enabled by a powerful and sane standard library that has builtins that handle the weird stuff for me. Now I just had to tackle the thought process for the basic flow of things in SIMD.&lt;/p&gt;
+    &lt;p&gt;I started with this foundation; a simple type declaration:&lt;/p&gt;
+    &lt;code&gt;const Vec4 = @Vector(4, f64);
+&lt;/code&gt;
+    &lt;p&gt;That's all you need to start. I now have a 4-wide vector of 64-bit floats. No intrinsics, no platform detection, no conditional compilation. The LLVM backend handles targeting the right instruction set for wherever the code runs.&lt;/p&gt;
+    &lt;p&gt;The builtin operations for vector operations are equally simple:&lt;/p&gt;
+    &lt;code&gt;// Broadcast a scalar to all lanes
+const twoPiVec: Vec4 = @splat(constants.twoPi);
+
+// Auto-vectorized transcendentals through LLVM
+pub fn sinSIMD(x: Vec4) Vec4 {
+    return @sin(x);
+}
+
+pub fn cosSIMD(x: Vec4) Vec4 {
+    return @cos(x);
+}
+&lt;/code&gt;
+    &lt;p&gt;The &lt;code&gt;@sin&lt;/code&gt; and &lt;code&gt;@cos&lt;/code&gt; builtins map directly to LLVM intrinsics, which use platform optimal implementations like libmvec on Linux x86_64. No manual work required.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Learning to Think in Lanes&lt;/head&gt;
+    &lt;p&gt;The arithmetic was easy. What took me a while to internalize was branching.&lt;/p&gt;
+    &lt;p&gt;In scalar code, you write &lt;code&gt;if&lt;/code&gt; statements and the CPU takes one path or the other. In SIMD, all four lanes execute together. If lane 0 needs the "true" branch and lane 2 needs the "false" branch, you can't just branch, you have to compute both outcomes and then pick per lane.&lt;/p&gt;
+    &lt;p&gt;Here's a concrete example. The scalar SGP4 code has a check like this:&lt;/p&gt;
+    &lt;code&gt;// Scalar version
+if (eccentricity &amp;lt; 1.0e-4) {
+    result = simple_calculation(x);
+} else {
+    result = complex_calculation(x);
+}
+&lt;/code&gt;
+    &lt;p&gt;In SIMD, this becomes:&lt;/p&gt;
+    &lt;code&gt;// SIMD version - compute both, select per-lane
+const simple_result = simple_calculation(x);
+const complex_result = complex_calculation(x);
+const mask = eccentricity &amp;lt; @as(Vec4, @splat(1.0e-4));
+const result = @select(f64, mask, simple_result, complex_result);
+&lt;/code&gt;
+    &lt;p&gt;This felt wasteful at first. Why compute both paths? But modern CPUs are so fast at arithmetic that computing both and selecting is often faster than branch misprediction. Plus, for SGP4, most satellites take the same path anyway, so we're rarely doing truly "wasted" work.&lt;/p&gt;
+    &lt;p&gt;The trickier case was convergence loops. SGP4's Kepler solver iterates until each result converges. In scalar code:&lt;/p&gt;
+    &lt;code&gt;// Scalar Kepler solver
+while (@abs(delta) &amp;gt; tolerance) {
+    // iterate...
+}
+&lt;/code&gt;
+    &lt;p&gt;But in SIMD, different lanes converge at different rates. Lane 0 might converge in 3 iterations while lane 3 needs 5. You can't exit early for just one lane. The solution is to track convergence per lane with a mask and use &lt;code&gt;@reduce&lt;/code&gt; to check if everyone's done:&lt;/p&gt;
+    &lt;code&gt;// SIMD Kepler solver
+var converged: @Vector(4, bool) = @splat(false);
+while (!@reduce(.And, converged)) {
+    // iterate...
+    converged = @abs(delta) &amp;lt;= tolerance_vec;
+}
+&lt;/code&gt;
+    &lt;p&gt;Once I understood this pattern, compute everything, mask the results, reduce to check completion, the rest of the conversion was methodical. I went through the scalar implementation line by line, keeping the original untouched so my test suite could compare outputs.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Three Propagation Modes&lt;/head&gt;
+    &lt;p&gt;With the core SIMD patterns figured out, I built three different propagation strategies for different use cases.&lt;/p&gt;
+    &lt;head rend="h3"&gt;1. Time Batched: &lt;code&gt;propagateV4&lt;/code&gt;&lt;/head&gt;
+    &lt;p&gt;The first question I asked: what's the most common workload? For me, it was generating ephemeris data, and propagating a single satellite across many time points. Pass prediction, trajectory analysis, conjunction screening: they all want dense time series for one object.&lt;/p&gt;
+    &lt;p&gt;Time batched propagation processes 4 time points for one satellite simultaneously:&lt;/p&gt;
+    &lt;code&gt;pub fn propagateV4(self: *const Sgp4, times: [4]f64) Error![4][2][3]f64 {
+    const el = &amp;amp;self.elements;
+    const timeV4 = Vec4{ times[0], times[1], times[2], times[3] };
+
+    const secular = updateSecularV4(el, timeV4);
+    const nm: Vec4 = @as(Vec4, @splat(el.grav.xke)) / simdMath.pow15V4(secular.a);
+    const kepler = solveKeplerV4(el, secular);
+    const corrected = applyShortPeriodCorrectionsV4(el, kepler, nm);
+    return computePositionVelocityV4(el, corrected);
+}
+&lt;/code&gt;
+    &lt;p&gt;Usage is straightforward:&lt;/p&gt;
+    &lt;code&gt;const sat = try Sgp4.init(tle);
+const times = [4]f64{ 0.0, 1.0, 2.0, 3.0 }; // minutes since epoch
+const results = try sat.propagateV4(times);
+// results[0] = position/velocity at t=0, results[1] at t=1, etc.
+&lt;/code&gt;
+    &lt;p&gt;This mode gave me the biggest initial speedup because it's the most cache friendly: the satellite's orbital elements stay in registers while we compute four outputs.&lt;/p&gt;
+    &lt;head rend="h3"&gt;2. Satellite Batched: &lt;code&gt;propagateSatellitesV4&lt;/code&gt;&lt;/head&gt;
+    &lt;p&gt;The opposite workload: what if you have many satellites and need their positions at one specific time? Collision screening snapshots, catalog-wide visibility checks, that sort of thing.&lt;/p&gt;
+    &lt;p&gt;Satellite batched propagation processes 4 different satellites at the same time point:&lt;/p&gt;
+    &lt;code&gt;pub inline fn propagateSatellitesV4(el: *const ElementsV4, tsince: f64) Error![4][2][3]f64 {
+    const tsinceVec: Vec4 = @splat(tsince);
+    const secular = updateSecularSatV4(el, tsinceVec);
+    const nm: Vec4 = el.xke / simdMath.pow15V4(secular.a);
+    const kepler = solveKeplerSatV4(el, secular);
+    const corrected = applyShortPeriodCorrectionsSatV4(el, kepler, nm);
+    return computePositionVelocitySatV4(el, corrected);
+}
+&lt;/code&gt;
+    &lt;p&gt;This required a different data layout. Instead of one satellite with 4 time points, I needed 4 satellites packed together. That's where &lt;code&gt;ElementsV4&lt;/code&gt; comes in. Its a struct where each field is a &lt;code&gt;Vec4&lt;/code&gt; holding values for 4 different satellites. More on that layout later.&lt;/p&gt;
+    &lt;head rend="h3"&gt;3. Constellation Mode: &lt;code&gt;propagateConstellationV4&lt;/code&gt;&lt;/head&gt;
+    &lt;p&gt;The third workload combines both: propagate many satellites across many time points. This is what the live demo does: 13,000 satellites across 1,440 time points.&lt;/p&gt;
+    &lt;p&gt;The naive approach would be: for each satellite, compute all time points. But that thrashes the cache. By the time you finish satellite 1's 1,440 points and move to satellite 2, all the time related data has been evicted.&lt;/p&gt;
+    &lt;p&gt;Constellation mode uses cache conscious tiling:&lt;/p&gt;
+    &lt;code&gt;// Time tile size tuned for L1 cache (~32KB)
+const TILE_SIZE: usize = 64;
+
+// Process in tiles over time to keep data in L1/L2 cache
+var timeStart: usize = 0;
+while (timeStart &amp;lt; numTimes) {
+    const timeEnd = @min(timeStart + TILE_SIZE, numTimes);
+
+    for (batches, 0..) |*batch, batchIdx| {
+        for (timeStart..timeEnd) |timeIdx| {
+            const satResults = try propagateSatellitesV4(batch, times[timeIdx]);
+            // Store results...
+        }
+    }
+    timeStart = timeEnd;
+}
+&lt;/code&gt;
+    &lt;p&gt;The idea here is to process 64 time points for all satellites, then the next 64, and so on. The time values stay hot in L1 cache while we sweep through the satellite batches. The tile size (64) isn't magic, it's roughly &lt;code&gt;L1_size / sizeof(working_data)&lt;/code&gt; rounded to a SIMD-friendly number.&lt;/p&gt;
+    &lt;p&gt;In practice, constellation mode is about 15-20% faster than calling satellite batched propagation in a naive loop for large catalogs.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The atan2 Problem (and Solution)&lt;/head&gt;
+    &lt;p&gt;Here's where things got interesting. SGP4's Kepler solver needs &lt;code&gt;atan2&lt;/code&gt;, but LLVM doesn't provide a vectorized builtin for it. Calling the scalar function would break the SIMD implementation.&lt;/p&gt;
+    &lt;p&gt;The solution I picked: a polynomial approximation. The key insight is that for SGP4's accuracy requirements (which are inherently limited by the model), we don't need perfect precision.&lt;/p&gt;
+    &lt;code&gt;pub fn atan2SIMD(y: Vec4, x: Vec4) Vec4 {
+    const abs_x = @abs(x);
+    const abs_y = @abs(y);
+
+    // Keep argument in [0, 1] for better polynomial accuracy
+    const max_xy = @max(abs_x, abs_y);
+    const min_xy = @min(abs_x, abs_y);
+    const t = min_xy / @max(max_xy, @as(Vec4, @splat(1.0e-30)));
+    const t2 = t * t;
+
+    const c1: Vec4 = @splat(1.0);
+    const c3: Vec4 = @splat(-0.3333314528);
+    const c5: Vec4 = @splat(0.1999355085);
+    // ... more coefficients
+
+    var atan_t = c17;
+    atan_t = atan_t * t2 + c15;
+    atan_t = atan_t * t2 + c13;
+    // ... Horner's method continues
+    atan_t = atan_t * t;
+
+    // Quadrant correction using branchless selects
+    const swap_mask = abs_y &amp;gt; abs_x;
+    atan_t = @select(f64, swap_mask, halfPiVec - atan_t, atan_t);
+
+    // ... more quadrant handling with @select
+    return result;
+}
+&lt;/code&gt;
+    &lt;p&gt;This polynomial approximation is accurate to ~1e-7 radians, which translates to about 10mm position error at LEO distances. That's well within SGP4's inherent accuracy limits. The algorithm itself has kilometers of uncertainty over multi-day propagations built into it.&lt;/p&gt;
+    &lt;p&gt;To be honest, this math was tricky for me to wrap my head around. I had to ask AI to help me here because I was really struggling with it.&lt;/p&gt;
+    &lt;head rend="h2"&gt;"Struct of Arrays" for Multi Satellite Processing&lt;/head&gt;
+    &lt;p&gt;For processing multiple satellites, I use a "struct of arrays" layout:&lt;/p&gt;
+    &lt;code&gt;pub const ElementsV4 = struct {
+    grav: constants.Sgp4GravityModel,
+
+    // Each field is a Vec4 holding values for 4 satellites
+    ecco: Vec4,
+    inclo: Vec4,
+    nodeo: Vec4,
+    argpo: Vec4,
+    mo: Vec4,
+    // ...
+
+    // Pre-splatted constants (computed once at init)
+    xke: Vec4,
+    j2: Vec4,
+    one: Vec4,
+    half: Vec4,
+    // ...
+};
+&lt;/code&gt;
+    &lt;p&gt;"Pre-splatting" constants eliminates repeated &lt;code&gt;@splat&lt;/code&gt; calls in the hot path. It's a small optimization, but in code running millions of times per second, everything counts, and its an easy win.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Benchmark Results&lt;/head&gt;
+    &lt;head rend="h3"&gt;Native Implementation Comparison (Zig vs Rust)&lt;/head&gt;
+    &lt;p&gt;First, let's compare apples to apples. Native compiled implementations:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="4"&gt;
+        &lt;cell role="head"&gt;Scenario&lt;/cell&gt;
+        &lt;cell role="head"&gt;astroz (Zig)&lt;/cell&gt;
+        &lt;cell role="head"&gt;Rust sgp4&lt;/cell&gt;
+        &lt;cell role="head"&gt;Speedup&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;1 day (minute)&lt;/cell&gt;
+        &lt;cell&gt;0.27 ms&lt;/cell&gt;
+        &lt;cell&gt;0.31 ms&lt;/cell&gt;
+        &lt;cell&gt;1.16x&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;1 week (minute)&lt;/cell&gt;
+        &lt;cell&gt;1.99 ms&lt;/cell&gt;
+        &lt;cell&gt;2.04 ms&lt;/cell&gt;
+        &lt;cell&gt;1.03x&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;2 weeks (minute)&lt;/cell&gt;
+        &lt;cell&gt;3.87 ms&lt;/cell&gt;
+        &lt;cell&gt;4.03 ms&lt;/cell&gt;
+        &lt;cell&gt;1.04x&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;2 weeks (second)&lt;/cell&gt;
+        &lt;cell&gt;222 ms&lt;/cell&gt;
+        &lt;cell&gt;234 ms&lt;/cell&gt;
+        &lt;cell&gt;1.05x&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;1 month (minute)&lt;/cell&gt;
+        &lt;cell&gt;8.37 ms&lt;/cell&gt;
+        &lt;cell&gt;8.94 ms&lt;/cell&gt;
+        &lt;cell&gt;1.07x&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Both implementations achieve around 5M propagations/sec for scalar (single-satellite) processing. The Zig implementation edges out Rust slightly. This is most likely hot path optimizations and &lt;code&gt;comptime&lt;/code&gt; being quite aggressive with its pre compute.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Native SIMD Throughput Comparison&lt;/head&gt;
+    &lt;p&gt;The real gains come from SIMD. When processing multiple satellites or time points in parallel using &lt;code&gt;@Vector(4, f64)&lt;/code&gt;, throughput jumps to 11-13M propagations/sec, more than 2x faster than scalar implementations.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Python Bindings Performance&lt;/head&gt;
+    &lt;p&gt;For Python users, here's how astroz compares to python-sgp4:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="4"&gt;
+        &lt;cell role="head"&gt;Scenario&lt;/cell&gt;
+        &lt;cell role="head"&gt;astroz&lt;/cell&gt;
+        &lt;cell role="head"&gt;python-sgp4&lt;/cell&gt;
+        &lt;cell role="head"&gt;Speedup&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;2 weeks (second)&lt;/cell&gt;
+        &lt;cell&gt;160 ms&lt;/cell&gt;
+        &lt;cell&gt;464 ms&lt;/cell&gt;
+        &lt;cell&gt;2.9x&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;1 month (minute)&lt;/cell&gt;
+        &lt;cell&gt;5.9 ms&lt;/cell&gt;
+        &lt;cell&gt;16.1 ms&lt;/cell&gt;
+        &lt;cell&gt;2.7x&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;head rend="h3"&gt;Python Bindings Throughput&lt;/head&gt;
+    &lt;head rend="h3"&gt;A Note on heyoka.py&lt;/head&gt;
+    &lt;p&gt;As mentioned in the intro, heyoka.py deserves attention. Here are the single-threaded benchmarks:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;Test&lt;/cell&gt;
+        &lt;cell role="head"&gt;heyoka.py&lt;/cell&gt;
+        &lt;cell role="head"&gt;astroz&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;8 sats × 1440 times&lt;/cell&gt;
+        &lt;cell&gt;16.2M/s&lt;/cell&gt;
+        &lt;cell&gt;7.5M/s&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;1 sat × 1440 times&lt;/cell&gt;
+        &lt;cell&gt;3.8M/s&lt;/cell&gt;
+        &lt;cell&gt;8.5M/s&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;100 sats × 100 times&lt;/cell&gt;
+        &lt;cell&gt;15.5M/s&lt;/cell&gt;
+        &lt;cell&gt;8.4M/s&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;heyoka.py wins on multi satellite batches; astroz wins on time batched workloads. Which one you pick depends on your use case:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;How many satellites at once? If you're propagating hundreds of satellites at the same time point (collision screening snapshots), heyoka.py wins this easily.&lt;/item&gt;
+      &lt;item&gt;How many time points per satellite? If you're generating ephemerides, predicting passes, or doing trajectory analysis for individual satellites across many time steps, astroz is 2x faster.&lt;/item&gt;
+      &lt;item&gt;Do you need easy deployment? astroz is &lt;code&gt;pip install astroz&lt;/code&gt;with just NumPy. heyoka.py requires LLVM and a C++ stack that conda-forge recommends over pip.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;Seeing It at Scale&lt;/head&gt;
+    &lt;p&gt;Speed numbers are abstract until you see what they enable. When propagation is this fast, you stop thinking about batching and scheduling, you just compute what you need, when you need it.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The Live Demo&lt;/head&gt;
+    &lt;p&gt;To show what this looks like, I built an interactive Cesium visualization that propagates the entire active catalog from CelesTrak (~13,000 satellites) across 1440 time points (a full day at minute resolution). That's ~19 million propagations completing in about 2.7 seconds. Add ~0.6 seconds for TEME→ECEF coordinate conversion, and you get a full day of orbital data for every tracked satellite in about 3.3 seconds. (This demo runs through Python bindings at ~7M/sec; native Zig hits 11-13M/sec.)&lt;/p&gt;
+    &lt;head rend="h2"&gt;Looking Forward&lt;/head&gt;
+    &lt;p&gt;Next up: SDP4 for deep space objects (the current implementation only handles near-earth satellites with periods under 225 minutes), and multithreading to scale across cores. The SIMD work here was single threaded, there's another multiplier waiting.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Try It Yourself&lt;/head&gt;
+    &lt;p&gt;astroz is available on PyPI:&lt;/p&gt;
+    &lt;code&gt;pip install astroz
+&lt;/code&gt;
+    &lt;p&gt;Or add it to your Zig project:&lt;/p&gt;
+    &lt;code&gt;zig fetch --save git+https://github.com/ATTron/astroz/#HEAD
+&lt;/code&gt;
+    &lt;p&gt;The code is open source on GitHub. Stars, issues, and contributions welcome.&lt;/p&gt;
+    &lt;p&gt;Browse the examples to integrate astroz into your own projects, or try the live demo to see it in action.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46703317</guid><pubDate>Wed, 21 Jan 2026 09:51:27 +0000</pubDate></item><item><title>EU–INC – A new pan-European legal entity</title><link>https://www.eu-inc.org/</link><description>&lt;doc fingerprint="a1be153739b2f6ef"&gt;
   &lt;main&gt;
     &lt;p&gt;WHAT IS EUâINC&lt;/p&gt;
     &lt;head rend="h2"&gt;EUâINC â A true pan-European solution&lt;/head&gt;
@@ -379,7 +501,7 @@ WHERE
     &lt;p&gt;You help us immensely if you share this page with your peers, follow &amp;amp; repost us on X &amp;amp; Linkedin and write about the EU-INC â see the FAQ for more infos.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46703763</guid><pubDate>Wed, 21 Jan 2026 10:49:20 +0000</pubDate></item><item><title>Nukeproof: Manifesto for European Data Sovereignty</title><link>https://nukeproof.org/</link><description>&lt;doc fingerprint="7dfebda9b1c62e4c"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46703763</guid><pubDate>Wed, 21 Jan 2026 10:49:20 +0000</pubDate></item><item><title>The super-slow conversion of the U.S. to metric (2025)</title><link>https://www.thefabricator.com/thefabricator/blog/testingmeasuring/the-super-slow-conversion-of-the-us-to-metric</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46704223</guid><pubDate>Wed, 21 Jan 2026 11:36:09 +0000</pubDate></item><item><title>Nukeproof: Manifesto for European Data Sovereignty</title><link>https://nukeproof.org/</link><description>&lt;doc fingerprint="7dfebda9b1c62e4c"&gt;
   &lt;main&gt;
     &lt;p&gt;NukeProof® Alliance&lt;/p&gt;
     &lt;head rend="h1"&gt;Manifesto for European Data Sovereignty&lt;/head&gt;
@@ -616,7 +738,7 @@ WHERE
     &lt;p&gt;Hightouch has been named America’s #3 best startup employer by Forbes&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46704465</guid><pubDate>Wed, 21 Jan 2026 12:02:09 +0000</pubDate></item><item><title>Stories removed from the Hacker News Front Page, updated in real time (2024)</title><link>https://github.com/vitoplantamura/HackerNewsRemovals</link><description>&lt;doc fingerprint="5bfbd97070e39b2"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46704465</guid><pubDate>Wed, 21 Jan 2026 12:02:09 +0000</pubDate></item><item><title>Stories removed from the Hacker News Front Page, updated in real time (2024)</title><link>https://github.com/vitoplantamura/HackerNewsRemovals</link><description>&lt;doc fingerprint="5bebd97070e39b2"&gt;
   &lt;main&gt;
     &lt;p&gt;UPDATE (February 4, 2024): This is the discussion about this project on HN: here. Please specifically read @dang's comment regarding the core assumption of this project: here. On a personal note, the number of Stories removed yesterday (Saturday, February 3, 2024) was the lowest ever recorded by the service. This includes 2 duplicate Stories. As a side note, in the list always check whether a Story is a duplicate or not: this is a very reasonable reason for removal and unfortunately I have no way of automatically determining it in the service!&lt;/p&gt;
     &lt;p&gt;The purpose of this project is to try to understand the type and scale of the moderation of the Hacker News Front Page.&lt;/p&gt;
@@ -728,7 +850,7 @@ WHERE
       &lt;item&gt;46703643 #30 33 points 19 comments -&amp;gt; EU chief says EU should abandon caution after Bessent calls Denmark 'irrelevant'&lt;/item&gt;
       &lt;item&gt;46705402 #21 10 points 1 comments -&amp;gt; Europe has a lot to learn from Mark Carney&lt;/item&gt;
       &lt;item&gt;46705385 #29 58 points 35 comments -&amp;gt; Canada Announces Divorce from America&lt;/item&gt;
-      &lt;item&gt;46665751 #22 25 points 41 comments -&amp;gt; Hypnosis with Aphantasia&lt;/item&gt;
+      &lt;item&gt;46706732 #22 12 points 0 comments -&amp;gt; The Oligarchs Pushing for Conquest in Greenland&lt;/item&gt;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
@@ -1007,7 +1129,154 @@ WHERE
     &lt;p&gt;I hope these little nuggets of Markdown trivialities will one day prove useful in your own Markdown misfortunes.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46705201</guid><pubDate>Wed, 21 Jan 2026 13:08:35 +0000</pubDate></item><item><title>AI Destroys Institutions</title><link>https://cyberlaw.stanford.edu/publications/how-ai-destroys-institutions/</link><description>&lt;doc fingerprint="bc6e12dd20c7bfcf"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46705201</guid><pubDate>Wed, 21 Jan 2026 13:08:35 +0000</pubDate></item><item><title>The first 100 days as a Renovate maintainer</title><link>https://www.jvt.me/posts/2026/01/21/renovate-100-days/</link><description>&lt;doc fingerprint="3f563115cdf74736"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;The first 100 days as a Renovate maintainer: the shocking inside view of a popular Open Source project&lt;/head&gt;
+    &lt;p&gt;Roughly 100 days ago, I joined Mend to work on the Renovate project as a maintainer and community manager. In a vague homage to the style of politics' "first hundred days", I'll talk about some things that have happened since I've joined the project, and some of the interesting (and mundane) things I've learned since joining the project.&lt;/p&gt;
+    &lt;p&gt;This was originally going to be a talk presented at FOSDEM 2026, but there was a lot of strong competition to the half-day Package Management track so I didn't get through to speaking.&lt;/p&gt;
+    &lt;p&gt;Instead of losing out on the opportunity to share this, I thought I'd write it up as a blog post instead, as well as it being quite a nice opportunity to reflect back on the last few months.&lt;/p&gt;
+    &lt;p&gt;Note that this post is focussing on the Mend Renovate CLI, the Open Source project that is commonly referred to as Renovate, and I won't be going into anything internal to Mend.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What's Renovate?&lt;/head&gt;
+    &lt;p&gt;First, before we dig into the learnings I've had, let's first explore what Renovate is. It's likely you have some inkling if you're reading this, but it's worth making sure you have the context before reading further.&lt;/p&gt;
+    &lt;p&gt;There's a good primer on what Renovate is on a recent post of mine, but a good TL;DR is that Renovate is an Open Source project (&lt;code&gt;AGPL-3.0-only&lt;/code&gt;) owned by Mend, which boasts the best support + extensibility in the ecosystem for dependency updates, and we had over 300 human contributors and 1599 releases last year alone.&lt;/p&gt;
+    &lt;p&gt;Since starting the project in 2017, we've gone through a few versions of how we operate the project.&lt;/p&gt;
+    &lt;p&gt;Right now, we have three classes of folks who interact with the project:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Maintainers: the team who have final say on the direction of the project and new features, and whom have merge rights&lt;/item&gt;
+      &lt;item&gt;Contributors: people who regularly contribute to Renovate's features, fix bugs, improve documentation and help answer user questions&lt;/item&gt;
+      &lt;item&gt;Users: the folks who use Renovate, or are responsible for their Renovate deployment. They may infrequently raise PRs for documentation of bug fixes&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;Shipping despite a tiny team&lt;/head&gt;
+    &lt;p&gt;As noted in my recent post about why we use GitHub Discussions as our triage process, I noted that we optimise for the people doing the work and making sure that Maintainers and Contributors are able to do their best work.&lt;/p&gt;
+    &lt;p&gt;The most surprising thing I've found since joining the project is seeing how lean the maintainers team is. I felt like I did intellectually know that, but seeing it in practice has been another thing.&lt;/p&gt;
+    &lt;p&gt;Within Renovate's maintainer team are 3 of us - Michael Kriese (who is contracted through Mend, but also does Renovate-y things in his free time), Sebastian Poxhofer (an external maintainer who is 100% not associated with Mend and works independently) and myself (who is 100% paid by Mend).&lt;/p&gt;
+    &lt;p&gt;Alongside the maintainers, we have two contributors who are paid by Mend to work part-time on the project - Rahul Gautam Singh and Sergei Zharinov, who do great work on Issues and Discussions that come in from the community, as well as work coming in from Mend customers.&lt;/p&gt;
+    &lt;p&gt;We also have a number of contributors who have Triage access on the project and get involved when they're able to, but there's no expectation of any time, given it's a volunteer basis.&lt;/p&gt;
+    &lt;p&gt;When you put together the size of the team behind Renovate (in and outside of Mend), you have to admit it's impressive how we've been able to ship all these changes over 2025!&lt;/p&gt;
+    &lt;p&gt;Especially when you also factor in the fact that none of the maintainers nor contributors work full-time on Renovate. I try to spend at least 50% of my time on the Open Source project, but it's worth bearing in mind.&lt;/p&gt;
+    &lt;p&gt;In the first 100 days since I joined, we've had:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;95 contributors (excluding &lt;code&gt;renovate[bot]&lt;/code&gt;and&lt;code&gt;github-actions[bot]&lt;/code&gt;)&lt;/item&gt;
+      &lt;item&gt;187 contributions from me&lt;/item&gt;
+      &lt;item&gt;735 from &lt;code&gt;renovate[bot]&lt;/code&gt;&lt;/item&gt;
+      &lt;item&gt;314 from contributors (including me)&lt;/item&gt;
+      &lt;item&gt;419 releases&lt;/item&gt;
+      &lt;item&gt;1 major release&lt;/item&gt;
+      &lt;item&gt;Renovate's GitHub repo hit 20k stars&lt;/item&gt;
+      &lt;item&gt;Renovate GitHub repo hit 40k Issues/PRs/Discussions&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;(these aren't things that I'm taking credit for being responsible for - aside from my own contributions - but I'm showing how much we've got done in a small period of time)&lt;/p&gt;
+    &lt;p&gt;So with all these changes coming in, how do we keep on top of them?&lt;/p&gt;
+    &lt;p&gt;As I'll talk about a bit more, community management for our Discussions is primarily taken by Rahul and I, working with users to help answer their questions.&lt;/p&gt;
+    &lt;p&gt;When things promote up to Pull Requests, a mix of Michael and I will do a lot of the code review (including my many PRs!), and merge them as they're ready to be shipped.&lt;/p&gt;
+    &lt;p&gt;Dependency bump PRs from Renovate are automagically approved + merged through PR-based automerge, allowing us to keep an eye on changes going in, and so we can action a failing build, but don't require human reviews given the number of dependencies being bumped. We require our external dependencies are at least 7 days old, via Minimum Release Age, to make sure that stability and security aren't lost by automated merges.&lt;/p&gt;
+    &lt;p&gt;Without using PR-based automerge, we'd be unlikely to ever get to reviewing all the dependency bumps on top of user contributions, and considering Renovate is many projects, we can't scale our minimal team quite that far.&lt;/p&gt;
+    &lt;p&gt;(And yes, I realise the irony of us not having time to review our own Renovate PRs ð)&lt;/p&gt;
+    &lt;head rend="h3"&gt;Too much shipping&lt;/head&gt;
+    &lt;p&gt;At one point, we found that the pace of delivery of shipping new releases regularly over the years would actually come back to bite us!&lt;/p&gt;
+    &lt;p&gt;In my first full week at Mend, publishes to the npm registry failed due to:&lt;/p&gt;
+    &lt;code&gt;npm error code E406
+npm error 406 Not Acceptable - PUT https://registry.npmjs.org/renovate - Package publish failed.
+npm error Your package metadata is too large (100.01 MB &amp;gt; 100 MB).
+npm error The likely cause is that you have too many versions (10451).
+npm error Resolve this problem by unpublishing older versions of your package.
+&lt;/code&gt;
+    &lt;p&gt;This wasn't down to an individual &lt;code&gt;package.json&lt;/code&gt; being too large, but down to the fact that we had so many releases that the npm registry APIs would no longer allow publishing.&lt;/p&gt;
+    &lt;p&gt;I feel that's a pretty cool "badge of honour" to note that we've been shipping consistently for so long that we end up hitting a rate limit on the npm registy side!&lt;/p&gt;
+    &lt;p&gt;(Note that not every commit has its own release - we perform a batched release if there are multiple commits landing on &lt;code&gt;main&lt;/code&gt; within the same timeframe, but sometimes it does end up being several releases a day that are a single commit worth of changes)&lt;/p&gt;
+    &lt;p&gt;This was also a "fun" incident because we weren't even able to manually unpublish any versions ourselves, as we're a popular package. We needed to work with npm support, who could perform some backend magic to force some unpublishes for us, saving us some time.&lt;/p&gt;
+    &lt;p&gt;We're also working to periodically clean up old tags, to make sure that we don't hit this again in the future.&lt;/p&gt;
+    &lt;head rend="h3"&gt;There's no "I" in team&lt;/head&gt;
+    &lt;p&gt;Working on a large project like this isn't possible to do on your own - it really "takes a village".&lt;/p&gt;
+    &lt;p&gt;The primary projects I've been maintaining over the years have largely been down to a single maintainer (me) who has been trying to fulfill all the roles necessary, as well as fitting it in with all the other things I'm working on.&lt;/p&gt;
+    &lt;p&gt;For instance, &lt;code&gt;oapi-codegen&lt;/code&gt; is a widely used OpenAPI-to-Go code generator. But right now, my co-maintainer is mostly unable to work on the project, which means that triage, user questions and PR review, let alone being able to do forward thinking product-y thinking is all down to me - that gets hard over time, especially as the Issues and PRs pile up.&lt;/p&gt;
+    &lt;p&gt;I noticed in the first couple of weeks of my time in the project that it was really nice to come in on a morning and see that Rahul had already triaged and/or resolved Discussions raised by users, or that Michael and Sebastian had already reviewed + merged Pull Requests.&lt;/p&gt;
+    &lt;p&gt;It makes a huge difference mentally to know that there are other Contributors and Maintainers who are also working to support the project and that it's not all on me, unlike other projects I maintain.&lt;/p&gt;
+    &lt;p&gt;I've also found that this gives me more ability to think about what I want to delegate, for instance a number of Mend customer requests may go to Rahul and Sergei, which frees me up to do a "bigger picture" piece of work, or frees me up to focus my time on code review instead.&lt;/p&gt;
+    &lt;head rend="h3"&gt;A welcoming bunch&lt;/head&gt;
+    &lt;p&gt;I'd also like to say another thank you for folks being so welcoming! It definitely helps being more of a familiar face, but it's still been nice that everyone's been lovely and welcoming.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Community Management&lt;/head&gt;
+    &lt;p&gt;I find it really important to build empathy with my users, and so working on the community management is super valuable to me, and allows me to continue helping others as I've been helped over the years.&lt;/p&gt;
+    &lt;p&gt;It's also fortunate I enjoy it because it's core part of my role at Mend as the community manager for the project, and so it's been good that it feels much more sustainable than other projects I've maintained in the past.&lt;/p&gt;
+    &lt;p&gt;This was especially something I was a little nervous about, as I was stepping into Rhys' shoes of being the community manager, but I've found I've settled well into the role.&lt;/p&gt;
+    &lt;p&gt;As I've written about, Renovate uses GitHub Discussions for the community to get in touch about questions, possible bugs and feature requests. I recommend you read the post for the full discussion (pun intended) about why it's worked so well for us.&lt;/p&gt;
+    &lt;p&gt;As my role as Community Manager on the project, I spend a lot of my time working with GitHub Discussions, and have found that although Discussions does work for us, there are a few areas where it's not the best experience (as an offering from GitHub).&lt;/p&gt;
+    &lt;p&gt;To improve the experience for (primarily) me, I've ended up building a sync-to-local-SQLite-and-web-application which I'm calling the "maintainer dashboard", where I can now get separate views of the data, such as the below information, which isn't possible to get out of GitHub otherwise:&lt;/p&gt;
+    &lt;p&gt;Another key benefit of getting raw access to the data means that we can look at other interesting queries for things that we care about as a project, such as "where have we not replied to a user request for some time" or "is someone trying to bump an old thread, instead of creating a fresh Discussion?".&lt;/p&gt;
+    &lt;p&gt;I'll soon be sharing about this in a bit more detail, as well as releasing it under an Open Source license.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Minimal reproductions take time&lt;/head&gt;
+    &lt;p&gt;As with many Open Source projects and commercial projects alike, before you can fix a bug you need to find a way to reproduce it.&lt;/p&gt;
+    &lt;p&gt;With Renovate this is no different, and it's a large part of the "Request Help" flow our users go through, where if we can't reasonably work out what's going on from debug logs provided by the user, we require a minimal reproduction repository.&lt;/p&gt;
+    &lt;p&gt;While debugging Mend customer requests, thinking about features I'd like to have in Renovate, and sometimes being extra nice and going the extra mile for a given user request, I'll put together the minimal reproductions, as our users do, which can take time.&lt;/p&gt;
+    &lt;p&gt;But like with writing a design document or a blog post, going through the process of breaking down the issue into the smallest possible unit can help determine "oh, it was actually something unrelated", or can make it much clearer that the behaviour you're trying to achieve doesn't make sense.&lt;/p&gt;
+    &lt;p&gt;It's hugely valuable, and was something I was doing at Elastic as our resident Renovate expert, too. I also have a separate post I've been working on, which will go into what I find works best for my own testing of Renovate configuration changes, which feeds into this.&lt;/p&gt;
+    &lt;p&gt;Although I've not yet had a chance to fully play around with it, I've been planning to get an LLM Agent set up with being able to take a bug report and convert it into a Minimal Reproduction - even if it gets a maximum of 80% of the way there, that's a good start!&lt;/p&gt;
+    &lt;head rend="h2"&gt;Hitting the ground running&lt;/head&gt;
+    &lt;p&gt;One of the key reasons I joined Mend to work on Renovate was because - in my humble opinion - I was the best person for the job. I had a lot of context with Renovate, some of Mend's offerings on top of the Renovate CLI, as well as the wider package management + dependency insights ecosystem Renovate sits in.&lt;/p&gt;
+    &lt;p&gt;One of the really nice things was being able to join a company and - while being cautious about over-exertion and burnout - get going straight away, without needing to onboard.&lt;/p&gt;
+    &lt;p&gt;Literally on my second day, I was reviewing Discussions and PRs, and drafting my own code changes.&lt;/p&gt;
+    &lt;p&gt;Going back 2 weeks before I joined, I proposed something that would take up a considerable chunk of the next couple of months - the enablement of Minimum Release Age across the npm ecosystem.&lt;/p&gt;
+    &lt;p&gt;As I'll mention below, this is something I was very proud of - and there was a lot of work for a few of us making the feature as stable and predictable as possible before enabling it for a significant percentage of our userbase.&lt;/p&gt;
+    &lt;p&gt;This isn't the sort of thing that you'd expect a new-starter at a company to be picking up, so it was pretty great to know that I was able to come in and immediately "push the needle".&lt;/p&gt;
+    &lt;head rend="h2"&gt;Renovate isn't one project&lt;/head&gt;
+    &lt;p&gt;Another thing that I learned fairly quickly on the job is that when we talk about "Renovate", most folks think of the Renovate CLI as the thing, but there's many more things behind it that we don't consider.&lt;/p&gt;
+    &lt;p&gt;Coming into the project I feel like I knew this, and I knew that the Renovate Docker image was built on top of "Containerbase", but I'd not fully appreciated how the two interacted, as well as the many other projects that make up the offering that is Renovate.&lt;/p&gt;
+    &lt;p&gt;A simplified list of some of the more interesting projects that fit under "Renovate" are:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;osv-offline&lt;/item&gt;
+      &lt;item&gt;Containerbase a command-line tool for being able to i.e. &lt;code&gt;install-tool node 22.22.0&lt;/code&gt;&lt;/item&gt;
+      &lt;item&gt;Containerbase's pre-built tools (i.e. Node, the Go toolchain)&lt;/item&gt;
+      &lt;item&gt;The official Helm charts&lt;/item&gt;
+      &lt;item&gt;The official GitHub Actions&lt;/item&gt;
+      &lt;item&gt;GitLab CI&lt;/item&gt;
+      &lt;item&gt;A number of packages under our npm user&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Each of these projects needs updates, they all have their own backlogs and sets of documentation to improve and keep on top of.&lt;/p&gt;
+    &lt;p&gt;As noted above, there has to be some level of automation in place for dependency updates, otherwise we'd spend all of the Maintainer + Contributor time reviewing dependency update PRs!&lt;/p&gt;
+    &lt;p&gt;Although we're primarily focussing on Renovate, there are times that to implement a feature in Renovate, it requires changes across multiple components before we can implement it upstream - so sometimes this can lead to a slightly more complex contribution process, as we're fairly well documented on the Renovate CLI, but not as many of the related projects.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Typescript is great&lt;/head&gt;
+    &lt;p&gt;This isn't a new opinion of mine, but I very much love Typescript. Although builds aren't quite as speedy as Go, I very much enjoy the stronger type system, and the way Renovate is configured as a project works very nicely.&lt;/p&gt;
+    &lt;p&gt;It's really quite nice to have real enum types - opposed to the hacks we have to do in Go - and the Language Server is much more powerful that &lt;code&gt;gopls&lt;/code&gt;, which has become more stark a contrast as I flip between the two languages.&lt;/p&gt;
+    &lt;p&gt;I'm not likely to migrate to Typescript for personal projects - due to the beauty of the single static binary from Go - but it is nice to be working on what I find to be a really nice codebase with a strong set of tooling.&lt;/p&gt;
+    &lt;head rend="h2"&gt;
+      &lt;code&gt;await response()&lt;/code&gt;
+    &lt;/head&gt;
+    &lt;p&gt;Open Source is naturally an asynchronous model of collaboration, with the globally distributed nature of users, contributors and maintainers, and Renovate is no different.&lt;/p&gt;
+    &lt;p&gt;We do fortunately have our maintainers all in Europe, so we have a significant timezone overlap, and cross-continent working with our contributors still works well.&lt;/p&gt;
+    &lt;p&gt;After years of working at Elastic, where my team at one point was across a couple of timezones in the US, the UK, Spain, Germany and two timezones in Australia, I'm very used to - and enjoy - more asynchronous working.&lt;/p&gt;
+    &lt;p&gt;I've managed to video call with a few folks, and I plan to try and meet with all of our core contributors + maintainers over the next few months, even if it's a "hey, let's make it easier to remember we're both humans" and get to know each other slightly more.&lt;/p&gt;
+    &lt;p&gt;The majority of interactions are done over GitHub, but we do have a Renovate developers Slack for contributors and maintainers, so every so often we can have some high bandwidth calls.&lt;/p&gt;
+    &lt;head rend="h2"&gt;So many package managers&lt;/head&gt;
+    &lt;p&gt;Although we've not yet merged support for new package managers (there are a couple of PRs waiting on me, sorry!), it's been really interesting finding out how many package managers there are out there.&lt;/p&gt;
+    &lt;p&gt;I knew that Renovate supports many package managers, but it's been eye-opening getting a chance to see what's in use, and get a gut-feel for what our users are actually using.&lt;/p&gt;
+    &lt;p&gt;With user requests coming in, it's also a little bit of a learning curve trying to work out how the package manager works, getting minimal reproductions set up, and this is another area where I need to try and lean on LLMs a little bit more.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Lots of "work in progress"&lt;/head&gt;
+    &lt;p&gt;As someone with ADHD, I've noted before that I'll often (but not always) thrive more when there's lots of stuff to do at a given time, rather than only having a single task to do at a given time.&lt;/p&gt;
+    &lt;p&gt;Working on the Renovate project is no different - I have several backlogs of "TODOs", coming in from community Discussions, Pull Requests, my own TODO list of "I'd love to have that done" and "that'd improve Mend's offerings if we had this" through to Mend customer requests.&lt;/p&gt;
+    &lt;p&gt;Having a strong level of control over how I spend the time towards these is good, but as users, it's good to remember that there's often a lot of background work going on which may be why you're not getting a response - as noted above, I'm not even 100% full time on the Renovate Open Source project, and if you saw my email inbox from Renovate Discussions, you'd understand the delays ð&lt;/p&gt;
+    &lt;p&gt;A lot of the time, this means that I'm working through 10+ Discussions at a given time, trying to provide an answer, the right documentation, or getting an Issue raised for changes to the codebase.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Big deliveries&lt;/head&gt;
+    &lt;p&gt;To take a bit of a self-congratulatory note, I'd like to talk about some of the things I'm most proud of us delivering since I've joined.&lt;/p&gt;
+    &lt;p&gt;Since joining, there have been a few things I've been most proud of leading + delivering:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Enabling Minimum Release Age to secure the npm ecosystem&lt;list rend="ul"&gt;&lt;item&gt;In particular, this involved a tonne of work getting ready to being able to turn it on for a significant portion of Renovate users. Although the feature (previously known as "stability days") has been in Renovate since 2019(!), enabling this for all users of the npm datasource who use &lt;code&gt;config:best-practices&lt;/code&gt;meant that we needed to make it more predictable, highly documented, and introduce additional log lines for folks to understand what was going on&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;
+      &lt;item&gt;In particular, this involved a tonne of work getting ready to being able to turn it on for a significant portion of Renovate users. Although the feature (previously known as "stability days") has been in Renovate since 2019(!), enabling this for all users of the npm datasource who use &lt;/item&gt;
+      &lt;item&gt;Significantly improved OpenTelemetry tracing, so it's much clearer what's now happening under-the-hood&lt;/item&gt;
+      &lt;item&gt;First major release (and a lot of learnings around how the process works, which is good ahead of next week's next major release!)&lt;/item&gt;
+      &lt;item&gt;Working to provide "secure by default" configuration like disabling unsafe execution of Gradle scripts or clarifying additional risks of self-hosting&lt;/item&gt;
+      &lt;item&gt;Handling my first GitHub Security Advisory report, and closing off a few other fixed reports&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;There are also a number of other smaller bug fixes, features and community contributions I've helped get shipped, as well as shaping a number of medium-/long-term routes for the project.&lt;/p&gt;
+    &lt;p&gt;One of the great benefits of being on the maintainer team means that I've been able to look at some of my previously raised feature requests, and I can now get them delivered because I now have much more experience, and ability to explain why the features should get done - including a few I've raised in the past that are super useful for Mend to have for our hosted platform!&lt;/p&gt;
+    &lt;head rend="h2"&gt;There's always more to do&lt;/head&gt;
+    &lt;p&gt;As noted on my interview on Open Source Security, package management is a pretty large space and there's so much to it.&lt;/p&gt;
+    &lt;p&gt;Renovate aims to make it possible to keep all the things updated, with safe defaults and a workflow that is configurable to work for you.&lt;/p&gt;
+    &lt;p&gt;To do this, however, is a balancing act to make sure that we're not adding features that make the maintenance of the project more difficult, or to make sure that we don't introduce too many more configuration options, while also continuing to move forward as a project.&lt;/p&gt;
+    &lt;p&gt;I've really enjoyed the last 100 days, and the work we've done so far. I'm very excited to see what the next 100 days bring, and onwards into the future!&lt;/p&gt;
+    &lt;p&gt;If you've got to the end - well done! Was this interesting? Anything you're interested in learning more about?&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46705512</guid><pubDate>Wed, 21 Jan 2026 13:35:41 +0000</pubDate></item><item><title>How AI destroys institutions</title><link>https://cyberlaw.stanford.edu/publications/how-ai-destroys-institutions/</link><description>&lt;doc fingerprint="bc6e12dd20c7bfcf"&gt;
   &lt;main&gt;
     &lt;p&gt;Civic institutions—the rule of law, universities, and a free press—are the backbone of democratic life. They are the mechanisms through which complex societies encourage cooperation and stability, while also adapting to changing circumstances. The real superpower of institutions is their ability to evolve and adapt within a hierarchy of authority and a framework for roles and rules while maintaining legitimacy in the knowledge produced and the actions taken. Purpose-driven institutions built around transparency, cooperation, and accountability empower individuals to take intellectual risks and challenge the status quo. This happens through the machinations of interpersonal relationships within those institutions, which broaden perspectives and strengthen shared commitment to civic goals.&lt;lb/&gt;Unfortunately, the affordances of AI systems extinguish these institutional features at every turn. In this essay, we make one simple point: AI systems are built to function in ways that degrade and are likely to destroy our crucial civic institutions. The affordances of AI systems have the effect of eroding expertise, short-circuiting decision-making, and isolating people from each other. These systems are anathema to the kind of evolution, transparency, cooperation, and accountability that give vital institutions their purpose and sustainability. In short, current AI systems are a death sentence for civic institutions, and we should treat them as such.&lt;/p&gt;
     &lt;p&gt;Authors:&lt;lb/&gt;Woodrow Hartzog&lt;lb/&gt;Boston University School of Law; Stanford Law School Center for Internet and Society&lt;lb/&gt;Jessica M. Silbey&lt;lb/&gt;Boston University - School of Law&lt;/p&gt;
@@ -1051,7 +1320,7 @@ WHERE
     &lt;p&gt;"We must also remember that measures introduced for exceptional or serious crimes tend, over time, to be used for much less serious crimes because there is institutional pressure to use them more frequently. What was once exceptional becomes routine." ®&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46705715</guid><pubDate>Wed, 21 Jan 2026 13:52:27 +0000</pubDate></item><item><title>Uber Faces Growing Pressure over Sexual Assault Record</title><link>https://www.nytimes.com/2026/01/21/business/uber-scrutiny-sexual-assault.html</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46705870</guid><pubDate>Wed, 21 Jan 2026 14:05:51 +0000</pubDate></item><item><title>Comic-Con Bans AI Art After Artist Pushback</title><link>https://www.404media.co/comic-con-bans-ai-art-after-artist-pushback/</link><description>&lt;doc fingerprint="3ec71335f15c64a9"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46705715</guid><pubDate>Wed, 21 Jan 2026 13:52:27 +0000</pubDate></item><item><title>Comic-Con Bans AI Art After Artist Pushback</title><link>https://www.404media.co/comic-con-bans-ai-art-after-artist-pushback/</link><description>&lt;doc fingerprint="3ec71335f15c64a9"&gt;
   &lt;main&gt;
     &lt;p&gt;San Diego Comic-Con changed an AI art friendly policy following an artist-led backlash last week. It was a small victory for working artists in an industry where jobs are slipping away as movie and video game studios adopt generative AI tools to save time and money.&lt;/p&gt;
     &lt;p&gt;Every year, tens of thousands of people descend on San Diego for Comic-Con, the world’s premier comic book convention that over the years has also become a major pan-media event where every major media company announces new movies, TV shows, and video games. For the past few years, Comic-Con has allowed some forms of AI-generated art at this art show at the convention. According to archived rules for the show, artists could display AI-generated material so long as it wasn’t for sale, was marked as AI-produced, and credited the original artist whose style was used.&lt;/p&gt;
@@ -1207,4 +1476,137 @@ function MyChart() {
     &lt;p&gt;MIT — see &lt;code&gt;LICENSE&lt;/code&gt;.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46706528</guid><pubDate>Wed, 21 Jan 2026 14:54:56 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46706528</guid><pubDate>Wed, 21 Jan 2026 14:54:56 +0000</pubDate></item><item><title>Show HN: yolo-cage – AI coding agents that can't exfiltrate secrets</title><link>https://github.com/borenstein/yolo-cage</link><description>&lt;doc fingerprint="9f781b9e1db7ca83"&gt;
+  &lt;main&gt;
+    &lt;p&gt;You're a responsible engineer. You'd never just let an AI run roughshod through your most sensitive systems and codebases.&lt;/p&gt;
+    &lt;p&gt;That's why you'd never just shut off the safeguards for a tool like Claude Code. It asks permission for every dangerous action! Safe!&lt;/p&gt;
+    &lt;p&gt;So you wait. And you answer. Decision fatigue sets in. And that's when it happens.&lt;/p&gt;
+    &lt;p&gt;Permission prompts neglect the weakest part of the thread model: a tired user. What if we could empower the agent while limiting its blast radius, thus deferring your decisions until PR review?&lt;/p&gt;
+    &lt;p&gt;That would be great! And that would be yolo-cage.&lt;/p&gt;
+    &lt;code&gt;curl -fsSL https://github.com/borenstein/yolo-cage/releases/latest/download/yolo-cage -o yolo-cage
+chmod +x yolo-cage &amp;amp;&amp;amp; sudo mv yolo-cage /usr/local/bin/
+yolo-cage build --interactive --up&lt;/code&gt;
+    &lt;p&gt;Then create a sandbox and start coding:&lt;/p&gt;
+    &lt;code&gt;yolo-cage create feature-branch
+yolo-cage attach feature-branch   # Claude in tmux, YOLO mode&lt;/code&gt;
+    &lt;p&gt;Prerequisites: Vagrant with libvirt (Linux) or QEMU (macOS, experimental), 8GB RAM, 4 CPUs, GitHub PAT (&lt;code&gt;repo&lt;/code&gt; scope), Claude account. See setup docs for details.&lt;/p&gt;
+    &lt;p&gt;Secrets in HTTP/HTTPS - egress proxy scans request bodies, headers, URLs:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;&lt;code&gt;sk-ant-*&lt;/code&gt;,&lt;code&gt;AKIA*&lt;/code&gt;,&lt;code&gt;ghp_*&lt;/code&gt;, SSH private keys, generic credential patterns&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Git operations - dispatcher enforces branch isolation:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Push to any branch except the one assigned at sandbox creation&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;git remote&lt;/code&gt;,&lt;code&gt;git clone&lt;/code&gt;,&lt;code&gt;git config&lt;/code&gt;,&lt;code&gt;git credential&lt;/code&gt;&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;GitHub CLI - dispatcher blocks dangerous commands:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;&lt;code&gt;gh pr merge&lt;/code&gt;,&lt;code&gt;gh repo delete&lt;/code&gt;,&lt;code&gt;gh api&lt;/code&gt;&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;GitHub API - proxy blocks at HTTP layer:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;&lt;code&gt;PUT /repos/*/pulls/*/merge&lt;/code&gt;,&lt;code&gt;DELETE /repos/*&lt;/code&gt;, webhook modifications&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Exfiltration sites: pastebin.com, file.io, transfer.sh, etc.&lt;/p&gt;
+    &lt;p&gt;See Architecture for the full threat model.&lt;/p&gt;
+    &lt;code&gt;┌──────────────────────────────────────────────────────────────────────────┐
+│ Vagrant VM (MicroK8s)                                                    │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │ Sandbox Pod                                                        │  │
+│  │                                                                    │  │
+│  │  Claude Code (YOLO mode)                                           │  │
+│  │       │                                                            │  │
+│  │       ├── git/gh ──▶ Dispatcher ──▶ GitHub                         │  │
+│  │       │              • Branch enforcement                          │  │
+│  │       │              • TruffleHog pre-push                         │  │
+│  │       │                                                            │  │
+│  │       └── HTTP/S ──▶ Egress Proxy ──▶ Internet                     │  │
+│  │                      • Secret scanning                             │  │
+│  │                      • Domain blocklist                            │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+&lt;/code&gt;
+    &lt;p&gt;One sandbox per branch. Agents can only push to their assigned branch. All outbound traffic is filtered.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="2"&gt;
+        &lt;cell role="head"&gt;Command&lt;/cell&gt;
+        &lt;cell role="head"&gt;Description&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;create &amp;lt;branch&amp;gt;&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Create sandbox&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;attach &amp;lt;branch&amp;gt;&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Attach (Claude in tmux)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;shell &amp;lt;branch&amp;gt;&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Attach (bash)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;list&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;List sandboxes&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;delete &amp;lt;branch&amp;gt;&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Delete sandbox&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;port-forward &amp;lt;branch&amp;gt; &amp;lt;port&amp;gt;&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Forward port from sandbox&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;&lt;code&gt;up&lt;/code&gt; / &lt;code&gt;down&lt;/code&gt;&lt;/cell&gt;
+        &lt;cell&gt;Start/stop VM&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;upgrade [--rebuild]&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Upgrade to latest version&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;
+          &lt;code&gt;version&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Show version&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Access web apps running inside a sandbox:&lt;/p&gt;
+    &lt;code&gt;yolo-cage port-forward feature-x 8080           # localhost:8080 → pod:8080
+yolo-cage port-forward feature-x 9000:3000      # localhost:9000 → pod:3000
+yolo-cage port-forward feature-x 8080 --bind 0.0.0.0  # LAN accessible&lt;/code&gt;
+    &lt;p&gt;See Configuration for proxy bypass, hooks, and resource limits.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Architecture - Threat model, design rationale&lt;/item&gt;
+      &lt;item&gt;Configuration - Egress policy, proxy bypass, hooks&lt;/item&gt;
+      &lt;item&gt;Customization - Adding tools, resource limits&lt;/item&gt;
+      &lt;item&gt;Security Audit - Escape testing guide&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;This reduces risk. It does not eliminate it.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;DNS exfiltration - data encoded in DNS queries&lt;/item&gt;
+      &lt;item&gt;Timing side channels - information leaked via response timing&lt;/item&gt;
+      &lt;item&gt;Steganography - secrets hidden in images or binary data&lt;/item&gt;
+      &lt;item&gt;Sophisticated encoding - bypassing pattern matching&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Use scoped credentials. Don't use production secrets where exfiltration would be catastrophic. See Security Audit to test it yourself.&lt;/p&gt;
+    &lt;p&gt;MIT. See LICENSE.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46706796</guid><pubDate>Wed, 21 Jan 2026 15:13:29 +0000</pubDate></item></channel></rss>
