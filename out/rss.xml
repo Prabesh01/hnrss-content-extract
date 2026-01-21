@@ -1,309 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 21 Jan 2026 18:29:07 +0000</lastBuildDate><item><title>I Made Zig Compute 33M Satellite Positions in 3 Seconds. No GPU Required</title><link>https://atempleton.bearblog.dev/i-made-zig-compute-33-million-satellite-positions-in-3-seconds-no-gpu-required/</link><description>&lt;doc fingerprint="ef1e7cfce90c1280"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;I Made Zig Compute 33 Million Satellite Positions in 3 Seconds. No GPU Required.&lt;/head&gt;
-    &lt;p&gt;I've spent the past month optimizing SGP4 propagation and ended up with something interesting: astroz is now the fastest general purpose SGP4 implementation I'm aware of, hitting 11-13M propagations per second in native Zig and ~7M/s through Python with just &lt;code&gt;pip install astroz&lt;/code&gt;. This post breaks down how I got there.&lt;/p&gt;
-    &lt;p&gt;A note on "general purpose": heyoka.py can be faster for batch-processing many satellites simultaneously (16M/s vs 7.5M/s). But it's a general ODE integrator with SGP4 as a module, requiring LLVM for JIT compilation and a C++ dependency stack that conda-forge recommends over pip. For time batched propagation, many time points for one satellite, astroz is 2x faster (8.5M/s vs 3.8M/s). Full comparison below. I'm also skipping GPU accelerated SGP4 implementations. They can be faster for massive batch workloads, but require CUDA/OpenCL setup and aren't what I'd consider "general purpose."&lt;/p&gt;
-    &lt;head rend="h2"&gt;Why Bother Optimizing SGP4?&lt;/head&gt;
-    &lt;p&gt;SGP4 is the standard algorithm for predicting satellite positions from TLE data. It's been around since the 80s and most implementations are straightforward ports of the original reference code. They work fine. You can read the implementation that I followed from SpaceTrack Report No. 3.&lt;/p&gt;
-    &lt;p&gt;But "fine" starts to feel slow when you need dense time resolution. Generating a month of ephemeris data at one-second intervals is 2.6 million propagations per satellite. Pass prediction over a ground station network might need sub-second precision across weeks. Trajectory analysis for conjunction screening wants fine-grained time steps to catch close approaches. At 2-3M propagations per second (typical for a good implementation), these workloads take seconds per satellite—that adds up fast when you're doing iterative analysis or building interactive tools.&lt;/p&gt;
-    &lt;p&gt;I wanted to see how fast I could make it.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Starting Point: Already Faster Than Expected&lt;/head&gt;
-    &lt;p&gt;Before I even started thinking about SIMD, the scalar implementation was already matching or beating the Rust sgp4 crate, the fastest open-source implementation I could find (general purpose). I hadn't done anything clever yet; the speed came from design choices that happened to play well with how Zig compiles.&lt;/p&gt;
-    &lt;p&gt;Two things mattered most:&lt;/p&gt;
-    &lt;p&gt;Branchless hot paths. The SGP4 algorithm has a lot of conditionals. Deep space vs near earth, different perturbation models, and convergence checks in the Kepler solver. I wrote these as branchless expressions where possible, not for performance reasons initially, but because it made the code easier to reason about. It happened to be a happy accident that modern CPUs love predictable instruction streams.&lt;/p&gt;
-    &lt;p&gt;Comptime precomputation. Zig's &lt;code&gt;comptime&lt;/code&gt; lets you run arbitrary code at compile time. A lot of SGP4's setup work, ie. gravity constants, polynomial coefficients, derived parameters can be computed once and baked into the binary. No runtime initialization, and no repeated calculations. I didn't have to do anything special. Zig is smart enough where if you mark a variable as &lt;code&gt;const&lt;/code&gt; it treats it as comptime automatically.&lt;/p&gt;
-    &lt;code&gt;const j2: comptime_float = 1.082616e-3; // explicit comptime (not needed)
-const j2 = 1.082616e-3; // implied comptime because of `const` (what I used)
-&lt;/code&gt;
-    &lt;p&gt;The result was a scalar implementation running at ~5.2M propagations per second, which was already slightly faster than Rust's ~5.0M, but within a margin of error. But I started to see some room to go faster. SGP4, by design, doesn't rely on state to calculate positions: each satellite and each time point is independent. This algorithm feels tailor made for something I have always been too afraid to try: SIMD.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Discovering Zig's SIMD Superpowers&lt;/head&gt;
-    &lt;p&gt;I have heard the nightmares about implementing SIMD. Most of the time its never worth it, it adds too much complexity, you have to build for different platforms, and the syntax itself is weird to write and think about.&lt;/p&gt;
-    &lt;p&gt;I was pleasantly surprised to learn that Zig, whether on purpose or not, makes SIMD a first class citizen. This is all enabled by a powerful and sane standard library that has builtins that handle the weird stuff for me. Now I just had to tackle the thought process for the basic flow of things in SIMD.&lt;/p&gt;
-    &lt;p&gt;I started with this foundation; a simple type declaration:&lt;/p&gt;
-    &lt;code&gt;const Vec4 = @Vector(4, f64);
-&lt;/code&gt;
-    &lt;p&gt;That's all you need to start. I now have a 4-wide vector of 64-bit floats. No intrinsics, no platform detection, no conditional compilation. The LLVM backend handles targeting the right instruction set for wherever the code runs.&lt;/p&gt;
-    &lt;p&gt;The builtin operations for vector operations are equally simple:&lt;/p&gt;
-    &lt;code&gt;// Broadcast a scalar to all lanes
-const twoPiVec: Vec4 = @splat(constants.twoPi);
-
-// Auto-vectorized transcendentals through LLVM
-pub fn sinSIMD(x: Vec4) Vec4 {
-    return @sin(x);
-}
-
-pub fn cosSIMD(x: Vec4) Vec4 {
-    return @cos(x);
-}
-&lt;/code&gt;
-    &lt;p&gt;The &lt;code&gt;@sin&lt;/code&gt; and &lt;code&gt;@cos&lt;/code&gt; builtins map directly to LLVM intrinsics, which use platform optimal implementations like libmvec on Linux x86_64. No manual work required.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Learning to Think in Lanes&lt;/head&gt;
-    &lt;p&gt;The arithmetic was easy. What took me a while to internalize was branching.&lt;/p&gt;
-    &lt;p&gt;In scalar code, you write &lt;code&gt;if&lt;/code&gt; statements and the CPU takes one path or the other. In SIMD, all four lanes execute together. If lane 0 needs the "true" branch and lane 2 needs the "false" branch, you can't just branch, you have to compute both outcomes and then pick per lane.&lt;/p&gt;
-    &lt;p&gt;Here's a concrete example. The scalar SGP4 code has a check like this:&lt;/p&gt;
-    &lt;code&gt;// Scalar version
-if (eccentricity &amp;lt; 1.0e-4) {
-    result = simple_calculation(x);
-} else {
-    result = complex_calculation(x);
-}
-&lt;/code&gt;
-    &lt;p&gt;In SIMD, this becomes:&lt;/p&gt;
-    &lt;code&gt;// SIMD version - compute both, select per-lane
-const simple_result = simple_calculation(x);
-const complex_result = complex_calculation(x);
-const mask = eccentricity &amp;lt; @as(Vec4, @splat(1.0e-4));
-const result = @select(f64, mask, simple_result, complex_result);
-&lt;/code&gt;
-    &lt;p&gt;This felt wasteful at first. Why compute both paths? But modern CPUs are so fast at arithmetic that computing both and selecting is often faster than branch misprediction. Plus, for SGP4, most satellites take the same path anyway, so we're rarely doing truly "wasted" work.&lt;/p&gt;
-    &lt;p&gt;The trickier case was convergence loops. SGP4's Kepler solver iterates until each result converges. In scalar code:&lt;/p&gt;
-    &lt;code&gt;// Scalar Kepler solver
-while (@abs(delta) &amp;gt; tolerance) {
-    // iterate...
-}
-&lt;/code&gt;
-    &lt;p&gt;But in SIMD, different lanes converge at different rates. Lane 0 might converge in 3 iterations while lane 3 needs 5. You can't exit early for just one lane. The solution is to track convergence per lane with a mask and use &lt;code&gt;@reduce&lt;/code&gt; to check if everyone's done:&lt;/p&gt;
-    &lt;code&gt;// SIMD Kepler solver
-var converged: @Vector(4, bool) = @splat(false);
-while (!@reduce(.And, converged)) {
-    // iterate...
-    converged = @abs(delta) &amp;lt;= tolerance_vec;
-}
-&lt;/code&gt;
-    &lt;p&gt;Once I understood this pattern, compute everything, mask the results, reduce to check completion, the rest of the conversion was methodical. I went through the scalar implementation line by line, keeping the original untouched so my test suite could compare outputs.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The Three Propagation Modes&lt;/head&gt;
-    &lt;p&gt;With the core SIMD patterns figured out, I built three different propagation strategies for different use cases.&lt;/p&gt;
-    &lt;head rend="h3"&gt;1. Time Batched: &lt;code&gt;propagateV4&lt;/code&gt;&lt;/head&gt;
-    &lt;p&gt;The first question I asked: what's the most common workload? For me, it was generating ephemeris data, and propagating a single satellite across many time points. Pass prediction, trajectory analysis, conjunction screening: they all want dense time series for one object.&lt;/p&gt;
-    &lt;p&gt;Time batched propagation processes 4 time points for one satellite simultaneously:&lt;/p&gt;
-    &lt;code&gt;pub fn propagateV4(self: *const Sgp4, times: [4]f64) Error![4][2][3]f64 {
-    const el = &amp;amp;self.elements;
-    const timeV4 = Vec4{ times[0], times[1], times[2], times[3] };
-
-    const secular = updateSecularV4(el, timeV4);
-    const nm: Vec4 = @as(Vec4, @splat(el.grav.xke)) / simdMath.pow15V4(secular.a);
-    const kepler = solveKeplerV4(el, secular);
-    const corrected = applyShortPeriodCorrectionsV4(el, kepler, nm);
-    return computePositionVelocityV4(el, corrected);
-}
-&lt;/code&gt;
-    &lt;p&gt;Usage is straightforward:&lt;/p&gt;
-    &lt;code&gt;const sat = try Sgp4.init(tle);
-const times = [4]f64{ 0.0, 1.0, 2.0, 3.0 }; // minutes since epoch
-const results = try sat.propagateV4(times);
-// results[0] = position/velocity at t=0, results[1] at t=1, etc.
-&lt;/code&gt;
-    &lt;p&gt;This mode gave me the biggest initial speedup because it's the most cache friendly: the satellite's orbital elements stay in registers while we compute four outputs.&lt;/p&gt;
-    &lt;head rend="h3"&gt;2. Satellite Batched: &lt;code&gt;propagateSatellitesV4&lt;/code&gt;&lt;/head&gt;
-    &lt;p&gt;The opposite workload: what if you have many satellites and need their positions at one specific time? Collision screening snapshots, catalog-wide visibility checks, that sort of thing.&lt;/p&gt;
-    &lt;p&gt;Satellite batched propagation processes 4 different satellites at the same time point:&lt;/p&gt;
-    &lt;code&gt;pub inline fn propagateSatellitesV4(el: *const ElementsV4, tsince: f64) Error![4][2][3]f64 {
-    const tsinceVec: Vec4 = @splat(tsince);
-    const secular = updateSecularSatV4(el, tsinceVec);
-    const nm: Vec4 = el.xke / simdMath.pow15V4(secular.a);
-    const kepler = solveKeplerSatV4(el, secular);
-    const corrected = applyShortPeriodCorrectionsSatV4(el, kepler, nm);
-    return computePositionVelocitySatV4(el, corrected);
-}
-&lt;/code&gt;
-    &lt;p&gt;This required a different data layout. Instead of one satellite with 4 time points, I needed 4 satellites packed together. That's where &lt;code&gt;ElementsV4&lt;/code&gt; comes in. Its a struct where each field is a &lt;code&gt;Vec4&lt;/code&gt; holding values for 4 different satellites. More on that layout later.&lt;/p&gt;
-    &lt;head rend="h3"&gt;3. Constellation Mode: &lt;code&gt;propagateConstellationV4&lt;/code&gt;&lt;/head&gt;
-    &lt;p&gt;The third workload combines both: propagate many satellites across many time points. This is what the live demo does: 13,000 satellites across 1,440 time points.&lt;/p&gt;
-    &lt;p&gt;The naive approach would be: for each satellite, compute all time points. But that thrashes the cache. By the time you finish satellite 1's 1,440 points and move to satellite 2, all the time related data has been evicted.&lt;/p&gt;
-    &lt;p&gt;Constellation mode uses cache conscious tiling:&lt;/p&gt;
-    &lt;code&gt;// Time tile size tuned for L1 cache (~32KB)
-const TILE_SIZE: usize = 64;
-
-// Process in tiles over time to keep data in L1/L2 cache
-var timeStart: usize = 0;
-while (timeStart &amp;lt; numTimes) {
-    const timeEnd = @min(timeStart + TILE_SIZE, numTimes);
-
-    for (batches, 0..) |*batch, batchIdx| {
-        for (timeStart..timeEnd) |timeIdx| {
-            const satResults = try propagateSatellitesV4(batch, times[timeIdx]);
-            // Store results...
-        }
-    }
-    timeStart = timeEnd;
-}
-&lt;/code&gt;
-    &lt;p&gt;The idea here is to process 64 time points for all satellites, then the next 64, and so on. The time values stay hot in L1 cache while we sweep through the satellite batches. The tile size (64) isn't magic, it's roughly &lt;code&gt;L1_size / sizeof(working_data)&lt;/code&gt; rounded to a SIMD-friendly number.&lt;/p&gt;
-    &lt;p&gt;In practice, constellation mode is about 15-20% faster than calling satellite batched propagation in a naive loop for large catalogs.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The atan2 Problem (and Solution)&lt;/head&gt;
-    &lt;p&gt;Here's where things got interesting. SGP4's Kepler solver needs &lt;code&gt;atan2&lt;/code&gt;, but LLVM doesn't provide a vectorized builtin for it. Calling the scalar function would break the SIMD implementation.&lt;/p&gt;
-    &lt;p&gt;The solution I picked: a polynomial approximation. The key insight is that for SGP4's accuracy requirements (which are inherently limited by the model), we don't need perfect precision.&lt;/p&gt;
-    &lt;code&gt;pub fn atan2SIMD(y: Vec4, x: Vec4) Vec4 {
-    const abs_x = @abs(x);
-    const abs_y = @abs(y);
-
-    // Keep argument in [0, 1] for better polynomial accuracy
-    const max_xy = @max(abs_x, abs_y);
-    const min_xy = @min(abs_x, abs_y);
-    const t = min_xy / @max(max_xy, @as(Vec4, @splat(1.0e-30)));
-    const t2 = t * t;
-
-    const c1: Vec4 = @splat(1.0);
-    const c3: Vec4 = @splat(-0.3333314528);
-    const c5: Vec4 = @splat(0.1999355085);
-    // ... more coefficients
-
-    var atan_t = c17;
-    atan_t = atan_t * t2 + c15;
-    atan_t = atan_t * t2 + c13;
-    // ... Horner's method continues
-    atan_t = atan_t * t;
-
-    // Quadrant correction using branchless selects
-    const swap_mask = abs_y &amp;gt; abs_x;
-    atan_t = @select(f64, swap_mask, halfPiVec - atan_t, atan_t);
-
-    // ... more quadrant handling with @select
-    return result;
-}
-&lt;/code&gt;
-    &lt;p&gt;This polynomial approximation is accurate to ~1e-7 radians, which translates to about 10mm position error at LEO distances. That's well within SGP4's inherent accuracy limits. The algorithm itself has kilometers of uncertainty over multi-day propagations built into it.&lt;/p&gt;
-    &lt;p&gt;To be honest, this math was tricky for me to wrap my head around. I had to ask AI to help me here because I was really struggling with it.&lt;/p&gt;
-    &lt;head rend="h2"&gt;"Struct of Arrays" for Multi Satellite Processing&lt;/head&gt;
-    &lt;p&gt;For processing multiple satellites, I use a "struct of arrays" layout:&lt;/p&gt;
-    &lt;code&gt;pub const ElementsV4 = struct {
-    grav: constants.Sgp4GravityModel,
-
-    // Each field is a Vec4 holding values for 4 satellites
-    ecco: Vec4,
-    inclo: Vec4,
-    nodeo: Vec4,
-    argpo: Vec4,
-    mo: Vec4,
-    // ...
-
-    // Pre-splatted constants (computed once at init)
-    xke: Vec4,
-    j2: Vec4,
-    one: Vec4,
-    half: Vec4,
-    // ...
-};
-&lt;/code&gt;
-    &lt;p&gt;"Pre-splatting" constants eliminates repeated &lt;code&gt;@splat&lt;/code&gt; calls in the hot path. It's a small optimization, but in code running millions of times per second, everything counts, and its an easy win.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The Benchmark Results&lt;/head&gt;
-    &lt;head rend="h3"&gt;Native Implementation Comparison (Zig vs Rust)&lt;/head&gt;
-    &lt;p&gt;First, let's compare apples to apples. Native compiled implementations:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="4"&gt;
-        &lt;cell role="head"&gt;Scenario&lt;/cell&gt;
-        &lt;cell role="head"&gt;astroz (Zig)&lt;/cell&gt;
-        &lt;cell role="head"&gt;Rust sgp4&lt;/cell&gt;
-        &lt;cell role="head"&gt;Speedup&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;1 day (minute)&lt;/cell&gt;
-        &lt;cell&gt;0.27 ms&lt;/cell&gt;
-        &lt;cell&gt;0.31 ms&lt;/cell&gt;
-        &lt;cell&gt;1.16x&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;1 week (minute)&lt;/cell&gt;
-        &lt;cell&gt;1.99 ms&lt;/cell&gt;
-        &lt;cell&gt;2.04 ms&lt;/cell&gt;
-        &lt;cell&gt;1.03x&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;2 weeks (minute)&lt;/cell&gt;
-        &lt;cell&gt;3.87 ms&lt;/cell&gt;
-        &lt;cell&gt;4.03 ms&lt;/cell&gt;
-        &lt;cell&gt;1.04x&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;2 weeks (second)&lt;/cell&gt;
-        &lt;cell&gt;222 ms&lt;/cell&gt;
-        &lt;cell&gt;234 ms&lt;/cell&gt;
-        &lt;cell&gt;1.05x&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;1 month (minute)&lt;/cell&gt;
-        &lt;cell&gt;8.37 ms&lt;/cell&gt;
-        &lt;cell&gt;8.94 ms&lt;/cell&gt;
-        &lt;cell&gt;1.07x&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Both implementations achieve around 5M propagations/sec for scalar (single-satellite) processing. The Zig implementation edges out Rust slightly. This is most likely hot path optimizations and &lt;code&gt;comptime&lt;/code&gt; being quite aggressive with its pre compute.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Native SIMD Throughput Comparison&lt;/head&gt;
-    &lt;p&gt;The real gains come from SIMD. When processing multiple satellites or time points in parallel using &lt;code&gt;@Vector(4, f64)&lt;/code&gt;, throughput jumps to 11-13M propagations/sec, more than 2x faster than scalar implementations.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Python Bindings Performance&lt;/head&gt;
-    &lt;p&gt;For Python users, here's how astroz compares to python-sgp4:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="4"&gt;
-        &lt;cell role="head"&gt;Scenario&lt;/cell&gt;
-        &lt;cell role="head"&gt;astroz&lt;/cell&gt;
-        &lt;cell role="head"&gt;python-sgp4&lt;/cell&gt;
-        &lt;cell role="head"&gt;Speedup&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;2 weeks (second)&lt;/cell&gt;
-        &lt;cell&gt;160 ms&lt;/cell&gt;
-        &lt;cell&gt;464 ms&lt;/cell&gt;
-        &lt;cell&gt;2.9x&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;1 month (minute)&lt;/cell&gt;
-        &lt;cell&gt;5.9 ms&lt;/cell&gt;
-        &lt;cell&gt;16.1 ms&lt;/cell&gt;
-        &lt;cell&gt;2.7x&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;head rend="h3"&gt;Python Bindings Throughput&lt;/head&gt;
-    &lt;head rend="h3"&gt;A Note on heyoka.py&lt;/head&gt;
-    &lt;p&gt;As mentioned in the intro, heyoka.py deserves attention. Here are the single-threaded benchmarks:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;Test&lt;/cell&gt;
-        &lt;cell role="head"&gt;heyoka.py&lt;/cell&gt;
-        &lt;cell role="head"&gt;astroz&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;8 sats × 1440 times&lt;/cell&gt;
-        &lt;cell&gt;16.2M/s&lt;/cell&gt;
-        &lt;cell&gt;7.5M/s&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;1 sat × 1440 times&lt;/cell&gt;
-        &lt;cell&gt;3.8M/s&lt;/cell&gt;
-        &lt;cell&gt;8.5M/s&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;100 sats × 100 times&lt;/cell&gt;
-        &lt;cell&gt;15.5M/s&lt;/cell&gt;
-        &lt;cell&gt;8.4M/s&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;heyoka.py wins on multi satellite batches; astroz wins on time batched workloads. Which one you pick depends on your use case:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;How many satellites at once? If you're propagating hundreds of satellites at the same time point (collision screening snapshots), heyoka.py wins this easily.&lt;/item&gt;
-      &lt;item&gt;How many time points per satellite? If you're generating ephemerides, predicting passes, or doing trajectory analysis for individual satellites across many time steps, astroz is 2x faster.&lt;/item&gt;
-      &lt;item&gt;Do you need easy deployment? astroz is &lt;code&gt;pip install astroz&lt;/code&gt;with just NumPy. heyoka.py requires LLVM and a C++ stack that conda-forge recommends over pip.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h2"&gt;Seeing It at Scale&lt;/head&gt;
-    &lt;p&gt;Speed numbers are abstract until you see what they enable. When propagation is this fast, you stop thinking about batching and scheduling, you just compute what you need, when you need it.&lt;/p&gt;
-    &lt;head rend="h3"&gt;The Live Demo&lt;/head&gt;
-    &lt;p&gt;To show what this looks like, I built an interactive Cesium visualization that propagates the entire active catalog from CelesTrak (~13,000 satellites) across 1440 time points (a full day at minute resolution). That's ~19 million propagations completing in about 2.7 seconds. Add ~0.6 seconds for TEME→ECEF coordinate conversion, and you get a full day of orbital data for every tracked satellite in about 3.3 seconds. (This demo runs through Python bindings at ~7M/sec; native Zig hits 11-13M/sec.)&lt;/p&gt;
-    &lt;head rend="h2"&gt;Looking Forward&lt;/head&gt;
-    &lt;p&gt;Next up: SDP4 for deep space objects (the current implementation only handles near-earth satellites with periods under 225 minutes), and multithreading to scale across cores. The SIMD work here was single threaded, there's another multiplier waiting.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Try It Yourself&lt;/head&gt;
-    &lt;p&gt;astroz is available on PyPI:&lt;/p&gt;
-    &lt;code&gt;pip install astroz
-&lt;/code&gt;
-    &lt;p&gt;Or add it to your Zig project:&lt;/p&gt;
-    &lt;code&gt;zig fetch --save git+https://github.com/ATTron/astroz/#HEAD
-&lt;/code&gt;
-    &lt;p&gt;The code is open source on GitHub. Stars, issues, and contributions welcome.&lt;/p&gt;
-    &lt;p&gt;Browse the examples to integrate astroz into your own projects, or try the live demo to see it in action.&lt;/p&gt;
-    &lt;p&gt;Who Am I?&lt;/p&gt;
-    &lt;p&gt;Anthony Templeton is a software engineer passionate about high-performance computing and aerospace applications. You can connect with me on LinkedIn or check out more of my work on GitHub.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46703317</guid><pubDate>Wed, 21 Jan 2026 09:51:27 +0000</pubDate></item><item><title>EU–INC – A new pan-European legal entity</title><link>https://www.eu-inc.org/</link><description>&lt;doc fingerprint="a1be153739b2f6ef"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 21 Jan 2026 19:05:24 +0000</lastBuildDate><item><title>EU–INC – A new pan-European legal entity</title><link>https://www.eu-inc.org/</link><description>&lt;doc fingerprint="a1be153739b2f6ef"&gt;
   &lt;main&gt;
     &lt;p&gt;WHAT IS EUâINC&lt;/p&gt;
     &lt;head rend="h2"&gt;EUâINC â A true pan-European solution&lt;/head&gt;
@@ -675,10 +371,7 @@ while (timeStart &amp;lt; numTimes) {
     &lt;p&gt;I hope these little nuggets of Markdown trivialities will one day prove useful in your own Markdown misfortunes.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46705201</guid><pubDate>Wed, 21 Jan 2026 13:08:35 +0000</pubDate></item><item><title>Swedish Alecta has sold off an estimated $8B of US Treasury Bonds</title><link>https://www.di.se/nyheter/di-avslojar-alecta-har-dumpat-amerikanska-statspapper/</link><description>&lt;doc fingerprint="d00b8a7446d4bfd2"&gt;
-  &lt;main&gt;&lt;p&gt;Är du redan prenumerant, logga in för att fortsätta läsa.&lt;/p&gt;Logga in&lt;head rend="h2"&gt; Erbjudande! &lt;lb/&gt; Prova Di Digitalt endast &lt;lb/&gt; 99 kr för 3 mån&lt;/head&gt;&lt;p&gt;Därefter tillsvidare med 30% rabatt, endast 385 kr/mån (ord.pris 549kr/mån) i 12 månader. Alla priser är inklusive moms. Erbjudandet gäller endast nya kunder.&lt;/p&gt;&lt;head rend="h3"&gt;Det här ingår i din prenumeration:&lt;/head&gt;&lt;list rend="ul"&gt;&lt;item&gt;Nordens största affärstidning i digitalt format&lt;/item&gt;&lt;item&gt;Tillgång till över 1100 aktiekurser i realtid&lt;/item&gt;&lt;item&gt;Tillgång till alla låsta artiklar&lt;/item&gt;&lt;item&gt;E-tidningen redan kvällen före&lt;/item&gt;&lt;item&gt;Di Weekend - Lyxiga livsstilsmagasinet digitalt&lt;/item&gt;&lt;/list&gt;&lt;head rend="h2"&gt; Erbjudande! &lt;lb/&gt; Prova Di Digitalt endast &lt;lb/&gt; 99 kr för 3 mån&lt;/head&gt;&lt;head rend="h3"&gt;Ditt erbjudande&lt;/head&gt;&lt;head rend="h3"&gt;Di Digitalt&lt;/head&gt;&lt;p&gt;Därefter tillsvidare med 30% rabatt, endast 385 kr/mån (ord.pris 549kr/mån) i 12 månader. Alla priser är inklusive moms. Erbjudandet gäller endast nya kunder.&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;Nordens största affärstidning i digitalt format&lt;/item&gt;&lt;item&gt;Tillgång till över 1100 aktiekurser i realtid&lt;/item&gt;&lt;item&gt;Tillgång till alla låsta artiklar&lt;/item&gt;&lt;item&gt;E-tidningen redan kvällen före&lt;/item&gt;&lt;item&gt;Di Weekend - Lyxiga livsstilsmagasinet digitalt&lt;/item&gt;&lt;/list&gt;&lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46705256</guid><pubDate>Wed, 21 Jan 2026 13:13:06 +0000</pubDate></item><item><title>Ireland wants to give its cops spyware, ability to crack encrypted messages</title><link>https://www.theregister.com/2026/01/21/ireland_wants_to_give_police/</link><description>&lt;doc fingerprint="fc3c993136b2f35d"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46705201</guid><pubDate>Wed, 21 Jan 2026 13:08:35 +0000</pubDate></item><item><title>Ireland wants to give its cops spyware, ability to crack encrypted messages</title><link>https://www.theregister.com/2026/01/21/ireland_wants_to_give_police/</link><description>&lt;doc fingerprint="fc3c993136b2f35d"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Ireland wants to give its cops spyware, ability to crack encrypted messages&lt;/head&gt;
     &lt;head rend="h2"&gt;Its very own Snooper’s Charter comes a month after proposed biometric tech expansion&lt;/head&gt;
@@ -1089,7 +782,7 @@ interface for creating and managing VM's.&lt;/p&gt;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46707572</guid><pubDate>Wed, 21 Jan 2026 16:04:49 +0000</pubDate></item><item><title>JPEG XL Demo Page</title><link>https://tildeweb.nl/~michiel/jxl/</link><description>&lt;doc fingerprint="df0313d10509d924"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46707572</guid><pubDate>Wed, 21 Jan 2026 16:04:49 +0000</pubDate></item><item><title>JPEG XL Test Page</title><link>https://tildeweb.nl/~michiel/jxl/</link><description>&lt;doc fingerprint="df0313d10509d924"&gt;
   &lt;main&gt;
     &lt;p&gt;This page shows a JPEG XL image, if your browser can handle it! At this point in time (January 2026) this means only Safari will display the image, as far as I know. See also Can I Use&lt;/p&gt;
     &lt;p&gt;The person in the image is Jon Sneyers, co-author of the JPEG XL spec and also creator of the "Free Lossless Image Format" that came before it.&lt;/p&gt;
@@ -1323,45 +1016,269 @@ interface for creating and managing VM's.&lt;/p&gt;
     &lt;p&gt;Published by Vladimir Prelovac and Raghu Murthi on January 21, 2026.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46708678</guid><pubDate>Wed, 21 Jan 2026 17:28:03 +0000</pubDate></item><item><title>illumos</title><link>https://illumos.org/</link><description>&lt;doc fingerprint="2d93b06d569b6dc2"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46708678</guid><pubDate>Wed, 21 Jan 2026 17:28:03 +0000</pubDate></item><item><title>Slouching Towards Bethlehem – Joan Didion (1967)</title><link>https://www.saturdayeveningpost.com/2017/06/didion/</link><description>&lt;doc fingerprint="3e299157a9e40435"&gt;
   &lt;main&gt;
-    &lt;head rend="h2"&gt;What is illumos?&lt;/head&gt;
-    &lt;p&gt;illumos is a Unix operating system which provides next-generation features for downstream distributions, including advanced system debugging, next generation filesystem, networking, and virtualization options.&lt;/p&gt;
-    &lt;p&gt;illumos is developed by both volunteers and companies building products on top of the software.&lt;/p&gt;
-    &lt;p&gt;illumos is an excellent base for both traditional and cloud-native deployments.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Getting Started&lt;/head&gt;
-    &lt;head rend="h3"&gt;Download and install&lt;/head&gt;
-    &lt;p&gt;The OmniOS, OpenIndiana, and Tribblix distributions are a good place for new users to get started. You can install in a virtual machine or on bare metal.&lt;/p&gt;
-    &lt;p&gt;Look at the full list to find a distribution that meets your needs!&lt;/p&gt;
-    &lt;head rend="h3"&gt;Get the source&lt;/head&gt;
-    &lt;p&gt;illumos is freely available from our source repository, or a read-only mirror on GitHub. You can see recent changes here.&lt;/p&gt;
-    &lt;p&gt;Instructions for building illumos on various distributions can be found here!&lt;/p&gt;
-    &lt;head rend="h3"&gt;Join the community&lt;/head&gt;
-    &lt;p&gt; Discussions occur on the project mailing lists; you can join and post, or read the archives on the web. The &lt;code&gt;#illumos&lt;/code&gt; channel on Libera Chat
-          (IRC) is very active and has online logs.
-          &lt;/p&gt;
-    &lt;p&gt;We strive to be inclusive, and enforce a code of conduct in our interactions.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Other Resources&lt;/head&gt;
-    &lt;p&gt;There are many online resources that describe the illumos project. Here are some important links:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Code Of Conduct&lt;/item&gt;
-      &lt;item&gt;Contribution Guide&lt;/item&gt;
-      &lt;item&gt;Manual Pages&lt;/item&gt;
-      &lt;item&gt;Online Books&lt;/item&gt;
-      &lt;item&gt;Bug Tracker&lt;/item&gt;
-      &lt;item&gt;Mailing Lists&lt;/item&gt;
-      &lt;item&gt;illumos Source on Gerrit (primary repository)&lt;/item&gt;
-      &lt;item&gt;illumos Source on GitHub (read-only mirror)&lt;/item&gt;
-      &lt;item&gt;illumos OpenGrok Source Browser&lt;/item&gt;
-      &lt;item&gt;illumos Project Discussions (IPD)&lt;/item&gt;
-      &lt;item&gt;Documentation&lt;/item&gt;
-      &lt;item&gt;Gerrit (Code Reviews)&lt;/item&gt;
-      &lt;item&gt;Supported Hardware Database&lt;/item&gt;
-      &lt;item&gt;Fault Management Message Database&lt;/item&gt;
-    &lt;/list&gt;
+    &lt;p&gt;[Editor’s note: Joan Didion’s “Slouching Towards Bethlehem” was first published in the September 23, 1967, edition of the Post. We republish it here as part of our 50th anniversary commemoration of the Summer of Love. Scroll to the bottom to see this story as it appeared in the magazine.]&lt;/p&gt;
+    &lt;quote&gt;&lt;p&gt;Things fall apart; the center cannot hold;&lt;/p&gt;&lt;lb/&gt;Mere anarchy is loosed upon the world . . .&lt;lb/&gt;Surely some revelation is at hand;&lt;lb/&gt;Surely the Second Coming is at hand . . .&lt;lb/&gt;And what rough beast, its hour come round at last,&lt;lb/&gt;Slouches towards Bethlehem to be born?&lt;lb/&gt;—W.B. Yeats&lt;/quote&gt;
+    &lt;p&gt;The center was not holding. It was a country of bankruptcy notices and public-auction announcements and commonplace reports of casual killings and misplaced children and abandoned homes and vandals who misspelled even the four-letter words they scrawled. It was a country in which families routinely disappeared, trailing bad checks and repossession papers. Adolescents drifted from city to torn city, sloughing off both the past and the future as snakes shed their skins, children who were never taught and would never now learn the games that had held the society together. People were missing. Children were missing. Parents were missing. Those who were left behind filed desultory missing-persons reports, then moved on themselves.&lt;/p&gt;
+    &lt;p&gt;It was not a country in open revolution. It was not a country under enemy siege. It was the United States of America in the year 1967, and the market was steady and the GNP high, and a great many articulate people seemed to have a sense of high social purpose, and it might have been a year of brave hopes and national promise, but it was not, and more and more people had the uneasy apprehension that it was not. All that seemed clear was that at some point we had aborted ourselves and butchered the job, and because nothing else seemed so relevant I decided to go to San Francisco. San Francisco was where the social hemorrhaging was showing up. San Francisco was where the missing children were gathering and calling themselves “hippies.” When I first went to San Francisco, I did not even know what I wanted to find out, and so I just stayed around awhile and made a few friends.&lt;/p&gt;
+    &lt;p&gt;A sign on Haight Street, San Francisco:&lt;lb/&gt; Last Easter Day&lt;lb/&gt; My Christopher Robin wandered away.&lt;lb/&gt; He called April 10th&lt;lb/&gt; But he hasn’t called since&lt;lb/&gt; He said he was coming home&lt;lb/&gt; But he hasn’t shown.&lt;/p&gt;
+    &lt;p&gt;If you see him on Haight&lt;lb/&gt; Please tell him not to wait&lt;lb/&gt; I need him now&lt;lb/&gt; I don’t care how&lt;lb/&gt; If he needs the bread&lt;lb/&gt; I’ll send it ahead.&lt;/p&gt;
+    &lt;p&gt;If there’s hope&lt;lb/&gt; Please write me a note&lt;lb/&gt; If he’s still there&lt;lb/&gt; Tell him how much I care&lt;lb/&gt; Where he’s at I need to know&lt;lb/&gt; For I really love him so!&lt;/p&gt;
+    &lt;p&gt;Deeply,&lt;lb/&gt; Marla&lt;/p&gt;
+    &lt;p&gt;I am looking for somebody called Deadeye (all single names in this story are fictitious; full names are real), and I hear he is on the Street this afternoon doing a little business, so I keep an eye out for him and pretend to read the signs in the Psychedelic Shop on Haight Street when a kid, 16, 17, comes in and sits on the floor beside me.&lt;/p&gt;
+    &lt;p&gt;“What are you looking for?” he says.&lt;/p&gt;
+    &lt;p&gt;I say nothing much.&lt;/p&gt;
+    &lt;p&gt;“I been out of my mind for three days,” he says. He tells me he’s been shooting crystal, which I pretty much know because he does not bother to keep his sleeves rolled down over the needle tracks. He came up from Los Angeles some number of weeks ago, he doesn’t remember what number, and now he’ll take off for New York, if he can find a ride. I show him a sign on the wall offering a ride to Chicago. He wonders where Chicago is. I ask where he comes from. “Here,” he says. I mean before here. “San Jose. Chula Vista, I dunno,” he says. “My mother’s in Chula Vista.”&lt;/p&gt;
+    &lt;p&gt;A few days later I see him in Golden Gate Park. I ask if he has found a ride to New York. “I hear New York’s a bummer,” he says.&lt;/p&gt;
+    &lt;p&gt;Deadeye never showed up that day, and somebody says maybe I can find him at his place. It is three o’clock and Deadeye is in bed. Somebody else is asleep on the living-room couch, and a girl is sleeping on the floor beneath a poster of Allen Ginsberg, and there are a couple of girls in pajamas making instant coffee. One of the girls introduces me to the friend on the couch, who extends one arm but does not get up because he is naked. Deadeye and I have a mutual acquaintance, but he does not mention his name in front of the others. “The man you talked to,” he says, or “that man I was referring to earlier.” The man is a cop.&lt;/p&gt;
+    &lt;p&gt;The room is overheated and the girl on the floor is sick. Deadeye says she has been sleeping for 24 hours. “Lemme ask you something,” he says. “You want some grass?” I say I have to be moving on. “You want it,” Deadeye says, “it’s yours.” Deadeye used to be a Hell’s Angel around Los Angeles, but that was a few years ago. “Right now,” he says, “I’m trying to set up this groovy religious group — ‘Teen-age Evangelism.’”&lt;/p&gt;
+    &lt;p&gt;Don and Max want to go out to dinner, but Don is on a macrobiotic diet so we end up in Japantown. Max is telling me how he lives free of all the old middle-class Freudian hang-ups. “I’ve had this old lady for a couple of months now, maybe she makes something special for my dinner, and I come in three days late and tell her I’ve been with some other chick, well, maybe she shouts a little but then I say, ‘That’s me, baby,’ and she laughs and says, ‘That’s you, Max. ‘“ Max says it works both ways. “I mean, if she comes in and tells me she wants to have Don, maybe, I say, ‘OK, baby, it’s your trip.’”&lt;/p&gt;
+    &lt;p&gt;Max sees his life as a triumph over “don’ts.” The don’ts he had done before he was 21 were peyote, alcohol, mescaline, and Methedrine. He was on a Meth trip for three years in New York and Tangier before he found acid. He first tried peyote when he was in an Arkansas boys’ school and got down to the Gulf and met “an Indian kid who was doing a don’t. Then every weekend I could get loose I’d hitchhike 700 miles to Brownsville, Texas, so I could pop peyote. Peyote went for thirty cents a button down in Brownsville on the street.” Max dropped in and out of most of the schools and fashionable clinics in the eastern half of America, his standard technique for dealing with boredom being to leave. Example: Max was in a hospital in New York, and “the night nurse was a groovy spade, and in the afternoon for therapy there was a chick from Israel who was interesting, but there was nothing much to do in the morning, so I left.”&lt;/p&gt;
+    &lt;p&gt;We drink some more green tea and talk about going up to Malakoff Diggins, a park in Nevada County, because some people are starting a commune there and Max thinks it would be a groove to take acid there. He says maybe we could go next week, or the week after, or anyway sometime before his case comes up. Almost everybody I meet in San Francisco has to go to court at some point in the middle future. I never ask why.&lt;/p&gt;
+    &lt;p&gt;I am still interested in how Max got rid of his middle-class Freudian hang-ups, and I ask if he is now completely free.&lt;/p&gt;
+    &lt;p&gt;“Nah,” he says. “I got acid.”&lt;/p&gt;
+    &lt;p&gt;Max drops a 250- or 350-microgram tab every six or seven days.&lt;/p&gt;
+    &lt;p&gt;Max and Don share a joint in the car, and we go over to North Beach to find out if Otto, who has a temporary job there, wants to go to Malakoff Diggins. Otto is trying to sell something to some electronics engineers. The engineers view our arrival with some interest, maybe, I think, because Max is wearing bells and an Indian headband. Max has a low tolerance for straight engineers and their Freudian hang-ups. “Look at ’em,” he says. “They’re always yelling ‘queer,’ and then they come prowling into the Haight-Ashbury trying to get a hippie chick.”&lt;/p&gt;
+    &lt;p&gt;We do not get around to asking Otto about Malakoff Diggins because he wants to tell me about a 14-year-old he knows who got busted in the Park the other day. She was just walking through the Park, he says, minding her own, carrying her schoolbooks, when the cops took her in and booked her and gave her a pelvic. “Fourteen years old,” Otto says. “A pelvic.”&lt;/p&gt;
+    &lt;p&gt;“Coming down from acid,” he adds, “that could be a real bad trip.”&lt;/p&gt;
+    &lt;p&gt;I call Otto the next afternoon to see if he can reach the 14-year-old. It turns out she is tied up with rehearsals for her junior-high-school play, The Wizard of Oz. “Yellow-brick-road time,” Otto says. Otto was sick all day. He thinks it was some cocaine somebody gave him.&lt;/p&gt;
+    &lt;p&gt;There are always little girls around rock groups — the same little girls who used to hang around saxophone players, girls who live on the celebrity and power and sex a band projects when it plays — and there are three of them out here this afternoon in Sausalito where a rock group, the Grateful Dead, rehearses. They are all pretty and two of them still have baby fat and one of them dances by herself with her eyes closed.&lt;/p&gt;
+    &lt;p&gt;I ask a couple of the girls what they do.&lt;/p&gt;
+    &lt;p&gt;“I just kind of come out here a lot,” one of the girls says.&lt;/p&gt;
+    &lt;p&gt;“I just sort of know the Dead,” the other says.&lt;/p&gt;
+    &lt;p&gt;The one who just sort of knows the Dead starts cutting up a loaf of French bread on the piano bench. The boys take a break, and one of them talks about playing at the Los Angeles Cheetah, which is in the old Aragon Ballroom. “We were up there drinking beer where Lawrence Welk used to sit,” he says.&lt;/p&gt;
+    &lt;p&gt;The little girl who was dancing by herself giggles. “Too much,” she says softly. Her eyes are still closed.&lt;/p&gt;
+    &lt;p&gt;Somebody said that if I was going to meet some runaways I better pick up a few hamburgers, cola, and French fries on the way, so I did, and we are eating them in the Park together, me, Debbie, who is 15, and Jeff, who is 16. Debbie and Jeff ran away 12 days ago, walked out of school one morning with $100 between them. Because a missing-juvenile is out on Debbie — she was already on probation because her mother had once taken her to the police station and declared her incorrigible — this is only the second time they have been out of a friend’s apartment since they got to San Francisco. The first time they went over to the Fairmont Hotel and rode the outside elevator, three times up and three times down. “Wow,” Jeff says, and that is all he can think of to say about that.&lt;/p&gt;
+    &lt;p&gt;I ask why they ran away.&lt;/p&gt;
+    &lt;p&gt;“My parents said I had to go to church,” Debbie says. “And they wouldn’t let me dress the way I wanted. In the seventh grade my skirts were longer than anybody’s — it got better in the eighth grade, but still.”&lt;/p&gt;
+    &lt;p&gt;“Your mother was kind of a bummer,” Jeff says to her.&lt;/p&gt;
+    &lt;p&gt;“They didn’t like Jeff. They didn’t like my girl friends. I had a C average and my father told me I couldn’t date until I raised it, and that bugged me a lot too.”&lt;/p&gt;
+    &lt;p&gt;“My mother was just a genuine all-American bitch.” Jeff says. “She was really troublesome about hair. Also, she didn’t like boots. It was really weird.”&lt;/p&gt;
+    &lt;p&gt;“Tell about the chores,” Debbie says.&lt;/p&gt;
+    &lt;p&gt;“For example, I had chores. If I didn’t finish ironing my shirts for the week, I couldn’t go out for the weekend. It was weird. Wow.”&lt;/p&gt;
+    &lt;p&gt;Debbie giggles and shakes her head. “This year’s gonna be wild.”&lt;/p&gt;
+    &lt;p&gt;“We’re just gonna let it all happen,” Jeff says. “Everything’s in the future, you can’t pre-plan it, you know. First we get jobs, then a place to live. Then, I dunno.”&lt;/p&gt;
+    &lt;p&gt;Jeff finishes off the French fries and gives some thought to what kind of job he could get. “I always kinda dug metal shop, welding, stuff like that.” Maybe he could work on cars, I say. “But I’m not too mechanically minded,” he says. “Anyway, you can’t pre-plan.”&lt;/p&gt;
+    &lt;p&gt;“I could get a job baby-sitting,” Debbie says. “Or in a dime store.”&lt;/p&gt;
+    &lt;p&gt;“You’re always talking about getting a job in a dime store,” Jeff says.&lt;/p&gt;
+    &lt;p&gt;“That’s because I worked in a dime store already,” Debbie says.&lt;/p&gt;
+    &lt;p&gt;Debbie is buffing her fingernails with the belt to her suede jacket. She is annoyed because she chipped a nail and because I do not have any polish remover in the car. I promise to get her to a friend’s apartment so that she can redo her manicure, but something has been bothering me, and as I fiddle with the ignition, I finally ask it. I ask them to think back to when they were children, to tell me what they had wanted to be when they were grown up, how they had seen the future then.&lt;/p&gt;
+    &lt;p&gt;Jeff throws a cola bottle out the car window. “I can’t remember I ever thought about it,” he says. “I remember I wanted to be a veterinarian once,” Debbie says. “But now I’m more or less working in the vein of being an artist or a model or a cosmetologist. Or something.”&lt;/p&gt;
+    &lt;p&gt;I hear quite a bit about one cop, Officer Arthur Gerrans, whose name has become a synonym for zealotry on the Street. Max is not personally wild about Officer Gerrans because Officer Gerrans took Max in after the Human Be-In last winter, that’s the big Human Be-In in Golden Gate Park where 20,000 people got turned on free, or 10,000 did, or some number did, but then Officer Gerrans has busted almost everyone in the District at one time or another. Presumably to forestall a cult of personality, Gerrans was transferred out of the District not long ago, and when I see him it is not at the Park Station but at the Central Station.&lt;/p&gt;
+    &lt;p&gt;We are in an interrogation room, and I am interrogating Gerrans. He is young, blond, and wary and I go in slow. I wonder what he thinks the major problems in the Haight area are.&lt;/p&gt;
+    &lt;p&gt;Officer Gerrans thinks it over. “I would say the major problems there,” he says finally, “the major problems are narcotics and juveniles. Juveniles and narcotics, those are your major problems.”&lt;/p&gt;
+    &lt;p&gt;I write that down.&lt;/p&gt;
+    &lt;p&gt;“Just one moment,” Officer Gerrans says, and leaves the room. When he comes back he tells me that I cannot talk to him without permission from Chief Thomas Cahill.&lt;/p&gt;
+    &lt;p&gt;“In the meantime,” Officer Gerrans adds, pointing at the notebook in which I have written major problems, juveniles, narcotics, “I’ll take those notes.”&lt;/p&gt;
+    &lt;p&gt;The next day I apply for permission to talk to Officer Gerrans and also to Chief Cahill. A few days later a sergeant returns my call.&lt;/p&gt;
+    &lt;p&gt;“We have finally received clearance from the chief per your request,” the sergeant says, “and that is taboo.”&lt;/p&gt;
+    &lt;p&gt;I wonder why it is taboo to talk to Officer Gerrans.&lt;/p&gt;
+    &lt;p&gt;Officer Gerrans is involved in court cases coming to trial.&lt;/p&gt;
+    &lt;p&gt;I wonder why it is taboo to talk to Chief Cahill.&lt;/p&gt;
+    &lt;p&gt;The chief has pressing police business.&lt;/p&gt;
+    &lt;p&gt;I wonder if I can talk to anyone at all in the police department.&lt;/p&gt;
+    &lt;p&gt;“No,” the sergeant says, “not at the particular moment.”&lt;/p&gt;
+    &lt;p&gt;Which was my last official contact with the San Francisco Police Department.&lt;/p&gt;
+    &lt;p&gt;Norris and I are standing around the Panhandle, and Norris is telling me how it is all set up for a friend to take me to Big Sur. I say what I really want to do is spend a few days with Norris and his wife and the rest of the people in their house. Norris says it would be a lot easier if I’d take some acid. I say I’m unstable. Norris says, all right, anyway, grass, and he squeezes my hand.&lt;/p&gt;
+    &lt;p&gt;One day Norris asks how old I am. I tell him I am 32. It takes a few minutes, but he rises to it. “Don’t worry,” he says at last. “There’s old hippies too.”&lt;/p&gt;
+    &lt;p&gt;It is a pretty nice evening, nothing much is happening and Max brings his old lady, Sharon, over to the Warehouse. The Warehouse, which is where Don and a floating number of other people live, is not actually a warehouse but the garage of a condemned hotel. The Warehouse was conceived as total theater, a continual happening, and I always feel good there. Somebody is usually doing something interesting, like working on a light show, and there are a lot of interesting things around, like an old touring car which is used as a bed and a vast American flag fluttering up in the shadows and an overstuffed chair suspended like a swing from the rafters.&lt;/p&gt;
+    &lt;p&gt;One reason I particularly like the Warehouse is that a child named Michael is staying there now. Michael’s mother, Sue Ann, is a sweet, wan girl who is always in the kitchen cooking seaweed or baking macrobiotic bread while Michael amuses himself with joss sticks or an old tambourine or an old rocking horse. The first time I ever saw Michael was on that rocking horse, a very blond and pale and dirty child on a rocking horse with no paint. A blue theatrical spotlight was the only light in the Warehouse that afternoon, and there was Michael in it, crooning softly to the wooden horse. Michael is three years old. He is a bright child but does not yet talk.&lt;/p&gt;
+    &lt;p&gt;On this night Michael is trying to light his joss sticks and there are the usual number of people floating through and they all drift in and sit on the bed and pass joints. Sharon is very excited when she arrives. “Don,” she cries breathlessly, “we got some STP today.” At this time STP, a hallucinogenic drug, is a pretty big deal; remember, nobody yet knew what it was and it was relatively, although just relatively, hard to come by. Sharon is blonde and scrubbed and probably 17, but Max is a little vague about that since his court case comes up in a month or so, and he doesn’t need statutory rape on top of it. Sharon’s parents were living apart when she last saw them. She does not miss school or anything much about her past, except her younger brother. “I want to turn him on,” she confided one day. “He’s 14 now, that’s the perfect age. I know where he goes to high school and someday I’ll just go get him.”&lt;/p&gt;
+    &lt;p&gt;Time passes and I lose the thread and when I pick it up again Max seems to be talking about what a beautiful thing it is the way that Sharon washes dishes.&lt;/p&gt;
+    &lt;p&gt;“It is beautiful,” she says. “Everything is. You watch that blue detergent blob run on the plate, watch the grease cut — well, it can be a real trip.”&lt;/p&gt;
+    &lt;p&gt;Pretty soon now, maybe next month, maybe later, Max and Sharon plan to leave for Africa and India, where they can live off the land. “I got this little trust fund, see,” Max says, “which is useful in that it tells cops and border patrols I’m OK, but living off the land is the thing. You can get your high and get your dope in the city, OK, but we gotta get out somewhere and live organically.”&lt;/p&gt;
+    &lt;p&gt;“Roots and things,” Sharon says, lighting a joss stick for Michael. Michael’s mother is still in the kitchen cooking seaweed. “You can eat them.”&lt;/p&gt;
+    &lt;p&gt;Maybe eleven o’clock, we move from the Warehouse to the place where Max and Sharon live with a couple named Tom and Barbara. Sharon is pleased to get home (“I hope you got some hash joints fixed in the kitchen,” she says to Barbara by way of greeting), and everybody is pleased to show off the apartment, which has a lot of flowers and candles and paisleys. Max and Sharon and Tom and Barbara get pretty high on hash, and everyone dances a little and we do some liquid projections and set up a strobe and take turns getting a high on that. Quite late, somebody called Steve comes in with a pretty, dark girl. They have been to a meeting of people who practice a western yoga, but they do not seem to want to talk about that. They lie on the floor awhile, and then Steve stands up.&lt;/p&gt;
+    &lt;p&gt;“Max,” he says, “I want to say one thing.”&lt;/p&gt;
+    &lt;p&gt;“It’s your trip.” Max is edgy.&lt;/p&gt;
+    &lt;p&gt;“I found love on acid. But I lost it. And now I’m finding it again. With nothing but grass.”&lt;/p&gt;
+    &lt;p&gt;Max mutters that heaven and hell are both in one’s karma.&lt;/p&gt;
+    &lt;p&gt;“That’s what bugs me about psychedelic art,” Steve says.&lt;/p&gt;
+    &lt;p&gt;“What about psychedelic art?” Max says. “I haven’t seen much psychedelic art.”&lt;/p&gt;
+    &lt;p&gt;Max is lying on a bed with Sharon, and Steve leans down. “Groove, baby,” he says. “You’re a groove.”&lt;/p&gt;
+    &lt;p&gt;Steve sits down then and tells me about one summer when he was at a school of design in Rhode Island and took 30 trips, the last ones all bad. I ask why they were bad. “I could tell you it was my neuroses,” he says, “but forget it.”&lt;/p&gt;
+    &lt;p&gt;A few days later I drop by to see Steve in his apartment. He paces nervously around the room he uses as a studio and shows me some paintings. We do not seem to be getting to the point.&lt;/p&gt;
+    &lt;p&gt;“Maybe you noticed something going on at Max’s,” he says abruptly.&lt;/p&gt;
+    &lt;p&gt;It seems that the girl he brought, the dark, pretty one, had once been Max’s girl. She had followed him to Tangier and now to San Francisco. But Max has Sharon. “So the girl is kind of staying around here,” Steve says.&lt;/p&gt;
+    &lt;p&gt;Steve is troubled by a lot of things. He is 23, was raised in Virginia and has the idea that California is the beginning of the end. “I feel it’s insane,” he says, and his voice drops. “This chick tells me there’s no meaning to life, but it doesn’t matter, we’ll just flow right out. There’ve been times I felt like packing up and taking off for the East Coast again. At least there I had a target. At least there you expect that it’s going to happen.” He lights a cigarette for me and his hands shake. “Here you know it’s not going to.”&lt;/p&gt;
+    &lt;p&gt;“What is supposed to happen?” I ask.&lt;/p&gt;
+    &lt;p&gt;“I don’t know. Something. Anything.”&lt;/p&gt;
+    &lt;p&gt;Arthur Lisch is on the telephone in his kitchen, trying to sell VISTA a program for the District. “We’ve already got an emergency,” he is saying into the telephone, meanwhile trying to disentangle his daughter, age one and a half, from the cord. “We don’t get help here, nobody can guarantee what’s going to happen. We’ve got people sleeping in the streets here. We’ve got people starving to death.” He pauses. “All right,” he says then, and his voice rises. “So they’re doing it by choice. So what?”&lt;/p&gt;
+    &lt;p&gt;By the time he hangs up he has limned what strikes me as a pretty Dickensian picture of life on the edge of Golden Gate Park, but then this is my first exposure to Arthur Lisch’s “riot-on-the-Street-unless” pitch. Arthur Lisch is a kind of leader of the Diggers, who, in the official District mythology, are supposed to be a group of anonymous good guys with no thought in their collective head but to lend a helping hand. The official District mythology also has it that the Diggers have no “leaders,” but nonetheless Arthur Lisch is one. Arthur Lisch is also a paid worker for the American Friends’ Service Committee, and he lives with his wife, Jane, and their two small children in a railroad flat, which on this particular day lacks organization. For one thing, the telephone keeps ringing. Arthur promises to attend a hearing at city hall. Arthur promises to “send Edward, he’s OK.” Arthur promises to get a good group, maybe the Loading Zone, to play free for a Jewish benefit. For a second thing, the baby is crying, and she does not stop until Jane appears with a jar of Gerber’s Chicken Noodle Dinner. Another confusing element is somebody named Bob, who just sits in the living room and looks at his toes. First he looks at the toes on one foot, then at the toes on the other. I make several attempts to include Bob before I realize he is on a bad trip. Moreover, there are two people hacking up what looks like a side of beef on the kitchen floor, the idea being that when it gets hacked up, Jane Lisch can cook it for the daily Digger feed in the park.&lt;/p&gt;
+    &lt;p&gt;Arthur Lisch does not seem to notice any of this. He just keeps talking about cybernated societies and the guaranteed annual wage and riot on the Street, unless.&lt;/p&gt;
+    &lt;p&gt;I call the Lisches a day or so later and ask for Arthur. Jane Lisch says he’s next door taking a shower because somebody is coming down from a bad trip in their bathroom. Besides the freak-out in the bathroom, they are expecting a psychiatrist in to look at Bob. Also a doctor for Edward, who is not OK at all but has the flu. Jane says maybe I should talk to Chester Anderson. She will not give me his number.&lt;/p&gt;
+    &lt;p&gt;Chester Anderson is a legacy of the Beat Generation, a man in his middle 30s whose peculiar hold on the District derives from his possession of a mimeograph machine, on which he prints communiqués signed “the communication company.” It is another tenet of the official District mythology that the communication company will print anything anybody has to say, but in fact Chester Anderson prints only what he writes himself, agrees with, or considers harmless or dead matter. His statements, which are left in piles and pasted on windows around Haight Street, are regarded with some apprehension in the District and with considerable interest by outsiders, who study them, like China watchers, for subtle shifts in obscure ideologies. An Anderson communiqué might be as specific as fingering someone who is said to have set up a marijuana bust, or it might be in a more general vein:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Pretty little 16-year-old middle-class chick comes to the Haight to see what it’s all about and gets picked up by a 17-year-old street dealer who spends all day shooting her full of speed again and again, then feeds her 3,000 mikes &amp;amp; raffles off her temporarily unemployed body for the biggest Haight Street . . . . since the night before last. The politics and ethics of ecstasy. Rape is as common as . . . . on Haight Street. Kids are starving on the Street. Minds and bodies are being maimed as we watch, a scale model of Vietnam.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Somebody other than Jane Lisch gave me an address for Chester Anderson, 443 Arguello, but 443 Arguello does not exist. I telephone the wife of the man who gave me 443 Arguello and she says it’s 742 Arguello.&lt;/p&gt;
+    &lt;p&gt;“But don’t go up there,” she says.&lt;/p&gt;
+    &lt;p&gt;I say I’ll telephone.&lt;/p&gt;
+    &lt;p&gt;“There’s no number,” she says. “I can’t give it to you.”&lt;/p&gt;
+    &lt;p&gt;“742 Arguello,” I say.&lt;/p&gt;
+    &lt;p&gt;“No,” she says. “I don’t know. And don’t go there. And don’t use either my name or my husband’s name if you do.”&lt;/p&gt;
+    &lt;p&gt;She is the wife of a full professor of English at San Francisco State College. I decide to lie low on the question of Chester Anderson for a while.&lt;/p&gt;
+    &lt;quote&gt;&lt;p&gt;Paranoia strikes deep —&lt;/p&gt;&lt;lb/&gt;Into your life it will creep —&lt;lb/&gt;is a song the Buffalo&lt;lb/&gt;Springfield sings.&lt;/quote&gt;
+    &lt;p&gt;The appeal of Malakoff Diggins has kind of faded out, but Max says why don’t I come to his place, just be there, the next time he takes acid. Tom will take it too, probably Sharon, maybe Barbara. We can’t do it for six or seven days because Max and Tom are in STP space now. They are not crazy about STP, but it has advantages. “You’ve still got your forebrain.” Tom says. “I could write behind STP, but not behind acid.” This is the first time I have heard that Tom writes.&lt;/p&gt;
+    &lt;p&gt;Otto is feeling better because he discovered it wasn’t the cocaine that made him sick. It was the chicken pox, which he caught while baby-sitting for Big Brother and the Holding Company one night when they were playing. I go over to see him and meet Vicki, who sings now and then with a group called the Jook Savages and lives at Otto’s place. Vicki dropped out of Laguna High “because I had mono,” followed the Grateful Dead up to San Francisco one time, and has been here “for a while.” Her mother and father are divorced, and she does not see her father, who works for a network in New York. A few months ago he came out to do a documentary on the District and tried to find her, but couldn’t. Later he wrote her a letter in care of her mother urging her to go back to school. Vicki guesses maybe she will go back sometime, but she doesn’t see much point in it right now.&lt;/p&gt;
+    &lt;p&gt;We are eating a little tempura in Japantown, Chet Helms and I, and he is sharing some of his insights with me. Until a couple of years ago Chet Helms never did much besides hitchhiking, but now he runs the Avalon Ballroom and flies over the Pole to check out the London scene and says things like, “Just for the sake of clarity I’d like to categorize the aspects of primitive religion as I see it.” Right now he is talking about Marshall McLuhan and how the printed word is finished, out, over. But then he considers the East Village Other, an “underground” biweekly published in New York. “The EVO is one of the few papers in America whose books are in the black,” he says. “I know that from reading Barron’s.”&lt;/p&gt;
+    &lt;p&gt;A new group is supposed to play today in the Panhandle, a section of Golden Gate Park, but they are having trouble with the amplifier and I sit in the sun listening to a couple of little girls, maybe 17 years old. One of them has a lot of makeup and the other wears Levi’s and cowboy boots. The boots do not look like an affectation, they look like she came up off a ranch about two weeks ago. I wonder what she is doing here in the Panhandle, trying to make friends with a city girl who is snubbing her, but I do not wonder long, because she is homely and awkward, and I think of her going all the way through the consolidated union high school out there where she comes from, and nobody ever asking her to go into Reno on Saturday night for a drive-in movie and a beer on the riverbank, so she runs. “I know a thing about dollar bills,” she is saying now. “You get one that says ‘1111’ in one corner and ‘1111’ in another, you take it down to Dallas, Texas, and they’ll give you $15 for it.”&lt;/p&gt;
+    &lt;p&gt;“Who will?” the city girl asks.&lt;/p&gt;
+    &lt;p&gt;“I don’t know.”&lt;/p&gt;
+    &lt;p&gt;“There are only three significant pieces of data in the world today,” is another thing Chet Helms told me one night. We were at the Avalon and the big strobe was going and so were the colored lights and the Day-Glo painting, and the place was full of high-school kids trying to look turned on. The Avalon sound system projects 126 decibels at 100 feet but to Chet Helms the sound is just there, like the air, and he talks through it. “The first is,” he said, “God died last year and was obited by the press. The second is, 50 percent of the population is or will be under 25.” A boy shook a tambourine toward us and Chet smiled benevolently at him. “The third,” he said, “is that they got 20 billion irresponsible dollars to spend.”&lt;/p&gt;
+    &lt;p&gt;Thursday comes, some Thursday, and Max and Tom and Sharon and maybe Barbara are going to take some acid. They want to drop it about three o’clock. Barbara has baked fresh bread, Max has gone to the Park for fresh flowers, and Sharon is busy making a sign for the door which reads, DO NOT DISTURB, RING, KNOCK, OR IN ANY OTHER WAY DISTURB. LOVE. This is not how I would put it to either the health inspector, who is due this week, or any of the several score of narcotics agents in the neighborhood, but I figure the sign is Sharon’s trip.&lt;/p&gt;
+    &lt;p&gt;Once the sign is finished Sharon gets restless. “Can I at least play the new record?” she asks Max.&lt;/p&gt;
+    &lt;p&gt;“Tom and Barbara want to save it for when we’re high.”&lt;/p&gt;
+    &lt;p&gt;“I’m getting bored, just sitting around here.”&lt;/p&gt;
+    &lt;p&gt;Max watches her jump up and walk out. “That’s what you call pre-acid uptight jitters,” he says.&lt;/p&gt;
+    &lt;p&gt;Barbara is not in evidence. Tom keeps walking in and out. “All these innumerable last-minute things you have to do,” he mutters.&lt;/p&gt;
+    &lt;p&gt;“It’s a tricky thing, acid,” Max says after a while. He is turning the stereo on and off. “When a chick takes acid, it’s all right if she’s alone, but when she’s living with somebody this edginess comes out. And if the hour-and-a-half process before you take the acid doesn’t go smooth. . . .” He picks up a marijuana butt and studies it, then adds, “They’re having a little thing back there with Barbara.”&lt;/p&gt;
+    &lt;p&gt;Sharon and Tom walk in.&lt;/p&gt;
+    &lt;p&gt;“You bugged too?” Max asks Sharon.&lt;/p&gt;
+    &lt;p&gt;Sharon does not answer.&lt;/p&gt;
+    &lt;p&gt;Max turns to Tom. “Is she all right?”&lt;/p&gt;
+    &lt;p&gt;“Yeh.”&lt;/p&gt;
+    &lt;p&gt;“Can we take acid?” Max is on edge.&lt;/p&gt;
+    &lt;p&gt;“I just don’t know what she’s going to do.”&lt;/p&gt;
+    &lt;p&gt;“What do you want to do?”&lt;/p&gt;
+    &lt;p&gt;“What I want to do depends on what she wants to do.” Tom is rolling some joints, first rubbing the papers with a marijuana resin he makes himself. He takes the joints back to the bedroom, and Sharon goes with him.&lt;/p&gt;
+    &lt;p&gt;“Something like this happens every time people take acid,” Max says. After a while he brightens and develops a theory around it. “Some people don’t like to go out of themselves, that’s the trouble. You probably wouldn’t. You’d probably like only a quarter of a tab. There’s still an ego on a quarter tab, and it wants things. Now if that thing is sex— and your old lady or your old man is off somewhere flashing and doesn’t want to be touched — well, you get put down on acid, you can be on a bummer for months.”&lt;/p&gt;
+    &lt;p&gt;Sharon drifts in, smiling. “Barbara might take some acid, we’re all feeling better, we smoked a joint.”&lt;/p&gt;
+    &lt;p&gt;At 3:30 that afternoon Max, Tom, and Sharon placed tabs under their tongues and sat down together in the living room to wait for the flash. Barbara stayed in the bedroom, smoking hash. During the next four hours a window banged once in Barbara’s room, and about 5:30 some children had a fight on the street. A curtain billowed in the afternoon wind. A cat scratched a beagle in Sharon’s lap. Except for the sitar music on the stereo there was no other sound or movement until 7:30, when Max said, “Wow.”&lt;/p&gt;
+    &lt;p&gt;I spot Deadeye on Haight Street, and he gets in the car. Until we get off the Street he sits very low and inconspicuous. Deadeye wants me to meet his old lady, but first he wants to talk to me about how he got hip to helping people.&lt;/p&gt;
+    &lt;p&gt;“Here I was, just a tough kid on a motorcycle,” he says, “and suddenly I see that young people don’t have to walk alone.” Deadeye has a clear evangelistic gaze and the reasonable rhetoric of a car salesman. He is society’s model product. I try to meet his gaze directly because he once told me he could read character in people’s eyes, particularly if he has just dropped acid, which he did about nine o’clock that morning. “They just have to remember one thing,” he says. “The Lord’s Prayer. And that can help them in more ways than one.”&lt;/p&gt;
+    &lt;p&gt;He takes a much-folded letter from his wallet. The letter is from a little girl he helped. “My loving brother,” it begins. “I thought I’d write you a letter since I’m a part of you. Remember that: When you feel happiness, I do, when you feel . . .”&lt;/p&gt;
+    &lt;p&gt;“What I want to do now,” Deadeye says, “is set up a house where a person of any age can come, spend a few days, talk over his problems. Any age. People your age, they’ve got problems too.”&lt;/p&gt;
+    &lt;p&gt;I say a house will take money.&lt;/p&gt;
+    &lt;p&gt;“I’ve found a way to make money,” Deadeye says. He hesitates only a few seconds. “I could’ve made $85 on the Street just then. See, in my pocket I had a hundred tabs of acid. I had to come up with $20 by tonight or we’re out of the house we’re in, so I knew somebody who had acid, and I knew somebody who wanted it, so I made the connection.&lt;/p&gt;
+    &lt;quote&gt;&lt;p&gt;“Since the Mafia moved into the LSD racket, the quantity is up and the quality is down. . . .&lt;/p&gt;&lt;lb/&gt;“Historian Arnold Toynbee celebrated his 78th birthday Friday night by snapping his fingers and tapping his toes to the Quicksilver Messenger Service . . .”&lt;/quote&gt;
+    &lt;p&gt;are a couple of items from Herb Caen’s column one morning as the West declined in the year 1967.&lt;/p&gt;
+    &lt;p&gt;When I was in San Francisco a tab, or a cap, of LSD-25 sold for three to five dollars, depending upon the seller and the district. LSD was slightly cheaper in the Haight-Ashbury than in the Fillmore, where it was used rarely, mainly as a sexual ploy, and sold by pushers of hard drugs, e.g., heroin, or “smack.” A great deal of acid was being cut with Methedrine, which is the trade name for an amphetamine, because Methedrine can simulate the flash that low-quality acid lacks. Nobody knows how much LSD is actually in a tab, but the standard trip is supposed to be 250 micrograms. Grass was running $10 a lid, $5 a matchbox. Hash was considered “a luxury item.” All the amphetamines, or “speed” — Benzedrine, Dexedrine, and particularly Methedrine (“crystal”) — were in common use. There was not only more tolerance of speed but there was a general agreement that heroin was now on the scene. Some attributed this to the presence of the Syndicate; others to a general deterioration of the scene, to the incursions of gangs and younger part-time, or “plastic,” hippies, who like the amphetamines and the illusions of action and power they give. Where Methedrine is in wide use, heroin tends to be available, because, I was told, “You can get awful damn high shooting crystal, and smack can be used to bring you down.”&lt;/p&gt;
+    &lt;p&gt;Deadeye’s old lady, Gerry, meets us at the door of their place. She is a big, hearty girl who has always counseled at Girl Scout camps during summer vacations and was “in social welfare” at the University of Washington when she decided that she “just hadn’t done enough living” and came to San Francisco. “Actually, the heat was bad in Seattle,” she adds.&lt;/p&gt;
+    &lt;p&gt;“The first night I got down here,” she says, “I stayed with a gal I met over at the Blue Unicorn. I looked like I’d just arrived, had a knapsack and stuff.” After that Gerry stayed at a house the Diggers were running, where she met Deadeye. “Then it took time to get my bearings, so I haven’t done much work yet.”&lt;/p&gt;
+    &lt;p&gt;I ask Gerry what work she does. “Basically I’m a poet, but I had my guitar stolen right after I arrived, and that kind of hung up my thing.”&lt;/p&gt;
+    &lt;p&gt;“Get your books,” Deadeye orders. “Show her your books.”&lt;/p&gt;
+    &lt;p&gt;Gerry demurs, then goes into the bedroom and comes back with several theme books full of verse. I leaf through them but Deadeye is still talking about helping people. “Any kid that’s on speed,” he says, “I’ll try to get him off it. The only advantage to it from the kids’ point of view is that you don’t have to worry about sleeping or eating.”&lt;/p&gt;
+    &lt;p&gt;“Or sex,” Gerry adds.&lt;/p&gt;
+    &lt;p&gt;“That’s right. When you’re strung out on crystal you don’t need nothing.”&lt;/p&gt;
+    &lt;p&gt;“It can lead to the hard stuff,” Gerry says. “Take your average Meth freak, once he’s started putting the needle in his arm, it’s not too hard to say, well, let’s shoot a little smack.”&lt;/p&gt;
+    &lt;p&gt;All the while I am looking at Gerry’s poems. They are a very young girl’s poems, each written out in a neat hand and finished off with a curlicue. Dawns are roseate, skies silver-tinted. When she writes “crystal” in her books, she does not mean Meth.&lt;/p&gt;
+    &lt;p&gt;“You gotta get back to your writing,” Deadeye says fondly, but Gerry ignores this. She is telling about somebody who propositioned her yesterday. “He just walked up to me on the Street, offered me $600 to go to Reno and do the thing.”&lt;/p&gt;
+    &lt;p&gt;“You’re not the only one he approached,” Deadeye says.&lt;/p&gt;
+    &lt;p&gt;“If some chick wants to go with him, fine,” Gerry says. “Just don’t bum my trip.” She empties the tuna-fish can we are using for an ashtray and goes over to look at a girl who is asleep on the floor. It is the same girl who was asleep on the floor the first day I came to Deadeye’s place. She has been sick a week now, 10 days. “Usually when somebody comes up to me on the Street like that,” Gerry adds, “I hit him for some change.”&lt;/p&gt;
+    &lt;p&gt;When I saw Gerry in the Park the next day I asked her about the sick girl, and Gerry said cheerfully that she was in the hospital with pneumonia.&lt;/p&gt;
+    &lt;p&gt;Max tells me about how he and Sharon got together. “When I saw her the first time on Haight Street, I flashed. I mean flashed. So I started some conversation with her about her beads, see, but I didn’t care about her beads.” Sharon lived in a house where a friend of Max’s lived, and the next time he saw her was when he took the friend some bananas. “Sharon and I were like kids — we smoked bananas and looked at each other and smoked more bananas and looked at each other.”&lt;/p&gt;
+    &lt;p&gt;But Max hesitated. For one thing, he thought Sharon was his friend’s girl. “For another I didn’t know if I wanted to get hung up with an old lady.” But the next time he visited the house, Sharon was on acid.&lt;/p&gt;
+    &lt;p&gt;“So everybody yelled, ‘Here comes the banana man,’” Sharon interrupts, “and I got all excited.”&lt;/p&gt;
+    &lt;p&gt;“She was living in this crazy house,” Max continues. “There was this one kid, all he did was scream. His whole trip was to practice screams. It was too much.” Max still hung back from Sharon. “But then Sharon offered me a tab, and I knew.”&lt;/p&gt;
+    &lt;p&gt;Max walked to the kitchen and back with the tab, wondering whether to take it. “And then I decided to flow with it, and that was that. Because once you drop acid with somebody, you flash on, you see the whole world melt in her eyes.”&lt;/p&gt;
+    &lt;p&gt;“It’s stronger than anything in the world,” Sharon says.&lt;/p&gt;
+    &lt;p&gt;“Nothing can break it up,” Max says. “As long as it lasts.”&lt;/p&gt;
+    &lt;quote&gt;&lt;p&gt;No milk today —&lt;/p&gt;&lt;lb/&gt;My love has gone away . . .&lt;lb/&gt;The end of my hopes —&lt;lb/&gt;The end of all my dreams —&lt;/quote&gt;
+    &lt;p&gt;is a song I heard on many mornings in 1967 on KFRC, the Flower Power Station, San Francisco.&lt;/p&gt;
+    &lt;p&gt;Deadeye and Gerry tell me that they plan to be married. An Episcopal priest in the District has promised to perform the wedding in Golden Gate Park, and they will have a few rock groups there, “a real community thing.” Gerry’s brother is also getting married, in Seattle. “Kind of interesting,” Gerry muses, “because, you know, his is the traditional straight wedding, and then you have the contrast with ours.”&lt;/p&gt;
+    &lt;p&gt;“I’ll have to wear a tie to his,” Deadeye says.&lt;/p&gt;
+    &lt;p&gt;“Right,” Gerry says.&lt;/p&gt;
+    &lt;p&gt;“Her parents came down to meet me, but they weren’t ready for me,” Deadeye notes philosophically.&lt;/p&gt;
+    &lt;p&gt;“They finally gave it their blessing,” Gerry says. “In a way.”&lt;/p&gt;
+    &lt;p&gt;“They came to me and her father said, ‘Take care of her,’ “Deadeye reminisces. “And her mother said, ‘Don’t let her go to jail.’”&lt;/p&gt;
+    &lt;p&gt;Barbara has baked a macrobiotic apple pie — one made without sweets and with whole-wheat flour — and she and Tom and Max and Sharon and I are eating it. Barbara tells me how she learned to find happiness in “the woman’s thing.” She and Tom had gone somewhere to live with the Indians, and although she first found it hard to be shunted off with the women and never to enter into any of the men’s talk, she soon got the point. “That was where the trip was,” she says.&lt;/p&gt;
+    &lt;p&gt;Barbara is on what is called the woman’s trip to the exclusion of almost everything else. When she and Tom and Max and Sharon need money, Barbara will take a part-time job, modeling or teaching kindergarten, but she dislikes earning more than $10 or $20 a week. Most of the time she keeps house and bakes. “Doing something that shows your love that way,” she says, “is just about the most beautiful thing I know.” Whenever I hear about the woman’s trip, which is often, I think a lot about nothin’-says-lovin’-like-something-from-the-oven and the Feminine Mystique and how it is possible for people to be the unconscious instruments of values they would strenuously reject on a conscious level, but I do not mention this to Barbara.&lt;/p&gt;
+    &lt;p&gt;It is a pretty nice day and I am just driving down the Street and I see Barbara at a light.&lt;/p&gt;
+    &lt;p&gt;What am I doing, she wants to know.&lt;/p&gt;
+    &lt;p&gt;I am just driving around.&lt;/p&gt;
+    &lt;p&gt;“Groovy,” she says.&lt;/p&gt;
+    &lt;p&gt;This is quite a beautiful day, I say.&lt;/p&gt;
+    &lt;p&gt;“Groovy,” she agrees.&lt;/p&gt;
+    &lt;p&gt;She wants to know if I will come over. Sometime soon, I say.&lt;/p&gt;
+    &lt;p&gt;“Groovy,” she says.&lt;/p&gt;
+    &lt;p&gt;I ask if she wants to drive in the Park but she is too busy. She is out to buy wool for her loom.&lt;/p&gt;
+    &lt;p&gt;Arthur Lisch gets pretty nervous whenever he sees me now because the Digger line this week is that they aren’t talking to “media poisoners,” which is me. So I still don’t have a tap on Chester Anderson, but one day in the Panhandle I run into a kid who says he is Chester’s “associate.” He has on a black cape, black slouch hat, mauve Job’s Daughters’ sweatshirt and dark glasses, and he says his name is Claude Hayward, but never mind that because I think of him just as The Connection. The Connection offers to “check me out.”&lt;/p&gt;
+    &lt;p&gt;I take off my dark glasses so he can see my eyes. He leaves his on.&lt;/p&gt;
+    &lt;p&gt;“How much you get paid for doing this kind of media poisoning?” he says for openers.&lt;/p&gt;
+    &lt;p&gt;I put my dark glasses back on.&lt;/p&gt;
+    &lt;p&gt;“There’s only one way to find out where it’s at,” The Connection says, and jerks his thumb at the photographer I’m with. “Dump him and get out on the Street. Don’t take money. You won’t need money.” He reaches into his cape and pulls out a mimeographed sheet announcing a series of classes at the Digger Free Store on How to Avoid Getting Busted, VD, Rape, Pregnancy, Beatings and Starvation. “You oughta come,” The Connection says. “You’ll need it.”&lt;/p&gt;
+    &lt;p&gt;I say maybe, but meanwhile I would like to talk to Chester Anderson.&lt;/p&gt;
+    &lt;p&gt;“If we decide to get in touch with you at all,” The Connection says, “we’ll get in touch with you real quick.” He kept an eye on me in the Park after that, but he never did call the number I gave him.&lt;/p&gt;
+    &lt;p&gt;It is twilight and cold and too early to find Deadeye at the Blue Unicorn so I ring Max’s bell. Barbara comes to the door.&lt;/p&gt;
+    &lt;p&gt;“Max and Tom are seeing somebody on a kind of business thing,” she says. “Can you come back a little later?” I am hard put to think what Max and Tom might be seeing somebody about in the way of business, but a few days later in the Park I find out.&lt;/p&gt;
+    &lt;p&gt;“Hey,” Tom calls. “Sorry you couldn’t come up the other day, but business was being done.” This time I get the point. “We got some great stuff,” he adds, and begins to elaborate. Every third person in the Park this afternoon looks like a narcotics agent and I try to change the subject. Later I suggest to Max that he be more wary in public. “Listen, I’m very cautious,” he says. “You can’t be too careful.”&lt;/p&gt;
+    &lt;p&gt;By now I have an unofficial taboo contact with the San Francisco Police Department. What happens is that this cop and I meet in various late-movie ways, like I happen to be sitting in the bleachers at a baseball game and he happens to sit down next to me, and we exchange guarded generalities. No information actually passes between us, but after a while we get to kind of like each other.&lt;/p&gt;
+    &lt;p&gt;“The kids aren’t too bright,” he is telling me on this particular day. “They’ll tell you they can always spot an undercover, they’ll tell you about ‘the kind of car he drives.’ They aren’t talking about undercovers, they’re talking about plainclothesmen who just happen to drive unmarked cars, like I do. They can’t tell an undercover. An undercover doesn’t drive some black Ford with a two-way radio.”&lt;/p&gt;
+    &lt;p&gt;He tells me about an undercover who was taken out of the District because he was believed to be over-exposed, too familiar. He was transferred to the narcotics squad, and by error was immediately sent back into the District as a narcotics undercover.&lt;/p&gt;
+    &lt;p&gt;The cop plays with his keys. “You want to know how smart these kids are?” he says finally. “The first week, this guy makes 43 cases.”&lt;/p&gt;
+    &lt;p&gt;Some kid with braces on his teeth is playing his guitar and boasting that he got the last of the STP from Mr. X himself, and someone else is talking about some acid that will be available within the next month, and you can see that nothing much is happening around the San Francisco Oracle office this afternoon. A boy sits at a drawing board drawing the infinitesimal figures that people do on speed, and the kid with the braces watches him. “I’m gonna shoot my wo–man,” he sings softly. “She been with a–noth–er man.” Someone works out the numerology of my name and the name of the photographer I’m with. The photographer’s is all white and the sea (“If I were to make you some beads, see, I’d do it mainly in white,” he is told), but mine has a double death symbol. The afternoon does not seem to be getting anywhere, so it’s suggested we get in touch with a man named Sandy. We are told he will take us to the Zen temple.&lt;/p&gt;
+    &lt;p&gt;Four boys and one middle-aged man are sitting on a grass mat at Sandy’s place, sipping anise tea and listening to Sandy read Laura Huxley’s You Are Not the Target.&lt;/p&gt;
+    &lt;p&gt;We sit down and have some anise tea. “Meditation turns us on,” Sandy says. He has a shaved head and the kind of cherubic face usually seen in newspaper photographs of mass murderers. The middle-aged man, whose name is George, is making me uneasy because he is in a trance next to me and he stares at me without seeing me.&lt;/p&gt;
+    &lt;p&gt;I feel that my mind is going — George is dead, or we all are — when the telephone suddenly rings.&lt;/p&gt;
+    &lt;p&gt;“It’s for George,” Sandy says.&lt;/p&gt;
+    &lt;p&gt;“George, telephone.”&lt;/p&gt;
+    &lt;p&gt;“George.”&lt;/p&gt;
+    &lt;p&gt;Somebody waves his hand in front of George and George finally gets up, bows, and moves toward the door on the balls of his feet.&lt;/p&gt;
+    &lt;p&gt;“I think I’ll take George’s tea,” somebody says. “George — are you coming back?”&lt;/p&gt;
+    &lt;p&gt;George stops at the door and stares at each of us in turn. “In a moment,” he snaps.&lt;/p&gt;
+    &lt;quote&gt;&lt;p&gt;Do you know who is the first eternal spaceman of this universe?&lt;/p&gt;&lt;lb/&gt;The first to send his wild wild vibrations&lt;lb/&gt;To all those cosmic superstations?&lt;lb/&gt;For the song he always shouts&lt;lb/&gt;Sends the planets flipping out . . .&lt;lb/&gt;But I’ll tell you before you think me loony&lt;lb/&gt;That I’m talking about Narada Muni . . .&lt;lb/&gt;Singing&lt;lb/&gt;HARE KRISHNA HARE KRISHNA&lt;lb/&gt;KRISHNA KRISHNA HARE HARE&lt;lb/&gt;HARE RAMA HARE RAMA&lt;lb/&gt;RAMA RAMA HARE HARE&lt;/quote&gt;
+    &lt;p&gt;is a Krishna song. Words by Howard Wheeler and music by Michael Grant.&lt;/p&gt;
+    &lt;p&gt;Maybe the trip is not in Zen but in Krishna, so I visit Michael Grant, the Swami A. C. Bhaktivedanta’s leading disciple in San Francisco. Grant is at home with his brother-in-law and his wife, a pretty girl wearing a cashmere pullover, a jumper and a red caste mark on her forehead.&lt;/p&gt;
+    &lt;p&gt;“I’ve been associated with the Swami since about last July,” Michael says. “See, the Swami came here from India, and he was at this ashram (hermitage) in upstate New York and he just kept to himself and chanted a lot. For a couple of months, pretty soon I helped him get his storefront in New York. Now it’s an international movement, which we spread by teaching this chant.” Michael is fingering his red wooden beads, and I notice that I am the only person in the room who is wearing shoes. “It’s catching on like wildfire.”&lt;/p&gt;
+    &lt;p&gt;“If everybody chanted,” the brother-in-law says, “there wouldn’t be any problem with the police or anybody.”&lt;/p&gt;
+    &lt;p&gt;“Ginsberg calls the chant ecstasy, but the Swami says that’s not exactly it.” Michael walks across the room and straightens a picture of Krishna as a baby. “Too bad you can’t meet the Swami,” he adds. “The Swami’s in New York now.”&lt;/p&gt;
+    &lt;p&gt;“Ecstasy’s not the right word at all,” says the brother-in-law, who has been thinking about it. “It makes you think of some mundane ecstasy.”&lt;/p&gt;
+    &lt;p&gt;The next day I drop by Max and Sharon’s, and find them in bed smoking a little morning hash. Sharon once advised me that even half a joint of grass would make getting up in the morning a beautiful thing. I ask Max how Krishna strikes him.&lt;/p&gt;
+    &lt;p&gt;“You can get a high on a mantra,” he says. “But I’m holy on acid.”&lt;/p&gt;
+    &lt;p&gt;Max passes the joint to Sharon and leans back. “Too bad you couldn’t meet the Swami,” he says. “The Swami was the turn-on.”&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;“Anybody who thinks this is all about drugs has his head in a bag. It’s a social movement, quintessentially romantic, the kind that recurs in times of real social crisis. The themes are always the same. A return to innocence. The invocation of an earlier authority and control. The mysteries of the blood. An itch for the transcendental, for purification. Right there you’ve got the ways that romanticism historically ends up in trouble, lends itself to authoritarianism. When the direction appears. How long do you think it’ll take for that to happen?”&lt;/p&gt;
+      &lt;p&gt;is a question a San Francisco psychiatrist asked me.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;At the time, I was in San Francisco, the political potential of the movement was just becoming clear. It had always been clear to the revolutionary core of the Diggers, whose guerrilla talent was now bent on open confrontations and the creation of a summer emergency, and it was clear to many of the doctors and priests and sociologists who had occasion to work in the District, and it could rapidly become clear to any outsider who bothered to decode Chester Anderson’s call-to-action communiqués or to watch who was there first at the street skirmishes which now set the tone for life in the District. One did not have to be a political analyst to see it: The boys in the rock groups saw it, because they were often where it was happening. “In the Park there are always twenty or thirty people below the stand,” one of the Grateful Dead complained to me, “ready to take the crowd on some militant trip.”&lt;/p&gt;
+    &lt;p&gt;But the peculiar beauty of this political potential, as far as the activists were concerned, was that it remained not clear at all to most of the inhabitants of the District. Nor was it clear to the press, which at varying levels of competence continued to report “the hippie phenomenon” as an extended panty raid; an artistic avant-garde led by such comfortable YMHA regulars as Allen Ginsberg; or a thoughtful protest, not unlike joining the Peace Corps.&lt;/p&gt;
+    &lt;p&gt;This last, or they’re-trying-to-tell-us-something approach, reached its apogee in July in a Time cover story which revealed that hippies “scorn money — they call it ‘bread,’” and remains the most remarkable, if unwitting, extant evidence that the signals between the generations are irrevocably jammed.&lt;/p&gt;
+    &lt;p&gt;Because the signals the press was getting were immaculate of political possibilities, the tensions of the District went unremarked upon, even during the period when there were so many observers on Haight Street from Life and Look and CBS that they were largely observing one another. The observers believed roughly what the children told them: That they were a generation dropped out of political action, beyond power games, that the New Left was on an ego trip. Ergo, there really were no activists in the Haight-Ashbury, and those things which happened every Sunday were spontaneous demonstrations because, just as the Diggers say, the police are brutal and juveniles have no rights and runaways are deprived of their right to self-determination, and people are starving to death on Haight Street.&lt;/p&gt;
+    &lt;p&gt;Of course the activists — not those whose thinking had become rigid, but those whose approach to revolution was imaginatively anarchic — had long ago grasped the reality which still eluded the press: We were seeing something important. We were seeing the desperate attempt of a handful of pathetically unequipped children to create a community in a social vacuum. Once we had seen these children, we could no longer overlook the vacuum, no longer pretend that the society’s atomization could be reversed. At some point between 1945 and 1967, we had somehow neglected to tell these children the rules of the game we happened to be playing. Maybe we had stopped believing in the rules ourselves, maybe we were having a failure of nerve about the game. Or maybe there were just too few people around to do the telling. These were children who grew up cut loose from the web of cousins and great-aunts and family doctors and lifelong neighbors who had traditionally suggested and enforced the society’s values. They are children who have moved around a lot, San Jose, Chula Vista, here. They are less in rebellion against the society than ignorant of it, able only to feed back certain of its most publicized self-doubts, Vietnam, diet pills, the Bomb.&lt;/p&gt;
+    &lt;p&gt;They feed back exactly what is given them. Because they do not believe in words — words are for “typeheads,” Chester Anderson tells them, and a thought which needs words is just another ego trip — their only proficient vocabulary is in the society’s platitudes. As it happens, I am still committed to the idea that the ability to think for oneself depends upon one’s mastery of the language, and I am not optimistic about children who will settle for saying, to indicate that their mother and father do not live together, that they come from “a broken home.” They are 14, 15, 16 years old, younger all the time, an army of children waiting to be given the words.&lt;/p&gt;
+    &lt;p&gt;Peter Berg knows a lot of words.&lt;/p&gt;
+    &lt;p&gt;“Is Peter Berg around?” I ask.&lt;/p&gt;
+    &lt;p&gt;“Maybe.”&lt;/p&gt;
+    &lt;p&gt;“Are you Peter Berg?”&lt;/p&gt;
+    &lt;p&gt;“Yeh.”&lt;/p&gt;
+    &lt;p&gt;The reason Peter Berg does not bother to share too many words with me is because two of the words he knows are “media poisoning.” Peter Berg wears a gold earring and is perhaps the only person in the District upon whom a gold earring looks obscurely ominous. He belongs to the San Francisco Mime Troupe, some of whose members started the Artist’s Liberation Front for “those who seek to combine their creative urge with socio-political involvement.” It was out of the Mime Troupe that the Diggers grew, during the 1966 Hunter’s Point riots when it seemed a good idea to give away food and do puppet shows in the streets, making fun of the National Guard. Along with Arthur Lisch, Peter Berg is part of the shadow leadership of the Diggers, and it was he who more or less invented and first introduced to the press the notion that there would be an influx into San Francisco this summer of 200,000 indigent adolescents. The only conversation I ever have with Peter Berg is about how he holds me personally responsible for the way Life captioned Henri Cartier-Bresson’s pictures out of Cuba, but I like to watch him at work in the Park.&lt;/p&gt;
+    &lt;p&gt;Big Brother is playing in the Panhandle, and almost everybody is high, and it is a pretty nice Sunday afternoon between three and six o’clock, which the activists say are the three hours of the week when something is most likely to happen in the Haight-Ashbury, and who turns up but Peter Berg. He is with his wife and six or seven other people, along with Chester Anderson’s associate The Connection, and the first peculiar thing is, they’re in blackface. I mention to Max and Sharon that some members of the Mime Troupe seem to be in blackface.&lt;/p&gt;
+    &lt;p&gt;“It’s street theater,” Sharon assures me. “It’s supposed to be really groovy.”&lt;/p&gt;
+    &lt;p&gt;The Mime Troupers get a little closer, and there are some other peculiar things about them. For one thing they are tapping people on the head with dimestore plastic nightsticks, and for another they are wearing signs on their backs: HOW MANY TIMES YOU BEEN RAPED, YOU LOVE FREAKS? and things like that. Then they are distributing communication-company fliers which say:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;code&gt;&amp;amp; this summer thousands of unwhite un–suburban boppers are going to want to know why you’ve given up what they can’t get &amp;amp; how you get away with it &amp;amp; how come you not a faggot with hair so long &amp;amp; they want haight street one way or the other. IF YOU DON’T KNOW, BY AUGUST HAIGHT STREET WILL BE A CEMETERY.&lt;/code&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Max reads the flier and stands up. “I’m getting bad vibes,” he says, and he and Sharon leave.&lt;/p&gt;
+    &lt;p&gt;I have to stay around because I’m looking for Otto so I walk over to where the Mime Troupers have formed a circle around a Negro. Peter Berg is saying, if anybody asks, that this is street theater, and I figure the curtain is up because what they are doing right now is jabbing the Negro with the nightsticks. They jab, and they bare their teeth, and they rock on the balls of their feet, and they wait.&lt;/p&gt;
+    &lt;p&gt;“I’m beginning to get annoyed here,” the Negro says. “I’m gonna get mad.” By now there are several Negroes around, reading the signs and watching.&lt;/p&gt;
+    &lt;p&gt;“Just beginning to get annoyed, are you?” one of the Mime Troupers says. “Don’t you think it’s about time?”&lt;/p&gt;
+    &lt;p&gt;“Listen, here,” another Negro says. “There’s room for everybody in the Park.”&lt;/p&gt;
+    &lt;p&gt;“Yeah?” a girl in blackface says. “Everybody who?”&lt;/p&gt;
+    &lt;p&gt;“Why,” he says, confused. “Everybody. In America.”&lt;/p&gt;
+    &lt;p&gt;“In America,”the blackface girl shrieks. “Listen to him talk about America.”&lt;/p&gt;
+    &lt;p&gt;“Listen,” he says. “Listen here.”&lt;/p&gt;
+    &lt;p&gt;“What’d America ever do for you?” the girl in blackface jeers. “White kids here, they can sit in the Park all summer long, listening to music, because their big-shot parents keep sending them money. Who ever sends you money?”&lt;/p&gt;
+    &lt;p&gt;“Listen,” the Negro says helplessly. “You’re gonna start something here, this isn’t right —”&lt;/p&gt;
+    &lt;p&gt;“You tell us what’s right, black boy,” the girl says.&lt;/p&gt;
+    &lt;p&gt;The youngest member of the blackface group, an earnest tall kid about 19, 20, is hanging back at the edge of the scene. I offer him an apple and ask what is going on. “Well,” he says, “I’m new at this, I’m just beginning to study it, but you see the capitalists are taking over the District, and that’s what Peter — well, ask Peter.”&lt;/p&gt;
+    &lt;p&gt;I did not ask Peter. It went on for a while. But on that particular Sunday between three and six o’clock everyone was too high, and the weather was too good, and the Hunter’s Point gangs who usually come in between three and six on Sunday afternoon had come in on Saturday instead, and nothing started. While I waited for Otto I asked a little girl I had met a couple of times before what she had thought of it. “It’s something groovy they call street theater,” she said. I said I had wondered if it might not have political overtones. She is 17 years old, and she worked it around in her mind for a while and finally she remembered a couple of words from somewhere. “Maybe it’s some John Birch thing,” she said.&lt;/p&gt;
+    &lt;p&gt;When I finally find Otto he says, “I got something at my place that’ll blow your mind,” and when we get there I see a child on the living-room floor, wearing a reefer coat, reading a comic book. She keeps licking her lips in concentration and the only off thing about her is that she’s wearing white lipstick.&lt;/p&gt;
+    &lt;p&gt;“Five years old,” he says. “On acid.”&lt;/p&gt;
+    &lt;p&gt;The five-year-old’s name is Susan, and she tells me she is in High Kindergarten. She lives with her mother and some other people, just got over the measles, wants a bicycle for Christmas, and particularly likes soda, ice cream, Marty in the Jefferson Airplane, Bob in the Grateful Dead, and the beach. She remembers going to the beach once a long time ago, and wishes she had taken a bucket. For a year, her mother has given her acid and peyote. Susan describes it as getting stoned.&lt;/p&gt;
+    &lt;p&gt;I start to ask if any of the other children in High Kindergarten get stoned, but I falter at the key words.&lt;/p&gt;
+    &lt;p&gt;“She means do the other kids in your class turn on, get stoned,” says the friend of her mothers who brought her to Otto’s.&lt;/p&gt;
+    &lt;p&gt;“Only Sally and Anne,” Susan says.&lt;/p&gt;
+    &lt;p&gt;“What about Lia?” her mother’s friend prompts.&lt;/p&gt;
+    &lt;p&gt;“Lia,” Susan says, “is not in High Kindergarten.”&lt;/p&gt;
+    &lt;p&gt;Sue Ann’s three-year-old Michael started a fire this morning before anyone was up, but Don got it out before much damage was done. Michael burned his arm, though, which is probably why his mother was so jumpy when she happened to see him chewing on an electric cord. “You’ll fry like rice,” she screamed. The only people around were Don and one of Sue Ann’s macrobiotic friends and somebody who was on his way to a commune in the Santa Lucias, and they didn’t notice Sue Ann screaming at Michael because they were in the kitchen trying to retrieve some very good Moroccan hash which had dropped down through a floorboard that had been damaged in the fire.&lt;/p&gt;
+    &lt;p&gt;This article is featured in the July/August 2017 issue of The Saturday Evening Post. Subscribe to the magazine for more art, inspiring stories, fiction, humor, and features from our archives.&lt;/p&gt;
+    &lt;p&gt;Yeats Poem © 1924 The Macmillan Company. Renewed 1952 Bertha Georgie Yeats.&lt;lb/&gt; “Krishna Song” © 1967 by International Society for Krishna Consciousness&lt;lb/&gt; “No Milk Today” © 1966-1967 Man-Ken Music Ltd.&lt;/p&gt;
+    &lt;p&gt;Become a Saturday Evening Post member and enjoy unlimited access. Subscribe now&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46708807</guid><pubDate>Wed, 21 Jan 2026 17:39:42 +0000</pubDate></item><item><title>Show HN: Company hiring trends and insights from job postings</title><link>https://jobswithgpt.com/company-profiles/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46708990</guid><pubDate>Wed, 21 Jan 2026 17:52:17 +0000</pubDate></item><item><title>Stanford scientists found a way to regrow cartilage and stop arthritis</title><link>https://www.sciencedaily.com/releases/2026/01/260120000333.htm</link><description>&lt;doc fingerprint="fc881a2139a70b82"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46708766</guid><pubDate>Wed, 21 Jan 2026 17:36:09 +0000</pubDate></item><item><title>Show HN: Company hiring trends and insights from job postings</title><link>https://jobswithgpt.com/company-profiles/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46708990</guid><pubDate>Wed, 21 Jan 2026 17:52:17 +0000</pubDate></item><item><title>Stanford scientists found a way to regrow cartilage and stop arthritis</title><link>https://www.sciencedaily.com/releases/2026/01/260120000333.htm</link><description>&lt;doc fingerprint="fc881a2139a70b82"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Stanford scientists found a way to regrow cartilage and stop arthritis&lt;/head&gt;
     &lt;head rend="h2"&gt;Scientists have found a way to regrow aging cartilage, raising hopes for arthritis treatments that could make joint replacements obsolete.&lt;/head&gt;
@@ -1515,4 +1432,100 @@ interface for creating and managing VM's.&lt;/p&gt;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46709320</guid><pubDate>Wed, 21 Jan 2026 18:14:34 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46709320</guid><pubDate>Wed, 21 Jan 2026 18:14:34 +0000</pubDate></item><item><title>Tell HN: Amazon has deactivated my seller account. No idea how to move forward</title><link>https://news.ycombinator.com/item?id=46709409</link><description>&lt;doc fingerprint="b76c9905a1eb0fc8"&gt;
+  &lt;main&gt;
+    &lt;div&gt;
+      &lt;p&gt;I sell 3d printed sleeves to attach an Apple Airtag to a Samsung TV remote. But Amazon thinks I am selling a Samsung device and has deactivated me for IP violations. My listings are very clear that this is FOR a Samsung device, and not an actual Samsung device. But Amazon's automated system can't figure it out. I am following their IP guidelines for compatible products (section 6C - https://sellercentral.amazon.com/help/hub/reference/GZUQ6GBBXQVHQKF2):&lt;/p&gt;
+      &lt;p&gt;You can see one of my listings here:&lt;/p&gt;
+      &lt;p&gt;https://www.amazon.com/dp/B0FHZVVL1H&lt;/p&gt;
+      &lt;p&gt;Every time I listed a new product for a different TV remote, my item would be flagged, but then I would go in and make a small edit, and that seemed to trigger some sort of review, and everything would be great.&lt;/p&gt;
+      &lt;p&gt;Until last week, out of nowhere, my account has been deactivated.&lt;/p&gt;
+      &lt;p&gt;To reinstate my account, they asked me to submit an authorization letter from the manufacturer or brand owner authorizing me to sell their products. Well, I figured, I am the manufacturer, so I wrote an authorization letter for myself, and even got it notarized for good measure, that I am legally allowed to sell these devices. But to no avail.&lt;/p&gt;
+      &lt;p&gt;I have an option to "Submit new information." But have no new information to submit, and fear if I try submitting anything else, I'll be permanently banned or something.&lt;/p&gt;
+      &lt;p&gt;The funny part is that on most of the products I have listed, I am losing money, just because of the FBA costs and the advertising costs. I lost about $250 last month between two of the variants.&lt;/p&gt;
+      &lt;p&gt;The sad part is that I sell a book, Computer Engineering for Babies, and do most all my sales through my website, but do get a few orders a week through amazon for the book, and am now afraid the Amazon door is closed forever.&lt;/p&gt;
+    &lt;/div&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46709409</guid><pubDate>Wed, 21 Jan 2026 18:20:19 +0000</pubDate></item><item><title>Show HN: Rails UI</title><link>https://railsui.com/</link><description>&lt;doc fingerprint="7d9ad0252bdc2161"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Stop fighting CSS and build beautiful Rails apps faster&lt;/head&gt;
+    &lt;p&gt;No more ugly Rails apps. Get professional-looking components and themes that work perfectly with Rails—no design skills required.&lt;/p&gt;
+    &lt;p&gt;Example components from various templates&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="4"&gt;
+        &lt;cell role="head"&gt;Booking date&lt;/cell&gt;
+        &lt;cell role="head"&gt;Property&lt;/cell&gt;
+        &lt;cell role="head"&gt;Payout&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;
+          &lt;p&gt;June 1, 2026&lt;/p&gt;
+          &lt;p&gt;7:38 PM CST&lt;/p&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Cozy Mountain A-Frame&lt;/cell&gt;
+        &lt;cell&gt;$1,165.45&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;
+          &lt;p&gt;Aug 3, 2026&lt;/p&gt;
+          &lt;p&gt;7:38 PM CST&lt;/p&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Mountain Vista Chalet&lt;/cell&gt;
+        &lt;cell&gt;$2,846.46&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;
+          &lt;p&gt;Jul 18, 2026&lt;/p&gt;
+          &lt;p&gt;4:30 PM CST&lt;/p&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Cozy Mountain A-Frame&lt;/cell&gt;
+        &lt;cell&gt;$1,326.36&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Pro&lt;/p&gt;
+    &lt;p&gt;Active subscriber&lt;/p&gt;
+    &lt;p&gt;Monthly&lt;/p&gt;
+    &lt;p&gt;Some activities...&lt;/p&gt;
+    &lt;p&gt;Account information...&lt;/p&gt;
+    &lt;p&gt;Billing information...&lt;/p&gt;
+    &lt;head rend="h1"&gt;Sign in to your account&lt;/head&gt;
+    &lt;p&gt;Or sign up for an account&lt;/p&gt;
+    &lt;head rend="h2"&gt;Enhanced User Authentication System&lt;/head&gt;
+    &lt;p&gt;A small-batch cycle to build a refreshed authentication flow.&lt;/p&gt;
+    &lt;p&gt;Components&lt;/p&gt;
+    &lt;head rend="h3"&gt;Components that make your Rails app &lt;lb/&gt; look professional&lt;/head&gt;
+    &lt;p&gt;No design experience? No problem. Copy-paste beautiful forms, buttons, and layouts that work perfectly with Rails. Focus on your business logic—we've got the pretty stuff covered.&lt;/p&gt;
+    &lt;p&gt;Theme&lt;/p&gt;
+    &lt;p&gt;Hound&lt;/p&gt;
+    &lt;p&gt;Example components&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Accordion&lt;/item&gt;
+      &lt;item&gt;Alert&lt;/item&gt;
+      &lt;item&gt;Badge&lt;/item&gt;
+      &lt;item&gt;Button&lt;/item&gt;
+      &lt;item&gt;Card&lt;/item&gt;
+      &lt;item&gt;Dropdown&lt;/item&gt;
+      &lt;item&gt;Modal&lt;/item&gt;
+      &lt;item&gt;includes 30+ more&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head class="flex w-full cursor-pointer select-none justify-between text-left text-base font-semibold leading-7 text-slate-900 group-open:text-indigo-600 [&amp;amp;::-webkit-details-marker]:hidden dark:group-open:text-indigo-300 dark:text-white"&gt;First accordion item&lt;/head&gt;
+    &lt;head class="flex w-full cursor-pointer select-none justify-between text-left text-base font-semibold leading-7 text-slate-900 group-open:text-indigo-600 [&amp;amp;::-webkit-details-marker]:hidden dark:group-open:text-indigo-300 dark:text-white"&gt;Second accordion item&lt;/head&gt;
+    &lt;head class="flex w-full cursor-pointer select-none justify-between text-left text-base font-semibold leading-7 text-slate-900 group-open:text-indigo-600 [&amp;amp;::-webkit-details-marker]:hidden dark:group-open:text-indigo-300 dark:text-white"&gt;Third accordion item&lt;/head&gt;
+    &lt;head rend="h3"&gt;Time to launch&lt;/head&gt;
+    &lt;p&gt;The beta is no more. &lt;lb/&gt;We are ready to go live.&lt;/p&gt;
+    &lt;p&gt;Themes&lt;/p&gt;
+    &lt;head rend="h3"&gt; Complete app designs that don't look like &lt;lb/&gt; programmer art&lt;/head&gt;
+    &lt;p&gt;Skip the hours of CSS frustration. Get complete, professional-looking app layouts that work with Rails out of the box. Your users will think you hired a designer.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Collie&lt;/head&gt;
+    &lt;p&gt;Community platform&lt;/p&gt;
+    &lt;head rend="h3"&gt;Husky&lt;/head&gt;
+    &lt;p&gt;Personal Finance&lt;/p&gt;
+    &lt;head rend="h3"&gt;Boxer&lt;/head&gt;
+    &lt;p&gt;Agency Management&lt;/p&gt;
+    &lt;quote&gt;&lt;p&gt;"Rails UI is going to save me months of work. I'm an experienced software developer building my first Ruby on Rails app, but I'm not strong at front-end design. Support has been awesome as well."&lt;/p&gt;Adam G. — Software Developer&lt;/quote&gt;
+    &lt;quote&gt;&lt;p&gt;"Launched our MVP in two weeks instead of two months. The themes look so polished that our investors thought we had a full design team."&lt;/p&gt;Sarah M. — Startup Founder&lt;/quote&gt;
+    &lt;quote&gt;&lt;p&gt;"My clients can't believe how fast I deliver now. Rails UI pays for itself on the first project."&lt;/p&gt;James T. — Freelance Developer&lt;/quote&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46709543</guid><pubDate>Wed, 21 Jan 2026 18:31:19 +0000</pubDate></item></channel></rss>
