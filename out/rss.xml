@@ -1,248 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sun, 25 Jan 2026 21:37:57 +0000</lastBuildDate><item><title>Introduction to PostgreSQL Indexes</title><link>https://dlt.github.io/blog/posts/introduction-to-postgresql-indexes/</link><description>&lt;doc fingerprint="791c02166dd40ba4"&gt;
-  &lt;main&gt;
-    &lt;p&gt;20 minutes&lt;/p&gt;
-    &lt;head rend="h1"&gt;Introduction to PostgreSQL Indexes&lt;/head&gt;
-    &lt;head rend="h2"&gt;Who’s this for&lt;/head&gt;
-    &lt;p&gt;This text is for developers that have an intuitive knowledge of what database indexes are, but don’t necessarily know how they work internaly, what are the tradeoffs associated with indexes, what are the types of indexes provided by postgres and how you can use some of its more advanced options to make them more optimized for your use case.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Basics&lt;/head&gt;
-    &lt;p&gt;Indexes are special database objects primarily designed to increase the speed of data access, by allowing the database to read less data from the disk. They can also be used to enforce constraints like primary keys, unique keys and exclusion. Indexes are important for performance but do not speedup a query unless the query matches the columns and data types in the index. Also, as a very rough rule of thumb, an index will only help if less than 15-20% of the table will be returned in the query, otherwise the query planner, a part of postgres used to determine how the query is going to be executed, might prefer a sequential scan. In fact, reality is much more complex than this rule of thumb. The query planner uses statistics and predefined costs associated with each type of scan to do its job, but we’re only going approach the query planner behavior tangentially in this article. So, if your query returns a large percentage of the table, consider refactoring it, using summary tables or other techniques before throwing an index at the problem. With that in mind, let’s give a closer look at how Postgres stores your data in the disk and how indexes help to speedup querying this data.&lt;/p&gt;
-    &lt;p&gt;There are six types of indexes available in the default postgres installation and more types available through extensions. Typically, they work by associating a key value with a data location in one or more rows of the table containing that key. Each line is identified by a TID, or tuple id.&lt;/p&gt;
-    &lt;head rend="h3"&gt;How data is stored in disk&lt;/head&gt;
-    &lt;p&gt;To understand indexes, it is important to first understand how postgres stores table data on disk. Every table in postgres has one or more corresponding files on disk, depending on its size. This set of files is called a heap and it is divided into 8kb pagesh. All table rows, internally referred to as “tuples”, are saved in these files and do not have a specific order. The index is a tree structure that links the indexes columns to the row locators, also known as ctid, in the heap. We’ll zoom into the index internals later.&lt;/p&gt;
-    &lt;p&gt;To see the heap files we can use a few postgres internal tables to see where they’re located in the disk. First, we can enter psql and use &lt;code&gt;show data_directory&lt;/code&gt; to show the directory Postgres uses to store databases physical files.&lt;/p&gt;
-    &lt;code&gt; show data_directory;
-
-         data_directory          
----------------------------------
- /opt/homebrew/var/postgresql@16&lt;/code&gt;
-    &lt;p&gt;Now we can use the internal &lt;code&gt;pg_class&lt;/code&gt; to find the file where the heap table is stored:&lt;/p&gt;
-    &lt;code&gt;create table foo (id int, name text);
-
-
-select oid, datname
-from pg_database
-where datname = 'my_database';                                                                                
-
-  oid  |         datname        
--------+-------------------------
- 71122 | my_database
-(1 row)&lt;/code&gt;
-    &lt;code&gt;select relfilenode from pg_class where relname = 'foo';                                                                                                  
- relfilenode
--------------
-       71123&lt;/code&gt;
-    &lt;p&gt;Finally, we can check the file on disk by running this command in the shell (ls $PGDATA/base/&amp;lt;database_oid&amp;gt;/&amp;lt;table_oid&amp;gt;):&lt;/p&gt;
-    &lt;code&gt;ls -lrt /opt/homebrew/var/postgresql@16/base/71122/71123
--rw-------  1 dlt  admin  0 16 Aug 14:20 /opt/homebrew/var/postgresql@16/base/71122/71123&lt;/code&gt;
-    &lt;p&gt;The file has size 0 because we haven’t done any INSERTs in this table yet.&lt;/p&gt;
-    &lt;p&gt;Let’s add a couple of rows to our table:&lt;/p&gt;
-    &lt;code&gt;insert into foo (id, name) values (1, 'Ronaldo');
-INSERT 0 1
-insert into foo (id, name) values (2, 'Romario');
-INSERT 0 1&lt;/code&gt;
-    &lt;p&gt;We can add the &lt;code&gt;ctid&lt;/code&gt; field to the query to retrieve the ctid of each line. The ctid is an internal field that has the address of the line in the heap. Think of it as a pointer to the row location in the heap. It consists of a tuple in the format (m, n) where m is the block id and n is the tuple offset. “ctid” stands for “current tuple id”. Here you can note that the row with id one is stored in the page 0, offset 1.&lt;/p&gt;
-    &lt;code&gt;select ctid, * from foo;
- ctid  | id |  name   
--------+----+---------
- (0,1) |  1 | Ronaldo
- (0,2) |  2 | Romario
-(2 rows)&lt;/code&gt;
-    &lt;head rend="h3"&gt;How indexes speedup access to data&lt;/head&gt;
-    &lt;p&gt;Let’s add more players to the table so that the total rows is one million:&lt;/p&gt;
-    &lt;code&gt;insert into foo (id, name);
-select generate_series(3, 1000000), 'Player ' || generate_series(3, 1000000);&lt;/code&gt;
-    &lt;p&gt;After adding more rows to the table its corresponding file is 30MB. Internally, it is divided into 8kb pages.&lt;/p&gt;
-    &lt;code&gt;ls -lrtah /opt/homebrew/var/postgresql@16/base/71122/71123
--rw-------  1 dlt  admin    30M 16 Aug 16:32 /opt/homebrew/var/postgresql@16/base/71122/71133&lt;/code&gt;
-    &lt;p&gt;When we query a table without an index, Postgres reads all tuples in every page and apply a filter. For example, let’s analyze the command below that searches for rows whose &lt;code&gt;name&lt;/code&gt; column value is equal to “Ronaldo” and show how the database performed this search. We use the explain command with the options &lt;code&gt;(analyse, buffers)&lt;/code&gt;. &lt;code&gt;analyse&lt;/code&gt; will actually execute the query instead of just using cost estimates, and the &lt;code&gt;buffers&lt;/code&gt; option shows how much IO work was done.&lt;/p&gt;
-    &lt;code&gt; explain (analyze, buffers) select * from foo where name = 'Ronaldo';
-                                                     QUERY PLAN
----------------------------------------------------------------------------------------------------------------------
- Gather  (cost=1000.00..12577.43 rows=1 width=18) (actual time=0.307..264.991 rows=1 loops=1)
-   Workers Planned: 2
-   Workers Launched: 2
-   Buffers: shared hit=97 read=6272
-   -&amp;gt;  Parallel Seq Scan on foo  (cost=0.00..11577.33 rows=1 width=18) (actual time=169.520..256.639 rows=0 loops=3)
-         Filter: (name = 'Ronaldo'::text)
-         Rows Removed by Filter: 333333
-         Buffers: shared hit=97 read=6272
- Planning Time: 0.143 ms
- Execution Time: 265.021 ms&lt;/code&gt;
-    &lt;p&gt;Note the in output the line starting with " -&amp;gt; Parallel Seq scan on foo". This line denotes that the database performed a sequential search and read all the rows in the table. The execution time for this query was 265.021ms. Also note the line that says “Buffers: shared hit=97 read=6272”. This mean that we needed to read 97 pages from memory, and 6272 pages from disk.&lt;/p&gt;
-    &lt;p&gt;Now let’s add an index on the name column and see how the same query performs. We’re using the command &lt;code&gt;create index concurrently&lt;/code&gt; because we don’t want to block the table for writes.&lt;/p&gt;
-    &lt;code&gt;create index concurrently on foo(name);
-CREATE INDEX
-
-explain (analyze, buffers) select * from foo where name = 'Ronaldo';
-                                                    QUERY PLAN
--------------------------------------------------------------------------------------------------------------------
- Index Scan using foo_name_idx on foo  (cost=0.42..8.44 rows=1 width=18) (actual time=0.047..0.049 rows=1 loops=1)
-   Index Cond: (name = 'Ronaldo'::text)
-   Buffers: shared hit=4
- Planning Time: 0.129 ms
- Execution Time: 0.077 ms
-(5 rows)&lt;/code&gt;
-    &lt;p&gt;Here we see that the index was used and that in this case the execution time was reduced from 264.21 to 0.074 milliseconds, and the database only needed to read 4 pages! The reduction in execution time happens because, now, instead of reading all the rows in the table, the database uses the index. The index is a tree structure mapping the value “Ronaldo” to the ctid(s) of the rows that have this value in the &lt;code&gt;name&lt;/code&gt; column (in our example we only have one such row). The ctid is then used to quickly locate these rows on the heap.&lt;/p&gt;
-    &lt;p&gt;If we use &lt;code&gt;\di+&lt;/code&gt; to show the indexes in our database we can see that the index we’ve created occupies &lt;code&gt;30MB&lt;/code&gt;, roughly the same size as the &lt;code&gt;foo&lt;/code&gt; table.&lt;/p&gt;
-    &lt;code&gt;\di+
-
-                                         List of relations
- Schema |     Name     | Type  | Owner | Table | Persistence | Access method | Size  | Description
---------+--------------+-------+-------+-------+-------------+---------------+-------+-------------
- public | foo_name_idx | index | dlt   | foo   | permanent   | btree         | 30 MB |
-(1 row)&lt;/code&gt;
-    &lt;head rend="h2"&gt;Costs associated with indexes&lt;/head&gt;
-    &lt;p&gt;It is important to highlight that the extra speed brought by indices is associated with several costs that must be considered when deciding where and how to apply them.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Disk Space&lt;/head&gt;
-    &lt;p&gt;Indexes are stored in a separate area of the heap and take up additional disk space. The more indexes a table has, the greater the amount of disk space required to store them. This incurs in additional storage costs for your database and for backups, increased replication traffic, and increased backup and failover recovery times. Bear in mind that its not uncommon for btree indexes to be larger than the table itself. Learning about partial indexes, and multicolumn indexes, as well as about other more space efficient index types such as BRIN can be helpful.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Write operations&lt;/head&gt;
-    &lt;p&gt;Also, there is a maintenance cost in writing operations such as UPDATE, INSERT and DELETE, if a field that is part of an index is modified, the corresponding index needs to be updated, which can add significant overhead to the writing process.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Query planner&lt;/head&gt;
-    &lt;p&gt;The query planner (also known as query optimizer) is the component responsible for determining the best execution strategy for a query. With more indexes available, the query planner has more options to consider, which can increase the time needed to plan the query, especially in systems with many complex queries or where there are many indexes available.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Memory usage&lt;/head&gt;
-    &lt;p&gt;PostgreSQL maintains a portion of frequently accessed data and index pages in memory in its shared buffers. When an index is used, the relevant index pages are loaded into shared buffers to speed up access. The more indexes you have and the more they are used, the more shared buffer memory is necessary. Since shared buffers are limited and are also used for caching data pages, filling the shared buffers with indexes can lead to less efficient caching of table data. It’s also good to keep in mind that the whole indexed column is copied in every node of the btree, since there’s a limit in node size capacity, the larger the indexed column the deeper the tree will be.&lt;/p&gt;
-    &lt;p&gt;Another aspect of memory usage is that PostgreSQL uses work memory when it executes queries that involves sorting or complex index scans (involving multi-column or covering indexes). Larger indexes require more memory for these operations. Also, indexes require memory to store some metadata about their structure, column names and statistics in the system catalog cache. And finally indexes require memory for maintainance operations like vacuuming and reindexing operations.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Types of Indexes&lt;/head&gt;
-    &lt;head rend="h3"&gt;Btree&lt;/head&gt;
-    &lt;p&gt;The B-Tree is a very powerful data structure, present not only in Postgres but in almost every database management system, since it is a very good general purpose index. It was invented by Rudolf Bayer and Edward M.McCreight while working at Boeing. Nobody really knows if the “B” in B-tree stands for Bayer, Boeing, balanced or better, and it doesn’t really matter. What really matters is that it enables us to search elements in the tree in O(log n) time. If you’re not familiar with Big-O notation, all you need to know is that is is really fast - you only need to make 20 comparisons in order to find an element in a set with 1 million items. Moreover, it can maintain O(log n) time complexity for data sets that are larger than the RAM available on a computer. This means that disks can be used to extend RAM, thanks to the btree efficient prevention of disk page accesses to find the desired data. In PostgreSQL the btree is the most common type of index and its the default, it’s also used to support system and TOAST indexes. Even an empty database has hundreds of btree indexes. It is the only index type that can be used for primary and unique key constraints.&lt;/p&gt;
-    &lt;p&gt;In contrast with a binary tree, the BTree is a balanced tree and all of its leave nodes have the same distance from the root. The root nodes and inner nodes have pointers to lower levels, and the leaf nodes have the keys and pointers to the heap. Postgres btrees also have pointers to the left and right nodes for easier forward and backward scanning. Nodes can have multiple keys and these keys are sorted so that it’s easy to walk in ordered directions and to perform ORDER BY and JOIN operations. The values are only stored in the leaf nodes, this makes the tree more compact and facilitates a full traversal of the objects in a tree with just a linear pass through all the leaf nodes. This is just a simplified description of PostgreSQL Btree indexes, if you want to get into the low level details, I suggest you to read the README and the paper that inspired them. Below there’s a simplified illustration of a Postgres Btree.&lt;/p&gt;
-    &lt;head rend="h4"&gt;Using multiple indexes&lt;/head&gt;
-    &lt;p&gt;Postgres can use multiple indexes to handle cases that cannot be handled by single index scans, by forming &lt;code&gt;AND&lt;/code&gt; and &lt;code&gt;OR&lt;/code&gt; conditions across several index scans with the support of bitmaps. The bitmaps are ANDed or ORed together as needed by the query and finally the table rows are visited and returned. Let’s say we have a query like this:&lt;/p&gt;
-    &lt;code&gt;select * from users where age = 30 and login_count = 100;&lt;/code&gt;
-    &lt;p&gt;If the &lt;code&gt;age&lt;/code&gt; and &lt;code&gt;login_count&lt;/code&gt; columns are indexed, postgres scans index &lt;code&gt;age&lt;/code&gt; for all pages with &lt;code&gt;age=30&lt;/code&gt; and makes a bitmap where the pages that might contain rows with &lt;code&gt;age=30&lt;/code&gt; are true. In a similar way, it builds a bitmap using the &lt;code&gt;login_count&lt;/code&gt; index. It then ANDs the two bitmaps to form a third bitmap, and performs a table scan, only reading the pages that might contain candidate values, and only adding the rows where &lt;code&gt;age=30 and login_count=100&lt;/code&gt; to the result set.&lt;/p&gt;
-    &lt;head rend="h4"&gt;Multi-column indexes&lt;/head&gt;
-    &lt;p&gt;Multi-column indexes are an alternative for using multiple indexes. They’re generaly going to be smaller and faster than using multiple indexes, but they’ll also be less flexible. That’s because the order of the columns matter, because the database can search for a subset of the indexed columns, as long as they are the leftmost columns. For example, if you have an index on column &lt;code&gt;a&lt;/code&gt; and another index on column &lt;code&gt;b&lt;/code&gt;, these indexes will serve all the of queries below:&lt;/p&gt;
-    &lt;code&gt;select * from my_table where a = 42 and b = 420;
-
-select * from my_table where a = 43;
-
-select * from my_table where b = 99;&lt;/code&gt;
-    &lt;p&gt;On the other hand, only the first two queries would use an index if you created a multi-column index on (a, b) with a command like &lt;code&gt;create index on my_table(a, b)&lt;/code&gt;; So, when building multi-column indexes choose the order of the columns well so that your index can be used by the most queries possible.&lt;/p&gt;
-    &lt;head rend="h4"&gt;Partial indexes&lt;/head&gt;
-    &lt;p&gt;Partial indexes allow you to use a conditional expression to control what subset of rows will be indexed, this can bring you many benefits:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;your index can be smaller and more likely fit in RAM.&lt;/item&gt;
-      &lt;item&gt;your index is shallower, so lookups are quicker&lt;/item&gt;
-      &lt;item&gt;less overhead for index/update/delete (but can also mean more overhead if the column you’re using to filter rows in/out of the index is updated very frequently triggering constant index maintenance)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;They’re mostly useful in situations where you don’t care about some rows, or when you’re indexing on a column where the proportion of one value is much greater than others. I’ll give two examples below.&lt;/p&gt;
-    &lt;head rend="h5"&gt;When you don’t care about some rows&lt;/head&gt;
-    &lt;p&gt;Let’s say you have a rules table where the rows can be marked as enabled/disabled, the vast majority of the rows are disabled and in your queries you only care about enabled rows. In this case, you would have a partial index, filtering out the disable rows like this:&lt;/p&gt;
-    &lt;code&gt;create index on rules(status) where status = 'enabled';&lt;/code&gt;
-    &lt;head rend="h5"&gt;When the distribution of values is skewed&lt;/head&gt;
-    &lt;p&gt;Now imagine you’re building a todo application and the status column value can be either &lt;code&gt;TODO&lt;/code&gt;, &lt;code&gt;DOING&lt;/code&gt;, and &lt;code&gt;DONE&lt;/code&gt;. Suppose you have 1M rows and this is the current distribution of rows in each status:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;Rows&lt;/cell&gt;
-        &lt;cell role="head"&gt;Status&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;TODO&lt;/cell&gt;
-        &lt;cell&gt;90%&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;DOING&lt;/cell&gt;
-        &lt;cell&gt;5%&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;DONE&lt;/cell&gt;
-        &lt;cell&gt;5%&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Since postgres keeps statistics about the distribution of values in your table columns and knows that the vast majority of the rows are in the &lt;code&gt;TODO&lt;/code&gt; status, it would choose to do a sequential scan on the &lt;code&gt;tasks&lt;/code&gt; table when you have &lt;code&gt;status='TODO'&lt;/code&gt; in the &lt;code&gt;WHERE&lt;/code&gt; clause of your query, even if you have an index on status, leaving most part of the index unused and wasting space. In this case, a partial scan such as the one below is recommended:&lt;/p&gt;
-    &lt;code&gt;create index on tasks(status) where status &amp;lt;&amp;gt; 'TODO';&lt;/code&gt;
-    &lt;head rend="h4"&gt;Covering indexes&lt;/head&gt;
-    &lt;p&gt;If you have a query that selects only columns in an index, Postgres has all information needed by the query in the index and doesn’t need to fetch pages from the heap to return the result. This optimization is called &lt;code&gt;index-only scan&lt;/code&gt;. To understand how it works, consider the following scenario:&lt;/p&gt;
-    &lt;code&gt;create table bar (a int, b int, c int);
-create index abc_idx on bar(a, b);
-
-/* query 1 */
-select a, b from bar;
-
-/* query 2 */
-select a, b, c from bar;&lt;/code&gt;
-    &lt;p&gt;In the first query, postgres can do an index-only scan and avoid fetching data from the heap because the values &lt;code&gt;a&lt;/code&gt; and &lt;code&gt;b&lt;/code&gt; are present in the index. In the second query, since &lt;code&gt;c&lt;/code&gt; isn’t in the index, posgres needs to follow the reference to the heap to fetch its value. In the first query we allowed postgres do to an index-only scan with the help of a multi-column index, but we could also achieve the same result by using a covering index. The syntax for creating a covering index looks like this:&lt;/p&gt;
-    &lt;code&gt;create index abc_cov_idx on bar(a, b) including c;&lt;/code&gt;
-    &lt;p&gt;This is more space efficient than creating a multi-column index on (a, b, c), because c will only be inserted at the leaf nodes of the btree. Also, we might want to use a covering index in cases where we want an unique index and &lt;code&gt;c&lt;/code&gt; would “break” the uniqueness of the index.&lt;/p&gt;
-    &lt;head rend="h4"&gt;Expression indexes&lt;/head&gt;
-    &lt;p&gt;Expression indexes to index the result of an expression or function, rather than just the raw column values. This can be extremely useful when you frequently query based on a transformed version of your data. It is necessary if you use a function as part of a where clause as in the example below:&lt;/p&gt;
-    &lt;code&gt;CREATE TABLE customers (
-    id SERIAL PRIMARY KEY,
-    name TEXT
-);
-
-CREATE INDEX idx_name ON customers(name);
-SELECT * FROM customers WHERE LOWER(name) = 'john doe';&lt;/code&gt;
-    &lt;p&gt;In this example above, Postgres won’t use the index because it was was built against the &lt;code&gt;name&lt;/code&gt; column. In order to make it work, the index key has to call the &lt;code&gt;lower&lt;/code&gt; function just like it’s used in the where clase. To fix it, do:&lt;/p&gt;
-    &lt;p&gt;Now, when you run a query like this:&lt;/p&gt;
-    &lt;code&gt;CREATE INDEX idx_lower_name ON customers (lower(name));&lt;/code&gt;
-    &lt;p&gt;Now PostgreSQL can use the expression index to efficiently find the matching rows.&lt;/p&gt;
-    &lt;p&gt;Expression indexes can be created using various types of expressions:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Built-in functions: Like &lt;code&gt;lower()&lt;/code&gt;,&lt;code&gt;upper()&lt;/code&gt;, etc.&lt;/item&gt;
-      &lt;item&gt;User-defined functions: As long as they are immutable.&lt;/item&gt;
-      &lt;item&gt;String concatenations: Like &lt;code&gt;first_name || ' ' || last_name&lt;/code&gt;.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h3"&gt;Hash&lt;/head&gt;
-    &lt;p&gt;The hash index differs from B-Tree in strucutre, it is much more alike a hashmap data structure present in most programming languages (e.g. dict in Python, array in php, HashMap in java, etc). Instead of adding the full column value to the index, a 32bit hash code is derived from it and added to the hash. This makes hash indexes much smaller than btrees when indexing longer data such as UUIDs, URLs, etc. Any data type can be indexed with the help of postgres hashing functions. If you type &lt;code&gt;\df hash*&lt;/code&gt; and press TAB in psql, you’ll see that there are more then 50 hash related functions. Although it gracefully handles hash conflicts, it works better for even distribution of hash values and is most suited to unique or mostly unique data. Under the correct conditions it will not only be smaller than btree indexes, but also it will be faster for reads when compared with btress. Here’s what the official docs says about it:&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;“In a B-tree index, searches must descend through the tree until the leaf page is found. In tables with millions of rows, this descent can increase access time to data. The equivalent of a leaf page in a hash index is referred to as a bucket page. In contrast, a hash index allows accessing the bucket pages directly, thereby potentially reducing index access time in larger tables. This reduction in “logical I/O” becomes even more pronounced on indexes/data larger than shared_buffers/RAM.”&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;As for its limitations, it only supports equality operations and isn’t going to be helpful if you need to order by the indexed field. It also doesn’t support multi-column indexes and checking for uniqueness. For a in-depth analysis of how hash indexes fare in relation to btree, check Evgeniy Demin’s blog post on the subject.&lt;/p&gt;
-    &lt;head rend="h3"&gt;BRIN&lt;/head&gt;
-    &lt;p&gt;BRIN stands for Block Range Index and its name tells a lot about how it is implemented. Nodes in BRIN indexes store the minimum and maximum values of a range of values present in the page referred by the index. This makes the index more compact and cache friendly, but restricts the use cases for it. If you have a very large in a work load that is heavy on writes and low on deletes and updates. You can think of a BRIN index as an optimizer for sequential scans of large amounts of data in very large databases, and is a good optimization to try before partitioning a table. For a BRIN index to work well, the index key should be a column that strongly correlates to the location of the row in the heap.Some good use cases for BRIN are append-only tables and tables storing time series data.&lt;/p&gt;
-    &lt;p&gt;BRIN won’t work well for tables where the rows are updated constantly, due to the nature of MVCC that duplicates rows and stores them in a different part of the heap. This tuple duplication and moving affect the correlation negatively and reduces the effectiveness of the index. Using extensions such as pg_repack or pg_squeeze isn’t recommended for tables that use BRIN indexes, since they change the internal data layour fo the table and mess up the correlation. Also, this index is lossy in the sense that the index leaf nodes point to pages taht might contain a value within a particular range. For this reason a BRIN is more helpful if you need to return large subset of data, and a btree would be more read performant for queries that only return one or few rows. You can make the index more or less lossy by adjusting the &lt;code&gt;page_per_range&lt;/code&gt; configuration, the trade off will be index size.&lt;/p&gt;
-    &lt;head rend="h3"&gt;GIN&lt;/head&gt;
-    &lt;p&gt;Generalized inverted index is appropriate for when you want to search for an item in composite data, such as finding a word in a blob of text, an item in an array or an object in a JSON. The GIN is generalized in the sense that it doesn’t need to know how it will acelerate the search for some item. Instead, there’s a set of custom strategies specific for each data type. Please note that in order to index an JSON value it needs to be stored in a JSONB column. Similarly, if you’re indexing text it’s better to store it as (or convert it to) tsvector or use the pg_trgm extension.&lt;/p&gt;
-    &lt;head rend="h3"&gt;GiST &amp;amp; SP-GiST&lt;/head&gt;
-    &lt;p&gt;The Generalized Search Tree and the Space-Partitioned Generalized Search Tree are tree structures that can be use as a base template to implement indexes for specific data types. You can think of them as framework for building indexes. The GiST is a balanced tree and the SP-GiST allow for the development of non-balanced data structures. They are useful for indexing points and geometric types, inet, ranges and text vectors. You can find an extensive list of the built-in strategies shipped with postgres in the official documentation. If you need an index to enable full-text search in your application, you’ll have to choose between GIN and GiST. Roughly speaking, GIN is faster for lookups but it’s bigger and has greater building and maintainance costs. So the right index type for you will depend on your application requirements.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Conclusion&lt;/head&gt;
-    &lt;p&gt;Understanding and effectively using indexes is crucial for optimizing database performance in PostgreSQL. While indexes can greatly speed up query execution and improve overall efficiency, it’s important to be mindful of their impact on write operations and storage. By carefully selecting the appropriate types of indexes based on your specific use cases you can ensure that your PostgreSQL database remains both fast and efficient. I hope this article taught you at least one or two things you didn’t know about Postgres indexes, and that you’re better equiped to deal with different scenarios involving databases from now on.&lt;/p&gt;
-    &lt;p&gt;4119 Words&lt;/p&gt;
-    &lt;p&gt;2024-09-11 08:07&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46751826</guid><pubDate>Sun, 25 Jan 2026 08:07:03 +0000</pubDate></item><item><title>Deutsche Telekom is throttling the internet</title><link>https://netzbremse.de/en/</link><description>&lt;doc fingerprint="66133f28ed9a317f"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Deutsche Telekom is throttling the internet. Let's do something about it!&lt;/head&gt;
-    &lt;p&gt;If you are a customer of Deutsche Telekom and some websites just won't load, then we might have the solution to your problem!&lt;/p&gt;
-    &lt;head rend="h2"&gt;Short Explanation!&lt;/head&gt;
-    &lt;head rend="h2"&gt;What is this about?&lt;/head&gt;
-    &lt;p&gt;Epicenter.works, the Society for Civil Rights, the Federation of German Consumer Organizations, and Stanford Professor Barbara van Schewick are filing an official complaint with the Federal Network Agency against Deutsche Telekom’s unfair business practices.&lt;/p&gt;
-    &lt;p&gt;Deutsche Telekom is creating artificial bottlenecks at access points to its network. Financially strong services that pay Telekom get through quickly and work perfectly. Services that cannot afford this are slowed down and often load slowly or not at all.&lt;/p&gt;
-    &lt;p&gt;This means Telekom decides which services we can use without issues, violating net neutrality. We are filing a complaint with the Federal Network Agency to stop this unfair practice together!&lt;/p&gt;
-    &lt;head rend="h2"&gt;Testimonials&lt;/head&gt;
-    &lt;head rend="h2"&gt;How can you help the project?&lt;/head&gt;
-    &lt;p&gt;Are you a Deutsche Telekom customer and want to help? Get in touch with usâevery experience counts! Maybe you even have networking expertise and measurement data that could be relevant? Whether with or without measurements, weâd love to hear from you at netzbremse@epicenter.works.&lt;/p&gt;
-    &lt;p&gt;Do you have experience with interconnection agreements with Deutsche Telekom and want to talk to us confidentially? Contact us via email or one of the following channels:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Signal: +43 670 404 98 89&lt;/item&gt;
-      &lt;item&gt;Threema (ID: BXJMX4R5)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h2"&gt;Donate now for a free internet!Donate now for a free internet!&lt;/head&gt;
-    &lt;head rend="h2"&gt;Talk at Chaos Communication Congress 38C3&lt;/head&gt;
-    &lt;head rend="h2"&gt;Media Coverage&lt;/head&gt;
-    &lt;p&gt;VerbraucherschÃ¼tzer werfen der Telekom vor, bewusst EngpÃ¤sse im Internet zu schaffen, um zusÃ¤tzlich Geld fÃ¼r schnellere ZugÃ¤nge zu kassieren. Sie sehen darin eine Verletzung von EU-Recht. Die Telekom widerspricht. Von Markus Reher.&lt;/p&gt;
-    &lt;p&gt;Ein BÃ¼ndnis aus mehreren Organisationen hat bei der Bundesnetzagentur eine Beschwerde wegen angeblicher Verletzungen von NetzneutralitÃ¤tspflichten eingereicht.&lt;/p&gt;
-    &lt;p&gt;VerbraucherschÃ¼tzer werfen der Telekom vor, mit schlechtem Netz zusÃ¤tzliches Geld zu machen.&lt;/p&gt;
-    &lt;p&gt;Ein BÃ¼ndnis mehrerer Organisationen wirft der Telekom vor, kÃ¼nstliche EngpÃ¤sse im Netz zu schaffen und damit Geld zu verdienen. Der Konzern weist die VorwÃ¼rfe zurÃ¼ck und holt zur Gegenkritik aus.&lt;/p&gt;
-    &lt;p&gt;VerbraucherschÃ¼tzer werfen der Telekom vor, mit schlechtem Netz zusÃ¤tzliches Geld zu machen.&lt;/p&gt;
-    &lt;p&gt;Die Telekom drosselt das Netz", beklagen die Macher einer neuen Kampagne. Das verstoÃe gegen die NetzneutralitÃ¤t. Eine offizielle Beschwerde soll bald folgen.&lt;/p&gt;
-    &lt;p&gt;“Die Telekom drosselt das Netz”, beklagen die Macher einer neuen Kampagne. Das verstoÃe gegen die NetzneutralitÃ¤t. Eine offizielle Beschwerde soll bald folgen.&lt;/p&gt;
-    &lt;p&gt;Die DeutÂsche Telekom muss endlich die Peering-KapaÂzitÃ¤ten zu anderen Internet-Knoten erhÃ¶hen.&lt;/p&gt;
-    &lt;p&gt;VerbrauÂcherÂschÃ¼tzer wollen bei der BundesÂnetzÂagentur Beschwerde gegen Peering-Probleme im Telekom-Netz einreiÂchen.&lt;/p&gt;
-    &lt;p&gt;Nicht nur als KrisenlÃ¶sung sucht das Deutsche Forschungsnetz den direkten Anschluss zur Deutschen Telekom. Die wollte sich aber zuerst auf nichts einlassen.&lt;/p&gt;
-    &lt;p&gt;Schon seit mindestens Mai 2015 gibt es sie, eine Option fÃ¼r Hetzner-Kunden, die ihre Server fÃ¼r Kunden der Telekom zwischen 19 und 22 Uhr besser erreichbar machen wollen.&lt;/p&gt;
-    &lt;p&gt;Die Telekom sieht sich mit schweren VorwÃ¼rfen konfrontiert, nach denen sie absichtlich gegen die NetzneutralitÃ¤t verstoÃen soll. Ãberzeugt davon ist nicht nur die Verbraucherzentrale.&lt;/p&gt;
-    &lt;p&gt;Die Verbraucherzentrale sucht Betroffene, die Probleme im Netz der Telekom haben. Der Vorwurf: Verletzung der NetzneutralitÃ¤t.&lt;/p&gt;
-    &lt;p&gt;Verbraucher und Organisationen wehren sich gegen Netzdrosselung von Telekom. Erste Beschwerden gehen ein.&lt;/p&gt;
-    &lt;p&gt;Der Verbraucherschutz schlÃ¤gt Alarm: Die Deutsche Telekom bevorzugt bei der Internet-Geschwindigkeit offenbar Dienste und Webseiten, die fÃ¼r mehr Tempo zahlen, wÃ¤hrend sie andere drosselt. User sollen das nun bestÃ¤tigen.&lt;/p&gt;
-    &lt;p&gt;Macht die Telekom Teile des Internets absichtlich langsam? Dieser Vorwurf hat es in sich und wird vom Verband der Verbraucherzentralen erhoben â ein Einblick in das Prinzip des Peerings und die Frage, wie die Telekom hier seit Jahren fÃ¼r Frust sorgt.&lt;/p&gt;
-    &lt;p&gt;Macht die Telekom ihr Netz absichtlich langsamer? Der Verbraucherschutz wirft dem Unternehmen vor, die NetzneutralitÃ¤t absichtlich zu verletzen. Die Telekom verlange von Anbietern Zahlungen fÃ¼r bevorzugten Datentransfer und bremse andere Dienste aus.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46751899</guid><pubDate>Sun, 25 Jan 2026 08:22:17 +0000</pubDate></item><item><title>A flawed paper in management science has been cited more than 6k times</title><link>https://statmodeling.stat.columbia.edu/2026/01/22/aking/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46752151</guid><pubDate>Sun, 25 Jan 2026 09:04:30 +0000</pubDate></item><item><title>Jurassic Park - Tablet device on Nedry's desk? (2012)</title><link>https://www.therpf.com/forums/threads/jurassic-park-tablet-device-on-nedrys-desk.169883/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46752261</guid><pubDate>Sun, 25 Jan 2026 09:22:17 +0000</pubDate></item><item><title>150k lines of vibe coded Elixir: The good, the bad and the ugly</title><link>https://getboothiq.com/blog/150k-lines-vibe-coded-elixir-good-bad-ugly</link><description>&lt;doc fingerprint="f72c54daabbd7c64"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sun, 25 Jan 2026 22:10:36 +0000</lastBuildDate><item><title>A flawed paper in management science has been cited more than 6k times</title><link>https://statmodeling.stat.columbia.edu/2026/01/22/aking/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46752151</guid><pubDate>Sun, 25 Jan 2026 09:04:30 +0000</pubDate></item><item><title>Jurassic Park - Tablet device on Nedry's desk? (2012)</title><link>https://www.therpf.com/forums/threads/jurassic-park-tablet-device-on-nedrys-desk.169883/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46752261</guid><pubDate>Sun, 25 Jan 2026 09:22:17 +0000</pubDate></item><item><title>150k lines of vibe coded Elixir: The good, the bad and the ugly</title><link>https://getboothiq.com/blog/150k-lines-vibe-coded-elixir-good-bad-ugly</link><description>&lt;doc fingerprint="f72c54daabbd7c64"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;150,000 Lines of Vibe Coded Elixir: The Good, The Bad, and The Ugly&lt;/head&gt;
     &lt;p&gt;TL;DR:&lt;/p&gt;
@@ -924,4 +681,218 @@ ON dlq_events (created_at);&lt;/code&gt;
     &lt;p&gt;My advice (and I’ve already said I know nothing) would just be to experiment, tinker, and try to remain curious. It certainly feels to me like software development is unrecognizable from where it was 3 years ago, so I have no idea where it will be 3 years from now. It’s gonna be a bumpy ride for everyone, so just try have some empathy for your fellow passengers in the other tribe.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46758175</guid><pubDate>Sun, 25 Jan 2026 21:01:37 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46758175</guid><pubDate>Sun, 25 Jan 2026 21:01:37 +0000</pubDate></item><item><title>Canada</title><link>https://www.jenn.site/on-canada/</link><description>&lt;doc fingerprint="ef02d1961f6494f9"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;On Canada&lt;/head&gt;
+    &lt;p&gt;I've been visiting the US a lot these days: for work, for conferences, and simply to see friends. Commensurately, I've been also thinking more about what Canadian culture is, and what being Canadian means to me.&lt;/p&gt;
+    &lt;p&gt;My gratitude towards my nation goes deep. Canada shaped me into person I am today, and I'd go far as to say that Canada raised me; not as much as my mother did, but perhaps more than any other entity. Growing up, our family was poor to the point where there were stretches of weeks where all we ate were frozen dumplings for lunch and cabbage and rice for dinner. But mom did her best to hide our lack from me, and Canada helped her greatly with the conspiracy. Canada gave us a rent-subsidized apartment and five hundred dollars a month to care for me until I turned eighteen. And that would be cause enough for gratitude, but Canada went further in its generosity.&lt;/p&gt;
+    &lt;p&gt;Canada taught me how to swim, and how to skate. Here, municipally-run community centres with ice rinks, pools, and programming rooms are standard civic infrastructure, and our neighbourhoods are dotted with them.1 The municipality runs regular classes and programming in the community centres, generally priced at a few hundred dollars for ten-week classes, but low-income families could register their children for a song. Mom ponied up for skates and bathing suits, and I swam in the summers and skated in the winters my entire childhood.&lt;/p&gt;
+    &lt;p&gt;And so when in my teens when my friends started to invite me over to their families' summer cottages, I could join them in jumping into lakes with glee. And so when an airbnb my university friends booked over the holidays one year turned out to be unexpectedly close to an outdoor rink, I was able to play in a terribly silly game of pick-up hockey. And so even though my body is clumsy and stupid by nature, there were kinds of physical activity that I had cultivated a decade of muscle memory in, and can make pleasing amounts of improvement on in adulthood.&lt;/p&gt;
+    &lt;p&gt;Canada let me read to my heart's content. I'll never forget the wonder and gratitude I felt, the very first time my parents took me to a public Canadian library. Looking around at the shelves, knowing that somehow every book inside was free for me to read and to take home. We didn't have anything like that in China.&lt;/p&gt;
+    &lt;p&gt;With my children's library card I could take out forty books at a time. Forty books! We would make the trip at least once a week, where I would return my previous pile and get a new one — as much as can fit in my backpack, and two of mom's grocery totes. And I spent entire summers among the stacks, because the library had air conditioning and our apartment did not. I gobbled up one book after another in my formative years, which I was only able to do with Canada's generosity.&lt;/p&gt;
+    &lt;p&gt;Canada made the holidays magical for me. Mom could not afford much in the way of frivolous things, but I would have a giant bounty of new toys every Christmas anyways courtesy of a local charity. They gave them out in jumbo translucent garbage bags, pink for girls and blue for boys, big enough for me to fit in. I would get sketchbooks and markers and colour pencils, stuffed toys, play-doh, puzzle books, and countless other things. I liked the art supplies best, but I wasn't picky. (From the same charities we would also get two turkeys a year, one for Thanksgiving and one for Christmas, though mom never quite managed to figure out how one was supposed to cook them.)&lt;/p&gt;
+    &lt;p&gt;At the end of every school year, Canada would slip a bunch of goodies into the same envelope that my report card came in — free tickets to the CNE and to the science centre2, and a booklet of deeply discounted tickets to other attractions near and far. And so my childhood was also filled with botanical gardens, and the giraffes at the zoo, and even the occasional Blue Jays game. And Canada ensured that memberships to the science centre were not too expensive, so mom was able to splurge on an annual family pass when it became clear how much I adored it, and we would go every rainy weekend until I knew all the exhibits by heart.3&lt;/p&gt;
+    &lt;p&gt;Canada continues to provide for me in adulthood. I applied for EI when I graduated into the pandemic and appreciated the breathing room that gave me, I'm grateful for my Canadian passport every time I breeze into the US for a visit. I know my mother will be cared for in her golden years, and I won't ever have to worry about her medical bills. Being Canadian gives me slack, enough for me to do meaningful work without having to worry about being underpaid.&lt;/p&gt;
+    &lt;p&gt;There are many things wrong with Canada. It has a go for bronze mentality, the smartest of us keep going to the US because there is not enough opportunity here, much of its public infrastructure is crumbling and the housing prices are frightful. The nation is very obviously sick.&lt;/p&gt;
+    &lt;p&gt;But in the US, when I step outside the walled gardens of my community, I notice the brittleness underneath the shining streets, the way the wealth is not load-bearing. I notice the medical self-serve kiosks in grocery stores, the necessities behind locked shelves at CVS. Parents there are not given five hundred dollars a month to buy infant formula for their babies, even with a GDP per capita twice ours. To the extent that feeding our infants preclude Canada from investing more in The Next Big Technology, the regret I can muster up about it is half-hearted at best.&lt;/p&gt;
+    &lt;p&gt;When I think about the counterfactual me that grew up in a large American city, New York or L.A. instead of Toronto, I see someone who's more stunted than me, in important ways. No skating classes, libraries too far to walk to on a regular basis and more poorly stocked. Student debt. Without generous public incentives, that version of me would only have the life that her own parents can afford to provide for her.&lt;/p&gt;
+    &lt;p&gt;I see someone who is a little more mercenary about money, and somehow even more disembodied than I am. (Would she ever feel at home in her body enough to dance, just for the fun of it?) I see someone less optimistic about the capacity for large institutions and government to do good.&lt;/p&gt;
+    &lt;p&gt;I'm glad that I grew up in Canada. And I want to stay here, and do my part in helping it recover from its sickness. And yes, some of this is because I feel some amount of obligation towards it. I feel deep gratitude towards every single Canadian who paid their taxes gladly to ensure that not only did I have enough to eat and a warm place to sleep, I would also have opportunities to be delighted by giraffes and taught how to swim. It wouldn't feel right to leave.&lt;/p&gt;
+    &lt;p&gt;But if I just say that, I don't think you'd get the right impression. The truth is, I love my country so much. I want to stay because it is my home, and it is a home with good bones and a solid foundation. I want to stay because I think it is good to live in a place that loves its children that much, the way I felt loved by it. I want my taxes to go to a place where the social safety net is generous and the people are easygoing and public skating rinks are treated like a human right.&lt;/p&gt;
+    &lt;p&gt;I want Canada to have a future, this wonderful nation that makes light of its harsh climate. If you are fortunate, you might not realize how much Canada cares for those who are not. And it feels like a terrible waste, to give up on it and count it out of the game. In any case, I love it too much to leave.&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Growing up in various Toronto suburbs, I've never lived more than a thirty minute walk away from one.↩&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;RIP :(↩&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;I'm minimizing the amount of labour that my mom did throughout the piece, btw. Not every impoverished child got as much out of living in Canada as I did, because some of the programs required additional effort to apply for, and poor parents often do not have the time, effort, or knowledge to take advantage.↩&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46758242</guid><pubDate>Sun, 25 Jan 2026 21:07:41 +0000</pubDate></item><item><title>LED lighting undermines visual performance unless supplemented by wider spectra</title><link>https://www.nature.com/articles/s41598-026-35389-6</link><description>&lt;doc fingerprint="541a12230e7947d4"&gt;
+  &lt;main&gt;
+    &lt;head rend="h2"&gt;Abstract&lt;/head&gt;
+    &lt;p&gt;Life evolved under broad spectrum sunlight, from ultraviolet to infrared (300–2500 nm). This spectrally balanced light sculpted life’s physiology and metabolism. But modern lighting has recently become dominated by restricted spectrum light emitting diodes (350–650 nm LEDs). Absence of longer wavelengths in LEDs and their short wavelength dominance impacts physiology, undermining normal mitochondrial respiration that regulates metabolism, disease and ageing. Mitochondria are light sensitive. The 420–450 nm dominant in LEDs suppresses respiration while deep red/infrared (670–900 nm) increases respiration in aging and some diseases including in blood sugar regulation. Here we supplement LED light with broad spectrum lighting (400–1500 nm+) for 2 weeks and test colour contrast sensitivity. We show significant improvement in this metric that last for 2 months after the supplemental lighting is removed. Mitochondria communicate across the body with systemic impacts following regional light exposure. This likely involves shifting patterns of serum cytokine expression, raising the possibility of wider negative impacts of LEDs on human health particularly, in the elderly or in the clinical environment where individuals are debilitated. Changing the lighting in these environments could be a highly economic route to improved public health.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Introduction&lt;/head&gt;
+    &lt;p&gt;Ambient light impacts on human health. Sunlight, under which life evolved, extends over approximately 300–2500 nm. Older incandescent lighting common until recently has a similar spectral range. But because our visual sensitivity is limited to 400–700 nm we are unaware of infrared light (approximately 700–2500 nm). However, light in the built environment is now driven by light emitting diodes (LEDs), whose restricted spectrum (approximately 350–650 nm) is designed around our visual sensitivity and consequently is economic1.&lt;/p&gt;
+    &lt;p&gt;Typical LED lighting produces strong elements in the shorter blue wavelengths (420–450 nm) with a second yellow peak which drops swiftly above 650 nm, with little light above 700 nm1. Short wavelength exposure in animals in the range of 420–450 nm reduces mitochondrial function, which provides the energy for physiological performance in the form of adenosine triphosphate (ATP). This short wavelength light reduces mitochondrial complex activity and ATP production, in a highly conserved manner. Hoh Kam et al. showed a significant decrease in mitochondrial enzymatic activity in fruit flies for complexes I-IV under 420 nm light2. Kaynezhad et al. used broadband near infrared spectroscopy (bNIRS) imaging the mouse retina and reported significant instability of deoxygenated haemoglobin and oxidised cytochrome-c-oxidase after exposure to 420 nm light. This instability remained significant through a 1 h recovery period when the light was withdrawn3. Short wavelength light (420 and 450 nm) also results in increased body weight. Hussaini et al. demonstrated that mice exposed to these wavelengths gaining weight rapidly compared to controls over the course of eight weeks4. Shorter wavelengths in similar ranges are also associated with reduced lifespan. Nash et al. revealed a 50% drop in the median lifespan of fruit flies exposed to unfiltered white LED light relative to those kept in darkness, but only 4% drop if this LED light was passed through a yellow filter, blocking the shorter wavelength light5. This negative influence is likely due to mitochondrial absorption by porphyrin that may increase proinflammatory oxygen singlet production reducing mitochondrial function as proposed by Kaynezhad et al.3.&lt;/p&gt;
+    &lt;p&gt;Longer wavelengths (700 nm+) penetrate deeply and those in sunlight can be measured passing through the human body6. These are absent from standard LEDs but present in sunlight and incandescent lighting. Their presence increases mitochondrial performance and ATP production, particularly when challenged by age or disease. Gkotsi et al. demonstrated significantly increased ATP production in the retina, cortex, and thalamus of mice following exposure to 670 nm light7. Calaza et al. revealed a 50% increase in ATP in eight-month-old complement factor H knock out mice that have a mitochondrial deficit and are used as a murine model of macular degeneration8.&lt;/p&gt;
+    &lt;p&gt;Increased mitochondrial performance is associated with increased lifespan and enhanced mobility. Begum et al. demonstrated using fruit flies that exposure to 670 nm resulted in a positive divergence of ageing survival rates of 10% at 4 weeks of age and up to nearly 180% by 8 weeks of age. The older animals also displayed an almost doubling of mobility against controls9. Neonicotinoid insecticides specifically target mitochondrial respiration inducing Parkinson like symptoms of immobility resulting in death. Here 670 exposure reversed damaged ATP levels to normal and corrects mobility and lifespan issues10.&lt;/p&gt;
+    &lt;p&gt;Increased mitochondrial activity should result in reduced blood sugars and increased oxygen consumption as mitochondria use both in respiration. Powner and Jeffery found both in bumble bees exposed to 670 nm light11. The same authors translated this to humans showing again, reduced blood sugars and increased oxygen consumption in a standard glucose tolerance test following 15 min of 670 nm exposure. Here the spike in blood glucose was reduced significantly by around 27%12.&lt;/p&gt;
+    &lt;p&gt;Changes in physiology produced by longer wavelengths translate to improved function. Shinhmar et al. revealed improved colour contrast sensitivity in humans after 3 min of morning exposure to 670 nm light13. Hence, exposure to different ends of the spectrum that impact differentially on mitochondria can translate into changes in key physiological metrics.&lt;/p&gt;
+    &lt;p&gt;Similar changes are found at the population level. Those spending more time in sunlight generally have improved health including reduced incidents of cardiovascular disease and the incidence of cancer. They also have lower rates of type 2 diabetes14,15.&lt;/p&gt;
+    &lt;p&gt;In this study we confront the impact of LED lighting on human visual performance by measuring colour contrast detection in an LED illuminated working environment that is then supplemented with incandescent lighting. The hypothesis is that LED lighting suppresses mitochondrial function in the retina and that this can be corrected by introduction of wide spectrum incandescent lights. The results highlight the potential damaging influence of LED lighting on human performance.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Methods&lt;/head&gt;
+    &lt;p&gt;The Subjects and their environment: The study was conducted in accordance with the Declaration of Helsinki and approved by University College London research ethics committee (16547/001). It was undertaken in University College London buildings in October to December. In October local daylight hours were approximately 10.37 with 75% cloud cover. In November local daylight hours were approximately 8.45 with 55% cloud cover. In December local daylight hours were approximately 7.5 with 90% cloud cover. Local sunset time in October is approximately 18.30. In November it is approximately 16.15 and in December it is approximately 16.00. Consequently, many subjects would be returning home after sunset in November and December. Subjects worked approximately 8 h a day 5 days a week and travel to and from work via public transport that was illuminated by LED devices. Most subjects did not leave the building in which they worked during the working day in these months. For those that did it was commonly for less than 15 min at lunch time. Within the work environment subjects were free to move around. Here the internal lighting they experienced was consistently LED based. Hence, natural daylight exposure during this latter part of the year was limited. We could not control for weekend exposure, however subjects homes were consistently illuminated with LEDs and because the weather in the UK at this time of year is inclement, their time outside buildings can be expected to be limited.&lt;/p&gt;
+    &lt;p&gt;Each participant provided written informed consent prior to testing and data generated was anonymised. Subjects (N = 22) were of both sexes and between the ages of 23 and 65 years. Prior to the experiment all subjects were asked to confirm normal corrected visual function and general good systemic health. This was undertaken in a simple interview prior to their inclusion in the study. All were healthy without visual or other health problems. Experimental subjects (N = 11) worked exclusively under LED lighting in the back of the Here East building on the north side, &amp;gt; 50 m from what little light did manage to penetrate the entrance doors when open. The LED lighting delivered an illuminance of 1000 lx at working height, with a correlated colour temperature (CCT) of 4000 K, and a TM-30 average colour fidelity index, Rf, of 91. The infrared light that was introduced was provided by tungsten desk lamps placed around the working space was non-uniform. The visible component of the 60 W tungsten bulbs was small when compared with the 1000 lx of LED. The test subjects were not expected to use these as task lamps. The LED lighting delivered an irradiance of 3.7 W/m2 on the horizontal working plane.&lt;/p&gt;
+    &lt;p&gt;Control subjects (N = 11) worked in similar environments under LED lighting without direct sunlight. The LED lighting delivered an illuminance of 900 lx at working height, with a CCT of 3000 K and a Rf of 85. The colour contrast tests were performed in a darkened room where the only light came from the test itself. There were no requirements restricting other light exposure patterns during the study.&lt;/p&gt;
+    &lt;p&gt;The experimental location: Subjects worked at UCL Here East, a media and innovation complex located in East London (London E15 2GW), originally built as a press and broadcast centre for the London 2012 Olympics and subsequently repurposed as a campus. UCL Here East occupies part of the Broadcast Centre, taking up the ground and first floor of unit B. The footprint of the building is deep, with daylight only able to enter through the glazing at the front of the building. This glazing uses an infrared blocking film, which can be revealed using infrared photography.&lt;/p&gt;
+    &lt;p&gt;A Canon 500D digital camera was modified to replace the infrared blocking layer with clear glass that passes infrared wavelengths. This was used in conjunction with filters that block visible and infrared wavelengths to explore the presence and absence of infrared light. Spectral measurements were made with two spectrophotometers (Ocean Optics SR-6XR250-50 and FLAME-NIR) with optic fibre and cosine correctors used to collect the incandescent spectra in the shorter and longer wavelengths.&lt;/p&gt;
+    &lt;p&gt;Incandescent desk lighting was introduced into the work environment using desk lamps with 60 W clear Edison bulbs (Polaris UK) placed on work benches. All subjects had worked in this LED-lit environment for more than 2 years. Desk lamps with incandescent bulbs were introduced onto the benches where experimental subjects spent the majority of their time. They were given the incandescent lighting for 2 weeks and, while they spend the majority of their time working near these lights, they were free to move around and leave their desks as they wished. The introduced light showed a high degree of reflectance from the work surfaces.&lt;/p&gt;
+    &lt;p&gt;Colour contrast testing: All subjects were tested for colour contrast ability using ChromaTest prior to the introduction of incandescent lighting and then again 2 weeks later. This test must be carried out in a darkened room, so a nearby windowless room was set aside for this purpose. The incandescent lighting was then removed and subjects retested at 4 and 6 weeks. Hence, this element of the experiment was a before and after design which avoids between subject variability. However, there was also a separate control group (N = 11) composed of subjects that worked under LED lighting similar to those in the experimental group.&lt;/p&gt;
+    &lt;p&gt;ChromaTests is a sensitive measure of colour contrast detection of letters presented in a random order against a noisy visual background in either tritan (blue) or protan (red) visual axes13. If subjects correctly identify a letter its contrast is reduced in the next presentation of a letter. Likewise, if they fail to correctly identify the letter, the contrast is increased. This is repeated until thresholds are determined in 5 identical repeated trials. This normally involved around 70–100 separate presentations in total. Subjects were given an initial trial before testing to avoid a learning effect. Initial presentations were at high colour contrast. No learning effects were noted in the study.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Results&lt;/head&gt;
+    &lt;head rend="h3"&gt;Light assessment in the experimental environment&lt;/head&gt;
+    &lt;p&gt;Figure 1 shows the front exterior of the Here East building using infrared imaging at ground level where experiments were undertaken. The windows are completely infrared reflective due to their blocking film and hence mirror-like. Figure 2 is an infrared image from inside the building looking out through the open doorway. Only infrared light coming through the open door and its reflectance can be seen, not light coming through adjacent windows. Hence, the building is relatively impervious to infrared light.&lt;/p&gt;
+    &lt;p&gt;Figure 3 shows the working environment in Here East in visible light in which the experiment took place. Images in infrared were completely black. The distance between the work environment and the front door was &amp;gt; 50 m with multiple doors between.&lt;/p&gt;
+    &lt;p&gt;The internal lighting throughout Here East was provided by arrays of ceiling mounted standard LED units. Spectral profiles of the lighting within the building are shown in Fig. 4. against incandescent lighting in black and red.&lt;/p&gt;
+    &lt;p&gt;The blue curve shows the spectral profile of the light delivered to the horizontal working plane. As the work environment was deep in the building and lit only with LED lighting, it received no daylight and was devoid of any infrared illumination. The LED units delivered 1000 lx on the horizontal working plane with a correlated colour temperature (CCT) of 4000 K and a TM-30 colour fidelity index of 91. The irradiance of this LED light was 3.6 W/m2.&lt;/p&gt;
+    &lt;p&gt;The specific spectra and energy levels were mapped over the workspace at fixed locations. This is shown in Fig. 5a and b. Here there is a plan of the space and measurements made at 9 locations of energy given in W/cm− 2 and lux, which is a metric corrected for the human eye. Also provided are the spectra at each location. Changes in brightness at different locations were largely not detectable by the human eye and were gradual. There were no differences in spectral profiles across the area only their relative intensity.&lt;/p&gt;
+    &lt;p&gt;Light assessment was also undertaken at bench level where individual subjects worked. This is shown in Fig. 6. This confirmed the absence of any part of the infrared spectrum in the work environment and how this changed with the addition of the incandescent lamps.&lt;/p&gt;
+    &lt;p&gt;In this study, responses to lighting were measured in test subjects both before and also after the lighting had been changed. However, there was also an independent control group that comprised individuals under similar LED lighting condition without daylight. A comparison of the lighting conditions in the two groups is shown in Fig. 7. Critically, the LEDs in both groups had very similar profiles with no infrared components. The overall brightness in the control group was slightly less than in the test group, although this was not apparent to the human eye. As in the test group, subjects were free to move around.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Visual responses to shifts in spectral lighting&lt;/head&gt;
+    &lt;p&gt;Exposure to 60 W incandescent luminaires, which have a wider spectrum than LEDs extending into the infra-red1, resulted in significant improvements in visual performance in all experimental subjects across both the protan and tritan visual ranges. Improvements in both tritan and protan were of the order of 25%. Hence, significant improvements were uniform across visual ranges (Fig. 8). This is unlike experiments where specific red/infrared ranges have been used in LED devices, for example via 670 nm, where visual improvements have been biased towards tritan function13.&lt;/p&gt;
+    &lt;p&gt;Figure 8 shows the results of both individual subjects on the left and also changes in the groups on the right. In spite of the universal improvement in visual function, in both tritan and protan range there was considerable variability between subjects. This variability validates the inclusion of a repeated measures design and the use of a sign test in the analysis. In all cases protan thresholds were lower than tritan consistent with previous studies13.&lt;/p&gt;
+    &lt;p&gt;At the end of the 2 week period the incandescent luminaires were removed and the subjects returned to an exclusively LED dominated light working environment. They were then retested at 4 and 6 weeks. In previous experiments where 670 nm alone has been used, rather than the wide spectrum infrared produced by incandescent lighting, visual improvements decline in approximately a week13. However, following incandescent light exposure improvements remain unchanged across both visual domains at both 4 and 6 weeks. Hence, the impact of broad-spectrum incandescent light not only resulted in balanced improvements in colour contrast but also these improvements lasted much longer than previous interventions with restricted red/infrared ranges13.&lt;/p&gt;
+    &lt;p&gt;An independent control group was used in addition to a before and after experimental design. Again, data between individuals was varied on both visual metrics. However, over a 2 week period there were no significant changes in proton or tritan visual thresholds (Fig. 9).&lt;/p&gt;
+    &lt;head rend="h2"&gt;Discussion&lt;/head&gt;
+    &lt;p&gt;We demonstrate that the visual performance of those working under standard LED is significantly improved by exposure to incandescent lighting that has a spectrum similar to daylight with an extensive infrared component. These data are consistent with the hypothesis that LED lighting undermines human visual performance. This result is consistent with laboratory experiments where specific red/infrared wavelength ranges generated by LEDs have been used to improve visual function in animals and humans in a conserved manner13,16,17. But there are three critical differences from these earlier studies. First, we have simply changed environmental lighting in a free moving work environment. Second, we have obtained significant balanced improvements in both the protan and tritan range. Previously, exposure to restricted experimental 670 nm resulted in improvements biased strongly in favour of only tritan function13. Hence, exposure to full spectrum lighting results in a balanced pattern of improvement in visual performance. Third, we have shown that improvements in visual function following incandescent light exposure are sustained for up to 6 weeks, and possibly beyond, whereas benefits from single LED restricted range red light were confined to around 5 days13. These three features change the way in which long wavelength light may be applied to improve human physiology by delivery in normal environments with lasting balance effects. These results are novel and may have public health implications.&lt;/p&gt;
+    &lt;p&gt;Our study used 22 subjects but was statistically significant using both a before and after metric and also against an independent control group. They are also similar to group sizes in aspects of Shinhmar et al.13 (Figs. 2, 3, 4 and 5). However, future studies would clearly benefit from inclusion of a larger number of subjects.&lt;/p&gt;
+    &lt;p&gt;The evolution of life on earth extends over 4 billion years, and that of humans over approximately 4–5 million years from the last common primate ancestor. This has all taken place under sunlight that has a spectral range of approximately 300–2500 nm+, within which there has been an invariant balance between short and longer wavelengths. Human adoption of fire 1–2 million years ago supplemented sunlight as they moved out of Africa as its spectrum is similar having a large infrared component. Likewise, development of the Edison filament luminaire, common until approximately the year 2000 had a spectrum similar to sunlight. However, around 2010 LED lighting with its highly restricted spectrum (350–650 nm) and energy saving characteristics became common, resulting in a loss of infrared light in the built environment1.&lt;/p&gt;
+    &lt;p&gt;The physiology of life forms are adapted to natural environmental light in a highly conserved pattern across species. Light impacts on mitochondrial function, which is a key regulator of metabolism and ageing in animals. When the balance of short and long wavelengths is shifted there are consequences for mitochondria. When shorter wavelength exposure is dominant, as in LED lighting, mitochondrial function declines. Mitochondrial complex proteins are reduced and there is reduced ATP production2,3. With reduced mitochondrial demand for glucose there is increased body weight and disruptions to serum cytokines4. Consequently, consistent with the mitochondrial theory of ageing there is an increased probability of cell/organism ageing and death18. It is suggested that this is partly due to 420–450 nm light, dominant in LEDs, being absorbed by porphyrin and the subsequent production of oxygen singlets driving inflammation3.&lt;/p&gt;
+    &lt;p&gt;Conversely, exposure to longer wavelengths is associated with increased mitochondrial membrane potential and increased concentration of mitochondrial complex proteins that have declined with ageing and disease. This in turn is associated with elevated ATP, reduced inflammation and extended average lifespan7,9,10,19. The experimental use of longer wavelengths in such situations is commonly referred to as photobiomodulation.&lt;/p&gt;
+    &lt;p&gt;The retina has the greatest metabolic rate in the body and a high mitochondrial concentration20. Retinal metabolism declines with age, but this can be partly corrected with long wavelength light across species16,21. In humans a single 3 min 670 nm exposure improves colour vision within 3 h, which is sustained for almost a week13. But what the authors of this study did not appreciate was that this was within a population who worked and lived mainly under LED lighting that may have undermined their baseline measurements. Here, we made no attempt to control light exposures or subject movements as would occur in laboratory-based experiments. Rather, our aim was to introduce wide spectrum long wavelengths into a work environment to improving human performance via mitochondrial manipulation in a translational step.&lt;/p&gt;
+    &lt;p&gt;There is considerable evidence that introduction of longer wavelengths impact systemically. Durieux et al.22 stated in relation to experiments in C.elegans that “ We find that mitochondrial perturbation in one tissue is perceived and acted upon by the mitochondrial stress response pathway in distal tissue”. In mice there are significant distinct changes serum cytokine expression to exposures of both short and long wavelength light4,23. Similarly, long wavelength exposures to the surface of the human body excluding the eyes significantly reduces blood glucose levels and increases oxygen consumption in humans. This is likely because mitochondrial upregulation will increase carbohydrate demand to support increased ATP production12. Other systemic impacts can be found and are clear in experimentally induced Parkinson’s in primates. Light targeted by implants focusing on the substantia nigra are effective in reducing symptoms24, but so also are those that are directed at distal locations25.&lt;/p&gt;
+    &lt;p&gt;Single 3 min 670 nm exposures remain effective for about 5 days13. But we show that with a wider spectrum they remain effective for 6 weeks, although we did not find the end of the effect. Here it is worth considering potential mechanisms of action which remain subject of debate. Historically, improvements with red light were thought to be due to light absorption by cytochrome C in the respiratory chain26. However, positive effects are found in vitro in the absence of this. Consequently, it has been suggested that longer wavelengths reduce water viscosity around rotary ATP pumps allowing the rotor to increase speed27. This cannot explain the sustained impacts of light exposure as this effect should be relatively transitory as viscosity would increase rapidly following light withdrawal. However, a key feature of long wavelength light absorption is increased respiratory chain protein synthesis. These proteins are in flux throughout the day28 and complex IV is upregulated following red light exposure19. Hence, while red light may initially increase rotor pump speed there rapidly follows an increase in protein synthesis which may establish greater respiratory chain capacity. The life of these proteins could then determine the length of effect.&lt;/p&gt;
+    &lt;p&gt;Only thirteen polypeptides are made in mitochondrial protein synthesis. This probably slows with age and likely contributes to aged mitochondrial decline18. But critically, we do not know the speed of mitochondrial protein synthesis, the life of such proteins or the pace of their decline. We suggest that these may be key events in the length of the effects from light exposure.&lt;/p&gt;
+    &lt;p&gt;LED lighting clearly has the ability to undermine visual performance probably via reduced mitochondrial function. As light induced changes in mitochondrial ability have been shown to have systemic impacts4,15,22,23,25, the effects of LEDs revealed here may be wider than initially anticipated. Given the prevalence of LEDs, this may represent an important issue in public health and clinical environments where changing lighting patterns in appreciation of this point can have significant positive outcomes29.&lt;/p&gt;
+    &lt;p&gt;Given our results, it is important to ask what solutions may be found to improve health in terms of lighting in the built environment. Incandescent lights that we reveal here to have significant positive impact over standard LEDs are being phased out universally for reasons of energy efficiency, where focus is only on the visible light produced.&lt;/p&gt;
+    &lt;p&gt;A solution may be found in creating lighting units with multiple longer wavelength LEDs to cover a wider span of the near infrared. However, our attempts here have had limited success. Multiple closely associated spectral peaks do not produce a smooth spectral output as found in incandescent lights and sunlight, which is problematic in improving function and has yet to deliver. This possibly may be overcome using a greater number of spectral peaks with tighter spacing. But this raises a different series of problems regarding cost and increased energy consumption making this solution no better than retention of incandescent sources in terms of environmental sustainability.&lt;/p&gt;
+    &lt;p&gt;Key to this issue is the question of how much infrared is needed to sustain improved function? Infrared has relatively few absorbers in the built environment and in current studies relatively little has to be added to the environment for effect. However, a viable option is to run an incandescent light at a lower temperature which results in both energy savings and increased life of the unit and also shifts the peak spectral output towards longer wavelengths.&lt;/p&gt;
+    &lt;p&gt;If this is done with a halogen bulb, which is a type of incandescent tungsten bulb, the filament lasts for a longer period as evaporated tungsten is redeposited on the filament rather than blackening the bulb glass. Hence, using a halogen bulb at lower voltage is a realistic alternative in terms of health and energy consumption.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Data availability&lt;/head&gt;
+    &lt;p&gt;The data sets used and/or analysed during the current study are available from the corresponding author on reasonable request.&lt;/p&gt;
+    &lt;head rend="h2"&gt;References&lt;/head&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Ratto, G. E., Videla, F. A. &amp;amp; Martinez Valiviezd, J. H. Artificial light: traditional and new sources, their potential impact on health, and coping strategies: preliminary spectral analysis. Proc. SPIE Conf. 11814. San Diego California. (2021).&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Hoh Kam, J., Hogg, C., Fosbury, R., Shinhmar, H. &amp;amp; Jeffery, G. Mitochondria are specifically vulnerable to 420nm light in drosophila which undermines their function and is associated with reduced fly mobility. Plos one. Sep 3;16(9):e0257149. (2021). https://pubmed.ncbi.nlm.nih.gov/34478469. PMID: 34478469.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Kaynezhad, P. et al. Near infrared spectroscopy reveals instability in retinal mitochondrial metabolism and haemodynamics with blue light exposure at environmental levels. J.Biophotonics. ;15(4):e202100283. (2022). https://pubmed.ncbi.nlm.nih.gov/35020273/. PMID: 35020273.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Al-Hussaini, H. et al. Impact of short wavelength light exposure on body weight, mobility, anxiety like behaviour and cytokine expression. Sci. Rep. ;15(1):5927. (2025). https://pubmed.ncbi.nlm.nih.gov/39966413/. PMID: 39966413.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Nash, T. R. et al. Daily blue-light exposure shortens lifespan and causes brain neurodegeneration in Drosophila. Aging. Mech. Dis 2019 Oct 17:5:8. https://pubmed.ncbi.nlm.nih.gov/31636947/. PMID: 31636947.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Jeffery, G. et al. Longer wavelengths in sunlight pass through the human body and have a systemic impact which improves vision. Sci. Rep. 2025 July;15(1);24435. https://doi.org/10.1038/s41598-025-09785-3&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Gkotsi, D. et al. Recharging mitochondrial batteries in old eyes. Near infra-red increases ATP. Exp.Eye Res. 2014 May:122:50 – 3. https://pubmed.ncbi.nlm.nih.gov/24631333/ PMID: 24631333.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Calaza, K. C., Hoh Kam, J., Hogg, C. &amp;amp; Jeffery, G. Mitochondrial decline precedes phenotype development in the complement factor H mouse model of retinal degeneration but can be corrected by near infrared light. Neurobiol. Aging. ;36(10):2869-76. (2015). https://pubmed.ncbi.nlm.nih.gov/26149919/ PMID: 26149919.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Begum, R. et al. Near-infrared light increases ATP, extends lifespan and improves mobility in aged Drosophila melanogaster. Biol.Lett. ;11(3):20150073. (2015). https://pubmed.ncbi.nlm.nih.gov/25788488/ PMID: 25788488.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Powner, P. MB, SaltTE, Hogg, C. &amp;amp; Jeffery, G. Improving mitochondrial function protects bumblebees from neonicotinoid pesticides. Plos One. 11 (11), e0166531 (2016). https://pubmed.ncbi.nlm.nih.gov/27846310/ PMID: 27846310.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Powner, P. MB &amp;amp; Jeffery, G. Systemic glucose levels are modulated by specific wavelengths in the solar light spectrum that shift mitochondrial metabolism. Plos One. 17 (11), e0276937 (2022). https://pubmed.ncbi.nlm.nih.gov/36327250/ PMID: 36327250.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Powner, M. B. &amp;amp; Jeffery, G. Light stimulation of mitochondria reduces blood glucose levels. J.Biophotonics. ;17(5):e202300521. (2024). https://pubmed.ncbi.nlm.nih.gov/38378043/. PMID: 38378043.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Shinhmar, H., Hoog, C., Neveu, M. &amp;amp; Jeffery, G. Weeklong improved colour contrasts sensitivity after single 670 nm exposures associated with enhanced mitochondrial function. Sci. Rep. ;11(1):22872. (2021). https://pubmed.ncbi.nlm.nih.gov/34819619/. PMID: 34819619.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Weller, R. B. &amp;amp; Sunlight Time for a Rethink? J.Invest. Dermatol. ;144(8):1724–1732. (2024). https://pubmed.ncbi.nlm.nih.gov/38661623/ PMID: 38661623.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Shore-Lorenti, C. et al. Shining the light on Sunshine: a systematic review of the influence of sun exposure on type 2 diabetes mellitus-related outcomes. Clin. Endocrinol. ;81(6):799–811. (2014). https://pubmed.ncbi.nlm.nih.gov/25066830/ PMID: 25066830.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Weinrich, T. W., Coyne, A., Salt, T. E., Hogg, C. &amp;amp; Jeffery, G. Improving mitochondrial function significantly reduces metabolic, visual, motor and cognitive decline in aged Drosophila melanogaster. Neurobiol. Aging. 2017 Dec:60:34–43. doi: 10.1016. https://pubmed.ncbi.nlm.nih.gov/28917665/ PMID: 28917665.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Sivapathasuntharam, C., Sivaprasad, S., Hogg, C. &amp;amp; Jeffery, G. Aging retinal function is improved by near infrared light (670 nm) that is associated with corrected mitochondrial decline. Neurbiol. Aging 2017 Apr:52:66–70. https://pubmed.ncbi.nlm.nih.gov/28129566/ PMID: 28129566.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Lopez-Otin, C., Blasco, M. A., Partridge, L., Serrano, M. &amp;amp; Kroemer, G. The hallmarks of aging. Cell 153 (6), 1194–1217 (2013). https://pubmed.ncbi.nlm.nih.gov/23746838/ PMID: 23746838.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Begum, R., Powner, P. MB, Hudson, N., Hogg, C. &amp;amp; Jeffery, G. Treatment with 670 Nm light up regulates cytochrome C oxidase expression and reduces inflammation in an Age-Related macular degeneration model. Plos One. 8 (2), e57828 (2013). https://pubmed.ncbi.nlm.nih.gov/23469078/ PMID: 23469078.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Kocherlakota, S., Hurley, J. B., Shu, D. Y. &amp;amp; Editorial Retinal metabolism in health and disease. Front Ophthalmol (Lausanne). 2024 Jul 17:4:1459318. https://pubmed.ncbi.nlm.nih.gov/39086994/ PMID: 39086994.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Hoh Kam, J. et al. Mitochondrial decline in the ageing old world primate retina: Little evidence for difference between the centre and periphery. Plos One. ;18(5):e0273882. (2023). https://pubmed.ncbi.nlm.nih.gov/37130143/ PMID: 37130143.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Durieux, J., Wolff, S. &amp;amp; Dillin, A. The cell-non-autonomous nature of electron transport chain-mediated longevity. Cell 144 (1), 79–91 (2011). https://pubmed.ncbi.nlm.nih.gov/21215371/ PMID: 21215371.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Shinhmar, H., Hogg, C. &amp;amp; Jeffery, G. Exposure to long wavelength light that improves aged mitochondrial function shifts acute cytokine expression in serum and the retina. Plos One. 18 (7), e0284172 (2023). https://pubmed.ncbi.nlm.nih.gov/37478072/ PMID: 37478072.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Darlot, F. et al. Near-infrared light is neuroprotective in a monkey model of Parkinson disease. Ann. Neurol. ;79(1):59–75. (2016). https://pubmed.ncbi.nlm.nih.gov/26456231/ PMID: 26456231.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Gordon, L. C. et al. Remote photobiomodulation targeted at the abdomen or legs provides effective neuroprotection against parkinsonian MPTP insult. Eur. J. Neurosci. ;57(9):1611–1624. (2023). https://pubmed.ncbi.nlm.nih.gov/36949610/. PMID: 36949610.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Salehpour, F., Mahmoudi, J., Kamari, F., Sadigh-Eteghad, Rasta, S. H. &amp;amp; Hamblin, M. R. Brain Photobiomodulation Therapy: a Narrative Review. Mol. Neurobiol. ;55(8):6601–6636. (2018). https://pubmed.ncbi.nlm.nih.gov/29327206/ PMID: 29327206.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Sommer, A. P. Mitochondrial cytochrome c oxidase is not the primary acceptor for near infrared light-it is mitochondrial bound water: the principles of low-level light therapy. Ann. Transl. Med. ;7(Suppl 1):S13. (2019). https://pubmed.ncbi.nlm.nih.gov/31032294/. PMID: 31032294.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Weinrich, T. et al. A day in the life of mitochondria reveals shifting workloads. Sci. Rep. ;9(1):13898. (2019). https://pubmed.ncbi.nlm.nih.gov/31554906/ PMID: 31554906.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Neto, R. P. M. et al. Photobiomodulation therapy (red/NIR LEDs) reduced the length of stay in intensive care unit and improved muscle function: A randomized, triple-blind, and sham-controlled trial. J.Biophotonics. ;17(5):e202300501. (2024). https://pubmed.ncbi.nlm.nih.gov/38262071/ PMID: 38262071.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;Acknowledgements&lt;/head&gt;
+    &lt;p&gt;We thank Chris Hogg for assistance with Chromatest, and Mandana Khanie for use of the Ocean Optics spectrophotometers.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Funding&lt;/head&gt;
+    &lt;p&gt;This research did not receive funding.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Author information&lt;/head&gt;
+    &lt;head rend="h3"&gt;Authors and Affiliations&lt;/head&gt;
+    &lt;head rend="h3"&gt;Contributions&lt;/head&gt;
+    &lt;p&gt;GJ and EB designed the experiments undertook all the experimental work and wrote the manuscript.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Corresponding author&lt;/head&gt;
+    &lt;head rend="h2"&gt;Ethics declarations&lt;/head&gt;
+    &lt;head rend="h3"&gt;Competing interests&lt;/head&gt;
+    &lt;p&gt;The authors declare no competing interests.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Additional information&lt;/head&gt;
+    &lt;head rend="h3"&gt;Publisher’s note&lt;/head&gt;
+    &lt;p&gt;Springer Nature remains neutral with regard to jurisdictional claims in published maps and institutional affiliations.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Rights and permissions&lt;/head&gt;
+    &lt;p&gt;Open Access This article is licensed under a Creative Commons Attribution 4.0 International License, which permits use, sharing, adaptation, distribution and reproduction in any medium or format, as long as you give appropriate credit to the original author(s) and the source, provide a link to the Creative Commons licence, and indicate if changes were made. The images or other third party material in this article are included in the article’s Creative Commons licence, unless indicated otherwise in a credit line to the material. If material is not included in the article’s Creative Commons licence and your intended use is not permitted by statutory regulation or exceeds the permitted use, you will need to obtain permission directly from the copyright holder. To view a copy of this licence, visit http://creativecommons.org/licenses/by/4.0/.&lt;/p&gt;
+    &lt;head rend="h2"&gt;About this article&lt;/head&gt;
+    &lt;head rend="h3"&gt;Cite this article&lt;/head&gt;
+    &lt;p&gt;Barrett, E.M., Jeffery, G. LED lighting (350-650nm) undermines human visual performance unless supplemented by wider spectra (400-1500nm+) like daylight. Sci Rep 16, 3061 (2026). https://doi.org/10.1038/s41598-026-35389-6&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Received:&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Accepted:&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Published:&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Version of record:&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;DOI: https://doi.org/10.1038/s41598-026-35389-6&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46758644</guid><pubDate>Sun, 25 Jan 2026 21:44:10 +0000</pubDate></item></channel></rss>
