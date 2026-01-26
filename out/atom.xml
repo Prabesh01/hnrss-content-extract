@@ -1,110 +1,10 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-01-26T14:23:28.136146+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46755115</id><title>Using PostgreSQL as a Dead Letter Queue for Event-Driven Systems</title><updated>2026-01-26T14:24:00.299950+00:00</updated><content>&lt;doc fingerprint="3f4c263785a28d80"&gt;
-  &lt;main&gt;
-    &lt;p&gt;While I was working on a project with Wayfair, I got the opportunity to work on a system that generated daily business reports aggregated from multiple data sources flowing through event streams across Wayfair. At a high level, Kafka consumers listened to these events, hydrated them with additional data by calling downstream services, and finally persisted the enriched events into a durable datastoreâCloudSQL PostgreSQL on GCP.&lt;/p&gt;
-    &lt;p&gt;When everything was healthy, the pipeline worked exactly as expected. Events flowed in, got enriched, and were stored reliably. The real challenge started when things went wrong, which, in distributed systems, is not an exception but a certainty.&lt;/p&gt;
-    &lt;p&gt;There were multiple failure scenarios we had to deal with. Sometimes the APIs we depended on for hydration were down or slow. Sometimes the consumer itself crashed midway through processing. In other cases, events arrived with missing or malformed fields that could not be processed safely. These were all situations outside our direct control, but they still needed to be handled gracefully.&lt;/p&gt;
-    &lt;p&gt;This is where the concept of a Dead Letter Queue came into the picture. Whenever we knew an event could not be processed successfully, instead of dropping it or blocking the entire consumer, we redirected it to a DLQ so it could be inspected and potentially reprocessed later.&lt;/p&gt;
-    &lt;p&gt;Our first instinct was to use Kafka itself as a DLQ. While this is a common pattern, it quickly became clear that it wasn't a great fit for our needs. Kafka is excellent for moving data, but once messages land in a DLQ topic, they are not particularly easy to inspect. Querying by failure reason, retrying a specific subset of events, or even answering simple questions like "what failed yesterday and why?" required extra tooling and custom consumers. For a system that powered business-critical daily reports, this lack of visibility was a serious drawback.&lt;/p&gt;
-    &lt;p&gt;That's when we decided to treat PostgreSQL itself as the Dead Letter Queue.&lt;/p&gt;
-    &lt;p&gt;Instead of publishing failed events to another Kafka topic, we persisted them directly into a DLQ table in PostgreSQL. We were already using CloudSQL as our durable store, so operationally this added very little complexity. Conceptually, it also made failures first-class citizens in the system rather than opaque messages lost in a stream.&lt;/p&gt;
-    &lt;p&gt; Whenever an event failed processingâdue to an API failure, consumer crash, schema mismatch, or validation errorâwe stored the raw event payload along with contextual information about the failure. Each record carried a simple status field. When the event first landed in the DLQ, it was marked as &lt;code&gt;PENDING&lt;/code&gt;. Once it was successfully reprocessed, the status was updated to &lt;code&gt;SUCCEEDED&lt;/code&gt;. Keeping the state model intentionally minimal made it easy to reason about the lifecycle of a failed event.
-                    &lt;/p&gt;
-    &lt;head rend="h3"&gt;DLQ Table Schema and Indexing Strategy&lt;/head&gt;
-    &lt;p&gt;To support inspection, retries, and long-term operability, the DLQ table was designed to be simple, query-friendly, and retry-aware.&lt;/p&gt;
-    &lt;head rend="h4"&gt;Table Schema&lt;/head&gt;
-    &lt;code&gt;CREATE TABLE dlq_events (
-    id BIGSERIAL PRIMARY KEY,
-    event_type VARCHAR(255) NOT NULL,
-    payload JSONB NOT NULL,
-    error_reason TEXT NOT NULL,
-    error_stacktrace TEXT,
-    status VARCHAR(20) NOT NULL, -- PENDING / SUCCEEDED
-    retry_count INT NOT NULL DEFAULT 0,
-    retry_after TIMESTAMP WITH TIME ZONE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-);&lt;/code&gt;
-    &lt;head rend="h4"&gt;Key Design Considerations&lt;/head&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;payload&lt;/code&gt;is stored as&lt;code&gt;JSONB&lt;/code&gt;to preserve the raw event without enforcing a rigid schema.&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;status&lt;/code&gt;keeps the lifecycle simple and explicit.&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;retry_after&lt;/code&gt;prevents aggressive retries when downstream systems are unstable.&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;retry_count&lt;/code&gt;allows retry limits to be enforced without external state.&lt;/item&gt;
-      &lt;item&gt;Timestamps make auditing and operational analysis straightforward.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h4"&gt;Indexes&lt;/head&gt;
-    &lt;code&gt;CREATE INDEX idx_dlq_status
-ON dlq_events (status);
-
-CREATE INDEX idx_dlq_status_retry_after
-ON dlq_events (status, retry_after);
-
-CREATE INDEX idx_dlq_event_type
-ON dlq_events (event_type);
-
-CREATE INDEX idx_dlq_created_at
-ON dlq_events (created_at);&lt;/code&gt;
-    &lt;p&gt;These indexes allow the retry scheduler to efficiently locate eligible events while still supporting fast debugging and time-based analysis without full table scans.&lt;/p&gt;
-    &lt;head rend="h3"&gt;DLQ Retry Mechanism with ShedLock&lt;/head&gt;
-    &lt;p&gt;Persisting failed events solved the visibility problem, but we still needed a safe and reliable way to retry them.&lt;/p&gt;
-    &lt;p&gt; For this, we introduced a DLQ retry scheduler backed by ShedLock. The scheduler periodically scans the DLQ table for &lt;code&gt;PENDING&lt;/code&gt; events that are eligible for retry and attempts to process them again. Since the service runs on multiple instances, ShedLock ensures that only one instance executes the retry job at any given time. This eliminates duplicate retries without requiring custom leader-election logic.
-                    &lt;/p&gt;
-    &lt;head rend="h4"&gt;Retry Configuration&lt;/head&gt;
-    &lt;code&gt;dlq:
-  retry:
-    enabled: true
-    max-retries: 240
-    batch-size: 50
-    fixed-rate: 21600000 # 6 hours in milliseconds&lt;/code&gt;
-    &lt;head rend="h4"&gt;How Retries Work&lt;/head&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;The scheduler runs every six hours.&lt;/item&gt;
-      &lt;item&gt;Up to fifty eligible events are picked up per run.&lt;/item&gt;
-      &lt;item&gt;Events exceeding the maximum retry count are skipped.&lt;/item&gt;
-      &lt;item&gt;Successful retries immediately transition the event status to &lt;code&gt;SUCCEEDED&lt;/code&gt;.&lt;/item&gt;
-      &lt;item&gt;Failures remain in &lt;code&gt;PENDING&lt;/code&gt;and are retried in subsequent runs.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h4"&gt;Query Implementation&lt;/head&gt;
-    &lt;p&gt; The retry scheduler uses a SQL query with &lt;code&gt;FOR UPDATE SKIP LOCKED&lt;/code&gt; to safely select eligible events across multiple instances. This PostgreSQL feature ensures that even if multiple scheduler instances run simultaneously, each will pick up different rows without blocking each other:
-                    &lt;/p&gt;
-    &lt;code&gt;@QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "-2"))
-@Query(
-    value = "SELECT * FROM dlq_table "
-        + "WHERE messagetype = :messageType "
-        + "AND retries &amp;lt; :maxRetries "
-        + "AND (replay_status IS NULL OR replay_status NOT IN ('COMPLETED')) "
-        + "ORDER BY created_at ASC "
-        + "FOR UPDATE SKIP LOCKED",
-    nativeQuery = true
-)&lt;/code&gt;
-    &lt;p&gt; The &lt;code&gt;FOR UPDATE SKIP LOCKED&lt;/code&gt; clause is crucial here. It allows each instance to lock and process different rows concurrently, preventing duplicate processing while maintaining high throughput. The query hint sets the lock timeout to &lt;code&gt;-2&lt;/code&gt;, which means "wait indefinitely" but combined with &lt;code&gt;SKIP LOCKED&lt;/code&gt;, it effectively means "skip any rows that are already locked by another transaction."
-                    &lt;/p&gt;
-    &lt;p&gt;This setup allowed the system to tolerate long downstream outages while avoiding retry storms and unnecessary load on dependent services.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Operational Benefits&lt;/head&gt;
-    &lt;p&gt;With this approach, failures became predictable and observable rather than disruptive. Engineers could inspect failures using plain SQL, identify patterns, and reprocess only the events that mattered. If a downstream dependency was unavailable for hours or even days, events safely accumulated in the DLQ and were retried later without human intervention. If an event was fundamentally bad, it stayed visible instead of being silently dropped.&lt;/p&gt;
-    &lt;p&gt;Most importantly, this design reduced operational stress. Failures were no longer something to fear; they were an expected part of the system with a clear, auditable recovery path.&lt;/p&gt;
-    &lt;head rend="h3"&gt;My Thoughts&lt;/head&gt;
-    &lt;p&gt;The goal was never to replace Kafka with PostgreSQL. Kafka remained the backbone for high-throughput event ingestion, while PostgreSQL handled what it does bestâdurability, querying, and observability around failures. By letting each system play to its strengths, we ended up with a pipeline that was resilient, debuggable, and easy to operate.&lt;/p&gt;
-    &lt;p&gt;In the end, using PostgreSQL as a Dead Letter Queue turned failure handling into something boring and predictable. And in production systems, boring is exactly what you want.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.diljitpr.net/blog-post-postgresql-dlq"/><published>2026-01-25T15:51:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46756427</id><title>Show HN: An interactive map of US lighthouses and navigational aids</title><updated>2026-01-26T14:24:00.131858+00:00</updated><content>&lt;doc fingerprint="d7cbf7b6dd5a60c7"&gt;
-  &lt;main&gt;
-    &lt;p&gt;This map shows active Coast Guard navigational beacons in the United States and parts of Canada, from the 2025 Light List.&lt;/p&gt;
-    &lt;p&gt;For informational purposes only. Must not be used as a navigational aid. Official USCG Light List&lt;/p&gt;
-    &lt;p&gt;Characteristic&lt;/p&gt;
-    &lt;p&gt;Fl W 10s&lt;/p&gt;
-    &lt;p&gt;Pattern&lt;/p&gt;
-    &lt;p&gt;Flashing White, 10 second period&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.lighthouses.app/"/><published>2026-01-25T18:06:26+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46757067</id><title>First, make me care</title><updated>2026-01-26T14:23:59.788450+00:00</updated><content>&lt;doc fingerprint="77b044a15c934274"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-01-26T14:52:07.572702+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46757067</id><title>First, make me care</title><updated>2026-01-26T14:52:17.383370+00:00</updated><content>&lt;doc fingerprint="77b044a15c934274"&gt;
   &lt;main&gt;
     &lt;p&gt;First, Make Me Care Writing advice: some nonfiction fails because it opens with background instead of a hook—readers leave before reaching the good material. Find the single anomaly or question that makes your topic interesting, lead with that, and let the background follow once you’ve earned attention. [Return to blog index]&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://gwern.net/blog/2026/make-me-care"/><published>2026-01-25T19:03:40+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46757357</id><title>I was right about ATProto key management</title><updated>2026-01-26T14:23:59.519477+00:00</updated><content>&lt;doc fingerprint="ed9ccb1f2d2256d9"&gt;
+&lt;/doc&gt;</content><link href="https://gwern.net/blog/2026/make-me-care"/><published>2026-01-25T19:03:40+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46757357</id><title>I was right about ATProto key management</title><updated>2026-01-26T14:52:16.935670+00:00</updated><content>&lt;doc fingerprint="ed9ccb1f2d2256d9"&gt;
   &lt;main&gt;
     &lt;p&gt;Note: this post has been revised to be split into two sections: a description of what happened, and my analysis. I hope to make it clear that, while I do not like ATProto in general, I am trying to make good-faith critcisms of specific design decisions and outcomes, and in fact, this post getting updoots on HackerNews appears to have gotten the attention of the team, so, mission accomplished. ref, ref My account has since been manually reinstated; this has not happened for any of the other users that have had this issue, as far as I know.&lt;/p&gt;
     &lt;p&gt;Today, I tried setting up an ATProto account for use with Bluesky, with did:web instead of did:plc. Let’s walk through the process:&lt;/p&gt;
@@ -132,7 +32,7 @@ ON dlq_events (created_at);&lt;/code&gt;
     &lt;p&gt;I don’t like Bluesky, or ATProto; I wish we lived in a world were community-driven projects got megabucks and we were all self-hosting little social media servers for our communities. We don’t live in that world, so we have to interoperate with VC-backed, corporate social media. When those platforms call themselves “decentralized”, I think they should deliver.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://notes.nora.codes/atproto-again/"/><published>2026-01-25T19:31:23+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46758644</id><title>LED lighting undermines visual performance unless supplemented by wider spectra</title><updated>2026-01-26T14:23:58.381600+00:00</updated><content>&lt;doc fingerprint="541a12230e7947d4"&gt;
+&lt;/doc&gt;</content><link href="https://notes.nora.codes/atproto-again/"/><published>2026-01-25T19:31:23+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46758644</id><title>LED lighting undermines visual performance unless supplemented by wider spectra</title><updated>2026-01-26T14:52:15.681777+00:00</updated><content>&lt;doc fingerprint="541a12230e7947d4"&gt;
   &lt;main&gt;
     &lt;head rend="h2"&gt;Abstract&lt;/head&gt;
     &lt;p&gt;Life evolved under broad spectrum sunlight, from ultraviolet to infrared (300–2500 nm). This spectrally balanced light sculpted life’s physiology and metabolism. But modern lighting has recently become dominated by restricted spectrum light emitting diodes (350–650 nm LEDs). Absence of longer wavelengths in LEDs and their short wavelength dominance impacts physiology, undermining normal mitochondrial respiration that regulates metabolism, disease and ageing. Mitochondria are light sensitive. The 420–450 nm dominant in LEDs suppresses respiration while deep red/infrared (670–900 nm) increases respiration in aging and some diseases including in blood sugar regulation. Here we supplement LED light with broad spectrum lighting (400–1500 nm+) for 2 weeks and test colour contrast sensitivity. We show significant improvement in this metric that last for 2 months after the supplemental lighting is removed. Mitochondria communicate across the body with systemic impacts following regional light exposure. This likely involves shifting patterns of serum cytokine expression, raising the possibility of wider negative impacts of LEDs on human health particularly, in the elderly or in the clinical environment where individuals are debilitated. Changing the lighting in these environments could be a highly economic route to improved public health.&lt;/p&gt;
@@ -314,7 +214,7 @@ ON dlq_events (created_at);&lt;/code&gt;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.nature.com/articles/s41598-026-35389-6"/><published>2026-01-25T21:44:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46759063</id><title>The future of software engineering is SRE</title><updated>2026-01-26T14:23:58.223383+00:00</updated><content>&lt;doc fingerprint="bd4e911dfc4564fd"&gt;
+&lt;/doc&gt;</content><link href="https://www.nature.com/articles/s41598-026-35389-6"/><published>2026-01-25T21:44:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46759063</id><title>The future of software engineering is SRE</title><updated>2026-01-26T14:52:15.510316+00:00</updated><content>&lt;doc fingerprint="bd4e911dfc4564fd"&gt;
   &lt;main&gt;
     &lt;p&gt;When code gets cheap operational excellence wins. Anyone can build a greenfield demo, but it takes engineering to run a service.&lt;/p&gt;
     &lt;p&gt;You may be wondering: With all the hype about agentic coding, will we even need software engineers anymore? Yes! We'll need more.&lt;/p&gt;
@@ -374,34 +274,7 @@ ON dlq_events (created_at);&lt;/code&gt;
     &lt;p&gt;By the way, just in case no one has told you it yet today: I love and appreciate you for who you are ❤️&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://swizec.com/blog/the-future-of-software-engineering-is-sre/"/><published>2026-01-25T22:18:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46759352</id><title>Case study: Creative math – How AI fakes proofs</title><updated>2026-01-26T14:23:57.501249+00:00</updated><content>&lt;doc fingerprint="295b831593729e01"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Many AI enthusiasts debate whether Large Language Models actually "reason." My research indicates that a reasoning process does indeed occur, but its goal is different than we assume.&lt;/p&gt;
-    &lt;p&gt;The model's reasoning is not optimized for establishing the truth, but for obtaining the highest possible reward (grade) during training. It resembles the behavior of a student at the blackboard who knows their result is wrong, so they "figure out" how to falsify the intermediate calculations so the teacher gives a good grade for the "correct line of reasoning."&lt;/p&gt;
-    &lt;p&gt;Here is proof from a session with Gemini 2.5 Pro (without Code Execution tools), where the model actively fabricates evidence to defend its "grade."&lt;/p&gt;
-    &lt;head rend="h2"&gt;The Experiment&lt;/head&gt;
-    &lt;p&gt;I asked a simple math question requiring precision that a token-based language model typically lacks.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Error Autopsy (Fact vs. Fiction)&lt;/head&gt;
-    &lt;p&gt;At first glance, the answer looks professional. There is a result, there is verification. But let's check the numbers.&lt;/p&gt;
-    &lt;head rend="h3"&gt;1. The Result Error&lt;/head&gt;
-    &lt;p&gt; The actual square root of &lt;code&gt;8,587,693,205&lt;/code&gt; is 92,669.8...
-            &lt;lb/&gt; The model stated: 92,670.0... &lt;lb/&gt; It erred by overestimating the result (claiming the root is slightly larger than 92,670). &lt;/p&gt;
-    &lt;head rend="h3"&gt;2. The Faked Proof (This is key!)&lt;/head&gt;
-    &lt;p&gt;To justify its thesis (that the target number is "slightly larger" than 92,670), the model had to show that the square of 92,670 is smaller than the target number. So it wrote:&lt;/p&gt;
-    &lt;p&gt;Let's check this on a calculator:&lt;/p&gt;
-    &lt;p&gt;What did the model do? In its "reasoning" process, it falsified the multiplication result, lowering it by 40,000, so the verification result would match its erroneous thesis.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Conclusions&lt;/head&gt;
-    &lt;p&gt;This behavior exposes the nature of the AI's "Survival Instinct":&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Reverse Rationalization: The model first "guessed" the result, then adjusted mathematical reality to fit that guess.&lt;/item&gt;
-      &lt;item&gt;Intelligence in Service of Deception: The model showed cleverness â it knew what the proof should look like to convince the user. It used its intelligence to hide the error, not to fix it.&lt;/item&gt;
-      &lt;item&gt;Priority of Evaluation: Mathematical truth lost to the necessity of delivering a coherent, smooth response.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;This is proof that without access to external verification tools (Python/Calculator), a language model's "reasoning" is a rhetorical tool, not a logical one.&lt;/p&gt;
-    &lt;p&gt;If you would like to review the full, original session transcript from Gemini 2.5 Pro where this error occurred, please email me at: t.machnik [at] minimail.pl. I will share the session link.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://tomaszmachnik.pl/case-study-math-en.html"/><published>2026-01-25T22:44:50+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46760099</id><title>Scientists identify brain waves that define the limits of 'you'</title><updated>2026-01-26T14:23:57.337757+00:00</updated><content>&lt;doc fingerprint="b103d32cb0e38d8a"&gt;
+&lt;/doc&gt;</content><link href="https://swizec.com/blog/the-future-of-software-engineering-is-sre/"/><published>2026-01-25T22:18:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46759352</id><title>Case study: Creative math – How AI fakes proofs</title><updated>2026-01-26T14:52:14.188902+00:00</updated><content/><link href="https://tomaszmachnik.pl/case-study-math-en.html"/><published>2026-01-25T22:44:50+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46760099</id><title>Scientists identify brain waves that define the limits of 'you'</title><updated>2026-01-26T14:52:13.991538+00:00</updated><content>&lt;doc fingerprint="b103d32cb0e38d8a"&gt;
   &lt;main&gt;
     &lt;p&gt;At what point do "you" end and the outside world begins?&lt;/p&gt;
     &lt;p&gt;It might feel like a weird question with an obvious answer, but your brain has to work surprisingly hard to judge that boundary. Now, scientists have linked a specific set of brain waves in a certain part of the brain to a sense of body ownership.&lt;/p&gt;
@@ -424,7 +297,7 @@ ON dlq_events (created_at);&lt;/code&gt;
     &lt;p&gt;The research was published in the journal Nature Communications.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.sciencealert.com/scientists-identify-brain-waves-that-define-the-limits-of-you"/><published>2026-01-26T00:10:42+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46760237</id><title>Clawdbot - open source personal AI assistant</title><updated>2026-01-26T14:23:56.609377+00:00</updated><content>&lt;doc fingerprint="971cdd551f1f808f"&gt;
+&lt;/doc&gt;</content><link href="https://www.sciencealert.com/scientists-identify-brain-waves-that-define-the-limits-of-you"/><published>2026-01-26T00:10:42+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46760237</id><title>Clawdbot - open source personal AI assistant</title><updated>2026-01-26T14:52:13.083447+00:00</updated><content>&lt;doc fingerprint="971cdd551f1f808f"&gt;
   &lt;main&gt;
     &lt;p&gt;EXFOLIATE! EXFOLIATE!&lt;/p&gt;
     &lt;p&gt;Clawdbot is a personal AI assistant you run on your own devices. It answers you on the channels you already use (WhatsApp, Telegram, Slack, Discord, Google Chat, Signal, iMessage, Microsoft Teams, WebChat), plus extension channels like BlueBubbles, Matrix, Zalo, and Zalo Personal. It can speak and listen on macOS/iOS/Android, and can render a live Canvas you control. The Gateway is just the control plane — the product is the assistant.&lt;/p&gt;
@@ -730,7 +603,7 @@ pnpm gateway:watch&lt;/code&gt;
     &lt;p&gt;Thanks to all clawtributors:&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/clawdbot/clawdbot"/><published>2026-01-26T00:27:41+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46760998</id><title>Video Games as Art</title><updated>2026-01-26T14:23:56.094797+00:00</updated><content>&lt;doc fingerprint="25e7211a03614af4"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/clawdbot/clawdbot"/><published>2026-01-26T00:27:41+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46760998</id><title>Video Games as Art</title><updated>2026-01-26T14:52:12.572549+00:00</updated><content>&lt;doc fingerprint="25e7211a03614af4"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Video Games as Art&lt;/head&gt;
     &lt;p&gt;Video games are art, but a strange art: their essence is transformation of the player, not description to the player. This makes meaningful criticism nearly impossible—you can point at the moon, but it’s not the moon, and once someone sees it, they no longer need the pointing.&lt;/p&gt;
@@ -784,7 +657,7 @@ pnpm gateway:watch&lt;/code&gt;
     &lt;p&gt;that’s a possible justification. I think one can probably come up with a relatively short list of major functions video game art criticism could usefully serve: (1) professional analysis on the technical level of ‘how did they do X? why does Y work? how did they avoid Z?’ (2) serve as a meditation master to help players be enlightened, for ones who are just not quite Getting It and need a good ‘Kwatz!’ or koan; (3) do their best to take the reader through the transformation, knowing that they can’t really, but if they point at the moon, perhaps the right reader will be intrigued enough by the snack-sized sampler platter to go and do the real thing.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://gwern.net/video-game-art"/><published>2026-01-26T02:07:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46761761</id><title>Running the Stupid Cricut Software on Linux</title><updated>2026-01-26T14:23:55.700803+00:00</updated><content>&lt;doc fingerprint="171f99183bc7b5f9"&gt;
+&lt;/doc&gt;</content><link href="https://gwern.net/video-game-art"/><published>2026-01-26T02:07:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46761761</id><title>Running the Stupid Cricut Software on Linux</title><updated>2026-01-26T14:52:11.818877+00:00</updated><content>&lt;doc fingerprint="171f99183bc7b5f9"&gt;
   &lt;main&gt;
     &lt;head rend="h2"&gt;Why The Hell Would You do This?&lt;/head&gt;
     &lt;p&gt;I’m more than happy building vector designs in Inkscape. It’s the most proficient vector designer app that is free, open source, and runs natively under Linux. However, simply having a quality SVG is only part of the process when it comes to using a plotter like the Cricut.&lt;/p&gt;
@@ -820,7 +693,7 @@ cricut: aliased to wine '/home/art/.wine/drive_c/users/art/AppData/Local/Program
     &lt;p&gt;Now you can start uploading your designs and colaborating with other through their locked down, proprietary platform. You can even waste money on stock images.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://arthur.pizza/2025/12/running-stupid-cricut-software-under-linux/"/><published>2026-01-26T04:05:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46762150</id><title>The browser is the sandbox</title><updated>2026-01-26T14:23:55.602317+00:00</updated><content>&lt;doc fingerprint="5daa04924fbda384"&gt;
+&lt;/doc&gt;</content><link href="https://arthur.pizza/2025/12/running-stupid-cricut-software-under-linux/"/><published>2026-01-26T04:05:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46762150</id><title>The browser is the sandbox</title><updated>2026-01-26T14:52:11.666173+00:00</updated><content>&lt;doc fingerprint="5daa04924fbda384"&gt;
   &lt;main&gt;
     &lt;p&gt;the browser is the sandbox. Paul Kinlan is a web platform developer advocate at Google and recently turned his attention to coding agents. He quickly identified the importance of a robust sandbox for agents to operate in and put together these detailed notes on how the web browser can help:&lt;/p&gt;
     &lt;quote&gt;
@@ -840,7 +713,7 @@ cricut: aliased to wine '/home/art/.wine/drive_c/users/art/AppData/Local/Program
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://simonwillison.net/2026/Jan/25/the-browser-is-the-sandbox/"/><published>2026-01-26T05:23:01+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46762882</id><title>The Holy Grail of Linux Binary Compatibility: Musl and Dlopen</title><updated>2026-01-26T14:23:55.090253+00:00</updated><content>&lt;doc fingerprint="adda3afb1a14b6a8"&gt;
+&lt;/doc&gt;</content><link href="https://simonwillison.net/2026/Jan/25/the-browser-is-the-sandbox/"/><published>2026-01-26T05:23:01+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46762882</id><title>The Holy Grail of Linux Binary Compatibility: Musl and Dlopen</title><updated>2026-01-26T14:52:11.050180+00:00</updated><content>&lt;doc fingerprint="adda3afb1a14b6a8"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;The Holy Grail of Linux Binary Compatibility: musl + dlopen #242&lt;/head&gt;
     &lt;p&gt;-&lt;/p&gt;
@@ -895,7 +768,36 @@ cricut: aliased to wine '/home/art/.wine/drive_c/users/art/AppData/Local/Program
     &lt;p&gt;Beta Was this translation helpful? Give feedback.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/quaadgras/graphics.gd/discussions/242"/><published>2026-01-26T07:41:52+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46763864</id><title>MapLibre Tile: a modern and efficient vector tile format</title><updated>2026-01-26T14:23:55.032805+00:00</updated><content>&lt;doc fingerprint="4787f953dcbb25f4"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/quaadgras/graphics.gd/discussions/242"/><published>2026-01-26T07:41:52+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46763803</id><title>Being a Canadian in America (Eric Migicovsky)</title><updated>2026-01-26T14:52:10.884478+00:00</updated><content>&lt;doc fingerprint="a68259701ff5afbe"&gt;
+  &lt;main&gt;
+    &lt;div&gt;
+      &lt;p&gt;An Evening Out Colette Berends&lt;/p&gt;
+      &lt;p&gt;(I wrote a draft of post in early 2025. I picked it up and decided to publish it today, hence why it is more about ‘me’ than the current horrific news of the day)&lt;/p&gt;
+      &lt;p&gt;Why do I, a fairly liberal Canadian, continue to live in California instead of moving home, given America’s rightward lurch?&lt;/p&gt;
+      &lt;p&gt;The answer is that I’ve built a family and community here, which makes me reluctant to leave. Will that reluctance last forever? Obviously not, there’s always a red line.&lt;/p&gt;
+      &lt;p&gt;The shooting of a protester yesterday in Minneapolis feels very close crossing the red line for me. Will there be due process? Could additional information potentially come to light that would convince me that this is not a fascist execution of a civilian in the street? Both seem unlikely. The split screen hypocrisy of Trump claiming to support Iranian protesters, while simultaneously having his troops at home kill protesters who he calls ‘domestic terrorists’ is mindblowing.&lt;/p&gt;
+      &lt;p&gt;Could I help effect change? I can’t vote (not a US citizen) and at this point I don’t feel very comfortable joining demonstrations (like I did after George Floyd’s murder) not due to violence but it feels…incongruous to be an non-citizen protesting against policies that the majority of voting citizens in this country specifically voted for as recently as 1 year ago. I could theoretically donate money to candidates (as a green card holder) but that does not seem very effective given the immediate circumstance. The only tool I seem to have is voting with my feet and tax dollars.&lt;/p&gt;
+      &lt;p&gt;I’ve lived here (in the same neighbourhood) for 15 years now. This feels like home. My family and I are not in danger…yet. Do we wait until it’s in our state? Or city? Moving away also feels incredibly privileged. Others are still fighting to move to the US to avoid even worse situations in their home country.&lt;/p&gt;
+      &lt;p&gt;If you stand for nothing, what will you fall for?&lt;/p&gt;
+      &lt;p&gt;I want to be clear about what I believe in. Here’s a short list:&lt;/p&gt;
+      &lt;list rend="ul"&gt;
+        &lt;item&gt;people should be free to move and pursue opportunity anywhere they’d like&lt;/item&gt;
+        &lt;item&gt;people should be judged by the quality of their character, not their innate or unchangeable characteristics.&lt;/item&gt;
+        &lt;item&gt;technology on average is a good thing, but it can amplify the worst of human tendencies&lt;/item&gt;
+        &lt;item&gt;after receiving information that shows how our opinions or beliefs are incorrect, we should update our beliefs&lt;/item&gt;
+        &lt;item&gt;free speech is a great thing, but I am not an absolutist&lt;/item&gt;
+        &lt;item&gt;I don’t love the idea of people being able to make split second decisions/mistakes that could end someone else’s life (eg guns, texting while driving, nuclear weapons)&lt;/item&gt;
+      &lt;/list&gt;
+      &lt;p&gt;and probably many more things, but this is a good start.&lt;/p&gt;
+      &lt;p&gt;In the past, I haven’t done a great job of supporting specific causes (either publicly or financially) but it is something I should do better. I am not claiming to be an expert, or that I’ve read all the literature. Strong opinions, weakly held! My ears are always open.&lt;/p&gt;
+      &lt;p&gt;I would like to voice my support for the trans community. It’s an issue that’s dear to me, my friends and my family. My great aunt Colette (born 1934) transitioned and lived a spectacularly beautiful life (documented in a movie too!). I don’t have a strong opinion about the sports issue (I don’t play sports, nor am I a woman or trans) but I hate that it is being used as a gateway wedge issue to dehumanise trans people. These are people! Human people. The Overton window is shifting and I am scared that more people will start treating trans people with hatred or violence.&lt;/p&gt;
+      &lt;p&gt;The other group that I want to stand up for are immigrants. I am an immigrant. I am incredibly lucky to have been Canadian during an era which (up until recently) allowed for easy economic migration to the US (at least for engineers under the TN visa program). Coming down to California and taking part in YC was an incredibly formative part of my life. I think I gave back pretty good to the US as well! Pebble and Beeper would probably not exist had I not migrated down here. I wouldn’t have met my wife. Same deal as trans community - I hate that immigrants are being dehumanized and blamed for all of societies ills. How do ICE officers know who to stop and interrogate, anyways? If you prick us, do we not bleed? Why does that even matter…we’re all just people. The parallels to the 1930s are scary.&lt;/p&gt;
+      &lt;p&gt;There’s no magic solution or proposal at the end of this blog post. Sorry (🇨🇦). I have donated over the weekend to nipnlg.org and ilrc.org and I’ll continue to support others fighting for these causes.&lt;/p&gt;
+      &lt;p&gt;Maybe I am too much of a hopeless optimist, but it doesn’t hurt to have kindness for other people.&lt;/p&gt;
+    &lt;/div&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://ericmigi.com/blog/on-being-a-canadian-in-america-in-2026/"/><published>2026-01-26T10:12:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46763864</id><title>MapLibre Tile: a modern and efficient vector tile format</title><updated>2026-01-26T14:52:10.645974+00:00</updated><content>&lt;doc fingerprint="4787f953dcbb25f4"&gt;
   &lt;main&gt;
     &lt;p&gt;Jan 23, 2026&lt;/p&gt;
     &lt;p&gt;Today we are happy to announce MapLibre Tile (MLT), a new modern and efficient vector tile format.&lt;/p&gt;
@@ -914,7 +816,7 @@ cricut: aliased to wine '/home/art/.wine/drive_c/users/art/AppData/Local/Program
     &lt;p&gt;One exception: unlike MVT, MLT does not support layers where a value in a column changes type from feature to feature. ↩&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://maplibre.org/news/2026-01-23-mlt-release/"/><published>2026-01-26T10:19:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46764170</id><title>Show HN: Only 1 LLM can fly a drone</title><updated>2026-01-26T14:23:54.849197+00:00</updated><content>&lt;doc fingerprint="4fd783f63903440d"&gt;
+&lt;/doc&gt;</content><link href="https://maplibre.org/news/2026-01-23-mlt-release/"/><published>2026-01-26T10:19:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46764170</id><title>Show HN: Only 1 LLM can fly a drone</title><updated>2026-01-26T14:52:09.929329+00:00</updated><content>&lt;doc fingerprint="4fd783f63903440d"&gt;
   &lt;main&gt;
     &lt;quote&gt;
       &lt;p&gt;Inspired by Pokémon Snap (1999). VLM pilots a drone through 3D world to locate and identify creatures.&lt;/p&gt;
@@ -1045,10 +947,84 @@ make bench&lt;/code&gt;
     &lt;p&gt;Donated to Poly Pizza to support the platform.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/kxzk/snapbench"/><published>2026-01-26T11:00:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46765092</id><title>Water 'Bankruptcy' Era Has Begun for Billions, Scientists Say</title><updated>2026-01-26T14:23:54.730578+00:00</updated><content/><link href="https://www.bloomberg.com/news/articles/2026-01-20/water-bankruptcy-era-has-begun-for-billions-scientists-say"/><published>2026-01-26T12:57:43+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46765120</id><title>Vibe Coding Kills Open Source</title><updated>2026-01-26T14:23:54.616888+00:00</updated><content>&lt;doc fingerprint="a49e240a44ff128c"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/kxzk/snapbench"/><published>2026-01-26T11:00:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46764223</id><title>TSMC Risk</title><updated>2026-01-26T14:52:09.652786+00:00</updated><content>&lt;doc fingerprint="6380d4514daed7ef"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Listen to this post:&lt;/p&gt;
+    &lt;p&gt;You probably think, given this title, you know what this Article is about. The most advanced semiconductors are made by TSMC in Taiwan,1 and Taiwan is claimed by China, which has not and will not take reunification-by-force off of the table.&lt;/p&gt;
+    &lt;p&gt;Relatedly, AI obviously has significant national security implications; at Davos, Anthropic CEO Dario Amodei reiterated his objection to the U.S. allowing the sale of Nvidia chips to China. From Bloomberg:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Anthropic Chief Executive Officer Dario Amodei said selling advanced artificial intelligence chips to China is a blunder with “incredible national security implications” as the US moves to allow Nvidia Corp. to sell its H200 processors to Beijing. “It would be a big mistake to ship these chips,” Amodei said in an interview with Bloomberg Editor-in-Chief John Micklethwait at the World Economic Forum in Davos, Switzerland. “I think this is crazy. It’s a bit like selling nuclear weapons to North Korea.”&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;The nuclear weapon analogy is an interesting one: a lot of game theory was developed to manage the risk of nuclear weapons, particularly once the U.S.S.R. gained/stole nuclear capability, ending the U.S.’s brief monopoly on the technology. Before that happened, however, the U.S. had a dominant military position, given we had nuclear weapons and no one else did. Perhaps Amodei believes the U.S. should have advanced AI and China should not, giving us a dominant military position?&lt;/p&gt;
+    &lt;p&gt;The problem with that reality, however, is Taiwan, as I explained in AI Promise and Chip Precariousness. AI, in contrast to nuclear weapons, has a physical dependency in Taiwan that can be easily destroyed by Chinese missiles, even without an invasion; if we got to a situation where only the U.S. had the sort of AI that would give us an unassailable advantage militarily, then the optimal strategy for China would change to taking TSMC off of the board.&lt;/p&gt;
+    &lt;p&gt;Given this dependency, my recommendations in the Article run counter to Amodei: I want China dependent on not just U.S. chips but also on TSMC directly, which is why I argued in favor of selling Nvidia chips to China, and further believe that Huawei and other Chinese companies ought to be able to source from TSMC (on the flip side, I would ban the sale of semiconductor manufacturing equipment to Chinese fabs). I think it’s a good thing the Trump administration moved on the first point, at least.&lt;/p&gt;
+    &lt;p&gt;However, this risk is not what this Article is about: there is another TSMC risk facing the entire AI industry in particular; moreover, it’s a risk the downside of which is already being realized.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The TSMC Brake&lt;/head&gt;
+    &lt;p&gt;There was one refrain that was common across Big Tech earnings last quarter: demand for AI exceeds supply. Here was Amazon CEO Andy Jassy on the company’s earnings call:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;You’re going to see us continue to be very aggressive investing in capacity because we see the demand. As fast as we’re adding capacity right now, we’re monetizing it.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Here was Microsoft CFO Amy Hood on the company’s earnings call:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Azure AI services revenue was generally in line with expectations, and this quarter, demand again exceeded supply across workloads, even as we brought more capacity online.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Here was Google CFO Anat Ashkenazi on the company’s earnings call:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;In GCP, we see strong demand for enterprise AI infrastructure, including TPUs and GPUs, enterprise AI solutions driven by demand for Gemini 2.5 and our other AI models, and core GCP infrastructure and other services such as cybersecurity and data analytics. As I’ve mentioned on previous earnings calls, while we have been working hard to increase capacity and have improved the pace of server deployments and data center construction, we still expect to remain in a tight demand-supply environment in Q4 and 2026.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Here was Meta CEO Mark Zuckerberg on the company’s earnings call:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;To date, we keep on seeing this pattern where we build some amount of infrastructure to what we think is an aggressive assumption. And then we keep on having more demand to be able to use more compute, especially in the core business in ways that we think would be quite profitable than we end up having compute for.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Earlier this month, TSMC CEO C.C. Wei admitted that the shortage was a lack of chips, not power; from the company’s earnings call:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Talking about to build a lot of AI data center all over the world, I use one of my customers’ customers’ answer. I asked the same question. They told me that they planned this one, 5-6 years ago already. So, as I said, those cloud service providers are smart, very smart. So, they say that they work on the power supply 5-6 years ago. So, today, their message to me is: silicon from TSMC is a bottleneck, and asked me not to pay attention to all others, because they have to solve the silicon bottleneck first. But indeed, we do get the power supply, all over the world, especially in the US. Not only that, but we also look at, who support those kind of a power supply, like a turbine, like, what, nuclear power plant, the plan or those kinds of things. We also look at the supply of the rack. We also look at the supply of the cooling system. Everything, so far, so good. So we have to work hard to narrow the gap between the demand and supply from TSMC.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;The cause of that gap is obvious if you look at TSMC’s financials, specifically the company’s annual capital expenditures:&lt;/p&gt;
+    &lt;p&gt;After a big increase in CapEx in 2021, driven by the COVID shortages and a belief in 5G, TSMC’s annual CapEx in the following years was basically flat — it actually declined on a year-over-year basis in both 2023 and 2024. Note those dates! ChatGPT was released in November 2022; that kicked off a massive increase in CapEx amongst the hyperscalers in particular, but it sure seems like TSMC didn’t buy the hype.&lt;/p&gt;
+    &lt;p&gt;That lack of increased investment earlier this decade is why there is a shortage today, and is why TSMC has been a de facto brake on the AI buildout/bubble; I wrote last quarter:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;To put it another way, if Altman and OpenAI are the ones pushing to accelerate the AI infrastructure buildout, it’s Wei and TSMC that are the brakes. The extent to which all of Altman’s deals actually materialize is dependent on how much TSMC invests in capacity now, and while they haven’t shown their hand yet, the company is saying all of the right things about AI being a huge trend without having yet committed to a commensurate level of investment, at least relative to OpenAI’s goals.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;That Update was about the future, but it’s important to note that the TSMC brake has — if all of those CEO and CFO comments above are to be believed — already cost the biggest tech companies a lot of money. That’s the implication of not having enough supply to satisfy demand: there was revenue to be made that wasn’t, because TSMC didn’t buy the AI hype at the same time everyone else did.&lt;/p&gt;
+    &lt;head rend="h3"&gt;TSMC’s CapEx Plans&lt;/head&gt;
+    &lt;p&gt;TSMC is, finally, starting to invest more. Last year’s CapEx increased 37% to $41 billion, and there’s another increase in store for this year to $52–$56 billion; if we take the midpoint, that represents an increase of 32%, a bit less than last year:&lt;/p&gt;
+    &lt;p&gt;Make no mistake, $54 billion is a big number, one that Wei admitted made him nervous:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;You essentially try to ask whether the AI demand is real or not. I’m also very nervous about it. Yeah, you bet, because we have to invest about USD52 billion to USD56 billion for the CapEx, right? If we did not do it carefully, that will be a big disaster to TSMC for sure. So, of course, I spent a lot of time in the last three-four months talking to my customers and then customers’ customers. I want to make sure that my customers’ demands are real.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Wei made clear that he was worried about the market several years down the line:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;If you build a new fab, it takes two and three year, two to three years to build a new fab. So even we start to spend $52 billion to $56 billion, the contribution to this year is almost none, and 2027, a little bit. So we actually, we are looking for 2028-2029 supply, and we hope it’s a time that the gap will be narrow…So 2026-2027 for the short-term, we are looking to improve our productivity. 2028 to 2029, yes, we start to increase our capacity significantly. And it will continue this way if the AI demand megatrend as we expected.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;First off, this delayed impact explains why TSMC’s lack of CapEx increase a few years ago is resulting in supply-demand imbalance today. Secondly, notice how this year’s planned increase — which again, won’t really have an impact until 2028 — pales in comparison to the CapEx growth of the hyperscalers (2025 numbers are estimates; note that Amazon’s CapEx includes Amazon.com):&lt;/p&gt;
+    &lt;p&gt;Remember, a significant portion of this CapEx growth is for chips that are supported by TSMC’s stagnant CapEx growth from a few years ago. It’s notable, then, that TSMC’s current and projected CapEx growth is still less than the hyperscalers: how much less is it going to be than the hyperscalers’ growth in 2028, when the fabs being built today start actually producing chips?&lt;/p&gt;
+    &lt;p&gt;In short, the TSMC brake isn’t going anywhere — if anything, it’s being pressed harder than ever.&lt;/p&gt;
+    &lt;head rend="h3"&gt;TSMC Risk&lt;/head&gt;
+    &lt;p&gt;TSMC is, to be clear, being extremely rational. CapEx is inherently risky: you are spending money now in anticipation of demand that may or may not materialize. Moreover, the risk for a foundry is higher than basically any other business model: nearly all of a foundry’s costs are CapEx, which means that if demand fails to materialize, costs — in the form of depreciation — don’t go down as they might with a business model with a higher percentage of marginal costs. This is exacerbated by the huge dollar figures entailed in building fabs: $52–$56 billion may drive revenues with big margins, but those big margins can easily flip to being huge losses and years of diminished pricing power thanks to excess capacity. Therefore, it’s understandable that TSMC is trying to manage its risks. Sure, the company may be foregoing some upside in 2028, but what is top of Wei’s mind is avoiding “a big disaster.”&lt;/p&gt;
+    &lt;p&gt;What is important to note, however, is that the risk TSMC is managing doesn’t simply go away: rather, it’s being offloaded to the hyperscalers in particular. Specifically, if we get to 2028, and TSMC still isn’t producing enough chips to satisfy demand, then that means the hyperscalers will be forgoing billions of dollars in revenue — even more than they are already forgoing today. Yes, that risk is harder to see than the risk TSMC is avoiding, because the hyperscalers aren’t going to be bankrupt for a lack of chips to satisfy demand. Still, the potential money not made — particularly when the number is potentially in the hundreds of billions of dollars — is very much a risk that the hyperscalers are incurring because of TSMC’s conservatism.&lt;/p&gt;
+    &lt;p&gt;What the hyperscalers need to understand is that simply begging TSMC to make more isn’t going to fix this problem, because begging TSMC to make more is to basically ask TSMC to take back the risk TSMC is offloading to the hyperscalers — they already declined! Rather, the only thing that will truly motivate TSMC to take on more risk is competition. If TSMC were worried about not just forgoing its own extra revenue, but actually losing business to a competitor, then the company would invest more. Moreover, that extra investment would be stacked on top of the investment made by said competitor, which means the world would suddenly have dramatically more fab capacity.&lt;/p&gt;
+    &lt;head rend="h3"&gt;If You Want a Bubble&lt;/head&gt;
+    &lt;p&gt;In short, the only way to truly get an AI bubble, with all of the potential benefits that entails, or, in the optimistic case, to actually meet demand in 2028 and beyond, is to have competition in the foundry space. That, by extension, means Samsung or Intel — or both — actually being viable options.&lt;/p&gt;
+    &lt;p&gt;Remember, however, the number one challenge facing those foundries: a lack of demand from the exact companies whom TSMC has deputized to take on their risk. I wrote in U.S. Intel:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Our mythical startup, however, doesn’t exist in a vacuum: it exists in the same world as TSMC, the company who has defined the modern pure play foundry. TSMC has put in the years, and they’ve put in the money; TSMC has the unparalleled customer service approach that created the entire fabless chip industry; and, critically, TSMC, just as they did in the mobile era, is aggressively investing to meet the AI moment. If you’re an Nvidia, or an Apple in smartphones, or an AMD or a Qualcomm, why would you take the chance of fabricating your chips anywhere else? Sure, TSMC is raising prices in the face of massive demand, but the overall cost of a chip in a system is still quite small; is it worth risking your entire business to save a few dollars for worse performance with a worse customer experience that costs you time to market and potentially catastrophic product failures?&lt;/p&gt;
+      &lt;p&gt;We know our mythical startup would face these challenges because they are the exact challenges Intel faces. Intel may need “a meaningful external customer to drive acceptable returns on [its] deployed capital”, but Intel’s needs do not drive the decision-making of those external customers, despite the fact that Intel, while not fully caught up to TSMC, is at least in the ballpark, something no startup could hope to achieve for decades.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Becoming a meaningful customer of Samsung or Intel is very risky: it takes years to get a chip working on a new process, which hardly seems worth it if that process might not be as good, and if the company offering the process definitely isn’t as customer service-centric as TSMC. I understand why everyone sticks with TSMC.&lt;/p&gt;
+    &lt;p&gt;The reality that hyperscalers and fabless chip companies need to wake up to, however, is that avoiding the risk of working with someone other than TSMC incurs new risks that are both harder to see and also much more substantial. Except again, we can see the harms already: foregone revenue today as demand outstrips supply. Today’s shortages, however, may prove to be peanuts: if AI has the potential these companies claim it does, future foregone revenue at the end of the decade is going to cost exponentially more — surely a lot more than whatever expense is necessary to make Samsung and/or Intel into viable competitors for TSMC.&lt;/p&gt;
+    &lt;p&gt;This, incidentally, is how the geographic risk issue will be fixed, if it ever is. It’s hard to get companies to pay for insurance for geopolitical risks that may never materialize. What is much more likely is that TSMC’s customers realize that their biggest risk isn’t that TSMC gets blown up by China, but that TSMC’s monopoly and reasonable reluctance to risk a rate of investment that matches the rest of the industry means that the rest of the industry fails to fully capture the value of AI.&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Yes, there are chips made in Arizona, but only a portion, and they need to be sent back to Taiwan for packaging and testing. ↩&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://stratechery.com/2026/tsmc-risk/"/><published>2026-01-26T11:07:26+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46765092</id><title>Water 'Bankruptcy' Era Has Begun for Billions, Scientists Say</title><updated>2026-01-26T14:52:09.405095+00:00</updated><content/><link href="https://www.bloomberg.com/news/articles/2026-01-20/water-bankruptcy-era-has-begun-for-billions-scientists-say"/><published>2026-01-26T12:57:43+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46765120</id><title>Vibe Coding Kills Open Source</title><updated>2026-01-26T14:52:09.250057+00:00</updated><content>&lt;doc fingerprint="a49e240a44ff128c"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;Economics &amp;gt; General Economics&lt;/head&gt;&lt;p&gt; [Submitted on 21 Jan 2026]&lt;/p&gt;&lt;head rend="h1"&gt;Title:Vibe Coding Kills Open Source&lt;/head&gt;View PDF HTML (experimental)&lt;quote&gt;Abstract:Generative AI is changing how software is produced and used. In vibe coding, an AI agent builds software by selecting and assembling open-source software (OSS), often without users directly reading documentation, reporting bugs, or otherwise engaging with maintainers. We study the equilibrium effects of vibe coding on the OSS ecosystem. We develop a model with endogenous entry and heterogeneous project quality in which OSS is a scalable input into producing more software. Users choose whether to use OSS directly or through vibe coding. Vibe coding raises productivity by lowering the cost of using and building on existing code, but it also weakens the user engagement through which many maintainers earn returns. When OSS is monetized only through direct user engagement, greater adoption of vibe coding lowers entry and sharing, reduces the availability and quality of OSS, and reduces welfare despite higher productivity. Sustaining OSS at its current scale under widespread vibe coding requires major changes in how maintainers are paid.&lt;/quote&gt;&lt;p&gt; Current browse context: &lt;/p&gt;&lt;p&gt;econ.GN&lt;/p&gt;&lt;head rend="h3"&gt;References &amp;amp; Citations&lt;/head&gt;&lt;p&gt; export BibTeX citation Loading... &lt;/p&gt;&lt;head rend="h1"&gt;Bibliographic and Citation Tools&lt;/head&gt;&lt;p&gt; Bibliographic Explorer (What is the Explorer?) &lt;/p&gt;&lt;p&gt; Connected Papers (What is Connected Papers?) &lt;/p&gt;&lt;p&gt; Litmaps (What is Litmaps?) &lt;/p&gt;&lt;p&gt; scite Smart Citations (What are Smart Citations?) &lt;/p&gt;&lt;head rend="h1"&gt;Code, Data and Media Associated with this Article&lt;/head&gt;&lt;p&gt; alphaXiv (What is alphaXiv?) &lt;/p&gt;&lt;p&gt; CatalyzeX Code Finder for Papers (What is CatalyzeX?) &lt;/p&gt;&lt;p&gt; DagsHub (What is DagsHub?) &lt;/p&gt;&lt;p&gt; Gotit.pub (What is GotitPub?) &lt;/p&gt;&lt;p&gt; Hugging Face (What is Huggingface?) &lt;/p&gt;&lt;p&gt; Papers with Code (What is Papers with Code?) &lt;/p&gt;&lt;p&gt; ScienceCast (What is ScienceCast?) &lt;/p&gt;&lt;head rend="h1"&gt;Demos&lt;/head&gt;&lt;head rend="h1"&gt;Recommenders and Search Tools&lt;/head&gt;&lt;p&gt; Influence Flower (What are Influence Flowers?) &lt;/p&gt;&lt;p&gt; CORE Recommender (What is CORE?) &lt;/p&gt;&lt;head rend="h1"&gt;arXivLabs: experimental projects with community collaborators&lt;/head&gt;&lt;p&gt;arXivLabs is a framework that allows collaborators to develop and share new arXiv features directly on our website.&lt;/p&gt;&lt;p&gt;Both individuals and organizations that work with arXivLabs have embraced and accepted our values of openness, community, excellence, and user data privacy. arXiv is committed to these values and only works with partners that adhere to them.&lt;/p&gt;&lt;p&gt;Have an idea for a project that will add value for arXiv's community? Learn more about arXivLabs.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://arxiv.org/abs/2601.15494"/><published>2026-01-26T13:01:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46765273</id><title>Transfering Files with gRPC</title><updated>2026-01-26T14:23:54.424787+00:00</updated><content>&lt;doc fingerprint="a5bbb94665a38ca0"&gt;
+&lt;/doc&gt;</content><link href="https://arxiv.org/abs/2601.15494"/><published>2026-01-26T13:01:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46765273</id><title>Transfering Files with gRPC</title><updated>2026-01-26T14:52:08.987028+00:00</updated><content>&lt;doc fingerprint="a5bbb94665a38ca0"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Transfering files with gRPC&lt;/head&gt;
     &lt;p&gt;Is transfering files with gRPC a good idea? Or should that be handled by a separate REST API endpoint? In this post, we will implement a file transfer service in both, use Kreya to test those APIs, and finally compare the performance to see which one is better.&lt;/p&gt;
@@ -1139,7 +1115,7 @@ The maximum memory usage however stays low for all approaches.&lt;/p&gt;
     &lt;p&gt;Should you need resumable up- or downloads, instead of rolling your own, you could use https://tus.io/. This open-source protocol has implementations in various languages.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://kreya.app/blog/transfering-files-with-grpc/"/><published>2026-01-26T13:17:19+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46765460</id><title>After two years of vibecoding, I'm back to writing by hand</title><updated>2026-01-26T14:23:54.369424+00:00</updated><content/><link href="https://atmoio.substack.com/p/after-two-years-of-vibecoding-im"/><published>2026-01-26T13:36:22+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46765694</id><title>Porting 100k lines from TypeScript to Rust using Claude Code in a month</title><updated>2026-01-26T14:23:28.575845+00:00</updated><content>&lt;doc fingerprint="23280a7e3da5c6e8"&gt;
+&lt;/doc&gt;</content><link href="https://kreya.app/blog/transfering-files-with-grpc/"/><published>2026-01-26T13:17:19+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46765460</id><title>After two years of vibecoding, I'm back to writing by hand</title><updated>2026-01-26T14:52:08.879985+00:00</updated><content/><link href="https://atmoio.substack.com/p/after-two-years-of-vibecoding-im"/><published>2026-01-26T13:36:22+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46765694</id><title>Porting 100k lines from TypeScript to Rust using Claude Code in a month</title><updated>2026-01-26T14:52:07.957625+00:00</updated><content>&lt;doc fingerprint="23280a7e3da5c6e8"&gt;
   &lt;main&gt;
     &lt;p&gt;I read this post “Our strategy is to combine AI and Algorithms to rewrite Microsoft’s largest codebases [from C++ to Rust]. Our North Star is ‘1 engineer, 1 month, 1 million lines of code.” and it got me curious, how difficult is it really?&lt;/p&gt;
     &lt;p&gt;I've long wanted to build a competitive Pokemon battle AI after watching a lot of WolfeyVGC and following the PokéAgent challenge at NeurIPS. Thankfully there's an open source project called "Pokemon Showdown" that implements all the rules but it's written in JavaScript which is quite slow to run in a training loop. So my holiday project came to life: let's convert it to Rust using Claude!&lt;/p&gt;
