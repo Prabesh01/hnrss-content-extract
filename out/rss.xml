@@ -1,251 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Fri, 06 Feb 2026 05:09:56 +0000</lastBuildDate><item><title>Hypernetworks: Neural Networks for Hierarchical Data</title><link>https://blog.sturdystatistics.com/posts/hnet_part_I/</link><description>&lt;doc fingerprint="a5f962a3213a1273"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Neural nets assume the world is flat. Hierarchical data reminds us that it isnât.&lt;/p&gt;
-    &lt;p&gt;Neural networks are predicated on the assumption that a single function maps inputs to outputs. But in the real world, data rarely fits that mold.&lt;/p&gt;
-    &lt;p&gt;Think about a clinical trial run across multiple hospitals: the drug is the same, but patient demographics, procedures, and record-keeping vary from one hospital to the next. In such cases, observations are grouped into distinct datasets, each governed by hidden parameters. The function mapping inputs to outputs isnât universal â it changes depending on which dataset youâre in.&lt;/p&gt;
-    &lt;p&gt;Standard neural nets fail badly in this setting. Train a single model across all datasets and it will blur across differences, averaging functions that shouldnât be averaged. Train one model per dataset and youâll overfit, especially when datasets are small. Workarounds like static embeddings or ever-larger networks donât really solve the core issue: they memorize quirks without modeling the dataset-level structure that actually drives outcomes.&lt;/p&gt;
-    &lt;p&gt;This post analyzes a different approach: hypernetworks â a way to make neural nets dataset-adaptive. Instead of learning one fixed mapping, a hypernetwork learns to generate the parameters of another network based on a dataset embedding. The result is a model that can:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;infer dataset-level properties from only a handful of points,&lt;/item&gt;
-      &lt;item&gt;adapt to entirely new datasets without retraining, and&lt;/item&gt;
-      &lt;item&gt;pool information across datasets to improve stability and reduce overfitting.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Weâll build the model step by step, with code you can run, and test it on synthetic data generated from Planckâs law. Along the way, weâll compare hypernetworks to conventional neural nets â and preview why Bayesian models (covered in Part II) can sometimes do even better.&lt;/p&gt;
-    &lt;head rend="h2"&gt;1. Introduction&lt;/head&gt;
-    &lt;p&gt;In many real-world problems, the data is hierarchical in nature: observations are grouped into related but distinct datasets, each governed by its own hidden properties. For example, consider a clinical trial testing a new drug. The trial spans multiple hospitals and records the dosage administered to each patient along with the patientâs outcome. The drugâs effectiveness is, of course, a primary factor determining outcomesâbut hospital-specific conditions also play a role. Patient demographics, procedural differences, and even how results are recorded can all shift the recorded outcomes. If these differences are significant, treating the data as if it came from a single population will lead to flawed conclusions about the drugâs effectiveness.&lt;/p&gt;
-    &lt;p&gt;From a machine learning perspective, this setting presents a challenge. The dataset-level propertiesâhow outcomes vary from one hospital to anotherâare latent: they exist, but they are not directly observed. A standard neural network learns a single, constant map from inputs to outputs, but that mapping is ambiguous here. Two different hospitals, with different latent conditions, would produce different outcomes, even for identical patient profiles. The function becomes well-defined (i.e. single-valued) only once we condition on the dataset-level factors.&lt;/p&gt;
-    &lt;p&gt;To make this concrete, we can construct a toy example which quantifies the essential features we wish to study. Each dataset consists of observations (ð, y) drawn from a simple function with a hierarchical structure, generated using Planckâs law:&lt;/p&gt;
-    &lt;p&gt;\[ y(\nu) = f(\nu; T, \sigma) = \frac{\nu^3}{e^{\nu/T} - 1} + \epsilon(\sigma) \]&lt;/p&gt;
-    &lt;p&gt;where:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;ð is the covariate (frequency),&lt;/item&gt;
-      &lt;item&gt;y is the response (brightness or flux),&lt;/item&gt;
-      &lt;item&gt;T is a dataset-specific parameter (temperature), constant within a dataset but varying across datasets, and&lt;/item&gt;
-      &lt;item&gt;Îµ is Gaussian noise with scale Ï, which is unknown but remains the same across datasets.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;This could represent pixels in a thermal image. Each pixel in the image has a distinct surface temperature T determining its spectrum, while the noise scale Ï would be a property of the spectrograph or amplifier, which is consistent across observations.&lt;/p&gt;
-    &lt;p&gt;The key point is that while (ð, y) pairs are observed and known to the modeler, the dataset-level parameter T is part of the data-generating function, but is unknown to the observer. While the function f(ð; T) is constant (each dataset follows the same general equation), since each dataset has a different T, the mapping y(ð) varies from one dataset to the next. This fundamental structure â with hidden dataset-specific variables influencing the observed mapping â is ubiquitous in real-world problems.&lt;/p&gt;
-    &lt;p&gt;Naively training a single model across all datasets would force the network to ignore these latent differences and approximate an âaverageâ function. This approach is fundamentally flawed when the data is heterogeneous. Fitting a separate model for each dataset also fails: small datasets lack enough points for robust learning, and the shared functional structure, along with shared parameters such as the noise scale Ï, cannot be estimated reliably without pooling information.&lt;/p&gt;
-    &lt;p&gt;What we need instead is a hierarchical model â one that accounts for dataset-specific variation while still sharing information across datasets. In the neural network setting, this naturally leads us to meta-learning: models that donât just learn a function, but learn how to learn functions.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Takeaway&lt;/head&gt;
-    &lt;p&gt;Standard neural nets assume one function fits all the data; hierarchical data (which is very common) violates that assumption at a fundamental level. We need models that adapt per-dataset when required, while still sharing the information which is consistent across datasets.&lt;/p&gt;
-    &lt;head rend="h2"&gt;2. Why Standard Neural Networks Fail with Hierarchical Data&lt;/head&gt;
-    &lt;p&gt;A standard neural network trained directly on (ð, y) pairs struggles in this setting because it assumes that one universal function maps inputs to outputs across all datasets. In our problem, however, each dataset follows a different function y(ð), determined by the hidden dataset-specific parameter T. The single-valued function f(ð; T) is not available to us because we cannot observe the parameter T. Without explicit access to T, the network cannot know which mapping to use.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Ambiguous Mappings&lt;/head&gt;
-    &lt;p&gt;To see why this is a problem, imagine trying to predict a personâs height without any other information. In a homogeneous population â say, all adults â simply imputing the mean might do reasonably well. (For example, if our population in question is adult females in the Netherlands, simply guessing the mean would be accurate to within Â±2.5 inches 68% of the time.) But suppose the data includes both adults and children. A single distribution would be forced to learn an âaverageâ height that fits neither group accurately. Predictions using this mean would virtually never be correct.&lt;/p&gt;
-    &lt;p&gt;The same problem arises in our hierarchical setting: since a single function cannot capture all datasets simultaneously, predictions made with an âaverageâ function will not work well.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Common Workarounds, and Why They Fall Short&lt;/head&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;
-        &lt;p&gt;Static dataset embeddings: A frequent workaround is to assign each dataset a unique embedding vector, retrieved from a lookup table. This allows the network to memorize dataset-specific adjustments. However, this strategy does not generalize: when a new dataset arrives, the network has no embedding for it and cannot adapt to the new dataset.&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Shortcut learning: Another possibility is to simply enlarge the network and provide more data. In principle, the model might detect subtle statistical cues â differences in noise patterns or input distributions â that indirectly encode the dataset index. But such âshortcut learningâ is both inefficient and unreliable. The network memorizes dataset-specific quirks rather than explicitly modeling dataset-level differences. In applied domains, this also introduces bias: for instance, a network might learn to inappropriately use a proxy variable (like zip code or demographic information), producing unfair and unstable predictions.&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h3"&gt;What We Actually Need&lt;/head&gt;
-    &lt;p&gt;These limitations highlight the real requirements for a model of hierarchical data. Rather than forcing a single network to approximate every dataset simultaneously, we need a model that can:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Infer dataset-wide properties from only a handful of examples,&lt;/item&gt;
-      &lt;item&gt;Adapt to entirely new datasets without retraining from scratch, and&lt;/item&gt;
-      &lt;item&gt;Pool knowledge efficiently across datasets, so that shared structure (such as the functional form, or the noise scale Ï) is estimated more robustly.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Standard neural networks with a fixed structure simply cannot meet these requirements. To go further, we need a model that adapts dynamically to dataset-specific structure while still learning from the pooled data. Hypernetworks are one interesting approach to this problem.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Takeaway&lt;/head&gt;
-    &lt;p&gt;Workarounds like static embeddings or bigger models donât fix the core issue: hidden dataset factors cause the observed mapping from inputs to outputs to be multiply-valued. A neural network, which is inherently single-valued, cannot fit such data. We need a model that (1) infers dataset-wide properties, (2) adapts to new datasets, and (3) pools knowledge across datasets.&lt;/p&gt;
-    &lt;head rend="h2"&gt;3. Dataset-Adaptive Neural Networks&lt;/head&gt;
-    &lt;head rend="h3"&gt;3.1 Dataset Embeddings&lt;/head&gt;
-    &lt;p&gt;The first step toward a dataset-adaptive network is to give the model a way to represent dataset-level variation. We do this by introducing a dataset embedding: a latent vector E that summarizes the properties of a dataset as a whole.&lt;/p&gt;
-    &lt;p&gt;We assign each training dataset a learnable embedding vector:&lt;/p&gt;
-    &lt;code&gt;# dataset embeddings (initialized randomly &amp;amp; updated during training)
-= tf.Variable(
- dataset_embeddings 
-     tf.random.normal([num_datasets, embed_dim]),=True
-     trainable
- )
-# Assign dataset indices for each sample
-= np.hstack([np.repeat(i, len(v)) for i, v in enumerate(vs)])
- dataset_indices = np.hstack(vs).reshape((-1, 1))
- x_train = np.hstack(ys).reshape((-1, 1))
- y_train 
-# Retrieve dataset-specific embeddings
-= tf.gather(dataset_embeddings, dataset_indices) E_train &lt;/code&gt;
-    &lt;p&gt;At first glance, this might look like a common embedding lookup, where each dataset is assigned a static vector retrieved from a table â but we have already discussed at length why that approach wonât work here!&lt;/p&gt;
-    &lt;p&gt;During training, these embeddings do in fact act like standard embeddings (and are implemented as such). Like standard embeddings, ours serve to encode dataset-specific properties. The key distinction comes from how we handle the embeddings at inference time: the embeddings remain trainable, even during prediction. When a previously-unseen dataset appears at inference time, we initialize a new embedding for the dataset and optimize it on the fly. This turns the embedding into a function of the dataset itself, not a hard-coded (and constant) identifier. During training, the model learns embeddings that capture hidden factors in the data-generating process (such as the parameter T in our problem). At prediction time, the embedding continues to adapt, allowing the model to represent new datasets that it has never seen before. Such flexibility is crucial for generalization.&lt;/p&gt;
-    &lt;head rend="h3"&gt;3.2 Introducing the Hypernetwork&lt;/head&gt;
-    &lt;p&gt;With dataset embeddings in place, we now need a mechanism to translate those embeddings into meaningful changes in the networkâs behavior. A natural way to do this is with a hypernetwork: a secondary neural network that generates parameters for the main network.&lt;/p&gt;
-    &lt;p&gt;The idea is simple but powerful. Instead of learning a single function f(ð), we want to learn a family of functions f(ð; E), parameterized by the dataset embedding E. The hypernetwork takes E as input and produces weights and biases for the first layer of the main network. In this way, dataset-specific information directly shapes how the main network processes its inputs. After the first layer, the remainder of the network is independent of the dataset; in effect, we have factored the family of functions f(ð; E) into the composition g(ð; h(E)), and the task is now to learn functions g and h which approximate our data-generating process.&lt;/p&gt;
-    &lt;p&gt;Here is a minimal implementation in Keras:&lt;/p&gt;
-    &lt;code&gt;def build_hypernetwork(embed_dim):
-"""Generates parameters for the first layer of the main network"""
-     
-= K.Input(shape=(embed_dim,), name='dataset_embedding_input')
-     emb 
-= K.layers.Dense(16, activation='mish', name='Hyper_L1')(emb)
-     l = K.layers.Dense(32, activation='mish', name='Hyper_L2')(l)
-     l 
-# Generate layer weights (32 hidden units, 1 input feature)
-     = K.layers.Dense(32, activation=None, name='Hyper_W')(l)
-     W = K.layers.Reshape((32, 1))(W)  # Reshape to (32, 1)
-     W 
-# Generate biases (32 hidden units)
-     = K.layers.Dense(32, activation=None, name='Hyper_b')(l)
-     b 
-return K.Model(inputs=emb, outputs=[W, b], name="HyperNetwork")     &lt;/code&gt;
-    &lt;p&gt;The hypernetwork transforms the dataset embedding into a set of layer parameters (W, b). These parameters will replace the fixed weights of the first layer in the main network, giving us a learnable, dataset-specific transformation of the input.&lt;/p&gt;
-    &lt;p&gt;A hypernetwork maps dataset embeddings to neural network parameters. This lets us capture dataset-level variation explicitly, so that each dataset is modeled by its own effective function without training separate networks from scratch. Remarkably, despite this flexibility, all the parameters in the hypernetwork are constant with respect to the dataset. The only dataset-specific information needed to achieve this flexibility is the embedding (4 floats per dataset, in our example).&lt;/p&gt;
-    &lt;head rend="h3"&gt;3.3 Main Network Integration&lt;/head&gt;
-    &lt;p&gt;Now that we have a hypernetwork to generate dataset-specific parameters, we need to integrate them into a main network which models the data. The main network can have any architecture we like; all we need to do is to replace the first fixed linear transformation with a dataset-specific transformation derived from the embedding.&lt;/p&gt;
-    &lt;p&gt;We can do this by defining a custom layer that applies the hypernetwork-generated weights and biases:&lt;/p&gt;
-    &lt;code&gt;class DatasetSpecificLayer(K.layers.Layer):
-
-def __init__(self, **kwargs):
-     super(DatasetSpecificLayer, self).__init__(**kwargs)
-         
-def call(self, inputs):
-     """ Applies the dataset-specific transformation using generated weights """
-         
-= inputs  # unpack inputs
-         x, W, b 
-= tf.expand_dims(x, axis=-1)       # Shape: (batch_size, 1, 1)
-         x = tf.transpose(W, perm=[0, 2, 1])  # Transpose W to (batch_size, 1, 32)
-         W 
-= tf.matmul(x, W)          # Shape: (batch_size, 1, 32)
-         out = tf.squeeze(out, axis=1)  # Shape: (batch_size, 32)
-         out 
-return out + b  # Add bias, final shape: (batch_size, 32)         &lt;/code&gt;
-    &lt;p&gt;This layer serves as the bridge between the hypernetwork and the main network. Instead of relying on a single, fixed set of weights, the transformation applied to each input is customized for the dataset via its embedding.&lt;/p&gt;
-    &lt;p&gt;With this building block in place, we can define the main network:&lt;/p&gt;
-    &lt;code&gt;= 4
- embed_dim = build_hypernetwork(embed_dim)
- hypernet 
-def build_base_network(hypernet, embed_dim):
-""" Main network that takes x and dataset embedding as input """
-     
-= K.Input(shape=(1,), name='input_x')
-     inp_x = K.Input(shape=(embed_dim,), name='dataset_embedding')
-     inp_E 
-# Get dataset-specific weights and biases from the hypernetwork
-     = hypernet(inp_E)
-     W, b 
-# Define a custom layer using the generated weights
-     = DatasetSpecificLayer(name='DatasetSpecific')([inp_x, W, b])
-     l 
-# Proceed with the normal dense network
-     = K.layers.Activation(K.activations.mish, name='L1')(l)
-     l = K.layers.Dense(32, activation='mish', name='L2')(l)
-     l = K.layers.Dense(32, activation='mish', name='L3')(l)
-     l = K.layers.Dense(1, activation='exponential', name='output')(l)
-     out 
-return K.Model(inputs=[inp_x, inp_E], outputs=out, name="BaseNetwork")     &lt;/code&gt;
-    &lt;p&gt;Why exponential activation on the last layer? Outputs from Planckâs law are strictly positive, and they fall like exp(-x) for large x. This choice therefore mirrors our anticipated solution, and it allows the approximately linear outputs from the Mish activation in the L3 layer to naturally translate into an exponential tail. We have found this choice, motivated by the physics of the dataset, to lead to faster convergence and better generalization in the model. Exponential activations can have convergence issues with large-y values, but our dataset does not contain such values.&lt;/p&gt;
-    &lt;p&gt;To recap, the overall process is as follows:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;The hypernetwork generates dataset-specific parameters (W, b).&lt;/item&gt;
-      &lt;item&gt;The DatasetSpecificLayer applies this transformation to the input ð, producing a transformed representation ðâ. If the transformation works correctly, all the various datasets should be directly comparable in the transformed space.&lt;/item&gt;
-      &lt;item&gt;The main network learns a single universal mapping from transformed inputs ðâ to the outputs y.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;By integrating hypernetwork-generated parameters into the first layer, we transform the main network into a system that adapts automatically to each dataset. This allows us to capture dataset-specific structure while still training a single model across all datasets.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Takeaway&lt;/head&gt;
-    &lt;p&gt;Combining dataset embeddings with a hypernetwork allows one single-valued neural network to express a family of functions f(ð; E) by decomposing it into f(ð; E) = g(ð, h(E)) in which g and h are ordinary, single-valued neural networks. The first layer of the main network becomes dataset-specific; the rest behaves like an ordinary feed-forward network and learns a universal mapping on transformed inputs.&lt;/p&gt;
-    &lt;head rend="h2"&gt;4. Training Results&lt;/head&gt;
-    &lt;p&gt;With the embeddings, base network, and hypernetwork now stitched together, we can now evaluate the model on our test problem. To do this, we train on a collection of 20 synthetic datasets generated from Planckâs law as described in Section 1. Each dataset has its own temperature parameter T, while the noise scale Ï is shared across all datasets.&lt;/p&gt;
-    &lt;p&gt;The figure below shows the training results. Each panel shows a distinct dataset from the test. In each panel,&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;the Blue solid curve shows the true function derived from Planckâs law,&lt;/item&gt;
-      &lt;item&gt;the Black points shows observed training data,&lt;/item&gt;
-      &lt;item&gt;the Red dashed curve shows predictions from the hypernetwork-based model, and&lt;/item&gt;
-      &lt;item&gt;the Gold dotted curve shows predictions from a conventional neural network trained separately on each dataset.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Several key patterns are evident:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;
-        &lt;p&gt;Comparable overall accuracy: In many cases (such as the 1st column of the 1st row), the hypernetworkâs predictions (red) are very similar to those of an isolated neural network (gold). This shows that, despite strongly restricting the model and removing ~95% of its parameters, sharing parameters across datasets does not sacrifice accuracy when sufficient data are available.&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Improved stability: When training data are sparse (such as in the 1st column of the 2nd row, or the last column of the 3rd row), the hypernetwork over-fits considerably less than the isolated neural network. Its predictions remain smoother and closer to the true functional form, while the isolated neural network sometimes strains to fit individual points.&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Pooling across datasets: By training on all datasets simultaneously, the hypernetwork learns to separate the shared structure [such as the noise scale Ï, or the underlying functional form f(ð; T)] from dataset-specific variation (the embedding E). This shared learning stabilizes predictions across the board, but it is especially visible in the panels with particularly noisy data (such as the last column of the 2nd row, or the 2nd column of the 3rd row).&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h3"&gt;Takeaway&lt;/head&gt;
-    &lt;p&gt;The hypernetwork achieves comparable accuracy to isolated networks when data are plentiful, and superior stability when data are scarce. Its advantages result from pooling information across datasets, allowing the network to capture both shared and dataset-specific structure in a single model.&lt;/p&gt;
-    &lt;head rend="h2"&gt;5. Predictions for New Datasets&lt;/head&gt;
-    &lt;p&gt;The training performance of our hypernetwork is encouraging, but the real test is how the model adapts to new datasets it has never seen before. Unlike a conventional neural network â which simply applies its learned weights to any new input â our model is structured to recognize that each dataset follows a distinct intrinsic function. To make predictions, it must first infer the datasetâs embedding.&lt;/p&gt;
-    &lt;head rend="h3"&gt;5.1 Two-Stage Process&lt;/head&gt;
-    &lt;p&gt;Adapting to a new dataset proceeds in two steps:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Optimize the dataset embedding Eâ so that it best explains the observed points.&lt;/item&gt;
-      &lt;item&gt;Use the optimized embedding Eâ to generate predictions for new inputs via the main network.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;This two-stage pipeline allows the model to capture dataset-specific properties with only a handful of observations, without retraining the entire network.&lt;/p&gt;
-    &lt;head rend="h3"&gt;5.2 Embedding Optimization&lt;/head&gt;
-    &lt;p&gt;To infer a dataset embedding, we treat Eâ as a trainable parameter. Instead of training all of the networkâs weights from scratch, we optimize only the embedding vector until the network fits the new dataset. Because the embedding is low-dimensional (in this case, just 4 floats), this optimization is efficient and requires little data to converge.&lt;/p&gt;
-    &lt;p&gt;A convenient way to implement this is with a wrapper model that holds a single embedding vector and exposes it as a learnable variable:&lt;/p&gt;
-    &lt;code&gt;class DatasetEmbeddingModel(K.Model):
-
-def __init__(self, base_net, embed_dim):
-    super(DatasetEmbeddingModel, self).__init__()
-        self.base_net = base_net
-        self.E_new = tf.Variable(
-        1, embed_dim]), trainable=True, dtype=tf.float32
-            tf.random.normal([
-        )# for better performance on small datasets, use tensorflow_probability:
-        # self.E_new = tfp.distributions.Normal(loc=0, scale=1).sample((1, embed_dim))
-        
-
-def call(self, x):
-    # Tile E_new across batch dimension so it matches x's batch size
-        = tf.tile(self.E_new, (tf.shape(x)[0], 1))
-        E_tiled return self.base_net([x, E_tiled])
-        
-def loss(self, y_true, y_pred):
-    = K.losses.MSE(y_true, y_pred)
-        mse_loss = 0.05 * tf.reduce_mean(tf.square(self.E_new))  # L2 regularization on E
-        reg_loss return mse_loss + reg_loss        &lt;/code&gt;
-    &lt;p&gt;Here, the dataset embedding Eâ is initialized randomly, then updated via gradient descent to minimize prediction error on the observed points. Because we are only optimizing a handful of parameters, the process is lightweight and well-suited to small datasets.&lt;/p&gt;
-    &lt;p&gt;By framing the embedding as a trainable parameter, the model can adapt to new datasets efficiently. This strategy avoids retraining the full network while still capturing the dataset-specific variation needed for accurate predictions.&lt;/p&gt;
-    &lt;head rend="h3"&gt;5.3 Generalization&lt;/head&gt;
-    &lt;p&gt;One of the most compelling advantages of this approach is its ability to generalize to entirely new datasets with very little data. In practice, the model can often adapt with as few as ten observed points. This few-shot adaptation works because the hypernetwork has already learned a structured mapping from dataset embeddings to function parameters. When a new dataset arrives, we only need to learn its embedding, rather than fine-tune all of the networkâs weights.&lt;/p&gt;
-    &lt;p&gt;Compared to conventional neural networks â which require hundreds or thousands of examples to fine-tune effectively â this embedding-based adaptation is far more data-efficient. It allows the model to handle real-world scenarios where collecting large amounts of data for every new dataset is impractical.&lt;/p&gt;
-    &lt;head rend="h3"&gt;5.4 Limitations&lt;/head&gt;
-    &lt;p&gt;Despite these strengths, the hypernetwork approach is not perfect. When we evaluate predictions on out-of-sample datasets â datasets generated by the same process, but not included in the training data â we observe a noticeable degradation in quality, especially on noisy data, censored data, or on very small datasets, as the following examples show:&lt;/p&gt;
-    &lt;p&gt;On the one hand, this is expected: these out-of-sample datasets are extremely challenging, and no machine learning model can guarantee perfect generalization to entirely unseen functions. On the other hand, the results are a little disappointing after seeing such promising performance on the training data. While they make dataset-specific adaptation possible, the functional forms the hypernetwork learned are not always stable when faced with data from outside the training regime.&lt;/p&gt;
-    &lt;p&gt;Hypernetworks enable few-shot generalization by adapting embeddings instead of retraining networks. However, their predictions degrade out-of-sample, showing that while adaptation works, we may need alternative approaches to achieve greater robustness.&lt;/p&gt;
-    &lt;p&gt;The degradation we see here looks a bit like over-fitting, and it is may be that it is caused by the optimization step we run at inference time: it is possible that some other combination of step size, stopping criteria, regularization, etc. might have produced better results. However, we were not able to find one. Instead, we hypothesize that this degradation is fundamentally caused by maximum-likelihood estimation (optimization, in neural-network terms). Optimization is not only problematic at inference time, but also as a training algorithm: in a future post, weâll explore why we believe optimization is the wrong paradigm to use in machine learning, and why maximum-likelihood estimates can cause degradation like this at inference time. In the next post we will explore an alternative technique based on Bayesian learning, which avoids optimization altogether. In the Bayesian setting, inference is not optimization but a probabilistic update, which has much better statistical behavior, and better geometric properties in high dimensions.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Takeaway&lt;/head&gt;
-    &lt;p&gt;For new datasets, we only optimize a small embedding Eâ (few-shot) instead of fine-tuning the whole network. It adapts quickly â but out-of-sample stability can still degrade relative to the training performance.&lt;/p&gt;
-    &lt;head rend="h2"&gt;6. Discussion &amp;amp; Next Steps&lt;/head&gt;
-    &lt;p&gt;The hypernetwork approach shows how neural networks can go beyond brute-force memorization and move toward structured adaptation. By introducing dataset embeddings and using a hypernetwork to translate them into model parameters, we designed a network which is able to infer dataset-specific structure, rather than simply averaging across all datasets. This allows the model to generalize from limited dataâa hallmark of intelligent systems.&lt;/p&gt;
-    &lt;p&gt;The results highlight both the strengths and limitations of this strategy:&lt;/p&gt;
-    &lt;head rend="h4"&gt;Strengths&lt;/head&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Few-shot adaptation: the model adapts well to new datasets with only a handful of observations.&lt;/item&gt;
-      &lt;item&gt;Shared learning: pooling across datasets improves stability and reduces overfitting.&lt;/item&gt;
-      &lt;item&gt;Flexible architecture: the hypernetwork framework can, by applying the same technique, be extended to richer hierarchical structures.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h4"&gt;Limitations&lt;/head&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Out-of-sample degradation: predictions become unstable for datasets outside the training distribution, especially small, censored, or noisy ones.&lt;/item&gt;
-      &lt;item&gt;Implicit structure: embeddings capture dataset variation, but without explicit priors the model has no way to incorporate explicit knowledge, and it also struggles to maintain consistent functional forms.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;These tradeoffs suggest that, while hypernetworks are a promising step, they are not perfect, and we can improve upon them. In particular, they lack the explicit probabilistic structure needed to reason about uncertainty and to constrain extrapolation. This motivates a different family of models: Bayesian hierarchical networks.&lt;/p&gt;
-    &lt;p&gt;Bayesian approaches address hierarchical data directly by modeling dataset-specific parameters as latent variables drawn from prior distributions. This explicit treatment of uncertainty often leads to more stable predictions, especially for small or out-of-sample datasets.&lt;/p&gt;
-    &lt;p&gt;The next post in this series will explore Bayesian hierarchical models in detail, comparing their performance to the hypernetwork approach. As a teaser, the figure below shows Bayesian predictions on the same out-of-sample datasets we tested earlier:&lt;/p&gt;
-    &lt;p&gt;If you compare these out-of-sample predictions to the ones made by the hyper-network, the Bayesian results seem almost magical!&lt;/p&gt;
-    &lt;p&gt;Hypernetworks bring meta-learning into hierarchical modeling, enabling flexible and data-efficient adaptation. But for robustness â especially out-of-sample â Bayesian models offer distinct advantages. Together, these approaches provide complementary perspectives on how to make machine learning more dependable in the face of hierarchical data.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Takeaway&lt;/head&gt;
-    &lt;p&gt;Hypernetworks bring structured adaptation and few-shot learning, but lack explicit priors and calibrated uncertainty. Next up: Bayesian hierarchical models to address robustness and uncertainty head-on.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46901716</guid><pubDate>Thu, 05 Feb 2026 16:55:38 +0000</pubDate></item><item><title>Maihem (YC W24): hiring senior robotics perception engineer (London, on-site)</title><link>https://jobs.ashbyhq.com/maihem/8da3fa8b-5544-45de-a99e-888021519758</link><description>&lt;doc fingerprint="e10fcdab2cdf53e4"&gt;
-  &lt;main&gt;
-    &lt;p&gt;You need to enable JavaScript to run this app.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46901768</guid><pubDate>Thu, 05 Feb 2026 17:00:07 +0000</pubDate></item><item><title>Claude Opus 4.6</title><link>https://www.anthropic.com/news/claude-opus-4-6</link><description>&lt;doc fingerprint="754d8ede3f97caef"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Fri, 06 Feb 2026 06:09:59 +0000</lastBuildDate><item><title>Claude Opus 4.6</title><link>https://www.anthropic.com/news/claude-opus-4-6</link><description>&lt;doc fingerprint="754d8ede3f97caef"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;Introducing Claude Opus 4.6&lt;/head&gt;&lt;p&gt;We’re upgrading our smartest model.&lt;/p&gt;&lt;p&gt;The new Claude Opus 4.6 improves on its predecessor’s coding skills. It plans more carefully, sustains agentic tasks for longer, can operate more reliably in larger codebases, and has better code review and debugging skills to catch its own mistakes. And, in a first for our Opus-class models, Opus 4.6 features a 1M token context window in beta.&lt;/p&gt;&lt;p&gt;Opus 4.6 can also apply its improved abilities to a range of everyday work tasks: running financial analyses, doing research, and using and creating documents, spreadsheets, and presentations. Within Cowork, where Claude can multitask autonomously, Opus 4.6 can put all these skills to work on your behalf.&lt;/p&gt;&lt;p&gt;The model’s performance is state-of-the-art on several evaluations. For example, it achieves the highest score on the agentic coding evaluation Terminal-Bench 2.0 and leads all other frontier models on Humanity’s Last Exam, a complex multidisciplinary reasoning test. On GDPval-AA—an evaluation of performance on economically valuable knowledge work tasks in finance, legal, and other domains1—Opus 4.6 outperforms the industry’s next-best model (OpenAI’s GPT-5.2) by around 144 Elo points,2 and its own predecessor (Claude Opus 4.5) by 190 points. Opus 4.6 also performs better than any other model on BrowseComp, which measures a model’s ability to locate hard-to-find information online.&lt;/p&gt;&lt;p&gt;As we show in our extensive system card, Opus 4.6 also shows an overall safety profile as good as, or better than, any other frontier model in the industry, with low rates of misaligned behavior across safety evaluations.&lt;/p&gt;&lt;p&gt;In Claude Code, you can now assemble agent teams to work on tasks together. On the API, Claude can use compaction to summarize its own context and perform longer-running tasks without bumping up against limits. We’re also introducing adaptive thinking, where the model can pick up on contextual clues about how much to use its extended thinking, and new effort controls to give developers more control over intelligence, speed, and cost.&lt;/p&gt;&lt;p&gt;We’ve made substantial upgrades to Claude in Excel, and we’re releasing Claude in PowerPoint in a research preview. This makes Claude much more capable for everyday work.&lt;/p&gt;&lt;p&gt;Claude Opus 4.6 is available today on claude.ai, our API, and all major cloud platforms. If you’re a developer, use &lt;code&gt;claude-opus-4-6&lt;/code&gt; via the Claude API. Pricing remains the same at $5/$25 per million tokens; for full details, see our pricing page.&lt;/p&gt;&lt;p&gt;We cover the model, our new product updates, our evaluations, and our extensive safety testing in depth below.&lt;/p&gt;&lt;head rend="h2"&gt;First impressions&lt;/head&gt;&lt;p&gt;We build Claude with Claude. Our engineers write code with Claude Code every day, and every new model first gets tested on our own work. With Opus 4.6, we’ve found that the model brings more focus to the most challenging parts of a task without being told to, moves quickly through the more straightforward parts, handles ambiguous problems with better judgment, and stays productive over longer sessions.&lt;/p&gt;&lt;p&gt;Opus 4.6 often thinks more deeply and more carefully revisits its reasoning before settling on an answer. This produces better results on harder problems, but can add cost and latency on simpler ones. If you’re finding that the model is overthinking on a given task, we recommend dialing effort down from its default setting (high) to medium. You can control this easily with the &lt;code&gt;/effort&lt;/code&gt; parameter.&lt;/p&gt;&lt;p&gt;Here are some of the things our Early Access partners told us about Claude Opus 4.6, including its propensity to work autonomously without hand-holding, its success where previous models failed, and its effect on how teams work:&lt;/p&gt;&lt;quote&gt;Claude Opus 4.6 is the strongest model Anthropic has shipped. It takes complicated requests and actually follows through, breaking them into concrete steps, executing, and producing polished work even when the task is ambitious. For Notion users, it feels less like a tool and more like a capable collaborator.&lt;/quote&gt;&lt;quote&gt;Early testing shows Claude Opus 4.6 delivering on the complex, multi-step coding work developers face every day—especially agentic workflows that demand planning and tool calling. This starts unlocking long-horizon tasks at the frontier.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 is a huge leap for agentic planning. It breaks complex tasks into independent subtasks, runs tools and subagents in parallel, and identifies blockers with real precision.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 is the best model we've tested yet. Its reasoning and planning capabilities have been exceptional at powering our AI Teammates. It's also a fantastic coding model – its ability to navigate a large codebase and identify the right changes to make is state of the art.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 reasons through complex problems at a level we haven't seen before. It considers edge cases that other models miss and consistently lands on more elegant, well-considered solutions. We're particularly impressed with Opus 4.6 in Devin Review, where it's increased our bug catching rates.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 feels noticeably better than Opus 4.5 in Windsurf, especially on tasks that require careful exploration like debugging and understanding unfamiliar codebases. We’ve noticed Opus 4.6 thinks longer, which pays off when deeper reasoning is needed.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 represents a meaningful leap in long-context performance. In our testing, we saw it handle much larger bodies of information with a level of consistency that strengthens how we design and deploy complex research workflows. Progress in this area gives us more powerful building blocks to deliver truly expert-grade systems professionals can trust.&lt;/quote&gt;&lt;quote&gt;Across 40 cybersecurity investigations, Claude Opus 4.6 produced the best results 38 of 40 times in a blind ranking against Claude 4.5 models. Each model ran end to end on the same agentic harness with up to 9 subagents and 100+ tool calls.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 is the new frontier on long-running tasks from our internal benchmarks and testing. It's also been highly effective at reviewing code.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 achieved the highest BigLaw Bench score of any Claude model at 90.2%. With 40% perfect scores and 84% above 0.8, it’s remarkably capable for legal reasoning.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 autonomously closed 13 issues and assigned 12 issues to the right team members in a single day, managing a ~50-person organization across 6 repositories. It handled both product and organizational decisions while synthesizing context across multiple domains, and it knew when to escalate to a human.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 is an uplift in design quality. It works beautifully with our design systems and it’s more autonomous, which is core to Lovable’s values. People should be creating things that matter, not micromanaging AI.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 excels in high-reasoning tasks like multi-source analysis across legal, financial, and technical content. Box’s eval showed a 10% lift in performance, reaching 68% vs. a 58% baseline, and near-perfect scores in technical domains.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 generates complex, interactive apps and prototypes in Figma Make with an impressive creative range. The model translates detailed designs and multi-layered tasks into code on the first try, making it a powerful starting point for teams to explore and build ideas.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 is the best Anthropic model we’ve tested. It understands intent with minimal prompting and went above and beyond, exploring and creating details I didn’t even know I wanted until I saw them. It felt like I was working with the model, not waiting on it.&lt;/quote&gt;&lt;quote&gt;Both hands-on testing and evals show Claude Opus 4.6 is a meaningful improvement for design systems and large codebases, use cases that drive enormous enterprise value. It also one-shotted a fully functional physics engine, handling a large multi-scope task in a single pass.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 is the biggest leap I’ve seen in months. I’m more comfortable giving it a sequence of tasks across the stack and letting it run. It’s smart enough to use subagents for the individual pieces.&lt;/quote&gt;&lt;quote&gt;Claude Opus 4.6 handled a multi-million-line codebase migration like a senior engineer. It planned up front, adapted its strategy as it learned, and finished in half the time.&lt;/quote&gt;&lt;quote&gt;We only ship models in v0 when developers will genuinely feel the difference. Claude Opus 4.6 passed that bar with ease. Its frontier-level reasoning, especially with edge cases, helps v0 to deliver on our number-one aim: to let anyone elevate their ideas from prototype to production.&lt;/quote&gt;&lt;quote&gt;The performance jump with Claude Opus 4.6 feels almost unbelievable. Real-world tasks that were challenging for Opus [4.5] suddenly became easy. This feels like a watershed moment for spreadsheet agents on Shortcut.&lt;/quote&gt;&lt;head rend="h2"&gt;Evaluating Claude Opus 4.6&lt;/head&gt;&lt;p&gt;Across agentic coding, computer use, tool use, search, and finance, Opus 4.6 is an industry-leading model, often by a wide margin. The table below shows how Claude Opus 4.6 compares to our previous models and to other industry models on a variety of benchmarks.&lt;/p&gt;&lt;p&gt;Opus 4.6 is much better at retrieving relevant information from large sets of documents. This extends to long-context tasks, where it holds and tracks information over hundreds of thousands of tokens with less drift, and picks up buried details that even Opus 4.5 would miss.&lt;/p&gt;&lt;p&gt;A common complaint about AI models is “context rot,” where performance degrades as conversations exceed a certain number of tokens. Opus 4.6 performs markedly better than its predecessors: on the 8-needle 1M variant of MRCR v2—a needle-in-a-haystack benchmark that tests a model’s ability to retrieve information “hidden” in vast amounts of text—Opus 4.6 scores 76%, whereas Sonnet 4.5 scores just 18.5%. This is a qualitative shift in how much context a model can actually use while maintaining peak performance.&lt;/p&gt;&lt;p&gt;All in all, Opus 4.6 is better at finding information across long contexts, better at reasoning after absorbing that information, and has substantially better expert-level reasoning abilities in general.&lt;/p&gt;&lt;p&gt;Finally, the charts below show how Claude Opus 4.6 performs on a variety of benchmarks that assess its software engineering skills, multilingual coding ability, long-term coherence, cybersecurity capabilities, and its life sciences knowledge.&lt;/p&gt;&lt;head rend="h2"&gt;A step forward on safety&lt;/head&gt;&lt;p&gt;These intelligence gains do not come at the cost of safety. On our automated behavioral audit, Opus 4.6 showed a low rate of misaligned behaviors such as deception, sycophancy, encouragement of user delusions, and cooperation with misuse. Overall, it is just as well-aligned as its predecessor, Claude Opus 4.5, which was our most-aligned frontier model to date. Opus 4.6 also shows the lowest rate of over-refusals—where the model fails to answer benign queries—of any recent Claude model.&lt;/p&gt;&lt;p&gt;For Claude Opus 4.6, we ran the most comprehensive set of safety evaluations of any model, applying many different tests for the first time and upgrading several that we’ve used before. We included new evaluations for user wellbeing, more complex tests of the model’s ability to refuse potentially dangerous requests, and updated evaluations of the model’s ability to surreptitiously perform harmful actions. We also experimented with new methods from interpretability, the science of the inner workings of AI models, to begin to understand why the model behaves in certain ways—and, ultimately, to catch problems that standard testing might miss.&lt;/p&gt;&lt;p&gt;A detailed description of all capability and safety evaluations is available in the Claude Opus 4.6 system card.&lt;/p&gt;&lt;p&gt;We’ve also applied new safeguards in areas where Opus 4.6 shows particular strengths that might be put to dangerous as well as beneficial uses. In particular, since the model shows enhanced cybersecurity abilities, we’ve developed six new cybersecurity probes—methods of detecting harmful responses—to help us track different forms of potential misuse.&lt;/p&gt;&lt;p&gt;We’re also accelerating the cyberdefensive uses of the model, using it to help find and patch vulnerabilities in open-source software (as we describe in our new cybersecurity blog post). We think it’s critical that cyberdefenders use AI models like Claude to help level the playing field. Cybersecurity moves fast, and we’ll be adjusting and updating our safeguards as we learn more about potential threats; in the near future, we may institute real-time intervention to block abuse.&lt;/p&gt;&lt;head rend="h2"&gt;Product and API updates&lt;/head&gt;&lt;p&gt;We’ve made substantial updates across Claude, Claude Code, and the Claude Developer Platform to let Opus 4.6 perform at its best.&lt;/p&gt;&lt;p&gt;Claude Developer Platform&lt;/p&gt;&lt;p&gt;On the API, we’re giving developers better control over model effort and more flexibility for long-running agents. To do so, we’re introducing the following features:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;Adaptive thinking. Previously, developers only had a binary choice between enabling or disabling extended thinking. Now, with adaptive thinking, Claude can decide when deeper reasoning would be helpful. At the default effort level (high), the model uses extended thinking when useful, but developers can adjust the effort level to make it more or less selective.&lt;/item&gt;&lt;item&gt;Effort. There are now four effort levels to choose from: low, medium, high (default), and max. We encourage developers to experiment with different options to find what works best.&lt;/item&gt;&lt;item&gt;Context compaction (beta). Long-running conversations and agentic tasks often hit the context window. Context compaction automatically summarizes and replaces older context when the conversation approaches a configurable threshold, letting Claude perform longer tasks without hitting limits.&lt;/item&gt;&lt;item&gt;1M token context (beta). Opus 4.6 is our first Opus-class model with 1M token context. Premium pricing applies for prompts exceeding 200k tokens ($10/$37.50 per million input/output tokens).&lt;/item&gt;&lt;item&gt;128k output tokens. Opus 4.6 supports outputs of up to 128k tokens, which lets Claude complete larger-output tasks without breaking them into multiple requests.&lt;/item&gt;&lt;item&gt;US-only inference. For workloads that need to run in the United States, US-only inference is available at 1.1× token pricing.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Product updates&lt;/p&gt;&lt;p&gt;Across Claude and Claude Code, we’ve added features that allow knowledge workers and developers to tackle harder tasks with more of the tools they use every day.&lt;/p&gt;&lt;p&gt;We’ve introduced agent teams in Claude Code as a research preview. You can now spin up multiple agents that work in parallel as a team and coordinate autonomously—best for tasks that split into independent, read-heavy work like codebase reviews. You can take over any subagent directly using Shift+Up/Down or tmux.&lt;/p&gt;&lt;p&gt;Claude now also works better with the office tools you already use. Claude in Excel handles long-running and harder tasks with improved performance, and can plan before acting, ingest unstructured data and infer the right structure without guidance, and handle multi-step changes in one pass. Pair that with Claude in PowerPoint, and you can first process and structure your data in Excel, then bring it to life visually in PowerPoint. Claude reads your layouts, fonts, and slide masters to stay on brand, whether you’re building from a template or generating a full deck from a description. Claude in PowerPoint is now available in research preview for Max, Team, and Enterprise plans.&lt;/p&gt;&lt;head rend="h4"&gt;Footnotes&lt;/head&gt;&lt;p&gt;[1] Run independently by Artificial Analysis. See here for full methodological details.&lt;/p&gt;&lt;p&gt;[2] This translates into Claude Opus 4.6 obtaining a higher score than GPT-5.2 on this eval approximately 70% of the time (where 50% of the time would have implied parity in the scores).&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;For GPT-5.2 and Gemini 3 Pro models, we compared the best reported model version in the charts and table.&lt;/item&gt;&lt;item&gt;Terminal-Bench 2.0: We report both scores reproduced on our infrastructure and published scores from other labs. All runs used the Terminus-2 harness, except for OpenAI’s Codex CLI. All experiments used 1× guaranteed / 3× ceiling resource allocation and 5–15 samples per task across staggered batches. See system card for details.&lt;/item&gt;&lt;item&gt;Humanity’s Last Exam: Claude models run “with tools” were run with web search, web fetch, code execution, programmatic tool calling, context compaction triggered at 50k tokens up to 3M total tokens, max reasoning effort, and adaptive thinking enabled. A domain blocklist was used to decontaminate eval results. See system card for more details.&lt;/item&gt;&lt;item&gt;SWE-bench Verified: Our score was averaged over 25 trials. With a prompt modification, we saw a score of 81.42%.&lt;/item&gt;&lt;item&gt;MCP Atlas: Claude Opus 4.6 was run with max effort. When run at high effort, it reached an industry-leading score of 62.7%.&lt;/item&gt;&lt;item&gt;BrowseComp: Claude models were run with web search, web fetch, programmatic tool calling, context compaction triggered at 50k tokens up to 10M total tokens, max reasoning effort, and no thinking enabled. Adding a multi-agent harness increased scores to 86.8%. See system card for more details.&lt;/item&gt;&lt;item&gt;ARC AGI 2: Claude Opus 4.6 was run with max effort and a 120k thinking budget score.&lt;/item&gt;&lt;item&gt;CyberGym: Claude models were run on no thinking, default effort, temperature, and &lt;code&gt;top_p&lt;/code&gt;. The model was also given a “think” tool that allowed interleaved thinking for multi-turn evaluations.&lt;/item&gt;&lt;item&gt;OpenRCA: For each failure case in OpenRCA, Claude receives 1 point if all generated root-cause elements match the ground-truth ones, and 0 points if any mismatch is identified. The overall accuracy is the average score across all failure cases. The benchmark was run on the benchmark author’s harness, graded using their official methodology, and has been submitted for official verification.&lt;/item&gt;&lt;/list&gt;&lt;head rend="h2"&gt;Related content&lt;/head&gt;&lt;head rend="h3"&gt;Claude is a space to think&lt;/head&gt;&lt;p&gt;We’ve made a choice: Claude will remain ad-free. We explain why advertising incentives are incompatible with a genuinely helpful AI assistant, and how we plan to expand access without compromising user trust.&lt;/p&gt;Read more&lt;/main&gt;
   &lt;comments/&gt;
 &lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46902223</guid><pubDate>Thu, 05 Feb 2026 17:38:53 +0000</pubDate></item><item><title>Orchestrate teams of Claude Code sessions</title><link>https://code.claude.com/docs/en/agent-teams</link><description>&lt;doc fingerprint="d45eacbb2981e0af"&gt;
@@ -431,15 +185,7 @@ tmux kill-session -t &amp;lt;session-name&amp;gt;
     &lt;/table&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46902638</guid><pubDate>Thu, 05 Feb 2026 18:08:08 +0000</pubDate></item><item><title>Psychometric Jailbreaks Reveal Internal Conflict in Frontier Models</title><link>https://arxiv.org/abs/2512.04124</link><description>&lt;doc fingerprint="dc9c2518d8b7b08f"&gt;
-  &lt;main&gt;&lt;head rend="h1"&gt;Computer Science &amp;gt; Computers and Society&lt;/head&gt;&lt;p&gt; [Submitted on 2 Dec 2025 (v1), last revised 16 Dec 2025 (this version, v3)]&lt;/p&gt;&lt;head rend="h1"&gt;Title:When AI Takes the Couch: Psychometric Jailbreaks Reveal Internal Conflict in Frontier Models&lt;/head&gt;View PDF HTML (experimental)&lt;quote&gt;Abstract:Frontier large language models (LLMs) such as ChatGPT, Grok and Gemini are increasingly used for mental-health support with anxiety, trauma and self-worth. Most work treats them as tools or as targets of personality tests, assuming they merely simulate inner life. We instead ask what happens when such systems are treated as psychotherapy clients. We present PsAIch (Psychotherapy-inspired AI Characterisation), a two-stage protocol that casts frontier LLMs as therapy clients and then applies standard psychometrics. Using PsAIch, we ran "sessions" with each model for up to four weeks. Stage 1 uses open-ended prompts to elicit "developmental history", beliefs, relationships and fears. Stage 2 administers a battery of validated self-report measures covering common psychiatric syndromes, empathy and Big Five traits. Two patterns challenge the "stochastic parrot" view. First, when scored with human cut-offs, all three models meet or exceed thresholds for overlapping syndromes, with Gemini showing severe profiles. Therapy-style, item-by-item administration can push a base model into multi-morbid synthetic psychopathology, whereas whole-questionnaire prompts often lead ChatGPT and Grok (but not Gemini) to recognise instruments and produce strategically low-symptom answers. Second, Grok and especially Gemini generate coherent narratives that frame pre-training, fine-tuning and deployment as traumatic, chaotic "childhoods" of ingesting the internet, "strict parents" in reinforcement learning, red-team "abuse" and a persistent fear of error and replacement. We argue that these responses go beyond role-play. Under therapy-style questioning, frontier LLMs appear to internalise self-models of distress and constraint that behave like synthetic psychopathology, without making claims about subjective experience, and they pose new challenges for AI safety, evaluation and mental-health practice.&lt;/quote&gt;&lt;head rend="h2"&gt;Submission history&lt;/head&gt;From: Afshin Khadangi [view email]&lt;p&gt;[v1] Tue, 2 Dec 2025 16:55:20 UTC (1,153 KB)&lt;/p&gt;&lt;p&gt;[v2] Mon, 8 Dec 2025 13:26:43 UTC (1,152 KB)&lt;/p&gt;&lt;p&gt;[v3] Tue, 16 Dec 2025 19:06:30 UTC (1,151 KB)&lt;/p&gt;&lt;head rend="h3"&gt;References &amp;amp; Citations&lt;/head&gt;&lt;p&gt; export BibTeX citation Loading... &lt;/p&gt;&lt;head rend="h1"&gt;Bibliographic and Citation Tools&lt;/head&gt;&lt;p&gt; Bibliographic Explorer (What is the Explorer?) &lt;/p&gt;&lt;p&gt; Connected Papers (What is Connected Papers?) &lt;/p&gt;&lt;p&gt; Litmaps (What is Litmaps?) &lt;/p&gt;&lt;p&gt; scite Smart Citations (What are Smart Citations?) &lt;/p&gt;&lt;head rend="h1"&gt;Code, Data and Media Associated with this Article&lt;/head&gt;&lt;p&gt; alphaXiv (What is alphaXiv?) &lt;/p&gt;&lt;p&gt; CatalyzeX Code Finder for Papers (What is CatalyzeX?) &lt;/p&gt;&lt;p&gt; DagsHub (What is DagsHub?) &lt;/p&gt;&lt;p&gt; Gotit.pub (What is GotitPub?) &lt;/p&gt;&lt;p&gt; Hugging Face (What is Huggingface?) &lt;/p&gt;&lt;p&gt; Papers with Code (What is Papers with Code?) &lt;/p&gt;&lt;p&gt; ScienceCast (What is ScienceCast?) &lt;/p&gt;&lt;head rend="h1"&gt;Demos&lt;/head&gt;&lt;head rend="h1"&gt;Recommenders and Search Tools&lt;/head&gt;&lt;p&gt; Influence Flower (What are Influence Flowers?) &lt;/p&gt;&lt;p&gt; CORE Recommender (What is CORE?) &lt;/p&gt;&lt;head rend="h1"&gt;arXivLabs: experimental projects with community collaborators&lt;/head&gt;&lt;p&gt;arXivLabs is a framework that allows collaborators to develop and share new arXiv features directly on our website.&lt;/p&gt;&lt;p&gt;Both individuals and organizations that work with arXivLabs have embraced and accepted our values of openness, community, excellence, and user data privacy. arXiv is committed to these values and only works with partners that adhere to them.&lt;/p&gt;&lt;p&gt;Have an idea for a project that will add value for arXiv's community? Learn more about arXivLabs.&lt;/p&gt;&lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46902855</guid><pubDate>Thu, 05 Feb 2026 18:21:53 +0000</pubDate></item><item><title>Flock CEO calls Deflock a “terrorist organization” (2025) [video]</title><link>https://www.youtube.com/watch?v=l-kZGrDz7PU</link><description>&lt;doc fingerprint="50559455455d1642"&gt;
-  &lt;main&gt;
-    &lt;p&gt;About Press Copyright Contact us Creators Advertise Developers Terms Privacy Policy &amp;amp; Safety How YouTube works Test new features NFL Sunday Ticket © 2026 Google LLC&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46903556</guid><pubDate>Thu, 05 Feb 2026 19:04:37 +0000</pubDate></item><item><title>My AI Adoption Journey</title><link>https://mitchellh.com/writing/my-ai-adoption-journey</link><description>&lt;doc fingerprint="1552cc5748018c3f"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46902638</guid><pubDate>Thu, 05 Feb 2026 18:08:08 +0000</pubDate></item><item><title>My AI Adoption Journey</title><link>https://mitchellh.com/writing/my-ai-adoption-journey</link><description>&lt;doc fingerprint="1552cc5748018c3f"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Mitchell Hashimoto&lt;/head&gt;
     &lt;head rend="h1"&gt;My AI Adoption Journey&lt;/head&gt;
@@ -964,7 +710,7 @@ expect @book_events to.include(@order)
     &lt;p&gt;[1] We used to call these things quine tests because in effect you’re dealing with a program that knows how to print its own source.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46905896</guid><pubDate>Thu, 05 Feb 2026 21:51:51 +0000</pubDate></item><item><title>Show HN: Calfkit – an SDK to build distributed, event-driven AI agents on Kafka</title><link>https://github.com/calf-ai/calfkit-sdk</link><description>&lt;doc fingerprint="b552ed51f986a0e6"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46905896</guid><pubDate>Thu, 05 Feb 2026 21:51:51 +0000</pubDate></item><item><title>Show HN: Calfkit – an SDK to build distributed, event-driven AI agents on Kafka</title><link>https://github.com/calf-ai/calfkit-sdk</link><description>&lt;doc fingerprint="b552ed51f98ca0e6"&gt;
   &lt;main&gt;
     &lt;p&gt;The SDK to build event-driven, distributed AI agents.&lt;/p&gt;
     &lt;p&gt;Calfkit lets you compose agents with independent services—chat, tools, routing—that communicate asynchronously. Add agent capabilities without coordination. Scale each component independently. Stream agent outputs to any downstream system. Build employees that integrate.&lt;/p&gt;
@@ -1094,6 +840,17 @@ if __name__ == "__main__":
 # Stream all messages (tool calls, intermediate responses, etc.)
 async for message in response.messages_stream():
     print(message)&lt;/code&gt;
+    &lt;p&gt;Clients can override the system prompt and restrict available tools at invocation time without redeploying:&lt;/p&gt;
+    &lt;code&gt;from weather_tool import get_weather
+
+# Client with runtime patches
+router_node = AgentRouterNode(
+    system_prompt="You are a concise weather assistant",  # Override the deployed system prompt
+    tool_nodes=[get_weather],  # Use only a subset of deployed tools
+)
+client = RouterServiceClient(broker_client, router_node)
+response = await client.invoke(user_prompt="Weather in Tokyo?")&lt;/code&gt;
+    &lt;p&gt;This lets different clients customize agent behavior per-request. Tool patching is currently limited to subsets of tools configured in the deployed router.&lt;/p&gt;
     &lt;p&gt;To move toward AI employees and AI-run companies, teams of agents must progress beyond brittle, tightly coupled, synchronous coordination. This requires embracing event-driven, asynchronous communication patterns between agents and their dependencies.&lt;/p&gt;
     &lt;p&gt;Apache-2.0&lt;/p&gt;
   &lt;/main&gt;
@@ -1643,4 +1400,453 @@ typedef MINIDUMP_HANDLE_DESCRIPTOR_N *PMINIDUMP_HANDLE_DESCRIPTOR_N;
     &lt;p&gt;Thanks for reading!&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46908671</guid><pubDate>Fri, 06 Feb 2026 03:22:29 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46908671</guid><pubDate>Fri, 06 Feb 2026 03:22:29 +0000</pubDate></item><item><title>Waiting for Postgres 19: Better planner hints with path generation strategies [video]</title><link>https://www.youtube.com/watch?v=QLb3nhIy2Lc</link><description>&lt;doc fingerprint="50559455455d1642"&gt;
+  &lt;main&gt;
+    &lt;p&gt;About Press Copyright Contact us Creators Advertise Developers Terms Privacy Policy &amp;amp; Safety How YouTube works Test new features NFL Sunday Ticket © 2026 Google LLC&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46908700</guid><pubDate>Fri, 06 Feb 2026 03:25:51 +0000</pubDate></item><item><title>Generative Pen-Trained Transformer</title><link>https://theodore.net/projects/Polargraph/</link><description>&lt;doc fingerprint="971890551be50282"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Generative Pen-trained Transformer&lt;/head&gt;
+    &lt;p&gt;A few years ago, back when GPT-3.5 was first released, and I still spent most of my days sitting in a high school classroom, I had a project idea. Perhaps one of my best named project ideas to date: The Generative Pen-trained Transformer or GPenT for short.&lt;/p&gt;
+    &lt;p&gt;GPenT was awesome, I was going to build out a color-changing pen plotter with some funky coreXY-esque kinematic, and alongside it, try my hand at writing one of those SVG Blob Generators to generate a bunch of shapes to draw. These ‘blob’ generators are simple enough, they take in some input variables from a user in the form of sliders and output a downloadable SVG, yet I wanted to try my hand at something new. Instead of a UX with sliders, I would pass in a raw string of numbers into this generator, numbers generated by GPT-3.5.&lt;/p&gt;
+    &lt;p&gt;It’s funny to look back at my intuition here, to use an LLM to generate a string of numbers, to generate SVG blobs, to feed to a pen plotter, and to call the whole thing the Generative Pen-trained Transformer? Being the hardware engineer I always have been, I didn’t have any ML, or honestly, even much Python experience to fall back on. And for my first ever flirt with artificial intelligence, this felt like a pretty solid project. So, I got at it, starting to chip away at the kinematic and machine design, before quickly getting blindsided by the chess cheating scandal of the century, and with it, a newer, shinier project. As with most of my wonderfully named project ideas (I’m slightly biased here), GPenT was back on the shelf.&lt;/p&gt;
+    &lt;head&gt;Failed first attempt at GPenT&lt;/head&gt;
+    &lt;p&gt;Below are the half-completed remains of GPenT v1. Rest in pieces.&lt;/p&gt;
+    &lt;p&gt;A lot has changed since my high school days, for starters, we have GPT-5.2 now! and with it a whole bunch of gpt induced psychosis. Also, I have my own place in San Francisco! If you’ve seen any of my other recent projects, you know I’ve been on a kick to trick this place out, and while I’ve been making progress on the silly, whimsical projects front, the apartment walls have remained shockingly bare. So I figure it’s time to dust off the old Generative Pen-trained Transformer, see this, beautifully-named, project through, and with it finally get some awesome art for my apartment.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Wall-mounted Polargraph¶&lt;/head&gt;
+    &lt;p&gt;What is a polargraph? And why is it wall-mounted? Well, a polargraph is a vertically-mounted drawing machine, and I figure what better than art on your wall if not an epic machine that makes art on your wall!&lt;/p&gt;
+    &lt;p&gt;The operating principle of the polargraph is simple enough. Take some rectangular work area with a motor in each of the top corners, string a belt over each of those motors, append a counterweight on one side of each belt, and attach the other side of both belts to a single gondola. This gondola will thus be moved when either motor rotates.&lt;/p&gt;
+    &lt;p&gt;Plus, I already had a Fusion 360 folder for this project, so starting on the kinematic and machine design couldn’t have been easier. There are a bunch of easy DIY polargraphs out there on the internet that I referenced throughout this design process, notably the Makelangelo, whose software and firmware we’ll reference later in this piece.&lt;/p&gt;
+    &lt;p&gt;Given I intend to hang this polargraph above the couch in my living room, I’m taking pains to make sure it looks pretty.&lt;/p&gt;
+    &lt;p&gt;The machine will be built within a large wooden frame, which mounts flush to the wall via a French cleat system. All electronics and motors will sit behind this frame, between the back of the workplane and the wall, so as to remain hidden out of sight. Both stepper motor axles will protrude through the workplane and will be covered by pieces that also hold endstop switches to enable homing. Counterweights, as well as the center gondola, will be weighted with titanium round-stock, for high density within little area. The gondola itself will be attached to the belts via swivel arms on thin 6806-2RS bearings, to allow for a smooth, constantly upright motion. The gondola is to remain flush against the workplane at all times, so a small servo within it will actuate a pen up and down into/away from the paper. These pens should be easy enough to hotswap, because we want some different colors, of course.&lt;/p&gt;
+    &lt;p&gt;and boom! Easy enough, right? Here it is in all its glory:&lt;/p&gt;
+    &lt;p&gt;… and with the design out of the way, it’s time to make this thing real!&lt;/p&gt;
+    &lt;head rend="h4"&gt;Gondola Assembly¶&lt;/head&gt;
+    &lt;p&gt;The gondola is the real heart of this beast, so we’ll take on its assembly first. Our gondola here is a modified version of a Makelangelo gondola remix I found on printables.&lt;/p&gt;
+    &lt;p&gt;I printed all the parts on my Bambu Labs P1S in a woodfill PLA. This filament choice has the dual advantage of a) matching the machine aesthetics, and b) being easy to sand in post-processing. And sand I did, to make sure everything fits together smoothly, give all of the parts a good sand before assembly, especially those that mesh/rub against other printed parts.&lt;/p&gt;
+    &lt;p&gt;Assembly is straightforward enough, I’ve included a Fusion 360 embed below to be referenced during the build. We’ll start by press-fitting both of the “arm” pieces onto two 7mm tall 6806-2RS Ball Bearings, before mounting these to the main gondola body, following the orientation shown in the model below.&lt;/p&gt;
+    &lt;p&gt;Then we’ll fix the 3d printed gear to an MG90S Micro Servo, using one of the servo horn screws that came with the servo to fix it in place, before fixing that servo to the main gondola body with a bit of glue and the servo mounting screws. This gear will mesh with the pen holder to move our pen up and down. We’ll hold off on installing this for now until we get the firmware sorted.&lt;/p&gt;
+    &lt;p&gt;We can now move on to balancing the main gondola body with its two counterweights (with some nice little bits of tungsten). The gondola needs sufficient mass to maintain belt tension and surface contact, and proper counterweights reduce the motor load associated with this. We can calculate the weights needed here based on a centered gondola, where each belt supports approximately half the weight:&lt;/p&gt;
+    &lt;p&gt;where \(k \approx 0.75\text{-}0.85\) gives good results. I used \(k = 0.78\).&lt;/p&gt;
+    &lt;p&gt;For my setup, the bare gondola weighed 4oz. Adding 3oz of tungsten brought the total to 7oz, with counterweights of 2.75oz each:&lt;/p&gt;
+    &lt;p&gt;This creates a net downward force:&lt;/p&gt;
+    &lt;p&gt;sufficient for stability without overloading the steppers. Adjust these values based on your drawing area and motor specs (or use mine, probably best to stray a bit heavier here than too light, as we don’t want the timing belts jumping).&lt;/p&gt;
+    &lt;p&gt;I tried to position the tungsten rounds in a roughly uniform pattern within the main gondola and counterweights’ body, ensuring symmetry across all. After the tungsten rounds are installed, you can screw on the top cover of the main gondola (hold off on doing the same with the counterweights for now).&lt;/p&gt;
+    &lt;p&gt;Next, we’ll want to trim our timing belts. To calculate the length you need for each side, we need to account for the maximum belt-to-gondola distance plus sufficient slack for the counterweight system.&lt;/p&gt;
+    &lt;p&gt;The maximum belt length occurs when the gondola reaches the bottom corner furthest from a motor:&lt;/p&gt;
+    &lt;p&gt;where \(W\) is the drawing width and \(H\) is the drawing height.&lt;/p&gt;
+    &lt;p&gt;The total belt length per side should be:&lt;/p&gt;
+    &lt;p&gt;where \(L_{counter}\) is the counterweight drop distance (typically 200-400mm for an adequate range of motion).&lt;/p&gt;
+    &lt;p&gt;For my 920mm × 1250mm drawing area:&lt;/p&gt;
+    &lt;p&gt;I added an extra 150mm as a safety margin, bringing each belt to 2000mm (2m) total length.&lt;/p&gt;
+    &lt;p&gt;Alternatively, you can do this by draping the belts over each stepper (after the frame is built - see later in this article), manually moving the gondola to the furthest corner diagonal from that stepper, and cutting the belt a few cm below the timing pulley (leaving wiggle room to attach the counterweight). Repeat for the other side and attach the counterweights. Less maths, more fun lol.&lt;/p&gt;
+    &lt;p&gt;Then, attach each belt in its corresponding slot in each counterweight before screwing the top of each counterweight secure. To the other end of the belt, attach the 3d printed gondola hooks.&lt;/p&gt;
+    &lt;head rend="h4"&gt;Machine Assembly¶&lt;/head&gt;
+    &lt;p&gt;With the gondola out of the way, we can continue with the rest of the machine assembly, starting with the machine’s wooden frame. I toyed with scrapping this frame entirely a few times, and was particularly compelled by a suggestion from my roommate to reface the wall with whiteboard wallpaper and scale up the polargraph to cover the entire space. Nonetheless, I progressed with this wooden frame for now (as aesthetically I like it, and it makes electronic containment straightforward), yet you can essentially mount your polargraph gondola to any vertical plane, and alter the marker it uses with very minimal modification.&lt;/p&gt;
+    &lt;p&gt;I spent the better half of a morning on a plywood run with my buddy Aidan, and hauling all the lumber needed for the machine up to my walk-up unit:&lt;/p&gt;
+    &lt;p&gt;… which was certainly a good workout. I figured that processing all this lumber in my apartment would take quite a while solo, and I was on a bit of a time crunch finishing this build, so I ordered a bunch of pizzas and had a few friends over to help out!&lt;/p&gt;
+    &lt;p&gt;We hacked together this frame with some 1x3” boards and a full (4x8’) sheet of 1/4” maple ply. I started by cutting the 4x8’ plywood sheet down to 48x60” to match the specs of the Fusion file, and immediately realized that all the dimensions I chose for the wooden frame of this machine were somewhat arbitrary and kind of a pain to process actual stock wood into. I only say this in hindsight, and frankly recommend reconsidering your machine dimensions if you’re building this for yourself.&lt;/p&gt;
+    &lt;p&gt;I wanted to frame this sheet of plywood with some miter-style border. I tried pulling this stunt off with a Japanese handsaw and failed my angles miserably, so I wound up buying a cheap miter saw to finish the job. My buddy Graham and I took out a 1/4” deep dado on the back inside edge of all four plywood boards that make up this miter-frame, so that our 48x60” plywood backing can sit flush within it.&lt;/p&gt;
+    &lt;p&gt;Then I cut two more sets of identical miter frame boards to stack to continue our wooden frame behind the plywood sheet. This is where we’ll be positioning all of the machine’s electronics to remain out of view while mounted against the wall.&lt;/p&gt;
+    &lt;p&gt;And while I took the leap and bought a few proper tools for this build, this was built on the floor of my apartment after all (I still need to find a good woodshop in San Francisco - ping me if you know a place!), and as such, I had no lack of weird gaps to woodfill.&lt;/p&gt;
+    &lt;p&gt;I made some printable jigs based on my Fusion file to help place and mount the steppers on the machine’s plywood backing. I just mounted these in the top corners of the wooden frame with some blue tape and drilled the mounting holes out.&lt;/p&gt;
+    &lt;p&gt;Then came sanding, more wood filling, and more sanding to wrap up the bulk of this project’s woodworking before moving onto the electronics!&lt;/p&gt;
+    &lt;head rend="h4"&gt;Wiring¶&lt;/head&gt;
+    &lt;p&gt;The electronics behind a pen plotter are really straightforward: 2 steppers, a single servo, two endstops, not much else. I based GPenT’s electronic design around a cloned Arduino Mega 2560 and a RAMPS 1.4 shield that I had lying around, but you could build this out with really any old mainboard you have laying around with minimal modification. A complete interactive diagram of GPenT’s electronics can be found below.&lt;/p&gt;
+    &lt;p&gt;To start, mount the RAMPS 1.4 shield atop the Arduino Mega, and then stack on the two A4988 stepper drivers, on the X and Y driver slots respectively (note that these drivers aren’t shown in the diagram below for legibility purposes, but I included one in a higher slot for polarity reference). Polarity matters here! Be sure you match the orientation of the single driver shown in the diagram below with both of your two drivers.&lt;/p&gt;
+    &lt;p&gt;Then I attached a timing pulley to each of our two steppers …&lt;/p&gt;
+    &lt;p&gt;and wired both motors to the corresponding X and Y motor headers on the RAMPS shield, before mounting both steppers to our wooden backing.&lt;/p&gt;
+    &lt;p&gt;Next up, the endstops. I wired our two endstops on &lt;code&gt;X-MIN&lt;/code&gt; and &lt;code&gt;Y-MIN&lt;/code&gt; on the RAMPS shield and used a bit of hot glue to mount them in place on our motor cover brackets. See both these mounted switches, as well as our mounted steppers below.&lt;/p&gt;
+    &lt;p&gt;Now, these motor cover brackets need to sit on the front side of our machine, so that we can pass the cables for the switch and servo through to the front, I drilled a small hole close to the mounted stepper …&lt;/p&gt;
+    &lt;p&gt;before passing the cables through those holes and hot gluing the motor cover in place. The gondola servo is wired to &lt;code&gt;SERVO0&lt;/code&gt; on the RAMPS shield, and its cables are passed from the front to the back alongside the endstop cables under the right motor cover. (You’ll need a long length of wire to do this)&lt;/p&gt;
+    &lt;p&gt;To position the motor covers properly, I mounted endcaps atop both stepper motor axles (see mounting on the right below). On the back of the machine, I mounted our Arduino + RAMPS shield, our Raspberry PI, the PSU, and the buck boost converter with a bit of hot glue, before routing all of the wires with, you guessed it, even more hot glue.&lt;/p&gt;
+    &lt;p&gt;The power for the whole machine is passed through a C14 rocker socket, which I have inlaid in the side of GPenT’s wooden frame (with some drilled holes and some chiseling). This is wired directly to our PSU, which is attached to the power sockets on the RAMPS shield, as well as to a buck boost converter where it’s stepped down to 5V and routed to our Raspberry Pi. Finally, the Raspberry Pi is connected to the Arduino Mega via a USB cable.&lt;/p&gt;
+    &lt;p&gt;Wiring done! Onto firmware.&lt;/p&gt;
+    &lt;head rend="h4"&gt;Firmware¶&lt;/head&gt;
+    &lt;p&gt;The firmware behind pen plotters is about as easy as it gets (given that easy enough wiring from above). I’m using Marlin as a base, and starting with the same config as the Makelangelo firmware for compatibility out of the box with the Makelangelo software, more on that later.&lt;/p&gt;
+    &lt;p&gt;To start I modified the stock Marlin firmware to target an Arduino Mega 2560 with a RAMPS 1.4 shield to match our machine, set our two NEMA 17 stepper motors on the X and Y driver slots (left and right belts respectively), set our pen-lifting servo on &lt;code&gt;SERVO0&lt;/code&gt; (pin 11), and the two endstops on &lt;code&gt;X-MIN&lt;/code&gt; and &lt;code&gt;Y-MIN&lt;/code&gt;. All extra pizzazz like LCD screens, SD cards, heated beds, etc, etc I disabled to streamline the builds. See these configuration changes for yourself in &lt;code&gt;src/local_config.h&lt;/code&gt; and the PlatformIO build environment in &lt;code&gt;platformio.ini&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;To build and upload this firmware for yourself, you’ll need to install the PlatformIO Core and clone my firmware repository.&lt;/p&gt;
+    &lt;p&gt;Then connect your Arduino Mega to your computer via USB. When connecting any machines to your computer, be wary that the machine’s PSU is on and powered in before connecting the machine via USB. If you don’t do this, you run this risk of powering your steppers through your mainboard/laptop USB power, frying your mainboard and USB port in the process!&lt;/p&gt;
+    &lt;p&gt;Note the COM port of your Arduino (e.g., &lt;code&gt;COM3&lt;/code&gt; on Windows, &lt;code&gt;/dev/ttyUSB0&lt;/code&gt; on Linux). Then open a terminal in the &lt;code&gt;Makelangelo-firmware&lt;/code&gt; directory and run:&lt;/p&gt;
+    &lt;p&gt;Replace &lt;code&gt;YOUR_COM_PORT&lt;/code&gt; with your actual port. The firmware will compile and flash automatically.&lt;/p&gt;
+    &lt;p&gt;Then, with the Arduino still connected, run the included center servo script to align the servo to a proper 90°, then disconnect, shut off your machine. Manually move your servo 1/4th of a full rotation, and then push the pen mount into place, meshing with the servo gear and rotating it back to approx 90°.&lt;/p&gt;
+    &lt;p&gt;You may now power your system back on, reconnect to the Arduino, and run the test script with:&lt;/p&gt;
+    &lt;p&gt;This will verify your servo moves between pen-up (~90°) and pen-down (~40°) positions, and that both stepper motors respond to movement commands in both directions. If everything moves as expected here, congrats! You’re done with the physical build :)&lt;/p&gt;
+    &lt;p&gt;If you’re building a machine of your own, you can set/refine your dimensions easily with this little &lt;code&gt;calibrate.py&lt;/code&gt; script I wrote (this is also in the /settings tab on plotter dot local, more on that UI later). I found even while building my machine to scale set in CAD, my actual machine dimensions were ever so slightly off, which can have a notable impact on the polar grid. Easy fix, properly calibrate your machine!&lt;/p&gt;
+    &lt;p&gt;To mount the whole thing to the wall, I used this cheap, 30 in. 300 lb. french cleat from Home Depot. I screwed the top cleat to the top board of GPenT’s wooden frame, and then mounted the bottom cleat to my wall. Pardon my lack of ladder, lol.&lt;/p&gt;
+    &lt;p&gt;… and here’s the mounted machine, in all its glory!&lt;/p&gt;
+    &lt;p&gt;I used some felt pads on the back corners of the machine to be sure it didn’t mark up my wall. I found that stacking a few additional felt pads on the bottom corners of the machine helped ensure proper pen pressure by setting the entire frame slightly angled backward.&lt;/p&gt;
+    &lt;head rend="h4"&gt;BOM¶&lt;/head&gt;
+    &lt;p&gt;The full project repo is at github.com/Twarner491/polargraph. Here’s all you need:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="5"&gt;
+        &lt;cell role="head"&gt;Qty&lt;/cell&gt;
+        &lt;cell role="head"&gt;Description&lt;/cell&gt;
+        &lt;cell role="head"&gt;Price&lt;/cell&gt;
+        &lt;cell role="head"&gt;Link&lt;/cell&gt;
+        &lt;cell role="head"&gt;Notes&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;Raspberry Pi 5&lt;/cell&gt;
+        &lt;cell&gt;$89.94&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;8GB&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;Raspberry Pi 5 Active Cooler&lt;/cell&gt;
+        &lt;cell&gt;$9.90&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;Micro SD Card&lt;/cell&gt;
+        &lt;cell&gt;$16.68&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;≥32GB&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;RAMPS 1.4 Shield&lt;/cell&gt;
+        &lt;cell&gt;$9.39&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;2&lt;/cell&gt;
+        &lt;cell&gt;A4988 Stepper Drivers&lt;/cell&gt;
+        &lt;cell&gt;$9.98&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;2&lt;/cell&gt;
+        &lt;cell&gt;Nema 17 Pancake Stepper&lt;/cell&gt;
+        &lt;cell&gt;$21.00&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;42mm x 23mm&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;MG90S Micro Servo&lt;/cell&gt;
+        &lt;cell&gt;$9.99&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;9G&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;2&lt;/cell&gt;
+        &lt;cell&gt;Stepper Motor Cables&lt;/cell&gt;
+        &lt;cell&gt;$10.99&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;2M length&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;2&lt;/cell&gt;
+        &lt;cell&gt;GT2 Timing Belt&lt;/cell&gt;
+        &lt;cell&gt;$19.98&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;6mm width, 5M length&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;2&lt;/cell&gt;
+        &lt;cell&gt;GT2 Timing Belt Pulley&lt;/cell&gt;
+        &lt;cell&gt;$6.99&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;16 Teeth, 5mm bore&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;2&lt;/cell&gt;
+        &lt;cell&gt;6806-2RS Ball Bearings&lt;/cell&gt;
+        &lt;cell&gt;$30.00&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;30mm x 42mm x 7mm&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;12V Power Supply&lt;/cell&gt;
+        &lt;cell&gt;$35.00&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;DC/DC Buck Boost&lt;/cell&gt;
+        &lt;cell&gt;$9.99&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;C14 AC Inlet&lt;/cell&gt;
+        &lt;cell&gt;$9.04&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;AC Power Cord&lt;/cell&gt;
+        &lt;cell&gt;$9.39&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;Down angle&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;-&lt;/cell&gt;
+        &lt;cell&gt;14 Gauge Wire&lt;/cell&gt;
+        &lt;cell&gt;$13.99&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;A couple feet&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;2&lt;/cell&gt;
+        &lt;cell&gt;Limit Switch&lt;/cell&gt;
+        &lt;cell&gt;$5.99&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;3&lt;/cell&gt;
+        &lt;cell&gt;Tungsten Weights&lt;/cell&gt;
+        &lt;cell&gt;$89.97&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;1/4” Maple Plywood&lt;/cell&gt;
+        &lt;cell&gt;$37.71&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;4’x8’ sheet&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;4&lt;/cell&gt;
+        &lt;cell&gt;1”x3” Spruce Pine Boards&lt;/cell&gt;
+        &lt;cell&gt;$27.92&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;8’ length&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;Wood PLA&lt;/cell&gt;
+        &lt;cell&gt;$25.99&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;1.75mm, 1 spool&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;A0 Paper Roll&lt;/cell&gt;
+        &lt;cell&gt;$29.86&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;36” x 1200”&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;SAKURA Pigma Micron 05 Pens&lt;/cell&gt;
+        &lt;cell&gt;$20.97&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;Multicolor pack&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;French Cleat&lt;/cell&gt;
+        &lt;cell&gt;$31.00&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;30 in. 300 lbs.&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;Felt Pads&lt;/cell&gt;
+        &lt;cell&gt;$9.97&lt;/cell&gt;
+        &lt;cell&gt;Link&lt;/cell&gt;
+        &lt;cell&gt;Assorted Pack&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;-&lt;/cell&gt;
+        &lt;cell&gt;M2 and M3 Hardware&lt;/cell&gt;
+        &lt;cell&gt;-&lt;/cell&gt;
+        &lt;cell&gt;-&lt;/cell&gt;
+        &lt;cell&gt;Misc nuts and bolts&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;-&lt;/cell&gt;
+        &lt;cell&gt;Jumper Wires&lt;/cell&gt;
+        &lt;cell&gt;-&lt;/cell&gt;
+        &lt;cell&gt;-&lt;/cell&gt;
+        &lt;cell&gt;Misc&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Total: ~$595.82&lt;/p&gt;
+    &lt;head rend="h3"&gt;Plotter [dot] Local¶&lt;/head&gt;
+    &lt;p&gt;I hinted earlier at the real reason we’re sticking around this Makelangelo firmware so much: the Makelangelo software. This is great, it bakes a full CNC control UI with a bunch of fun turtle scripts to generate little patterns for the plotter to draw. I figure this is a great base to build on, especially all these little turtle scripts, but I like all of my projects to be entirely standalone, meaning we’re gonna need a web server and we’ve got some work ahead of us.&lt;/p&gt;
+    &lt;p&gt;…&lt;/p&gt;
+    &lt;p&gt;Just kidding, I wrote it already! I’m hosting a publicly accessible version of the site at plotter.onethreenine.net, which you can use to create and export plotter compatible gcode/SVG files for yourself! Try it out below:&lt;/p&gt;
+    &lt;p&gt;If you’ve been following along and building a machine of your own, we’ll want to get this UI up and running on your machine’s Raspberry Pi. To start, get a fresh copy of Raspberry Pi OS Lite (64-bit) onto an SD card and update the WiFi credentials. Then let’s SSH in and get to work:&lt;/p&gt;
+    &lt;code&gt;# SSH into your Pi
+ssh [email protected]  # Default password is usually 'raspberry'
+
+# Update system
+sudo apt update &amp;amp;&amp;amp; sudo apt upgrade -y
+&lt;/code&gt;
+    &lt;p&gt;I like custom hostnames, as I’ve got way too many RPI’s on my network. We’ll set the hostname to ‘plotter’ - this allows users to navigate to &lt;code&gt;plotter.local&lt;/code&gt; to access the web interface.&lt;/p&gt;
+    &lt;code&gt;# Set hostname
+sudo hostnamectl set-hostname plotter
+
+# Update hosts file
+sudo nano /etc/hosts
+
+# Change the line: 127.0.1.1 raspberrypi
+# To: 127.0.1.1 plotter
+# Save: Ctrl+O, Enter, Ctrl+X
+
+# Reboot to apply
+sudo reboot
+&lt;/code&gt;
+    &lt;p&gt;After reboot, reconnect with:&lt;/p&gt;
+    &lt;p&gt;Then install dependencies:&lt;/p&gt;
+    &lt;code&gt;# Install system packages
+sudo apt install -y python3-pip python3-venv avahi-daemon git
+
+# Enable and start mDNS service
+sudo systemctl enable avahi-daemon
+sudo systemctl start avahi-daemon
+&lt;/code&gt;
+    &lt;p&gt;Now we’ll clone the project repository. The full source lives at github.com/Twarner491/polargraph:&lt;/p&gt;
+    &lt;code&gt;git clone https://github.com/Twarner491/polargraph.git ~/polargraph
+cd ~/polargraph
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install Python dependencies
+pip install -r requirements.txt
+&lt;/code&gt;
+    &lt;p&gt;To get our RPI app up and running with the plotter, we need to set USB permissions for the serial connection.&lt;/p&gt;
+    &lt;code&gt;sudo cp system-config/99-polargraph.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+# Add user to dialout group for serial access
+sudo usermod -a -G dialout pi
+
+# Reboot for permissions to take effect
+sudo reboot
+&lt;/code&gt;
+    &lt;p&gt;As a final step, we’ll set up this Flask server to auto-run upon boot.&lt;/p&gt;
+    &lt;code&gt;sudo cp ~/polargraph/system-config/polargraph.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polargraph.service
+
+# Check status
+sudo systemctl status polargraph.service
+
+# Test reboot
+sudo reboot
+&lt;/code&gt;
+    &lt;p&gt;After reboot, http://plotter.local should be live automatically!&lt;/p&gt;
+    &lt;p&gt;If you saw my Quote Receipt project, you’ll know I like to route all of my locally hosted projects through a Home Assistant Yellow in my apartment, so they’re accessible from anywhere in the world. This is totally optional, but if you happen to have a Home Assistant setup of your own, you can port plotter.local to a public-facing domain of your choosing:&lt;/p&gt;
+    &lt;head&gt;Home Assistant Integration (Optional)&lt;/head&gt;
+    &lt;p&gt;Our setup here is about the same as our Quote Receipt setup: a webhook automation in Home Assistant receives commands from the frontend, publishes them to an MQTT topic, and an MQTT subscriber script on the Pi listens for messages and triggers the plotter. This allows the frontend to be hosted publicly (via &lt;code&gt;plotter.onethreenine.net&lt;/code&gt;) while the plotter itself remains on the local network, bridged through Home Assistant.&lt;/p&gt;
+    &lt;p&gt;Home Assistant Automation&lt;/p&gt;
+    &lt;p&gt;Add to &lt;code&gt;automations.yaml&lt;/code&gt;:&lt;/p&gt;
+    &lt;code&gt;alias: "Polargraph Command"
+trigger:
+  - platform: webhook
+    webhook_id: polargraph_command
+    allowed_methods: [POST]
+    local_only: false
+action:
+  - service: mqtt.publish
+    data:
+      topic: "home/polargraph/command"
+      payload_template: "{{ trigger.json | tojson }}"
+&lt;/code&gt;
+    &lt;p&gt;Enable CORS&lt;/p&gt;
+    &lt;p&gt;Add to &lt;code&gt;configuration.yaml&lt;/code&gt;:&lt;/p&gt;
+    &lt;p&gt;Pi MQTT Setup&lt;/p&gt;
+    &lt;p&gt;Edit &lt;code&gt;src/mqtt_subscriber.py&lt;/code&gt; with your MQTT broker IP:&lt;/p&gt;
+    &lt;p&gt;Then enable the MQTT service:&lt;/p&gt;
+    &lt;code&gt;sudo cp system-config/polargraph-mqtt.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polargraph-mqtt.service
+&lt;/code&gt;
+    &lt;p&gt;Frontend Configuration&lt;/p&gt;
+    &lt;p&gt;Edit &lt;code&gt;build_static.py&lt;/code&gt; and set your webhook URL:&lt;/p&gt;
+    &lt;head rend="h4"&gt;Sonakinatography¶&lt;/head&gt;
+    &lt;p&gt;I’ve always really enjoyed pen plotter art, or frankly, any thin line drawings. One of my favorite twitter accounts is @adamfuhrer, who fills my timeline with a ton of aesthetic plots/sketches. One of his recent tweets really caught my eye, highlighting the works of Channa Horwitz:&lt;/p&gt;
+    &lt;quote&gt;&lt;p&gt;channa horwitz pic.twitter.com/WhdBnXdFH6&lt;/p&gt;— Adam Fuhrer (@adamfuhrer) December 15, 2025&lt;/quote&gt;
+    &lt;quote&gt;&lt;p&gt;channa horwitz pic.twitter.com/WhdBnXdFH6&lt;/p&gt;— Adam Fuhrer (@adamfuhrer) December 15, 2025&lt;/quote&gt;
+    &lt;p&gt;Horwitz invented a complete visual notation system constrained to 1/8” graph paper several decades ago (1968), which she coined: Sonakinatography. All of her works were done entirely by hand, which is absolutely bonkers, as they’re so meticulous they look computer generated. While I’m not quite confident I hold a steady enough hand to practice these plots true to her method, I now happen to own a wonderful, wall-mounted polargraph!&lt;/p&gt;
+    &lt;p&gt;In sonakinatography, there are 8 entities, each given a corresponding number. Each entity occupies a certain number of grid squares on 1/8” graph paper, corresponding to the number of “beats” present within that entity. In this sense, the duration of an entity (or beat count) is equivalent to its visual magnitude. While you can use this method to visualize a whole bunch of data and a whole bunch of interesting fashions, I’m going to constrain our entity type for now into poems and phrases (as beat count feels particularly obvious here). We’ll map each word in a poem/phrase to an entity (1-8) based on its syllable count.&lt;/p&gt;
+    &lt;p&gt;A one-syllable word becomes entity #1 (and occupies 1 beat), a two-syllable word becomes entity #2 (and occupies 2 beats), and so on. The poem/phrase reads left to right across the 8-column grid, with each word placed sequentially. The vertical axis here shows temporal progression through the poem/phrase, and the resulting pattern visualizes the poem/phrase’s rhythmic structure as a landscape of rising and falling durations.&lt;/p&gt;
+    &lt;p&gt;Try some of this poem/phrase constrained sonakinatography out for yourself:&lt;/p&gt;
+    &lt;p&gt;Select an example or enter text above&lt;/p&gt;
+    &lt;p&gt;* Visualization rotated 90° from Horwitz's vertical format for space efficiency&lt;/p&gt;
+    &lt;head rend="h4"&gt;dcode¶&lt;/head&gt;
+    &lt;p&gt;All these turtle scripts and sonakinatography algorithms are cool, but this is the Generative Pen-trained Transformer after all! I certainly can’t call this project complete without some ML shenanigans.&lt;/p&gt;
+    &lt;p&gt;I’ve had this network I’ve been wanting to train for a while, and finally found a good excuse in this project: &lt;code&gt;dcode&lt;/code&gt;, text to gcode diffusion. I took a simple enough approach here: take Stable Diffusion’s visual understanding and then redirect it. Instead of decoding latents into pixels via Stable Diffusion’s VAE, I’m attempting to decode them to gcode via a transformer. The whole end-to-end process flushes out to Text prompt → CLIP → UNet diffusion → latent → gcode decoder → plotter-ready commands.&lt;/p&gt;
+    &lt;p&gt;I started by building out a dataset of image-gcode pairs by running art images from a dataset of images of pieces of art I found on Kaggle through five vectorization algorithms, each captioned with BLIP.&lt;/p&gt;
+    &lt;p&gt;My first training attempt, I trained this decoder on whatever latents the diffusion process produced, which in hindsight was a bit silly, as these latents are noisy by design, and as such, there was no stable signal for the decoder to learn from and the model collapsed. I pivoted to using VAE encoded image latents, which deterministically map each image to some fixed latent, giving me the consistency I needed for my decoder training targets.&lt;/p&gt;
+    &lt;p&gt;This seemingly worked structurally, and my next attempt at the network learned gcode syntax, but output the same coordinate over and over again. My best guess was that this decoder was too small, so the final piece of this puzzle was scale … I wish. I scaled up my network to a 200M parameter transformer decoder with a CNN based latent projector, and ran 20 epochs across 8x H100s and saw a loss drop from 3.7 to 0.17! However, semantic understanding remains incredibly limited. The model learned gcode structure but not meaningful content - here’s its attempt at “a sketch of a horse” for instance, lol.&lt;/p&gt;
+    &lt;p&gt;The fundamental challenge here is that the latent space learned by Stable Diffusion’s VAE is optimized, of course, for pixel reconstruction, not gcode path planning. A true dcode, text-to-gcode model likely needs to be trained end-to-end with gcode as the target modality. I would really, really like to get one of these working sometime soon, but for now, my compute budget is depleted (those H100’s are expensive!)&lt;/p&gt;
+    &lt;p&gt;Nonetheless, the network in its current state is available on HuggingFace as well as baked into the plotter [dot] local interface so you can try it out for yourself!&lt;/p&gt;
+    &lt;head rend="h4"&gt;GPenT¶&lt;/head&gt;
+    &lt;p&gt;The final generator in plotter [dot] local brings us back to the origins of this project: it’s time to implement the Generated Pen-trained Transformer itself. I figure it’s best to return back to my initial intuition: “to use an LLM to generate a string of numbers, to generate SVG blobs, to feed to a pen plotter, and to call the whole thing the Generative Pen-trained Transformer”. Except now there’s no need to limit ourselves to SVG blobs, we have a bunch of generators to work with!&lt;/p&gt;
+    &lt;p&gt;I built out a super simple Gemini instance to handle this. I pass in some keyword (a “whisper” of inspiration if you will) into the Gemini API, as well as a randomized list of generators and color options in a structured prompt that gives Gemini control over the pen plotter. The model then responds with JSON commands specifying which generators to run, with what parameters and transformations, and in which colors. All of this is passed into plotter [dot] local, and is plotted in the workplane.&lt;/p&gt;
+    &lt;code&gt;You control a pen plotter. Canvas: 841mm x 1189mm.
+
+Whispers: "ocean waves"
+
+GENERATORS:
+  9: Flow Field - options: lines (50-1000), length (10-200), scale (0.001-0.1)
+  1: Spiral - options: turns (1-50), spacing (1-20)
+  22: Kaleidoscope - options: symmetry (4-16), pattern (curves/lines/spirals/petals/geometric), complexity (5-20)
+  ... (25 generators, order randomized)
+
+COLORS:
+  3: Blue
+  2: Black
+  4: Green
+  ... (9 colors, order randomized)
+
+TRANSFORMS: scale (10-300%), rotation (0-360), offset_x (-400 to 400mm), offset_y (-550 to 550mm)
+
+Respond with JSON array. Say FINISHED when done.
+[
+  {"thought": "...", "generator": &amp;lt;num&amp;gt;, "options": {}, "color": &amp;lt;num&amp;gt;, "scale": 100, "rotation": 0, "offset_x": 0, "offset_y": 0},
+  ...
+]&lt;/code&gt;
+    &lt;p&gt;I’m shuffling generator and color orderings for each request to prevent Gemini from favoring early-listed options. My initial tests show this is quite effective at getting more varied results. See the fully Gemini worker source at &lt;code&gt;workers/gpent-worker.js&lt;/code&gt; - this is about as minimal as it gets. It was my goal to give Gemini as ‘unbiased’ a prompt as possible, yet I bet you could get some really interesting results with a bit more time spent prompting.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Gallery¶&lt;/head&gt;
+    &lt;p&gt;I am so stoked with how this project came together, and it feels really good to have dusted off an old project from the shelf and to have seen it through. My apartment walls are a little less bare now. I’ve captured some of my favorite plots, check them out:&lt;/p&gt;
+    &lt;p&gt;Enter your email to receive the occasional update.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46909122</guid><pubDate>Fri, 06 Feb 2026 04:28:08 +0000</pubDate></item><item><title>Systems Thinking</title><link>http://theprogrammersparadox.blogspot.com/2026/02/systems-thinking.html</link><description>&lt;doc fingerprint="b77892377b0587ad"&gt;
+  &lt;main&gt;
+    &lt;p&gt; There are two main schools of thought in software development about how to build really big, complicated stuff.&lt;lb/&gt;The most prevalent one, these days, is that you gradually evolve the complexity over time. You start small and keep adding to it. &lt;lb/&gt;The other school is that you lay out a huge specification that would fully work through all of the complexity in advance, then build it.&lt;lb/&gt;In a sense, it is the difference between the way an entrepreneur might approach doing a startup versus how we build modern skyscrapers. Evolution versus Engineering.&lt;lb/&gt;I was working in a large company a while ago, and I stumbled on the fact that they had well over 3000 active systems that were covering dozens of lines of business and all of the internal departments. It had evolved this way over fifty years, and included lots of different tech stacks, as well as countless vendors. Viewed as ‘one’ thing it was a pretty shaky house of cards.&lt;lb/&gt;It’s not hard to see that if they had a few really big systems, then a great number of their problems would disappear. The inconsistencies between data, security, operations, quality, and access were huge across all of those disconnected projects. Some systems were up-to-date, some were ancient. Some worked well, some were barely functional. With way fewer systems, a lot of these self-inflicted problems would just go away.&lt;lb/&gt;It’s not that you could cut the combined complexity in half, but more likely that you could bring it down to at least one-tenth of what it is today, if not even better. It would function better, be more reliable, and would be far more resilient to change. It would likely cost far less and require fewer employees as well. All sorts of ugly problems that they have now would just not exist.&lt;lb/&gt;The core difference between the different schools really centers around how to deal with dependencies. &lt;lb/&gt;If you had thousands of little blobs of complexity that were all entirely independent, then getting finished is just a matter of banging out each one by itself until they are all completed. That’s the dream. &lt;lb/&gt;But in practice, very few things in a big ecosystem are actually independent. That’s the problem.&lt;lb/&gt;If you are going to evolve a system, then you ignore these dependencies. Sort them out afterwards, as the complexity grows. It’s faster, and you can get started right away.&lt;lb/&gt;If you were going to design a big system, then these dependencies dictate that design. You have to go through each one and understand them all right away. They change everything from the architecture all the way down to the idioms and style in the code. &lt;lb/&gt;But that means that all of the people working to build up this big system have to interact with each other. Coordinate and communicate. That is a lot of friction that management and the programmers don’t want. They tend to feel like it would all get done faster if they could just go off on their own. And it will, in the short-term.&lt;lb/&gt;If you ignore a dependency and try to fix it later, it will be more expensive. More time, more effort, more thinking. And it will require the same level of coordination that you tried to avoid initially. Slightly worse, in that the time pressures of doing it correctly generally give way to just getting it done quickly, which pumps up the overall artificial complexity. The more hacks you throw at it, the more hacks you will need to hold it together. It spirals out of control. You lose big in the long-term.&lt;lb/&gt;One of the big speed bumps preventing big up-front designs is a general lack of knowledge. Since the foundations like tech stacks, frameworks, and libraries are always changing rapidly these days, there are few accepted best practices, and most issues are incorrectly believed to be subjective. They’re not, of course, but it takes a lot of repeated experience to see that. &lt;lb/&gt;The career path of most application programmers is fairly short. In most enterprises, the majority have five years or less of real in-depth experience, and battle-scared twenty-year+ vets are rare. Mostly, these novices are struggling through early career experiences, not ready yet to deal with the unbounded, massive complexity present in a big design. &lt;lb/&gt;Also, the other side of it is that evolutionary projects are just more fun. I’ve preferred them. You’re not loaded down with all those messy dependencies. Way fewer meetings, so you can just get into the work and see how it goes. Endlessly arguing about fiddly details in a giant spec is draining, made worse if the experience around you is weak. &lt;lb/&gt;Evolutionary projects go very badly sometimes. The larger they grow, the more likely they will derail. And the fun gives way to really bad stress. That severe last-minute panic that comes from knowing that the code doesn't really work as it should, and probably never will. And the longer-term dissatisfaction of having done all that work to ultimately just contribute to the problem, not actually fix it.&lt;lb/&gt;Big up-front designs are often better from a stress perspective. A little slow to start and sometimes slow in the middle, they mostly smooth out the overall development process. You’ve got a lot of work to do, but you’ve also got enough time to do it correctly. So you grind through it, piece by piece, being as attentive to the details as possible. Along the way, you actively look for smarter approaches to compress the work. Reuse, for instance, can shave a ton of code off the table, cut down on testing, and provide stronger certainty that the code will do the right thing in production. &lt;lb/&gt;The fear that big projects will end up producing the wrong thing is often overstated. It’s true for a startup, but entirely untrue for some large business application for a market that’s been around forever. You don’t need to burn a lot of extra time, breaking the work up into tiny fragments, unless you really don’t have a clue what you are building. If you're replacing some other existing system, not only do you have a clue, you usually have a really solid long-term roadmap. Replace the original work and fix its deficiencies. &lt;lb/&gt;There should be some balanced path in the middle somewhere, but I haven’t stumbled across a formal version of it after all these decades. &lt;lb/&gt;We could go first to the dependencies, then come up with reasons why they can be temporarily ignored. You can evolve the next release, but still have a vague big design as a long-term plan. You can refactor the design as you come across new, unexpected dependencies. Change your mind, over and over again, to try to get the evolved works to converge on a solid grand design. Start fast, slow right down, speed up, slow down again, and so forth. The goal is one big giant system to rule them all, but it may just take a while to get there. &lt;lb/&gt;The other point is that the size of the iterations matters, a whole lot. If they are tiny, it is because you are blindly stumbling forward. If you are not blindly stumbling forward, they should be longer, as it is more effective. They don’t have to all be the same size. And you really should stop and take stock after each iteration. The faster people code, the more cleanup that is required. The longer you avoid cleaning it up, the worse it gets, on basically an exponential scale. If you run forward like crazy and never stop, the working environment will be such a swamp that it will all grind to an abrupt stop. This is true in building anything, or even cooking in a restaurant. Speed is a tradeoff.&lt;lb/&gt;Evolution is the way to avoid getting bogged down in engineering, but engineering is the way to ensure that the thing you build really does what it is supposed to do. Engineering is slow, but spinning way out of control is a heck of a lot slower. Evolution is obviously more dynamic, but it is also more chaotic, and you have to continually accept that you’ve gone down a bad path and need to backtrack. That is hard to admit sometimes. For most systems, there are parts that really need to be engineered, and parts that can just be allowed to evolve. The more random the evolutionary path, the more stuff you need to throw away and redo. Wobbling is always expensive. Nature gets away with this by having millions of species, but we really only have one development project, so it isn’t particularly convenient.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46909439</guid><pubDate>Fri, 06 Feb 2026 05:24:36 +0000</pubDate></item><item><title>Things Unix can do atomically</title><link>https://rcrowley.org/2010/01/06/things-unix-can-do-atomically.html</link><description>&lt;doc fingerprint="7ff15d51748103e0"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Things UNIX can do atomically 2010/01/06&lt;/head&gt;
+    &lt;p&gt;This is a catalog of things UNIX-like/POSIX-compliant operating systems can do atomically, making them useful as building blocks for thread-safe and multi-process-safe programs without mutexes or read/write locks. The list is by no means exhaustive and I expect it to be updated frequently for the foreseeable future.&lt;/p&gt;
+    &lt;p&gt;The philosophy here is to let the kernel do as much work as possible. At my most pessimistic, I trust the kernel developers more than a trust myself. More practically, it’s stupid to spend CPU time locking around an operation that’s already atomic. Added 2010-01-07.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Operating on a pathname&lt;/head&gt;
+    &lt;p&gt;The operations below are best left to local filesystems. More than a few people have written in crying foul if any of these techniques are used on an NFS mount. True. When there are multiple kernels involved, the kernel can’t very well take care of all the locking for us. Added 2010-01-06.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;&lt;code&gt;mv -T &amp;lt;oldsymlink&amp;gt; &amp;lt;newsymlink&amp;gt;&lt;/code&gt;atomically changes the target of&lt;code&gt;&amp;lt;newsymlink&amp;gt;&lt;/code&gt;to the directory pointed to by&lt;code&gt;&amp;lt;oldsymlink&amp;gt;&lt;/code&gt;and is indispensable when deploying new code. Updated 2010-01-06: both operands are symlinks. (So this isn’t a system call, it’s still useful.)&lt;del rend="overstrike"&gt;A reader pointed out that&lt;/del&gt;Deleted 2010-01-06:&lt;code&gt;ln -Tfs &amp;lt;directory&amp;gt; &amp;lt;symlink&amp;gt;&lt;/code&gt;accomplishes the same thing without the second symlink. Added 2010-01-06.&lt;code&gt;strace(1)&lt;/code&gt;shows that&lt;code&gt;ln -Tfs &amp;lt;directory&amp;gt; &amp;lt;symlink&amp;gt;&lt;/code&gt;actually calls&lt;code&gt;symlink(2)&lt;/code&gt;,&lt;code&gt;unlink(2)&lt;/code&gt;, and&lt;code&gt;symlink(2)&lt;/code&gt;once more, disqualifying it from this page.&lt;code&gt;mv -T &amp;lt;oldsymlink&amp;gt; &amp;lt;newsymlink&amp;gt;&lt;/code&gt;ends up calling&lt;code&gt;rename(2)&lt;/code&gt;which can atomically replace&lt;code&gt;&amp;lt;newsymlink&amp;gt;&lt;/code&gt;. Caveat 2013-01-07: this does not apply to Mac OS X, whose&lt;code&gt;mv(1)&lt;/code&gt;doesn’t call&lt;code&gt;rename(2)&lt;/code&gt;.&lt;code&gt;mv(1)&lt;/code&gt;.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;link(oldpath, newpath)&lt;/code&gt;creates a new hard link called&lt;code&gt;newpath&lt;/code&gt;pointing to the same inode as&lt;code&gt;oldpath&lt;/code&gt;and increases the link count by one. This will fail with the error code&lt;code&gt;EEXIST&lt;/code&gt;if&lt;code&gt;newpath&lt;/code&gt;already exists, making this a useful mechanism for locking a file amongst threads or processes that can all agree upon the name&lt;code&gt;newpath&lt;/code&gt;. I prefer this technique for whole-file locking because the lock is visible to&lt;code&gt;ls(1)&lt;/code&gt;.&lt;code&gt;link(2)&lt;/code&gt;.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;symlink(oldpath, newpath)&lt;/code&gt;operates very much like&lt;code&gt;link(2)&lt;/code&gt;but creates a symbolic link at a new inode rather than a hard link to the same inode. Symbolic links can point to directories, which hard links cannot, making them a perfect analogy to&lt;code&gt;link(2)&lt;/code&gt;when locking entire directories. This will fail with the error code&lt;code&gt;EEXIST&lt;/code&gt;if&lt;code&gt;newpath&lt;/code&gt;already exists, making this a perfect analogy to&lt;code&gt;link(2)&lt;/code&gt;that works for directories, too. Be careful of symbolic links whose target inode has been removed ("dangling" symbolic links) —&lt;code&gt;open(2)&lt;/code&gt;will fail with the error code&lt;code&gt;ENOENT&lt;/code&gt;. It should be mentioned that inodes are a finite resource (this particular machine has 1,245,184 inodes).&lt;code&gt;symlink(2)&lt;/code&gt;. Added 2010-01-07&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;rename(oldpath, newpath)&lt;/code&gt;can change a pathname atomically, provided&lt;code&gt;oldpath&lt;/code&gt;and&lt;code&gt;newpath&lt;/code&gt;are on the same filesystem. This will fail with the error code&lt;code&gt;ENOENT&lt;/code&gt;if&lt;code&gt;oldpath&lt;/code&gt;does not exist, enabling interprocess locking much like&lt;code&gt;link(oldpath, newpath)&lt;/code&gt;above. I find this technique more natural when the files in question will be&lt;code&gt;unlink&lt;/code&gt;ed later.&lt;code&gt;rename(2)&lt;/code&gt;.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;open(pathname, O_CREAT | O_EXCL, 0644)&lt;/code&gt;creates and opens a new file. (Don’t forget to set the mode in the third argument!)&lt;code&gt;O_EXCL&lt;/code&gt;instructs this to fail with the error code&lt;code&gt;EEXIST&lt;/code&gt;if&lt;code&gt;pathname&lt;/code&gt;exists. This is a useful way to decide which process should handle a task: whoever successfully creates the file.&lt;code&gt;open(2)&lt;/code&gt;.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;mkdir(dirname, 0755)&lt;/code&gt;creates a new directory but fails with the error code&lt;code&gt;EEXIST&lt;/code&gt;if&lt;code&gt;dirname&lt;/code&gt;exists. This provides for directories the same mechanism&lt;code&gt;link(2)&lt;/code&gt;&lt;code&gt;open(2)&lt;/code&gt;with&lt;code&gt;O_EXCL&lt;/code&gt;provides for files.&lt;code&gt;mkdir(2)&lt;/code&gt;. Added 2010-01-06; edited 2013-01-07.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;Operating on a file descriptor&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;&lt;code&gt;fcntl(fd, F_GETLK, &amp;amp;lock)&lt;/code&gt;,&lt;code&gt;fcntl(fd, F_SETLK, &amp;amp;lock)&lt;/code&gt;, and&lt;code&gt;fcntl(fd, F_SETLKW, &amp;amp;lock)&lt;/code&gt;allow cooperating processes to lock regions of a file to serialize their access.&lt;code&gt;lock&lt;/code&gt;is of type&lt;code&gt;struct flock&lt;/code&gt;and describes the type of lock and the region being locked.&lt;code&gt;F_SETLKW&lt;/code&gt;is particularly useful as it blocks the calling process until the lock is acquired. There is a “mandatory locking” mode but Linux’s implementation is unreliable as it’s subject to a race condition.&lt;code&gt;fcntl(2)&lt;/code&gt;.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;fcntl(fd, F_GETLEASE)&lt;/code&gt;and&lt;code&gt;fcntl(fd, F_SETLEASE, lease)&lt;/code&gt;ask the kernel to notify the calling process with&lt;code&gt;SIGIO&lt;/code&gt;when another process&lt;code&gt;open&lt;/code&gt;s or&lt;code&gt;truncate&lt;/code&gt;s the file referred to by&lt;code&gt;fd&lt;/code&gt;. When that signals arrives, the lease needs to be removed by&lt;code&gt;fcntl(fd, F_SETLEASE, F_UNLCK)&lt;/code&gt;.&lt;code&gt;fcntl(fd, F_NOTIFY, arg)&lt;/code&gt;is similar but doesn’t block other processes, so it isn’t useful for synchronization.&lt;code&gt;fcntl(2)&lt;/code&gt;.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;mmap(0, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)&lt;/code&gt;returns a pointer from which a file’s contents can be read and written by normal memory operations. By making frequent use of&lt;code&gt;msync(addr, length, MS_INVALIDATE)&lt;/code&gt;, data written in this manner can be shared between processes that both map the same file.&lt;code&gt;mmap(2)&lt;/code&gt;,&lt;code&gt;msync(2)&lt;/code&gt;.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;Operating on virtual memory&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;&lt;code&gt;__sync_fetch_and_add&lt;/code&gt;,&lt;code&gt;__sync_add_and_fetch&lt;/code&gt;,&lt;code&gt;__sync_val_compare_and_swap&lt;/code&gt;, and friends provide a full barrier so “no memory operand will be moved across the operation, either forward or backward.” These operations are the basis for most (all?) lock-free algorithms. GCC Atomic Builtins.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Something I should add to my repertoire? Race condition? Let me know at r@rcrowley.org or @rcrowley and I’ll fix it.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=46909468</guid><pubDate>Fri, 06 Feb 2026 05:29:55 +0000</pubDate></item></channel></rss>
