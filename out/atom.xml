@@ -1,175 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-02-14T13:57:17.970928+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46967147</id><title>Adventures in Neural Rendering</title><updated>2026-02-14T13:57:25.361844+00:00</updated><content>&lt;doc fingerprint="3f11131518231f21"&gt;
-  &lt;main&gt;
-    &lt;p&gt;In recent years, neural networks have started to find their way into many areas of rendering. While antialiasing and upscaling are probably the most well‑known uses, they’re far from the only ones—texture compression, material representation, and indirect lighting are all active areas of research and development.&lt;/p&gt;
-    &lt;p&gt;I recently started tinkering with neural networks, experimenting with small multilayer perceptrons (MLPs) as a way to encode data in the context of rendering. This post outlines the process and shares some of the initial results and observations from a graphics programmer’s perspective (without much previous experience in neural networks).&lt;/p&gt;
-    &lt;p&gt;Before we begin, a quick note that this is not really a tutorial about MLPs, neural networks (NNs), even in their simplest form are a fairly complex topic and there are many good resources out there to start learning about them, I recommend these 2 as an introduction: Machine Learning for Game Developers and Crash Course in Deep Learning. Instead, I will summarise a few aspects of them for reference.&lt;/p&gt;
-    &lt;p&gt;For a visual reference, this is what a simple MLP looks like:&lt;/p&gt;
-    &lt;p&gt;In this case the network is made up of 3 input nodes, 2 hidden layers of 3 nodes each and one output node (From now on I will use the 3-3-3-1 notation to describe an MLP). The intermediate layers are “hidden” in the sense that we don’t interact with them directly, we only provide the input data and observe the output data. Also, I used this particular number of nodes in this configuration but there is no limit to the number of nodes in each layer, other than memory and processing time. And the number of nodes in a layer matters, because each node processes all the nodes of the preceding layer (i.e. the graph is fully connected), for example focusing on Node 0 in the hidden layer 1:&lt;/p&gt;
-    &lt;p&gt;it will combine the 3 input nodes and produce its output (fed to the next layer) as follows&lt;/p&gt;
-    &lt;p&gt;The output value of node 0 is simply put a biased weighted sum of all the input nodes output. Before we feed that value to the next layer we have to pass it through an “activation” function. This performs an operation on that value, a popular one being removing all negative values, called ReLU:&lt;/p&gt;
-    &lt;p&gt;and a variation of it&lt;/p&gt;
-    &lt;p&gt;for a small alpha value (eg 0.01). This version still keeps some negative outputs and I have found leads to faster learning. There are many options when it comes to selecting an activation function for a neural network, each having a different impact on the learning rate and convergence, ReLU and LeakyReLU are a good first starts though and LeakyReLU is what I used for the experiments described in this post.&lt;/p&gt;
-    &lt;p&gt;Going back to the reference to storage requirements, to store the weights and biases for the above MLP, assuming a float data type for each, we would need for the first hidden layer 3 floats for the weights of the inputs and one float for the bias per node (3×3+3 floats), for the second the same amount and for the output 1×3+1 floats, so in total 28 floats to store the whole MLP. It easy to see that this can go up significantly, for an MLP with 9 input nodes, 3 hidden layers of 64 nodes and a 3 node output we would need 9155 float numbers to store. This can go down by using smaller data types, like fp16 or even lower for example.&lt;/p&gt;
-    &lt;p&gt;Implementing an MLP to successively combine nodes and produce output like described above is very straightforward. What is tricky is to calculate the weights and biases used and this is where training of the neural network is needed. Going deep into training is outside the scope of this post, like mentioned there are many good tutorials out there. For some context though, at a high level, this is what is happening: We start with some random weights and biases and given an input vector, we calculate the output of the network (forward propagation, aka inference). The output will of course be wrong, so we calculate how much wrong it is (during training we need to know both the input and the expected, correct output of the network), calculating a gradient (difference) using a “loss” function. We then feed that gradient backwards into the network to adjust weights and biases (back propagation). Having adjusted the weights/biases, we try again feeding a new (or the same) input vector and calculating the output, finding the difference/gradient from the correct output and back propagating it through the network. The intention is, after having repeated this process many, many times, for the calculated output will be close to the expected output, i.e. the network will have “learned” the set of input to output mappings.&lt;/p&gt;
-    &lt;p&gt;In terms of implementation, I assumed MLPs of a maximum of 5 layers, including the input and output layers (so a maximum of 3 hidden layers). The weights and biases I stored in 2 ByteAddressBuffers. Both inference and back propagation are loop heavy, to help the compiler a bit, similarly to this post, I defined number of layers and nodes per layer statically, avoiding dynamic loops. I won’t be adding too much code to the post, I’d suggest the reader has a look at the mentioned blog post which also includes a good sample but as an example, this is the code that returns the index into the weights and biases buffers based on layer index, node index and element (weight or bias) index:&lt;/p&gt;
-    &lt;code&gt;
-#define MAX_LAYER_COUNT 5
-
-static const uint neuronsPerLayer[MAX_LAYER_COUNT] =
-{
-    LAYER0_NEURON_COUNT, LAYER1_NEURON_COUNT, LAYER2_NEURON_COUNT, LAYER3_NEURON_COUNT, LAYER4_NEURON_COUNT
-};
-
-static const uint weightOffsetsPerLayer[MAX_LAYER_COUNT] =
-{
-    LAYER0_WEIGHT_OFFSET, LAYER1_WEIGHT_OFFSET, LAYER2_WEIGHT_OFFSET, LAYER3_WEIGHT_OFFSET, LAYER4_WEIGHT_OFFSET
-};
-
-static const uint biasOffsetsPerLayer[MAX_LAYER_COUNT] =
-{
-    LAYER0_BIAS_OFFSET, LAYER1_BIAS_OFFSET, LAYER2_BIAS_OFFSET, LAYER3_BIAS_OFFSET, LAYER4_BIAS_OFFSET
-};
-
-static const uint neuronOffsetsPerLayer[MAX_LAYER_COUNT] =
-{
-    LAYER0_NEURON_OFFSET, LAYER1_NEURON_OFFSET, LAYER2_NEURON_OFFSET, LAYER3_NEURON_OFFSET, LAYER4_NEURON_OFFSET
-};
-
-uint GetNeuronCount(uint layer)
-{
-    return neuronsPerLayer[layer];
-}
-
-uint GetWeightIndex(uint layer, uint neuronIndex, uint weightIndex)
-{
-    return weightOffsetsPerLayer[layer] + neuronIndex * neuronsPerLayer[layer-1] + weightIndex;
-}
-
-uint GetBiasIndex(uint layer, uint neuronIndex)
-{
-    return biasOffsetsPerLayer[layer] + neuronIndex;
-}
-
-uint GetNeuronIndex(uint layer, uint index)
-{
-    return neuronOffsetsPerLayer[layer] + index;
-}
-&lt;/code&gt;
-    &lt;p&gt;The inference code is like I mentioned is quite simple, made up of 3 nested loop as we need to iterate over the layers, the nodes of a layer and the inputs to the nodes.&lt;/p&gt;
-    &lt;code&gt;
-void ForwardPass(inout float inputs[LAYER0_NEURON_COUNT], inout float nodeOutputs[MAX_NOOF_NODES])
-{
-    uint outputIndex = 0;
-    
-    //input layer
-    for (uint index = 0; index &amp;lt; GetNeuronCount(0); index++)
-    {
-        nodeOutputs[outputIndex++] = inputs[index];
-    }
-    
-    //rest of the layers
-    for (uint layer = 1; layer &amp;lt; LAYER_COUNT; layer++)
-    {
-        for (uint index = 0; index &amp;lt; GetNeuronCount(layer); index++)
-        {
-            float output = GetBias(layer, index);
-    
-            for (int i = 0; i &amp;lt; GetNeuronCount(layer-1); i++)
-            {
-                float weight = GetWeight(layer, index, i);
-                float previousLayerOut = nodeOutputs[GetNeuronIndex(layer - 1, i)];
-                
-                output += weight * previousLayerOut;
-            }
-        
-            nodeOutputs[outputIndex++] = ActivationFunction(output);
-        }
-    }
-}
-&lt;/code&gt;
-    &lt;p&gt;The training phase broadly follows the above post again and I also implemented Adam optimisation to improve convergence.&lt;/p&gt;
-    &lt;p&gt;Once I had the MLP implementation I started wondering where could I use it in the context of graphics. My approach was a bit simplistic, I focused on small MLPs with a low number of layers and nodes, with a single activation function for everything which is likely not the best way to get good results. The MLP output will depend on the number of layers, number of nodes per layer, activation function which could even be different per layer, loss function etc and to get good results one would need to experiment with all these, something that takes time due to the cost of training.&lt;/p&gt;
-    &lt;p&gt;One interesting aspect of MLPs is that they can encode information/signals, in a similar way Spherical Harmonics, octahedral representations can, but in a non-analytical way, “learning” the expected output based on the input. As an example, I tried encoding the radiance from a cubemap along the normal direction. I used a minimal MLP of a 3-node input layer (normal xyz), one hidden layer of 3 nodes and a 3-node output layer (radiance rgb).&lt;/p&gt;
-    &lt;p&gt;I also used an L2 Spherical Harmonics cubemap radiance encoding (using this great library) as a reference:&lt;/p&gt;
-    &lt;p&gt;The SH approximation gives a general sense of radiance directionality but it is very coarse. The MLP described above on the other hand produces this output:&lt;/p&gt;
-    &lt;p&gt;The directionality is much improved in this case, the output is like a very low resolution version of the cubemap. What is more interesting is that the L2 SH representation requires 27 floats (9 float3s) to store the coefficients, while that MLP needs 24 for a much improved quality.&lt;/p&gt;
-    &lt;p&gt;Can the MLP be even smaller, what would happen if we reduce the hidden layer to 2 nodes?&lt;/p&gt;
-    &lt;p&gt;and then to 1 node only?&lt;/p&gt;
-    &lt;p&gt;With 2 nodes the output maintains the directionality broadly but introduces a colour shift which is undesirable. With one node it approximates the coarseness of the L2 SH representation closer, impressive for a mere 10 float storage requirement but the colour shifts will again make it unusable for radiance encoding applications.&lt;/p&gt;
-    &lt;p&gt;Irradiance is also a directional quantity that can be encoded with an MLP. The output of a single hidden layer with 3 nodes NN looks as follows:&lt;/p&gt;
-    &lt;p&gt;For comparison, this is the L2 Spherical Harmonics version&lt;/p&gt;
-    &lt;p&gt;And this is the “ground truth” version, performing Monte Carlo integration of the cubemap in the shader.&lt;/p&gt;
-    &lt;p&gt;Worth mentioning that the MLP is trained using the output of the ground truth irradiance calculation method. The MLP output is fairly close to the ground truth output, but not as close as the SH one, it appears that in the above scenario SH manages to encode irradiance slightly better.&lt;/p&gt;
-    &lt;p&gt;A smaller MLP with a 1 node hidden later doesn’t manage to capture the directionality in the irradiance well.&lt;/p&gt;
-    &lt;p&gt;One should never evaluate lighting techniques only on smooth spheres as this tends to hide issues that will become very obvious when a normal map is applied. For this reason, let’s rerun the above experiment adding a normal map to the sphere and zooming in a bit to see the result of each irradiance encoding approach.&lt;/p&gt;
-    &lt;p&gt;The output of our small (1 hidden layer of 3 nodes) MLP is this&lt;/p&gt;
-    &lt;p&gt;Along with the L2 SH output&lt;/p&gt;
-    &lt;p&gt;And the ground truth output&lt;/p&gt;
-    &lt;p&gt;Again, the Spherical Harmonics and Ground Truth outputs are quite similar, the difference of the MLP encoding become more pronounced though, the tiny MLP can’t encode irradiance directionality as well which can be seen as bounce light from the floor “leaking” on the faces of the bricks.&lt;/p&gt;
-    &lt;p&gt;To cut a long story short, it appears that to get similar to SH response from the MLP, it needs to have 2 hidden layers of 4 nodes each:&lt;/p&gt;
-    &lt;p&gt;Such an MLP would require 51 (floating point) numbers to store, which is quite a bit more than an L2 SH’s 27. In this context at least, it appears that a similar to an L2 SH, in terms of storage, MLP can encoding radiance better than irradiance.&lt;/p&gt;
-    &lt;p&gt;Another signal I tried encoding is depth for a number of directions over a sphere centered at a world position (something that one could do with a depth cubemap as well), using raytracing to get the ground truth&lt;/p&gt;
-    &lt;p&gt;The output of a 3-3-3-1 MLP, using a vector distributed over a sphere as an input is as follows&lt;/p&gt;
-    &lt;p&gt;which is very coarse to be useful. Increasing the hidden layers to 3-32-32-32-1 we are beginning to discern features in the output:&lt;/p&gt;
-    &lt;p&gt;And finally increasing to 3-128-128-128-1:&lt;/p&gt;
-    &lt;p&gt;we can see many more details in the output and it is starting to become usable. An MLP of that size would need about 33,665 fp numbers for storage which is 134KB. For comparison a small, 128x128x6 depth cubemap is ~393KB. The MLP inference is very expensive though to make it useful using a compute shader implementation at least (44ms on an 3080 mobile GPU).&lt;/p&gt;
-    &lt;p&gt;Another experiment I did was to test if an MLP could be used as an RTAO cache. In this case I used the world position and normal as input to a 6-32-32-32-1 NN (40ms)&lt;/p&gt;
-    &lt;p&gt;Also increasing to 6-64-64-64-1 (240ms):&lt;/p&gt;
-    &lt;p&gt;The MLP does a decent job of capturing AO at a world position for that view at a very large inference cost though. Also, didn’t try “teaching” the MLP multiple views due to training time, so it is not clear how suitable it is for learning the whole scene. For example, moving the camera to another view and spending the time to learn the AO, coming back to the original view the MLP struggles to remember the AO.&lt;/p&gt;
-    &lt;p&gt;I am not sure if an MLP is capable of representing the whole scene AO accurately, I am assuming though a lot more training is needed and potentially a much larger network if this is the case. Even then the inference cost makes it less useful, at least for a compute shader implementation.&lt;/p&gt;
-    &lt;p&gt;As a final test, I tried encoding a specular BRDF (Cook-Torrance). For that I went all in providing normal, light direction, view direction, F0 and roughness as inputs (13 in total) to the MLP. Although the inputs were selected randomly, I restricted light direction and view direction on the hemisphere centered on the normal to reduce the number of invalid combinations (eg light directions below the horizon which won’t contribute).&lt;/p&gt;
-    &lt;p&gt;It turns out that the MLP really struggled to approximate the BRDF, even with a relatively large model 13-128-128-128-3&lt;/p&gt;
-    &lt;p&gt;compared to the reference output&lt;/p&gt;
-    &lt;p&gt;The same happened when I tried to reduce the inputs, removing F0 and roughness. It appears that the MLP (at least of that size for that amount of training) struggles to capture the specular lobe, especially for low roughness values.&lt;/p&gt;
-    &lt;p&gt;Turns out there is a different parameterisation of a brdf, called the Rusinkiewicz parameterisation, popular in neural brdf implementations, which can reduce dimensional variation and improve specular lobe representation. In short, this approach reparameterises the brdf from the original normal vector reference (the origin of the brdf angles is the normal vector), to a half vector reference.&lt;/p&gt;
-    &lt;p&gt;As a result the specular lobe lies mostly on the theta_h axis, irrespective of the value of theta_d. Also, for isotropic brdfs, like the one I am using, phi_h is zero reducing the input size even more.&lt;/p&gt;
-    &lt;p&gt;Using the Rusinkiewicz parameterisation with 3 angles, theta_h, theta_d and phi_d, as input we manage to represent the specular lobe much better for a much smaller MLP 3-64-64-64-3 (output quality would likely increase with additional training time):&lt;/p&gt;
-    &lt;p&gt;Even a smaller one, 3-32-32-3, seems to capture the specular lobe with some degree of accuracy although at a much increased training time and some extra quantisation visible.&lt;/p&gt;
-    &lt;p&gt;Both the above examples assumed a fixed roughness and F0 which makes the MLP suitable for a single material only. Re-introducing F0 and roughness reduces the ability to capture the lobe, at least for the amount of training time I allowed, which was significantly longer than without those extra inputs.&lt;/p&gt;
-    &lt;p&gt;To summarise the findings: neural networks, MLPs at least, are relatively easy to implement but tricky to get to produce useful results. Graphics programmers are used to tweaking parameters to fine tune systems and achieve better results but in this case, being a new area of me, I don’t feel I have a good grasp yet of what the impact of the various MLP parameters are, number of nodes vs numbers of layers and why one activation function is better than another. Training time is another factor, it takes a lot of time to see the outcome of any MLP alteration, especially for larger networks and the inference cost can also be quite high which may restrict real time rendering applications. I find this an interesting area though that shows promise as a way to encode/represent signals and the incoming HLSL support for inference acceleration has the potential to reduce the cost significantly.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://interplayoflight.wordpress.com/2026/02/10/adventures-in-neural-rendering/"/><published>2026-02-10T21:26:16+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46971794</id><title>CoLoop (YC S21) Is Hiring Ex Technical Founders in London</title><updated>2026-02-14T13:57:24.752957+00:00</updated><content>&lt;doc fingerprint="225cd3373f6c257e"&gt;
-  &lt;main&gt;
-    &lt;p&gt;At CoLoop we’re on a mission to make every company in the world as customer obsessed as Amazon. We’re doing this by giving the next generation of workers immediate, intuitive access to the customer knowledge they need to make better decisions, faster. Our goal is to become the customer context layer for every company in the world.&lt;/p&gt;
-    &lt;p&gt;We started CoLoop in 2020 while still at university. We survived multiple cofounder breakups and all sorts of other near-death experiences. Despite that we built our first product to $1M ARR… and then killed it after realising the opportunity was too small and we didn't have real PMF. We spent six months pivoting, and through that process came to understand just how important customer research is to finding a winning strategy. So we built a product to make it faster, cheaper, and better.&lt;/p&gt;
-    &lt;p&gt;We don't tell you this because we think suffering is something to aspire to. We tell you because if you're an ex-founder evaluating whether to work for someone else, you should know who you'd be working with. We are not going to sell early, get comfortable, or lose interest. This is everything to us.&lt;/p&gt;
-    &lt;p&gt;We also take seriously that you're trusting us with your time. Three people who've worked at CoLoop have gone on to become YC founders. When you're here, we'll share everything we know and everything we learn along the way. All we ask is total commitment. And if you eventually get the itch to build your own thing again, we will back you 100%.&lt;/p&gt;
-    &lt;p&gt;We're looking for ex-founders who want to write code, ship product, and work on hard problems in agentic AI.&lt;/p&gt;
-    &lt;p&gt;At CoLoop, engineers own the full cycle. There are no product managers. You gather context, decide what to build, build it, launch it, measure the impact, and iterate. We track individual attribution in PostHog. One engineer recently drove 40 new active users through a single small growth experiment.&lt;/p&gt;
-    &lt;p&gt;The structure is flat. Influence is earned through skill and context. We'd rather you make a wrong call than wait to be told what to do.&lt;/p&gt;
-    &lt;p&gt;We think ex-founders tend to work well here because the expectations match how they already think: own the problem, move quickly, care about customers, and measure what matters. If you've built and run a company before, the pace and autonomy at CoLoop will feel familiar.&lt;/p&gt;
-    &lt;p&gt;If you failed to find PMF, we're building the product that helps companies avoid that fate. Your experience is valued here.&lt;/p&gt;
-    &lt;p&gt;Bonus: you've led an engineering team of 3+ people; you have experience with enterprise customers.&lt;/p&gt;
-    &lt;p&gt;If you're excited about this role but don't meet every requirement, we'd still love to hear from you. If you’d like to meet the team, we host CoLoop CoWorking from our office most Saturdays!&lt;/p&gt;
-    &lt;p&gt;fulltimeLondon, England, GB£30 - £40 GBPAny (new grads ok)&lt;/p&gt;
-    &lt;p&gt;fulltimeLondon, England, GBFull stack£90K - £180K GBP0.10% - 0.40%6+ years&lt;/p&gt;
-    &lt;p&gt;fulltimeLondon, England, GB£60K - £80K GBP0.05%3+ years&lt;/p&gt;
-    &lt;p&gt;fulltimeLondon, England, GB£30K - £60K GBP1+ years&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.workatastartup.com/jobs/90016"/><published>2026-02-11T07:00:46+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=46983873</id><title>Common Lisp Screenshots: today's CL applications in action</title><updated>2026-02-14T13:57:24.280806+00:00</updated><link href="http://www.lisp-screenshots.org"/><published>2026-02-12T01:44:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47008931</id><title>The wonder of modern drywall</title><updated>2026-02-14T13:57:24.082736+00:00</updated><content>&lt;doc fingerprint="773ff532670707f8"&gt;
-  &lt;main&gt;
-    &lt;p&gt;We’re experimenting with turning on comments on our Substack. Please leave your thoughts below! We’re also hosting a Stripe Press pop-up coffee shop and bookstore on Saturday, June 28, in Washington, DC. RSVP here if you can make it.&lt;/p&gt;
-    &lt;p&gt;Minecraft is not real life; you cannot stack blocks of dirt infinitely high. This is a shame, because dirt has a lot going for it as a construction material. It is abundant. You can go outside right now and scoop up a handful of dirt into your pockets without anyone stopping you. Just like in Minecraft.&lt;/p&gt;
-    &lt;p&gt;To render dirt into a plausible building material, you need another Minecraft staple: wood. If you take a bunch of sticks, weave them into a tapestry, then slather wet dirt (also known by its technical name mud) and let it dry, you get wattle-n-daub, a method of constructing walls that has been a mainstay for at least 6,000 years, predating mud bricks. Some buildings standing today still have wattle-and-daub panels from 700 years ago.&lt;/p&gt;
-    &lt;p&gt;If you fast-forward through the reel of history fast enough, it’s remarkable how consistent some activities are throughout the ages. The tried-n-true technique of slathering a moldable workable paste onto a rigid canvas as a way of constructing walls has barely budged across eons. Even past the industrial revolution, the cutting edge technique at the turn of the 20th century was plaster-n-lath. Instead of random sticks, you use uniform wooden strips. Instead of dirt, you use plaster made out of gypsum — a mineral known for its fire resistance. Same, but different.&lt;/p&gt;
-    &lt;p&gt;The problem with slathering paste to make walls is that it is a skilled trade and incredibly labor-intensive. Creating a plaster wall on top of a lath canvas was done in-situ, and required multiple coats, each with its own drying time. You slather, then wait for it to dry, then slather on again, then wait for it to dry again. The walls of a typical home would take a skilled plasterer a week or two to make. The end result was either ok at best, or a wobbly warped mess. You are fighting against gravity after all.&lt;/p&gt;
-    &lt;p&gt;As someone who has spent far too much time battling the quirks of a house built in 1901, I can personally vouch for the joys and sorrows of old plaster-and-lath walls. It’s impossible to mount even lightweight items such as picture frames onto the wall, because even the tiniest hole from nails or the like would crumble and erode into dust. Victorian-era homes relied on picture rail moulding near the ceiling, with hooks strung down to mount anything of significance. You can’t just pick any random spot to put up a picture of your cat; you have to dangle everything from one string, and if you’re dangling one you might as well dangle all.&lt;/p&gt;
-    &lt;p&gt;The plaster mixture used then was a homegrown concoction, with recipes matching the climate needs and vernacular material availability. The popular additive was asbestos. While today we all know about its intense toxicity, the reason asbestos became so widespread from the 1870s until the 1970s was because it was extraordinarily fire resistant. It was better to die of a lung disease you didn’t even know about than to die in a house fire you definitely were cognizant of.&lt;/p&gt;
-    &lt;p&gt;Which gets us to modern drywall sheets. Drywall, also known as gypsum board or plasterboard, is essentially a rigid panel made by pressing a thick layer of familiar gypsum plaster between two durable sheets of heavy paper. This creates a strong, smooth, and easily paintable surface that forms the backbone of most modern interior walls and ceilings. Developed in the early 20th century, it wasn’t until the 1950s that drywall rapidly took over as the standard for walls and ceilings in American homes.&lt;/p&gt;
-    &lt;p&gt;Superficially, drywall looks the same as and is made of the same stuff as a plaster and lath wall. While both are a hardened layer of gypsum powder, drywall sheets are manufactured en masse off-site, in large factories under tightly controlled conditions for consistency and efficiency, then shipped to construction sites ready to install. Instead of a plasterer working his damndest to ensure straightness across a 12-foot tall canvas of paste, gypsum powder is trivially extruded into uniform shapes, sandwiched by protective layers of heavy-duty paper, like an inedible ice cream sandwich. Cheap, uniform, and free of defects.&lt;/p&gt;
-    &lt;p&gt;The end product is simultaneously more robust and more malleable. Because drywall is a dense and uniform mixture, hanging anything off the wall (from pictures to heavier items like shelves, TVs, or even cabinetry) is a trivial exercise, either a simple nail for a small frame, plaster anchors for medium loads, or toggle bolts for the real heavy hitters.&lt;/p&gt;
-    &lt;p&gt;Picture rails are a kitschy and twee feature that few people today even know their purpose, but anyone who tells you that they’re just as good for hanging things on are committing perjury. Speaking from experience, I have spent a not-insignificant amount of my life wrangling with the horrors of hanging things on old-fashioned plaster walls. Something as simple as putting up a coat rack turned into a months-long slog. Ideally you bolt it onto the load-bearing wooden studs, but plaster and lath foils the typical attempts of identifying where the studs are. Density scanners which differentiate the ‘empty’ gaps between studs are confused by the presence of wooden laths. Magnets which identify studs by the presence of metal nails are similarly foiled by the thicker plaster layer. Really, the only practical option is to drill multiple pilot holes until you hit something solid.&lt;/p&gt;
-    &lt;p&gt;Modern glue-based options are also no match for the erratic plaster mixture of ye olde. Paint does not bite as well as it does on today’s paper coats, and sticker mounts will fall off older walls and drag a big chunk of paint down with them.&lt;/p&gt;
-    &lt;p&gt;All of this adds up. By eschewing the lath lattices, buildings now have way more room in wall cavities for improved insulation and conduits.&lt;/p&gt;
-    &lt;p&gt;Drywall’s fatal vulnerability has long been water damage. Fortunately, the quiet innovation engine is still humming along, churning out mold-resistant, fire-resistant, and soundproof drywall. There are even ‘smart drywall’ systems with integrated temperature, humidity, and sound sensors. You’re in luck if you’ve been hankering to have your wall connected to wifi.&lt;/p&gt;
-    &lt;p&gt;Yes, this is all boring. No sane person should ever get excited about a blank wall, let alone read a thousand plus words on the subject. But your wall at home is a recurring reminder that most true architectural and design advancements are almost entirely invisible.&lt;/p&gt;
-    &lt;p&gt;Yassine Meskhout is a public defender and writer.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.worksinprogress.news/p/the-wonder-of-modern-drywall"/><published>2026-02-13T03:33:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47000505</id><title>Babylon 5 is now free to watch on YouTube</title><updated>2026-02-14T13:57:23.798981+00:00</updated><content>&lt;doc fingerprint="3616b4e0b7a0dbb8"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-02-14T14:21:15.937953+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=46983873</id><title>Common Lisp Screenshots: today's CL applications in action</title><updated>2026-02-14T14:21:28.190920+00:00</updated><link href="http://www.lisp-screenshots.org"/><published>2026-02-12T01:44:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47000505</id><title>Babylon 5 is now free to watch on YouTube</title><updated>2026-02-14T14:21:27.954295+00:00</updated><content>&lt;doc fingerprint="3616b4e0b7a0dbb8"&gt;
   &lt;main&gt;
     &lt;p&gt;In a move that has delighted fans of classic science fiction, Warner Bros. Discovery has begun uploading full episodes of the iconic series Babylon 5 to YouTube, providing free access to the show just as it departs from the ad-supported streaming platform Tubi. The transition comes at a pivotal time for the series, which has maintained a dedicated following since its original run in the 1990s. Viewers noticed notifications on Tubi indicating that all five seasons would no longer be available after February 10, 2026, effectively removing one of the most accessible free streaming options for the space opera. With this shift, Warner Bros. Discovery appears to be steering the property toward its own digital ecosystem, leveraging YouTube’s vast audience to reintroduce the show to both longtime enthusiasts and a new generation.&lt;/p&gt;
     &lt;p&gt;You can find Babylon 5 on YouTube HERE.&lt;/p&gt;
@@ -183,12 +13,12 @@ void ForwardPass(inout float inputs[LAYER0_NEURON_COUNT], inout float nodeOutput
     &lt;p&gt;Please add Cord Cutters News as a source for your Google News feed HERE. Please follow us on Facebook and X for more news, tips, and reviews. Need cord cutting tech support? Join our Cord Cutting Tech Support Facebook Group for help.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://cordcuttersnews.com/babylon-5-is-now-free-to-watch-on-youtube/"/><published>2026-02-13T08:49:02+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47001756</id><title>GovDash (YC W22) Is Hiring Senior Engineers (Product and Search) in NYC</title><updated>2026-02-14T13:57:22.893848+00:00</updated><content>&lt;doc fingerprint="323fd5eb29cdca05"&gt;
+&lt;/doc&gt;</content><link href="https://cordcuttersnews.com/babylon-5-is-now-free-to-watch-on-youtube/"/><published>2026-02-13T08:49:02+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47001756</id><title>GovDash (YC W22) Is Hiring Senior Engineers (Product and Search) in NYC</title><updated>2026-02-14T14:21:26.880189+00:00</updated><content>&lt;doc fingerprint="323fd5eb29cdca05"&gt;
   &lt;main&gt;
     &lt;p&gt;Menu Work at a Startup Startup Jobs Internships Upcoming Events How it Works Log In › Work at a Startup Startup Jobs Internships Upcoming Events How it Works Log In Check out other YC startups on Work at a Startup below. Sign up to see more ›&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.workatastartup.com/companies/govdash"/><published>2026-02-13T12:01:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47001871</id><title>Monosketch</title><updated>2026-02-14T13:57:22.611976+00:00</updated><content>&lt;doc fingerprint="118fb4538df9d3ce"&gt;
+&lt;/doc&gt;</content><link href="https://www.workatastartup.com/companies/govdash"/><published>2026-02-13T12:01:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47001871</id><title>Monosketch</title><updated>2026-02-14T14:21:26.638550+00:00</updated><content>&lt;doc fingerprint="118fb4538df9d3ce"&gt;
   &lt;main&gt;
     &lt;head rend="h2"&gt;MonoSketch [*]&lt;/head&gt;
     &lt;head rend="h1"&gt;Unleash your ideas with ASCII&lt;/head&gt;
@@ -228,7 +58,7 @@ void ForwardPass(inout float inputs[LAYER0_NEURON_COUNT], inout float nodeOutput
     &lt;quote&gt;╭────────────╮ │ Enjoy mono │ │ sketching │ ╭─┼────────────╯ /^--^\ /^--^\ /^--^\╰─╯ \____/ \____/ \____/ / \ / \ / \ | | | | | | \__ __/ \__ __/ \__ __/ |^|^|^|^|^|^|^|^|^|^|^|^\ \^|^|^|^/ /^|^|^|^|^\ \^|^|^|^|^|^|^|^|^|^|^|^| | | | | | | | | | | | | |\ \| | |/ /| | | | | |\ \| | | | | | | | | | | | #########################/ /#####\ \###########/ /####################### | | | | | | | | | | | | |\/ | | | \/| | | | | |\/ | | | | | | | | | | | | |_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|_|&lt;/quote&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://monosketch.io/"/><published>2026-02-13T12:18:05+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47003064</id><title>Fix the iOS keyboard before the timer hits zero or I'm switching back to Android</title><updated>2026-02-14T13:57:22.484602+00:00</updated><content>&lt;doc fingerprint="ed72411d56af16f6"&gt;
+&lt;/doc&gt;</content><link href="https://monosketch.io/"/><published>2026-02-13T12:18:05+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47003064</id><title>Fix the iOS keyboard before the timer hits zero or I'm switching back to Android</title><updated>2026-02-14T14:21:26.466095+00:00</updated><content>&lt;doc fingerprint="ed72411d56af16f6"&gt;
   &lt;main&gt;
     &lt;p&gt;Deadline: end of WWDC 2026. The exact dates haven't been announced yet and this timer is based on the estimated schedule (June 9–13). I'll update it when Apple confirms the dates. They have until the conference ends.&lt;/p&gt;
     &lt;p&gt;The iOS keyboard has been broken since at least iOS 17 and it's somehow only gotten worse. iOS 26 has been my breaking point. Autocorrect is nearly useless and often hostile, that part I'm used to. But now the correctly tapped letters aren't even registering correctly. This isn't just me.&lt;/p&gt;
@@ -239,7 +69,7 @@ void ForwardPass(inout float inputs[LAYER0_NEURON_COUNT], inout float nodeOutput
     &lt;p&gt;You were the "it just works" company. Now you're just a fruit that I used to know.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://ios-countdown.win/"/><published>2026-02-13T14:21:01+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47005509</id><title>Building a TUI is easy now</title><updated>2026-02-14T13:57:22.246522+00:00</updated><content>&lt;doc fingerprint="372d06fb2f979ae9"&gt;
+&lt;/doc&gt;</content><link href="https://ios-countdown.win/"/><published>2026-02-13T14:21:01+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47005509</id><title>Building a TUI is easy now</title><updated>2026-02-14T14:21:26.325921+00:00</updated><content>&lt;doc fingerprint="372d06fb2f979ae9"&gt;
   &lt;main&gt;
     &lt;p&gt;When I first booted up Claude Code in May 2025, I thought: huh, this is cute. A terminal-based coding agent...they must be pandering to developers.&lt;/p&gt;
     &lt;p&gt;Within the first 30 minutes, I was convinced: this was going to be huge. So huge that we at Hatchet discussed whether we should build a new product line around terminal-based coding agents.&lt;/p&gt;
@@ -274,7 +104,7 @@ void ForwardPass(inout float inputs[LAYER0_NEURON_COUNT], inout float nodeOutput
     &lt;p&gt;Stay updated with our latest work on distributed systems, workflow engines, and developer tools.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://hatchet.run/blog/tuis-are-easy-now"/><published>2026-02-13T17:50:54+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47006594</id><title>GPT-5.2 derives a new result in theoretical physics</title><updated>2026-02-14T13:57:21.974635+00:00</updated><content>&lt;doc fingerprint="56739ad400c48ea8"&gt;
+&lt;/doc&gt;</content><link href="https://hatchet.run/blog/tuis-are-easy-now"/><published>2026-02-13T17:50:54+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47006594</id><title>GPT-5.2 derives a new result in theoretical physics</title><updated>2026-02-14T14:21:26.054496+00:00</updated><content>&lt;doc fingerprint="56739ad400c48ea8"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;GPT‑5.2 derives a new result in theoretical physics&lt;/head&gt;
     &lt;p&gt;In a new preprint, GPT‑5.2 proposed a formula for a gluon amplitude later proved by an internal OpenAI model and verified by the authors.&lt;/p&gt;
@@ -294,14 +124,20 @@ void ForwardPass(inout float inputs[LAYER0_NEURON_COUNT], inout float nodeOutput
     &lt;p&gt;—Nathaniel Craig, Professor of Physics at the University of California, Santa Barbara (UCSB), specializing in high-energy physics, particle phenomenology, and cosmology&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://openai.com/index/new-result-theoretical-physics/"/><published>2026-02-13T19:20:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47007656</id><title>The EU moves to kill infinite scrolling</title><updated>2026-02-14T13:57:21.635717+00:00</updated><content>&lt;doc fingerprint="75b8dacc0951db29"&gt;
+&lt;/doc&gt;</content><link href="https://openai.com/index/new-result-theoretical-physics/"/><published>2026-02-13T19:20:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47007656</id><title>The EU moves to kill infinite scrolling</title><updated>2026-02-14T14:21:25.924537+00:00</updated><content>&lt;doc fingerprint="75b8dacc0951db29"&gt;
   &lt;main&gt;
     &lt;p&gt;BRUSSELS — Doom scrolling is doomed, if the EU gets its way.&lt;/p&gt;
     &lt;p&gt;The European Commission is for the first time tackling the addictiveness of social media in a fight against TikTok that may set new design standards for the world’s most popular apps.&lt;/p&gt;
     &lt;p&gt;Brussels has told the company to change several key features, including disabling infinite scrolling, setting strict screen time breaks and changing its recommender systems. The demand follows the Commission's declaration that TikTok’s design is addictive to users — especially children.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.politico.eu/article/tiktok-meta-facebook-instagram-brussels-kill-infinite-scrolling/"/><published>2026-02-13T20:52:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47008163</id><title>Show HN: Data Engineering Book – An open source, community-driven guide</title><updated>2026-02-14T13:57:21.591595+00:00</updated><content/><link href="https://github.com/datascale-ai/data_engineering_book/blob/main/README_en.md"/><published>2026-02-13T21:35:52+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47010823</id><title>NPMX – a fast, modern browser for the NPM registry</title><updated>2026-02-14T13:57:21.388504+00:00</updated><content>&lt;doc fingerprint="6ef81275d993482d"&gt;
+&lt;/doc&gt;</content><link href="https://www.politico.eu/article/tiktok-meta-facebook-instagram-brussels-kill-infinite-scrolling/"/><published>2026-02-13T20:52:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47008163</id><title>Show HN: Data Engineering Book – An open source, community-driven guide</title><updated>2026-02-14T14:21:25.841050+00:00</updated><content>&lt;doc fingerprint="eb7ad05e09566404"&gt;
+  &lt;main&gt;
+    &lt;p&gt;We read every piece of feedback, and take your input very seriously.&lt;/p&gt;
+    &lt;p&gt;To see all available qualifiers, see our documentation.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://github.com/datascale-ai/data_engineering_book/blob/main/README_en.md"/><published>2026-02-13T21:35:52+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47010823</id><title>NPMX – a fast, modern browser for the NPM registry</title><updated>2026-02-14T14:21:25.753765+00:00</updated><content>&lt;doc fingerprint="6ef81275d993482d"&gt;
   &lt;main&gt;
     &lt;p&gt;a fast, modern browser for the npm registry&lt;/p&gt;
     &lt;p&gt;Help us build a better npm experience.&lt;/p&gt;
@@ -309,7 +145,7 @@ void ForwardPass(inout float inputs[LAYER0_NEURON_COUNT], inout float nodeOutput
     &lt;p&gt;Find out the latest on npmx.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://npmx.dev"/><published>2026-02-14T02:14:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47011567</id><title>Show HN: SQL-tap – Real-time SQL traffic viewer for PostgreSQL and MySQL</title><updated>2026-02-14T13:57:20.956230+00:00</updated><content>&lt;doc fingerprint="211fb96f04b8e083"&gt;
+&lt;/doc&gt;</content><link href="https://npmx.dev"/><published>2026-02-14T02:14:34+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47011567</id><title>Show HN: SQL-tap – Real-time SQL traffic viewer for PostgreSQL and MySQL</title><updated>2026-02-14T14:21:25.637964+00:00</updated><content>&lt;doc fingerprint="211fb96f04b8e083"&gt;
   &lt;main&gt;
     &lt;p&gt;Real-time SQL traffic viewer — proxy daemon + TUI client.&lt;/p&gt;
     &lt;p&gt;sql-tap sits between your application and your database (PostgreSQL or MySQL), capturing every query and displaying it in an interactive terminal UI. Inspect queries, view transactions, and run EXPLAIN — all without changing your application code.&lt;/p&gt;
@@ -622,10 +458,10 @@ Flags:
     &lt;p&gt;sql-tapd parses the database wire protocol (PostgreSQL or MySQL) to intercept queries transparently. It tracks prepared statements, parameter bindings, transactions, execution time, rows affected, and errors. Events are streamed to connected TUI clients via gRPC.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/mickamy/sql-tap"/><published>2026-02-14T04:27:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47011602</id><title>Backblaze Drive Stats for 2025</title><updated>2026-02-14T13:57:20.536049+00:00</updated><content>&lt;doc fingerprint="f644bf53c6e86b4d"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/mickamy/sql-tap"/><published>2026-02-14T04:27:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47011602</id><title>Backblaze Drive Stats for 2025</title><updated>2026-02-14T14:21:25.120370+00:00</updated><content>&lt;doc fingerprint="f644bf53c6e86b4d"&gt;
   &lt;main&gt;&lt;p&gt;This year marks 13 years of collecting Drive Stats data. Thirteen is an unlucky number (to some), but we count our lucky stars (or perhaps our lucky stats?) that we’ve had 13 years of this experiment.&lt;/p&gt;&lt;p&gt;The traditional 13-year anniversary gift is lace—intricate, impressive, and vulnerable to a snag if you don’t plan ahead to protect the pattern. Systems, like lace, don’t survive by pretending there are no points of vulnerability. When it comes to our infrastructure, we want to build with the snags in mind to create something durable, and the Drive Stats series is always seeking to publish and provide data so that you, too, can go the distance with your drives.&lt;/p&gt;&lt;p&gt;This year-end Drive Stats report looks at Q4 2025, the full year, and the lifetime view with that in mind. I think you’ll find the same things we do: over time, the patterns matter more than any single strand (or drive, to run this lace metaphor into the ground once and for all). Let’s look at the stats.&lt;/p&gt;&lt;head rend="h4"&gt;Drive Stats is here for you&lt;/head&gt;Drive Stats is not a situationship. We’re a conversation and a relationship—to the data. Join the Drive Stats team for our regularly scheduled webinar to walk through the 2025 annualized failure rates, break down the data for interesting trends, and get the latest from the Backblaze drive fleet happenings.&lt;head rend="h2"&gt;Drive Stats: The digest version&lt;/head&gt;&lt;head rend="h2"&gt;Q4 2025 hard drive failure rates&lt;/head&gt;&lt;p&gt;As of the end of 2025, Backblaze was monitoring 341,664 drives used to store data. For our evaluation, we removed from consideration 4,013 boot drives and 459 hard drives, as they did not meet the criteria to be included. We’ll discuss the criteria we used in the next section of this report. Removing these drives leaves us with 337,192 hard drives to analyze. The table below shows the annualized failure rates for Q4 2025 for this collection of drives.&lt;/p&gt;&lt;p&gt;Backblaze Hard Drive Failure Rates for Q4 2025&lt;/p&gt;&lt;p&gt;Reporting period October 1, 2025–December 31, 2025 inclusive&lt;lb/&gt;Drive models with drive count &amp;gt; 100 as of December 31, 2025 and drive days &amp;gt; 10,000 in Q4 2025.&lt;/p&gt;&lt;head rend="h3"&gt;Note and observations&lt;/head&gt;&lt;list rend="ul"&gt;&lt;item&gt;New drives! &lt;list rend="ul"&gt;&lt;item&gt;Seagate ST16000NM000J 16TB, with 112 drives&lt;/item&gt;&lt;item&gt;WDC WUH722626ALE6L4 26TB with 1,201 drives. Our first 26TB drive!&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;&lt;item&gt;The honor roll: &lt;list rend="ul"&gt;&lt;item&gt;HGST HMS5C4040BLE640 4TB: 1 failure&lt;/item&gt;&lt;item&gt;Seagate ST8000NM000A 8TB: 0 failure&lt;/item&gt;&lt;item&gt;Seagate ST12000NM000J 12TB: 1 failure&lt;/item&gt;&lt;item&gt;Seagate ST16000NM000J 16TB: 1 failure&lt;/item&gt;&lt;item&gt;Seagate ST16000NM002J 16TB: 0 failure&lt;/item&gt;&lt;item&gt;WDC WUH722626ALE6L4 26TB: 1 failure. Shoutout to the new kid—starting off strong!&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;&lt;item&gt;Red flags: &lt;list rend="ul"&gt;&lt;item&gt;HGST HUH728080ALE600 8TB: 10.29%&lt;/item&gt;&lt;item&gt;Seagate ST10000NM0086 10TB: 5.23%&lt;/item&gt;&lt;item&gt;Toshiba MG08ACA16TEY 16TB: 4.14%&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;&lt;/list&gt;&lt;p&gt;We talked about two of these drives last quarter, and what we said about the Seagate still holds true—we’re seeing end of life activity with this drive. But, let’s dig in on the 8TB HGST and 16TB Toshiba and see what’s going on.&lt;/p&gt;&lt;head rend="h3"&gt;HGST HUH728080ALE600 8TB&lt;/head&gt;&lt;p&gt;There’s always some digging to be done when we see a double digit failure rate, especially on a drive that, in the past year, hasn’t had terrible failure rates (despite the fact that it’s about 7.5 years old).&lt;/p&gt;&lt;p&gt;It’s worth contextualizing, first, that the total drive count of this model is 1,073, which equates to less than one Vault. (A standard Vault has 1,200 drives.) While Vaults aren’t always the same drive model, especially with older drives, in an ideal world, those Vaults would be uniform. So, in this case, we’re dealing with drives that are all hanging out in the same location in a data center, which means we could be working with environmental factors like a change in temperature or airflow.&lt;/p&gt;&lt;p&gt;By the time Drive Stats data gets to me, of course, lots of smart people have already seen the disturbances in the force, so to speak. When I dug into the data center work tickets, it turned turned out that folks had already ruled out temperature as a factor—the working theory at the moment is that the drive could be sensitive to vibration, but given the age of these drives, we decided to just flag them for our normal CVT migration process.&lt;/p&gt;&lt;head rend="h3"&gt;Toshiba MG08ACA16TEY 16TB&lt;/head&gt;&lt;p&gt;We talked about this model last quarter because it clocked in at a 16.95% AFR (!!). Our investigation turned up some collaborative (and routine) firmware work with Toshiba, and at that time, we predicted that these failure rates would normalize once again. We’re still a little high, but that’s likely a function of rolling out the work. As predicted, this is a healthy normalization.&lt;/p&gt;&lt;head rend="h2"&gt;Defining the relationship, aka setting some boundaries&lt;/head&gt;&lt;p&gt;We’ve covered the reasons that we’ve designed these exclusions in past reports, but here’s the quick and dirty:&lt;/p&gt;&lt;table&gt;&lt;row span="3"&gt;&lt;cell role="head"&gt;Period&lt;/cell&gt;&lt;cell role="head"&gt;Drive Count&lt;/cell&gt;&lt;cell role="head"&gt;Drive Days&lt;/cell&gt;&lt;/row&gt;&lt;row span="3"&gt;&lt;cell&gt;Quarterly&lt;/cell&gt;&lt;cell&gt;&amp;gt; 100&lt;/cell&gt;&lt;cell&gt;&amp;gt; 10,000&lt;/cell&gt;&lt;/row&gt;&lt;row span="3"&gt;&lt;cell&gt;Annual&lt;/cell&gt;&lt;cell&gt;&amp;gt; 250&lt;/cell&gt;&lt;cell&gt;&amp;gt; 50,000&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Lifetime&lt;/cell&gt;&lt;cell&gt;&amp;gt; 500&lt;/cell&gt;&lt;cell&gt;&amp;gt;100,000&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;Regardless of whether or not a given drive model is included in this article’s charts and tables, all of the line item data is included in our Drive Stats dataset which you can download by visiting our Drive Stats page.&lt;/p&gt;&lt;head rend="h2"&gt;2025 Annual hard drive failure rates&lt;/head&gt;&lt;p&gt;As of the end of 2025, Backblaze was monitoring 349,462 hard drives used to store data. We removed 4,176 boot drives and 1,090 hard drives from consideration as they did not meet the annual criteria we have defined. This leaves us with 344,196 drives divided across 30 different drive models. The table below shows the AFRs for 2025 for this collection of drives.&lt;/p&gt;&lt;p&gt;Backblaze Hard Drive Failure Rates for 2025&lt;/p&gt;&lt;p&gt;Reporting period January 1, 2025–December 31, 2025 inclusive&lt;lb/&gt;Drive models with drive count &amp;gt; 250 and drive days &amp;gt; 50,000 in 2025&lt;/p&gt;&lt;head rend="h3"&gt;Notes and observations&lt;/head&gt;&lt;list rend="ul"&gt;&lt;item&gt;The annual AFR is down: This year finishes strong at 1.36%, down from 1.55% in 2024. Still those paying attention to the quarterly AFR have seen some volatility in that number.&lt;/item&gt;&lt;/list&gt;&lt;list rend="ul"&gt;&lt;item&gt;Nobody made it out unscathed: There are zero 0 failures.&lt;/item&gt;&lt;item&gt;But, let’s talk about it: These are the drives that averaged less than two failures per quarter (though, not necessarily evenly distributed when you look at the data). &lt;list rend="ul"&gt;&lt;item&gt;HGST HMS5C4040BLE640 4TB: 5 failures&lt;/item&gt;&lt;item&gt;Seagate ST12000NM000J 12TB: 4 failures&lt;/item&gt;&lt;item&gt;Seagate ST14000NM000J 14TB: 7 failures&lt;/item&gt;&lt;item&gt;Seagate ST16000NM002J 16TB: 1 failure&lt;/item&gt;&lt;item&gt;Toshiba MG09ACA16TE 16TB: 3 failures&lt;/item&gt;&lt;item&gt;WDC WUH722626ALE6L4 26TB: 1 failures. &lt;list rend="ul"&gt;&lt;item&gt;Note that this drive is in its first quarter of life, so it’s hard to call this significant yet.&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;&lt;/list&gt;&lt;p&gt;And, all those drive tickets and models mean lots and lots of work—we wrote a whole article on that front, but here’s a breakdown of hours spent in each data center.&lt;/p&gt;&lt;p&gt;And here’s an even more interesting slice, from a drive perspective:&lt;/p&gt;&lt;p&gt;Yes, you’ll see some funky drive sizes on that list; it’s inclusive of all of our drives, not just the hard drives we include in this report.&lt;/p&gt;&lt;head rend="h2"&gt;Comparing Drive Stats for 2023, 2024, and 2025&lt;/head&gt;&lt;p&gt;Let’s take a look back at the previous years’ annual AFRs to get a sense of how 2025 compares:&lt;/p&gt;&lt;p&gt;Three Year Comparison of Annual Backblaze Hard Drive Failure Rates&lt;/p&gt;&lt;p&gt;For drive models with &amp;gt; 250 drives as of 12/31/25 and drive models with &amp;gt; 50,000 drive days in 2025&lt;lb/&gt;Data for each year is inclusive of that year.&lt;/p&gt;&lt;head rend="h3"&gt;Notes and observations&lt;/head&gt;&lt;list rend="ul"&gt;&lt;item&gt;The annual AFR is down to 1.36%. We haven’t seen those numbers since 2022 (1.37%). Cool!&lt;/item&gt;&lt;/list&gt;&lt;list rend="ul"&gt;&lt;item&gt;Slicing our data by drive size shows how impactful the shift to high capacity drives really is: based on the current quarterly data, our drive size breakdown looks like this: &lt;list rend="ul"&gt;&lt;item&gt;0–12TB: 25.13%&lt;/item&gt;&lt;item&gt;14–16TB: 52.06%&lt;/item&gt;&lt;item&gt;20TB+: 22.81%&lt;/item&gt;&lt;/list&gt;&lt;/item&gt;&lt;/list&gt;&lt;p&gt;This is an already long report, so in the interest of time, we’ll just say this: There are multiple factors that go into how and why things are changing, including the average age of drives within our cohort, how much drive technology has improved over the years, how drives on the market have gotten bigger over time while the cost per GB has also dropped, and how the current demand for drives has been changing some of those things.&lt;/p&gt;&lt;p&gt;If that sentence sounds confusing, welcome to the world of enterprise drive buying. But, as always, we have to contextualize the real data we see with the way we source and use drives.&lt;/p&gt;&lt;head rend="h2"&gt;Lifetime hard drive failure rates&lt;/head&gt;&lt;p&gt;Backblaze Lifetime Hard Drive Failure Rates&lt;/p&gt;&lt;p&gt;Reporting period ending December 31, 2025 inclusive&lt;lb/&gt;Drive models with &amp;gt; 500 drives and &amp;gt; 100,000 lifetime drive days&lt;/p&gt;&lt;head rend="h3"&gt;Notes and observations&lt;/head&gt;&lt;list rend="ul"&gt;&lt;item&gt;Ol’ faithful: Lifetime AFR is 1.30% this quarter, and there’s been no significant change in that number for quite some time.&lt;/item&gt;&lt;item&gt;Say hi to the new guy: The Toshiba MG11ACA24TE 24TB made the cut for the lifetime table. Last quarter, we deployed another 2,400 of these, bringing us to 4,806 drives total.&lt;/item&gt;&lt;/list&gt;&lt;head rend="h2"&gt;The Hard Drive dataset (and beyond)&lt;/head&gt;&lt;p&gt;Thank you, as always, for making it through ~2,500 or so words to examine the fun side of data. Here’s our standard fine print:&lt;/p&gt;&lt;p&gt;The complete dataset used to create the tables and charts in this report is available on our Hard Drive Test Data page. You can download and use this data for free for your own purpose. All we ask are three things:&lt;/p&gt;&lt;list rend="ol"&gt;&lt;item&gt;You cite Backblaze as the source if you use the data;&lt;/item&gt;&lt;item&gt;You accept that you are solely responsible for how you use the data, and;&lt;/item&gt;&lt;item&gt;You do not sell this data itself to anyone; it is free.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;If you’re a new Drive Stats fan, consider signing up for the newsletter. If you’re not ready for that kind of commitment, sound off in the comments section below or reach out directly to us to let us know what you’re working on. Happy investigating!&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.backblaze.com/blog/backblaze-drive-stats-for-2025/"/><published>2026-02-14T04:35:01+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47012312</id><title>Cogram (YC W22) – Hiring former technical founders</title><updated>2026-02-14T13:57:19.918136+00:00</updated><content>&lt;doc fingerprint="6cf1d76951142566"&gt;
+&lt;/doc&gt;</content><link href="https://www.backblaze.com/blog/backblaze-drive-stats-for-2025/"/><published>2026-02-14T04:35:01+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47012312</id><title>Cogram (YC W22) – Hiring former technical founders</title><updated>2026-02-14T14:21:24.642920+00:00</updated><content>&lt;doc fingerprint="6cf1d76951142566"&gt;
   &lt;main&gt;
     &lt;p&gt;The AI Platform for Architects, Builders, and Engineers&lt;/p&gt;
     &lt;p&gt;Location: Remote&lt;lb/&gt; Timezone: within CET ±3 hours&lt;/p&gt;
@@ -640,7 +476,7 @@ Flags:
     &lt;p&gt;Cogram is an AI platform for the architecture, engineering, and construction (AEC) industry. Our products automate a growing number of AEC workflows such as site reports, meeting minutes, mail management, and RFP bidding. We’re backed by Y Combinator and other world-leading investors and are growing fast and sustainably. We believe that a small, winning team can achieve outsize results—especially in the age of AI—and consistently beat competitors 100x our size.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.ycombinator.com/companies/cogram/jobs/LDTrViN-ex-technical-founder-product-engineer"/><published>2026-02-14T07:00:15+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47012717</id><title>Zig – io_uring and Grand Central Dispatch std.Io implementations landed</title><updated>2026-02-14T13:57:19.192159+00:00</updated><content>&lt;doc fingerprint="2e55b219462d0e92"&gt;
+&lt;/doc&gt;</content><link href="https://www.ycombinator.com/companies/cogram/jobs/LDTrViN-ex-technical-founder-product-engineer"/><published>2026-02-14T07:00:15+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47012717</id><title>Zig – io_uring and Grand Central Dispatch std.Io implementations landed</title><updated>2026-02-14T14:21:23.841475+00:00</updated><content>&lt;doc fingerprint="2e55b219462d0e92"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Devlog&lt;/head&gt;
     &lt;p&gt;This page contains a curated list of recent changes to main branch Zig.&lt;/p&gt;
@@ -852,7 +688,7 @@ info: fork /home/andy/dev/dvui matched 1 (dvui) packages
     &lt;p&gt;The very same day I sat at home writing this devlog like a coward, less than five miles away, armed forces who are in my city against the will of our elected officials shot tear gas, unprovoked, at peaceful protestors. Next time I hope to have the courage to join my neighbors, and I hope to not get shot like Alex Pretti and RenÃ©e Good.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://ziglang.org/devlog/2026/#2026-02-13"/><published>2026-02-14T08:22:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47012964</id><title>YouTube as Storage</title><updated>2026-02-14T13:57:19.077721+00:00</updated><content>&lt;doc fingerprint="665db65d6969e050"&gt;
+&lt;/doc&gt;</content><link href="https://ziglang.org/devlog/2026/#2026-02-13"/><published>2026-02-14T08:22:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47012964</id><title>YouTube as Storage</title><updated>2026-02-14T14:21:23.746322+00:00</updated><content>&lt;doc fingerprint="665db65d6969e050"&gt;
   &lt;main&gt;
     &lt;p&gt;Stores files onto YouTube by encoding them into lossless video and decoding them back to the original file. Supports both a command-line interface and a graphical user interface.&lt;/p&gt;
     &lt;list rend="ul"&gt;
@@ -943,12 +779,38 @@ cmake --build build&lt;/code&gt;
     &lt;p&gt;This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/PulseBeat02/yt-media-storage"/><published>2026-02-14T09:10:15+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47013059</id><title>Ars Technica makes up quotes from Matplotlib maintainer; pulls story</title><updated>2026-02-14T13:57:18.681438+00:00</updated><content>&lt;doc fingerprint="f8eb8f2f2d953eed"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/PulseBeat02/yt-media-storage"/><published>2026-02-14T09:10:15+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47013059</id><title>Ars Technica makes up quotes from Matplotlib maintainer; pulls story</title><updated>2026-02-14T14:21:23.392282+00:00</updated><content>&lt;doc fingerprint="f8eb8f2f2d953eed"&gt;
   &lt;main&gt;
     &lt;p&gt;To use the Mastodon web application, please enable JavaScript. Alternatively, try one of the native apps for Mastodon for your platform.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://infosec.exchange/@mttaggart/116065340523529645"/><published>2026-02-14T09:28:45+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47014405</id><title>How many registers does an x86-64 CPU have? (2020)</title><updated>2026-02-14T13:57:18.338092+00:00</updated><content>&lt;doc fingerprint="b37994100575c24a"&gt;
+&lt;/doc&gt;</content><link href="https://infosec.exchange/@mttaggart/116065340523529645"/><published>2026-02-14T09:28:45+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47014337</id><title>Russia killed opposition leader Alexei Navalny using dart frog toxin, UK says</title><updated>2026-02-14T14:21:23.054814+00:00</updated><content>&lt;doc fingerprint="36314a15dab3a3a6"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Russia killed opposition leader Alexei Navalny using dart frog toxin, UK says&lt;/head&gt;
+    &lt;p&gt;Russian opposition leader Alexei Navalny was killed using a poison developed from a dart frog toxin, the Foreign Office has said.&lt;/p&gt;
+    &lt;p&gt;Two years on from the death of Navalny at a Siberian penal colony, Britain and its allies have blamed the Kremlin following analysis of material samples found on his body.&lt;/p&gt;
+    &lt;p&gt;There is no innocent explanation for the toxin, called epibatidine, being found in samples taken from Navalny's body, the Foreign Office said.&lt;/p&gt;
+    &lt;p&gt;Speaking from the Munich Security Conference, Foreign Secretary Yvette Cooper said: "Only the Russian government had the means, motive and opportunity to deploy this lethal toxin against Alexei Navalny during his imprisonment in Russia."&lt;/p&gt;
+    &lt;p&gt;Cooper met with Navalny's widow Yulia Navalnaya at the conference this weekend.&lt;/p&gt;
+    &lt;p&gt;"Russia saw Navalny as a threat," Cooper said at the event.&lt;/p&gt;
+    &lt;p&gt;"By using this form of poison the Russian state demonstrated the despicable tools it has at its disposal and the overwhelming fear it has of political opposition", she added.&lt;/p&gt;
+    &lt;p&gt;The UK has been joined by Sweden, France, the Netherlands and Germany in accusing Russia of the poisoning.&lt;/p&gt;
+    &lt;p&gt;The Foreign Office said the UK has informed the Organisation on the Prohibition of Chemical Weapons of Russia's alleged breach of the Chemical Weapons Convention.&lt;/p&gt;
+    &lt;p&gt;Navalny – an anti-corruption campaigner and Russia's most vociferous opposition leader - died suddenly in jail on 16 February 2024 at the age of 47.&lt;/p&gt;
+    &lt;p&gt;In 2020 he was poisoned with a Novichok nerve agent. He underwent treatment in Germany, and was arrested at the airport upon his return to Russia.&lt;/p&gt;
+    &lt;p&gt;Before Saturday's announcement, Navalny's wife Yulia Navalnaya had consistently argued that her husband was killed by poisoning while serving a prison sentence in an Arctic penal colony in 2024.&lt;/p&gt;
+    &lt;p&gt;In September last year, Navalnaya said analysis of smuggled biological samples carried out by laboratories in two countries showed that her husband had been "murdered".&lt;/p&gt;
+    &lt;p&gt;She did not provide details on the poison allegedly used, on the samples or on the analysis – but challenged the two laboratories to publish their results.&lt;/p&gt;
+    &lt;p&gt;Reacting to the Foreign Office announcement, Navalnaya said: "I was certain from the first day that my husband had been poisoned, but now there is proof.&lt;/p&gt;
+    &lt;p&gt;"I am grateful to the European states for the meticulous work they carried out over two years and for uncovering the truth," she added.&lt;/p&gt;
+    &lt;p&gt;The Kremlin has not commented on the allegations.&lt;/p&gt;
+    &lt;p&gt;Russian President Vladimir Putin, who studiously avoided naming Navalny while he was alive, briefly referred to him a month after his death by stating that a person passing was "always a sad event".&lt;/p&gt;
+    &lt;p&gt;At the time of his death, Navalny had been in jail for three years on trumped-up charges and had recently been transferred to the Arctic Circle penal colony.&lt;/p&gt;
+    &lt;p&gt;According to Russian accounts, the 47-year-old took a short walk at his Siberian penal colony, said he felt unwell, then collapsed and never regained consciousness.&lt;/p&gt;
+    &lt;p&gt;Navalny's family later confirmed that the political activist died on 16 February.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://www.bbc.com/news/articles/cwyk4lz4e3eo"/><published>2026-02-14T13:22:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47014405</id><title>How many registers does an x86-64 CPU have? (2020)</title><updated>2026-02-14T14:21:22.693448+00:00</updated><content>&lt;doc fingerprint="b37994100575c24a"&gt;
   &lt;main&gt;&lt;p&gt;Nov 30, 2020 Tags: programming, x86&lt;/p&gt;&lt;p&gt;This post is at least a year old.&lt;/p&gt;&lt;p&gt;x86 is back in the general programmer discourse, in part thanks to Appleâs M1 and Rosetta 2. As such, I figured Iâd do yet another x86-64 post.&lt;/p&gt;&lt;p&gt;Just like the last one, Iâm going to cover a facet of the x86-64 ISA that sets it apart as unusually complex among modern ISAs: the number and diversity of registers available.&lt;/p&gt;&lt;p&gt;Like instruction counting, register counting on x86-64 is subject to debates over methodology. In particular, for this blog post, Iâm going to lay the following ground rules:&lt;/p&gt;&lt;p&gt;I will count sub-registers (e.g., &lt;code&gt;EAX&lt;/code&gt; for &lt;code&gt;RAX&lt;/code&gt;) as distinct registers. My justification:
 they have different instruction encodings, and both Intel and AMD optimize/pessimize
 particular sub-register use patterns in their microcode.&lt;/p&gt;&lt;p&gt;I will count registers that are present on x86-64 CPUs, but that canât be used in long mode.&lt;/p&gt;&lt;p&gt;I wonât count registers that are only present on older x86 CPUs, like the 80386 and 80486 test registers.&lt;/p&gt;&lt;p&gt;I wonât count microarchitectural implementation details, like shadow registers.&lt;/p&gt;&lt;p&gt;I will count registers that arenât directly addressable, like MSRs that can only be accessed through &lt;code&gt;RDMSR&lt;/code&gt;. However, I wonât (or will try not to) double-count registers that
@@ -1000,4 +862,365 @@ top of the empty ranges, there are also ranges that are explicitly marked as res
 generally or explicitly for later expansion of a particular MSR family.&lt;/p&gt;&lt;p&gt;To count the actual number of MSRs, I did a bit of pipeline ugliness:&lt;/p&gt;&lt;p&gt;Extract just table 2-2 from Volume 4 of the SDM (link):&lt;/p&gt;&lt;p&gt;Use &lt;code&gt;pdftotext&lt;/code&gt; to convert it to plain text and manually trim the next table from the last page:&lt;/p&gt;&lt;p&gt;Split the plain text table into a sequence of words, filter by &lt;code&gt;IA32_&lt;/code&gt;, remove cruft, and do a
 standard sort-unique-count:&lt;/p&gt;&lt;p&gt;(Output preserved for posterity here).&lt;/p&gt;&lt;p&gt;That pipeline left a bit of cruft towards the end thanks to quoted variants, so I count the actual number at 400 architectural MSRs. Thatâs a lot more reasonable than 6096!&lt;/p&gt;&lt;p&gt;Registers in this group: 400&lt;/p&gt;&lt;p&gt;Running count: &amp;gt;556.&lt;/p&gt;&lt;p&gt;The footnotes at the bottom of this post cover most of my notes, but I also wanted to dump some other resources that I found useful while discovering registers:&lt;/p&gt;&lt;p&gt;sandpile.org has a nice visualization of many of the architectural MSRs, including field breakdowns.&lt;/p&gt;&lt;p&gt;Vol. 3A Â§ 8.7.1 (âState of the Logical Processorsâ) of the Intel SDM has a useful list of nearly all of the registers that are either unique to or shared between x86-64 cores.&lt;/p&gt;&lt;p&gt;The OSDev Wiki has collection of helpful pages on various x86-64 registers, including a great page on the behavior of the segment base MSRs.&lt;/p&gt;&lt;p&gt;All told, I think that there are roughly 557 registers on the average (relatively recent) x86-64 CPU core. With that being said, I have some peripheral cases that Iâm not sure about:&lt;/p&gt;&lt;p&gt;Modern Intel CPUs use integrated APICs as part of their SMT implementation. These APICs have their own register banks which can be memory-mapped for reading and potential modification by an x86 core. I didnât count them because (1) theyâre memory mapped, and thus behave more like mapped registers from an arbitrary piece of hardware than CPU registers, and (2) Iâm not sure whether AMD uses the same mechanism/implementation.&lt;/p&gt;&lt;p&gt;The Intel SDM implies that Last Branch Records are stored in discrete, non-MSR registers. AMDâs developer manual, on the other hand, specifies a range of MSRs. As such, I didnât attempt to count these separately.&lt;/p&gt;&lt;p&gt;Both Intel and AMD have their own (and incompatible) virtualization extensions, as well as their own enclave/hardened execution extensions. My intuition is that each introduces some additional registers (or maybe just MSRs), but their vendor-specificity made me inclined to not look too deeply.&lt;/p&gt;&lt;p&gt;Information on these (and any other) registers would be deeply appreciated.&lt;/p&gt;&lt;p&gt;Both ISA and OS specified.Â ↩&lt;/p&gt;&lt;p&gt;With a few exceptions: some x86 instructions have their register(s) baked into their encodings, preventing programmers from directly substituting another GPR. Examples: the stack operations (with &lt;code&gt;rsp&lt;/code&gt;/&lt;code&gt;rbp&lt;/code&gt;) and some of the rep-prefix operations (with &lt;code&gt;rcx&lt;/code&gt;/&lt;code&gt;rsi&lt;/code&gt;/&lt;code&gt;rdi&lt;/code&gt;).Â ↩&lt;/p&gt;&lt;p&gt;64-bit kernels can run 32-bit userspace processes, but 64-bit and 32-bit code canât be mixed in the same process.Â ↩&lt;/p&gt;&lt;p&gt;Specifically, when &lt;code&gt;CPUID.80000001H:ECX.LAHF-SAHF[bit 0] = 1&lt;/code&gt;.Â ↩&lt;/p&gt;&lt;p&gt;Thereâs also a &lt;code&gt;KERNELGSBASE&lt;/code&gt; MSR, which can be used with &lt;code&gt;SWAPGS&lt;/code&gt; to quickly switch between user- and kernel-space &lt;code&gt;GS&lt;/code&gt; base addresses.Â ↩&lt;/p&gt;&lt;p&gt;âNormalâ in the sense that theyâre for data processing, but theyâre actually in a weird stack structure for reasons that are lost to me.Â ↩&lt;/p&gt;&lt;p&gt;My names; Intel doesnât abbreviate these.Â ↩&lt;/p&gt;&lt;p&gt;Educated guess: there wasnât enough space in the original 32-bit control register for them, and the debug registers are niche enough for it to be not worth fixing.Â ↩&lt;/p&gt;&lt;p&gt;Based on my reading of the SDM, but Iâm less sure about this last part.Â ↩&lt;/p&gt;&lt;p&gt;Intel SDM Vol. 3A Â§ 8.7.1: âState of the Logical Processorsâ and Â§ 8.7.3: âMemory Type Range Registers (MTRR)âÂ ↩&lt;/p&gt;&lt;p&gt;Specifically, &lt;code&gt;IA32_PAT&lt;/code&gt;.Â ↩&lt;/p&gt;&lt;p&gt;Linux provides &lt;code&gt;msr(4)&lt;/code&gt;, which can be loaded to provide userspace R/W access to MSRs via devfs.Â ↩&lt;/p&gt;&lt;p&gt;Unless support for &lt;code&gt;FSGSBASE&lt;/code&gt; is enabled, in which case &lt;code&gt;FSBASE&lt;/code&gt; and &lt;code&gt;GSBASE&lt;/code&gt; can be modified directly from ring 3. Linux enabled &lt;code&gt;FSGSBASE&lt;/code&gt; in 5.9, which was released a bit over a month ago.Â ↩&lt;/p&gt;&lt;p&gt;Intel SDM Vol. 4 Â§ 2.1: âArchitectural MSRsâÂ ↩&lt;/p&gt;&lt;p&gt;Intel SDM Vol. 4, Table 2-2: âIA-32 Architectural MSRsâÂ ↩&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://blog.yossarian.net/2020/11/30/How-many-registers-does-an-x86-64-cpu-have"/><published>2026-02-14T13:33:03+00:00</published></entry></feed>
+&lt;/doc&gt;</content><link href="https://blog.yossarian.net/2020/11/30/How-many-registers-does-an-x86-64-cpu-have"/><published>2026-02-14T13:33:03+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47014449</id><title>Ooh.directory: a place to find good blogs that interest you</title><updated>2026-02-14T14:21:21.722580+00:00</updated><content>&lt;doc fingerprint="221ae459abb23f30"&gt;
+  &lt;main&gt;
+    &lt;div&gt;
+      &lt;h2&gt;&lt;span&gt;🍾&lt;/span&gt;Four years old today!&lt;/h2&gt;
+      &lt;ol&gt;
+        &lt;li&gt;
+          &lt;p&gt;
+            &lt;a&gt;LIP SERVICE — Split Lip Magazine&lt;/a&gt;
+            &lt;q&gt;We’re a literary journal that’s totally bonkers-in-love with voice-driven writing, pop culture, and the kind of honesty that gets you right in the kidneys.&lt;/q&gt;
+            &lt;span&gt;
+              &lt;span&gt;
+                &lt;span&gt;🇺🇸&lt;/span&gt;
+              &lt;/span&gt;
+              &lt;a&gt;More info&lt;/a&gt;
+            &lt;/span&gt;
+          &lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;4 days ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;Now Playing: January 2026&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;Our January 2026 edition of Now Playing features love letters, a novella, and a limited series, all from our contributors!Lia HagenLately, I've been looking for queerness in women's letters. In a slim collection of love …&lt;/blockquote&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+      &lt;/ol&gt;
+      &lt;h2&gt;&lt;span&gt;🎂&lt;/span&gt;Three years old today!&lt;/h2&gt;
+      &lt;ol&gt;
+        &lt;li&gt;
+          &lt;p&gt;&lt;a&gt;maerk.xyz | Blog&lt;/a&gt;&lt;br/&gt; By Mark. &lt;span&gt;&lt;a&gt;More info&lt;/a&gt;&lt;/span&gt;&lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;a month ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;01/24/26&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;Relevant audio. God, what a fucking banger. Comments are broken. Reply to this post via email.&lt;/blockquote&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+      &lt;/ol&gt;
+      &lt;h2&gt;Recently added blogs&lt;/h2&gt;
+      &lt;p&gt;Or see &lt;a&gt;recently &lt;em&gt;updated&lt;/em&gt;blogs&lt;/a&gt;&lt;/p&gt;
+      &lt;ol&gt;
+        &lt;li&gt;
+          &lt;p&gt;
+            &lt;a&gt;Carol Peters poems&lt;/a&gt;
+            &lt;span&gt;
+              &lt;span&gt;
+                &lt;span&gt;🇺🇸&lt;/span&gt;
+              &lt;/span&gt;
+              &lt;a&gt;More info&lt;/a&gt;
+            &lt;/span&gt;
+          &lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;a month ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;Jan 13 2026&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;the two gray squirrels might be puppet strungbound bound bound halt on two back feetnose at ice-furred snow survey stubbled fieldbound bound bound&lt;/blockquote&gt;
+                &lt;footer&gt;
+                  &lt;small&gt;By Carol Peters, 23 words&lt;/small&gt;
+                &lt;/footer&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;
+            &lt;a&gt;Molecular Design&lt;/a&gt;
+            &lt;q&gt;Controlling the behavior of compounds and materials by manipulation of molecular properties.&lt;/q&gt;
+            &lt;span&gt;
+              &lt;a&gt;More info&lt;/a&gt;
+            &lt;/span&gt;
+          &lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;a month ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;Hit to Lead best practice?&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;I'm now in Trinidad and I'll share a 180° panorama from Paramin where I walk for exercise. This district in Trinidad's Northern Range is renowned for its agriculture and the most excellent produce is grown …&lt;/blockquote&gt;
+                &lt;footer&gt;
+                  &lt;small&gt;By Peter Kenny, 7,986 words&lt;/small&gt;
+                &lt;/footer&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;&lt;a&gt;One Starry Night&lt;/a&gt;&lt;q&gt;A cozy constellation of stories, stardust, nostalgia, and chronic illness adventures. Still sparkling since 2001.&lt;/q&gt; By Sarah DiLullo. &lt;span&gt;&lt;span&gt;&lt;span&gt;🇺🇸&lt;/span&gt;&lt;/span&gt;&lt;a&gt;More info&lt;/a&gt;&lt;/span&gt;&lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;2 months ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;Still Alive a Year Later&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;Today marks one year since my rare cancer discovery. Since that diagnosis and massive life-threatening surgery, only my best friend, her daughter, my teenage son, and, to a lesser degree, my oldest son have given …&lt;/blockquote&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;&lt;a&gt;Infinite Regress&lt;/a&gt;&lt;q&gt;Clinical trials, cancer research, book reviews, coffee making, photography, and the like.&lt;/q&gt; By Miloš Miljković. &lt;span&gt;&lt;span&gt;&lt;span&gt;🇺🇸&lt;/span&gt;&lt;/span&gt;&lt;a&gt;More info&lt;/a&gt;&lt;/span&gt;&lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;16 hours ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;2026-02-13 22:14&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;🎙 A plug for the most recent ATP podcast special, After Apple. Yes, my frustration with the company has grown since reading about their dubious business practices and I typing this from Asahi Fedora to …&lt;/blockquote&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;
+            &lt;a&gt;Carlos Roldán • Blog&lt;/a&gt;
+            &lt;q&gt;Technology or anything else. By Carlos Roldán, researcher, entrepreneur and hobbyist.&lt;/q&gt;
+            &lt;span&gt;
+              &lt;span&gt;
+                &lt;span&gt;🇪🇸&lt;/span&gt;
+              &lt;/span&gt;
+              &lt;a&gt;More info&lt;/a&gt;
+            &lt;/span&gt;
+          &lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;a day ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;Tensei: a teleportation sokoban&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;Two weeks ago, I participated in the Seville Global Game Jam (GGJ), developing a game in 48 hours with @Pabletos: The theme was mask, so we built a Sōkoban-style puzzle game centered on pushing statues. …&lt;/blockquote&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;&lt;a&gt;Every Day Is Like Wednesday&lt;/a&gt;&lt;q&gt;A freelance writer and long time comics blogger based in Ohio.&lt;/q&gt; By J. Caleb Mozzocco. &lt;span&gt;&lt;span&gt;&lt;span&gt;🇺🇸&lt;/span&gt;&lt;/span&gt;&lt;a&gt;More info&lt;/a&gt;&lt;/span&gt;&lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;a day ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;Art Adams' Creature Features, a great book you probably won't be able to find.&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;I had read most of the contents of this 1996 trade paperback collection before, having found the 1993 Arthur Adams-drawn Creature from the Black Lagoon adaptation in a back issue bin, and having read his …&lt;/blockquote&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;&lt;a&gt;theHigherGeometer&lt;/a&gt;&lt;q&gt;…higher geometry, a kind of an amalgamation of geometry/topology and category theory. I also dabble in topos-theoretic foundational issues.&lt;/q&gt; By David Michael Roberts. &lt;span&gt;&lt;span&gt;&lt;span&gt;🇦🇺&lt;/span&gt;&lt;/span&gt;&lt;a&gt;More info&lt;/a&gt;&lt;/span&gt;&lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;2 months ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;PSA: a category satisfying all but the smallness condition from Giraud’s theorem…&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;…is called an infinitary pretopos. Once you add the existence of a small set of generators then Giraud’s theorem applies and you know you have a Grothendieck topos. A pretopos can even have a subobject …&lt;/blockquote&gt;
+                &lt;footer&gt;
+                  &lt;small&gt;By David Roberts, 474 words&lt;/small&gt;
+                &lt;/footer&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;&lt;a&gt;prior probability&lt;/a&gt;&lt;q&gt;Hey, where did you get your priors?&lt;/q&gt; By F. E. Guerra-Pujol. &lt;span&gt;&lt;span&gt;&lt;span&gt;🇺🇸&lt;/span&gt;&lt;/span&gt;&lt;a&gt;More info&lt;/a&gt;&lt;/span&gt;&lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;7 hours ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;Sierpinski Valentine&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;I will resume my series on The Wealth of Nations on Monday. In the meantime, Saint Valentine’s Day is just as good as any to revisit my work on the alleged “lost loves” of Adam …&lt;/blockquote&gt;
+                &lt;footer&gt;
+                  &lt;small&gt;By F. E. Guerra-Pujol, 52 words&lt;/small&gt;
+                &lt;/footer&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;&lt;a&gt;roughghosts&lt;/a&gt;&lt;q&gt;words, images and musings on life, literature and creative self expression.&lt;/q&gt; By Joseph Schreiber. &lt;span&gt;&lt;span&gt;&lt;span&gt;🇨🇦&lt;/span&gt;&lt;/span&gt;&lt;a&gt;More info&lt;/a&gt;&lt;/span&gt;&lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;2 days ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;The church that falls again will rise again: A Parish Chronicle by Halldór Laxness&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;This is the story of a church, one that exists whether it is standing or not. Standing high above the Mosfellsdalur Valley in southwest Iceland, not far from the nation’s capital, Mosfell Church has, at …&lt;/blockquote&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;&lt;a&gt;tonsky.me&lt;/a&gt;&lt;q&gt;Here I write about programming and UI design.&lt;/q&gt; By Nikita Prokopov. &lt;span&gt;&lt;span&gt;&lt;span&gt;🇩🇪&lt;/span&gt;&lt;/span&gt;&lt;a&gt;More info&lt;/a&gt;&lt;/span&gt;&lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;a month ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;Podcast: На Маке нет никаких шкафов @ Думаем дальше&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;С Ильей Бирманом провожаем Алана Дая, вспоминая, в чём состоят достижения Мака, Джобса и ХИГа (но и Винду добрым словом тоже вспоминаем).&lt;/blockquote&gt;
+                &lt;footer&gt;
+                  &lt;small&gt;By Nikita Prokopov, 31 words&lt;/small&gt;
+                &lt;/footer&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;&lt;a&gt;halloumi season&lt;/a&gt;&lt;q&gt;Thoughts and essays on classic cinema.&lt;/q&gt; By Sofya. &lt;span&gt;&lt;span&gt;&lt;span&gt;🇨🇾&lt;/span&gt;&lt;/span&gt;&lt;a&gt;More info&lt;/a&gt;&lt;/span&gt;&lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;a month ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;Lost Highway (1997; David Lynch), an analysis&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;Night, absence of sound, and David Bowie. I think I already mentioned a bunch of times in my previous not numerous posts that David Lynch is my favourite director, and how passionately I love Mulholland …&lt;/blockquote&gt;
+                &lt;footer&gt;
+                  &lt;small&gt;By halloumiseason, 1,898 words&lt;/small&gt;
+                &lt;/footer&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;
+            &lt;a&gt;Everything Flows&lt;/a&gt;
+            &lt;q&gt;Glasgow/Scotland based music blog with playlists. By a fan for fans. Blogging about music I love from Scotland and beyond since 2008.&lt;/q&gt;
+            &lt;span&gt;
+              &lt;span&gt;
+                &lt;span&gt;🇬🇧&lt;/span&gt;
+              &lt;/span&gt;
+              &lt;a&gt;More info&lt;/a&gt;
+            &lt;/span&gt;
+          &lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;a day ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;Introducing Other People's Leisure&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;Other People's Lesiure came to my attention towards the end of 2025 via Instagram. A video of two people with a bank of electronic equipment, rainbow coloured lights and a silhouetted singer was captivating. The …&lt;/blockquote&gt;
+                &lt;footer&gt;
+                  &lt;small&gt;By everythingflows, 933 words&lt;/small&gt;
+                &lt;/footer&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;
+            &lt;a&gt;Matthew Muñoz&lt;/a&gt;
+            &lt;q&gt;Demi-daily poetic detritus. Sibilant shibboleths. Feckless blasphemies. Python.&lt;/q&gt;
+            &lt;span&gt;
+              &lt;a&gt;More info&lt;/a&gt;
+            &lt;/span&gt;
+          &lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;a month ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;Brainfuck: Pied Beauty&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+++++++.&amp;gt;++++++++[&amp;lt;++++&amp;gt;-]&amp;lt;+++++.+++.+++.+++++++.&amp;gt;++++++++[&amp;lt;-----------&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;++.+++.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;-----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;++++.-----.&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;-------.&amp;gt;++++++++[&amp;lt;++++&amp;gt;-]&amp;lt;+++++++.&amp;gt;++++++++[&amp;lt;+++++&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;++++++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+.+++.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;++++.---.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++++..----.-------.-.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.+.+++++.-------.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++..&amp;gt;++++++++[&amp;lt;----&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;++++++...&amp;gt;++++++++[&amp;lt;++++&amp;gt;-]&amp;lt;++++++.&amp;gt;++++++++[&amp;lt;+++++&amp;gt;-]&amp;lt;+.+++.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;+++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;.--.----.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++++.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;+++++++++&amp;gt;-]&amp;lt;+++++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;------.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++.++++++.-----.----.-------.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;++++++&amp;gt;-]&amp;lt;++++++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++.---.+++.++++++.---.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;++.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;++.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-.+++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;--.+.-.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;------&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;++++++......&amp;gt;++++++++[&amp;lt;++++&amp;gt;-]&amp;lt;++++++.&amp;gt;++++++++[&amp;lt;+++++&amp;gt;-]&amp;lt;+.+++.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;++.---.++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;------.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;.++.---.-------.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++++.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++..&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;+++++++++&amp;gt;-]&amp;lt;+.+++++.&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;------.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;+++.+.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;---.+++++++..----.-------.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;-----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;+++++.-----.-.-.&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;------.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;++++.--.---.++++++.-.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.-------.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;+++.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;+++.++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;------.++++.&amp;gt;++++++++[&amp;lt;------&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;------&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;+++++++&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;+++++&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-----.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;+++++++&amp;gt;-]&amp;lt;+.+++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-----.--.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;------.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++.&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+++.+++++.---.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++++.+.------.+++++++.-.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;-------.&amp;gt;++++++++[&amp;lt;+++++++&amp;gt;-]&amp;lt;+.-----.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++..+++++++.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;---&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;++++++.+++.+++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;---.+++++.---.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++++.&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;----.-------.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;+++++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;------.+++++.-------.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;------&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;++++++...&amp;gt;++++++++[&amp;lt;+++++&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;+++++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++++.&amp;gt;++++++++[&amp;lt;--&amp;gt;-]&amp;lt;.--.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;-----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;.----.+++.+++++..&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-------.-.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;.-------.----.--.++.-.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++..&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;++++++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+.---.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;++++++.-----.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++..+++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;.----.+++.++++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;------.+.&amp;gt;++++++++[&amp;lt;-----&amp;gt;-]&amp;lt;-----.&amp;gt;++++++++[&amp;lt;------&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;++++++......&amp;gt;++++++++[&amp;lt;++++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;+++++&amp;gt;-]&amp;lt;+++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++..&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;++++.--.&amp;gt;++++++++[&amp;lt;--&amp;gt;-]&amp;lt;-.+++.+.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++++.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;-------.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.---.++++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+++++++.--.----.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;--&amp;gt;-]&amp;lt;---.++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;.+.-------.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;-----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;++++.--.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-.++++.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;-------.&amp;gt;++++++++[&amp;lt;----&amp;gt;-]&amp;lt;----..&amp;gt;++++++++[&amp;lt;++++++&amp;gt;-]&amp;lt;+++++++.&amp;gt;++++++++[&amp;lt;+++++&amp;gt;-]&amp;lt;+++..&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.+.+++++.-------.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++.++++++.-------.++++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-------.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;------.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;+++++++++&amp;gt;-]&amp;lt;+++++++.+++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-.--.++.+++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-----.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;+++.---.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-------.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-----.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;+++.+.--.&amp;gt;++++++++[&amp;lt;--&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++.-------.--.&amp;gt;++++++++[&amp;lt;-----&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;------&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;++++++...&amp;gt;++++++++[&amp;lt;++++++&amp;gt;-]&amp;lt;+++++++.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;+.-------.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;+++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-------.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;--&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;+++++++++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;++++++.+++.------.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;.+.-------.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;++++++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-----.--.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;.+.-------.-.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;+++++++++&amp;gt;-]&amp;lt;+++++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-------.+++++++.&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;-------.&amp;gt;++++++++[&amp;lt;+++++++++&amp;gt;-]&amp;lt;+++.+++.+.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;.----.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;+++++++++&amp;gt;-]&amp;lt;.+++++++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;--&amp;gt;-]&amp;lt;------.&amp;gt;++++++++[&amp;lt;---&amp;gt;-]&amp;lt;-------.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;++++++......&amp;gt;++++++++[&amp;lt;++++++&amp;gt;-]&amp;lt;+++++++.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;+++.++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;------.---.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++++++.&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;+++.-------.+++.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;---&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;+++.++++.&amp;gt;++++++++[&amp;lt;--&amp;gt;-]&amp;lt;--..&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++++.&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;+++.----.++++++.---.&amp;gt;++++++++[&amp;lt;------&amp;gt;-]&amp;lt;-------.&amp;gt;++++++++[&amp;lt;---&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+.+++.---.&amp;gt;++++++++[&amp;lt;+++&amp;gt;-]&amp;lt;+..&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;------.-------.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;++++.+++++.++++.&amp;gt;++++++++[&amp;lt;------&amp;gt;-]&amp;lt;--.&amp;gt;++++++++[&amp;lt;------&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;+++++++&amp;gt;-]&amp;lt;++++++.&amp;gt;++++++++[&amp;lt;+++&amp;gt;-]&amp;lt;+++++.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;-----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;++++++.-----.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;+++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.---.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++.+.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;------.&amp;gt;++++++++[&amp;lt;+++++++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+.+++.++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;---------&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;+++++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-------.+++++++.++++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;------.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;-----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;++.+++.----.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;++++.-.+++++.&amp;gt;++++++++[&amp;lt;-----------&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;+++++++++&amp;gt;-]&amp;lt;+.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;++++++++++&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;-------.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;++.+.&amp;gt;++++++++[&amp;lt;----------&amp;gt;-]&amp;lt;----.&amp;gt;++++++++[&amp;lt;++++++++&amp;gt;-]&amp;lt;+++.+++++.-------.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;+++++.-------.--.&amp;gt;++++++++[&amp;lt;-----&amp;gt;-]&amp;lt;---.&amp;gt;++++++++[&amp;lt;------&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;++&amp;gt;-]&amp;lt;++++++................................&amp;gt;++++++++[&amp;lt;++++++&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;++++&amp;gt;-]&amp;lt;++.&amp;gt;++++++++[&amp;lt;--&amp;gt;-]&amp;lt;-.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;.&amp;gt;++++++++[&amp;lt;+&amp;gt;-]&amp;lt;++.&amp;gt;++++++++[&amp;lt;-&amp;gt;-]&amp;lt;------.&amp;gt;++++++++[&amp;lt;--------&amp;gt;-]&amp;lt;-----.&amp;gt;++++++++[&amp;lt;+++++++++&amp;gt;-]&amp;lt;.+.++++.&amp;gt;++++++++[&amp;lt;-------&amp;gt;-]&amp;lt;-------. Cf. Brainfuck&lt;/blockquote&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;
+            &lt;a&gt;Structure Tech Home Inspections - Home Inspection Blog&lt;/a&gt;
+            &lt;q&gt;We try to focus on topics and issues, rather than stories and anecdotes... but you'll still find a few of those.&lt;/q&gt;
+            &lt;span&gt;
+              &lt;span&gt;
+                &lt;span&gt;🇺🇸&lt;/span&gt;
+              &lt;/span&gt;
+              &lt;a&gt;More info&lt;/a&gt;
+            &lt;/span&gt;
+          &lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;4 days ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;What does a home inspection include at Structure Tech?&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;Here at Structure Tech, we do things a bit differently from other Minnesota home inspectors. When you get a home inspection with us, you’re not getting a commodity: you’re getting the best inspection money can …&lt;/blockquote&gt;
+                &lt;footer&gt;
+                  &lt;small&gt;By Reuben Saltzman, 66 words&lt;/small&gt;
+                &lt;/footer&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+        &lt;li&gt;
+          &lt;p&gt;
+            &lt;a&gt;Tom Casavant&lt;/a&gt;
+            &lt;q&gt;Blog about things.&lt;/q&gt;
+            &lt;span&gt;
+              &lt;span&gt;
+                &lt;span&gt;🇺🇸&lt;/span&gt;
+              &lt;/span&gt;
+              &lt;a&gt;More info&lt;/a&gt;
+            &lt;/span&gt;
+          &lt;/p&gt;
+          &lt;details&gt;
+            &lt;summary&gt;Updated&lt;time&gt;a month ago&lt;/time&gt;&lt;/summary&gt;
+            &lt;div&gt;
+              &lt;figure&gt;
+                &lt;figcaption&gt;
+                  &lt;a&gt;Your Search Button Powers my Smart Home&lt;/a&gt;
+                &lt;/figcaption&gt;
+                &lt;blockquote&gt;[Skip to conclusion] A few weeks ago I wrote about security issues in AI generated code. After writing that, I figured I'd test my theory and searched "vibe coded" on Bluesky: a "Senior Vice President" …&lt;/blockquote&gt;
+              &lt;/figure&gt;
+            &lt;/div&gt;
+          &lt;/details&gt;
+        &lt;/li&gt;
+      &lt;/ol&gt;
+      &lt;p&gt;&lt;a&gt;See more&lt;/a&gt;, or see &lt;a&gt;recently &lt;em&gt;updated&lt;/em&gt;blogs&lt;/a&gt;&lt;/p&gt;
+    &lt;/div&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://ooh.directory/"/><published>2026-02-14T13:40:20+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47014500</id><title>Show HN: Sameshi – a ~1200 Elo chess engine that fits within 2KB</title><updated>2026-02-14T14:21:21.415754+00:00</updated><content>&lt;doc fingerprint="5816c3b00a6cdfd7"&gt;
+  &lt;main&gt;
+    &lt;p&gt;A minimal chess engine supporting a constrained subset of the game.&lt;/p&gt;
+    &lt;p&gt;&lt;code&gt;sameshi.h&lt;/code&gt;: 1.95 KB&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;120 cell mailbox board&lt;/item&gt;
+      &lt;item&gt;negamax search&lt;/item&gt;
+      &lt;item&gt;alpha beta pruning&lt;/item&gt;
+      &lt;item&gt;material only eval&lt;/item&gt;
+      &lt;item&gt;capture first move ordering&lt;/item&gt;
+      &lt;item&gt;full legal move validation (check / mate / stalemate)&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Note&lt;/p&gt;
+    &lt;p&gt;not implemented: castling, en passant, promotion, repetition, 50-move rule.&lt;/p&gt;
+    &lt;p&gt;~1170 Elo (95% CI: 1110-1225)&lt;lb/&gt; 240 games vs stockfish (1320-1600 levels)&lt;lb/&gt; fixed depth 5, constrained rules, max 60 plies.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://github.com/datavorous/sameshi"/><published>2026-02-14T13:47:44+00:00</published></entry></feed>
