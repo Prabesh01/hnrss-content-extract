@@ -1,710 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 18 Feb 2026 19:39:09 +0000</lastBuildDate><item><title>AVX2 is slower than SSE2-4.x under Windows ARM emulation</title><link>https://blogs.remobjects.com/2026/02/17/nerdsniped-windows-arm-emulation-performance/</link><description>&lt;doc fingerprint="379af5bf29427480"&gt;
-  &lt;main&gt;&lt;p&gt;If you compile your app for AVX2 and it runs on Windows ARM under Prism emulation, is it faster or slower than compiling for SSE2-4.x?&lt;/p&gt;&lt;p&gt;I assumed it would be roughly the same — maybe slightly slower due to emulation overhead, but AVX2's wider operations would compensate. The headline gives it away: I was wrong.&lt;/p&gt;&lt;p&gt;'Should I compile for AVX2 if my app might run on Windows ARM?' has a clear answer: No. At least if performance matters.&lt;/p&gt;&lt;p&gt;This post explains how I found out, what I measured and how, the benchmark results, and why.&lt;/p&gt;&lt;head rend="h2"&gt;Curiosity&lt;/head&gt;&lt;p&gt;A few weeks ago, in a Hacker News thread on WoW (the game) emulated performance on Windows ARM, I wondered:&lt;/p&gt;&lt;quote&gt;I’ve been testing some math benchmarks on ARM emulating x64, and saw very little performance improvement with the AVX2+FMA builds, compared to the SSE4.x level. (X64 v2 to v3.) ... I’ve found very little info online about this.&lt;/quote&gt;&lt;p&gt;Well, I nerdsniped myself, because those math benchmarks are now complete and so we have the perfect framework for testing AVX2+FMA emulation performance overhead on ARM Windows. I have no technical reason to do so: if you use our compiler we encourage that if you want to run your app on Windows ARM to just compile your app for Windows ARM. It's simply: I want to know.&lt;/p&gt;&lt;p&gt;Thus I spent much of Sunday crunching our data and figuring it out.&lt;/p&gt;&lt;head rend="h2"&gt;ARM emulation of x86&lt;/head&gt;&lt;p&gt;You can skip this bit if you know about Windows ARM's emulation and what various Intel instruction sets like SSE through AVX2 are: go forward to Benchmarks.&lt;/p&gt;&lt;p&gt;Windows 11 lets you run both 32-bit and 64-bit Intel apps on ARM. It does this via emulation. Essentially, x86/64 code is translated on the fly into ARM. Windows 10 supported emulating 32-bit Intel, and by 2021 Windows 11 introduced emulating 64-bit apps.&lt;/p&gt;&lt;p&gt;In 2024 Windows 11 was updated with a new emulation layer, Prism. The main user-facing change seems to have been performance: 'Microsoft told Ars Technica that Prism is as fast as Apple’s Rosetta 2' and:&lt;/p&gt;&lt;quote&gt;Most x86 apps now run without issues, and in many cases don't even feel like they're being emulated. These days, the majority of users won't notice a difference between using an Intel PC or a Snapdragon one&lt;lb/&gt;– Windows Central&lt;/quote&gt;&lt;head rend="h3"&gt;Is emulation complete / entire?&lt;/head&gt;&lt;p&gt;x86 and x86_64 have not always remained the same. Over time they add more functionality, which is exposed as instruction sets. These are the base instructions that an app can be compiled to use and are often focused around doing things faster. For example, the x87 floating point math instruction set still exists (it was introduced in the 1980s!) but was succeeded a quarter century ago by SSE2, introduced with the Pentium 4. SSE2 lets you perform floating point math operations much faster. A few years later the SSE 4.x series also improved largely integer-based operations. This is a very handwavy summary: in fact, these are part of a wide series of instructions intended to process data fast, where possible in wider configurations (more data at a time per clock tick) than older instructions, each new improvement introduced one by one over many years. This does not even begin to address the other supplementary extensions: ones for bit manipulation, specific math patterns like multiply-add, and more.&lt;/p&gt;&lt;p&gt;This is important to understand because software does not all use the same sets of instructions. Figuring out baseline standards of which sets it was reasonable for an app to use was a mess, and Linux folk found it annoying enough that, working together with Intel and AMD, Red Hat and SUSE defined standardised versions to allow known safe targets for compiling for specific collections of instruction sets. Thanks to them, x86_64 now has four main versions that modern compilers target, which define generations of new instructions. x64 version 1 is that same old year-2000-ish era; x64 version 2 circa 2008 level, v3 circa 2013 level, and v4 circa 2017 level.&lt;/p&gt;&lt;p&gt;It takes time for instructions to become mainstream: if you are building software for 64bit Intel Windows in general, you likely won't build solely for the v4 2017 level because you may have users who have older computers, or ones newer than 2017 but which had less capable chips that didn't feature all the latest instruction sets. AVX-512 (v4) is a wonderful instruction set for very wide vectorised behaviour but still many computers in practical use today don't have it.&lt;/p&gt;&lt;p&gt;Luckily, most apps are written targeting older x64 versions with broad support.&lt;/p&gt;&lt;p&gt;Some apps actually target multiple versions at once through something called target_clones, where for some critical parts of the app the compiler will generate the same code multiple times, each one optimised for a different generation of CPU, and at runtime it will choose which one to use.&lt;/p&gt;&lt;p&gt;And similarly to how actual hardware may or may not support specific instruction sets, Windows x86 emulation also supported only a subset.&lt;/p&gt;&lt;p&gt;That subset was approximately x64 version 2 (ie with SSE2 and 4.x) and only recently have newer versions of Windows have supported v3: to handwave, AVX2 and FMA. This is new, exciting, and to my knowledge, largely unknown.&lt;/p&gt;&lt;p&gt;We are comparing performance using &lt;code&gt;x86-64-2&lt;/code&gt; level vs &lt;code&gt;v3&lt;/code&gt; level running emulated on ARM.&lt;/p&gt;&lt;p&gt;That brings us to that Hacker News comment and today. What's the emulation performance for those newer instructions?&lt;/p&gt;&lt;head rend="h2"&gt;Our benchmarks&lt;/head&gt;&lt;p&gt;At RemObjects we make a multi-language (6 of them!) compiler toolchain that targets native CPUs via LLVM (as well as .NET, JVM, and WASM backends.) We recently integrated a new vectorised math library, which gave us the perfect benchmark framework for testing this.&lt;/p&gt;&lt;p&gt;We already supported ARM Windows, that is not new, but our cross-platform RTL had our own implementations of common math methods on the 'Island' (native) platform (the normal set: sin/pow/exp/floor and so forth.) These were correct in that they followed known algorithms, but we felt there was room for performance optimisation. We settled on integrating a third party open source math library. At the time I wrote the above HN comment, this integration was still being tested and tweaked; we even changed some of LLVM's internal passes.&lt;/p&gt;&lt;p&gt;Today, we have this new math implemented for macOS ARM (and x64), and Windows i386, x86_64, and ARM64. Our Windows 32-bit (i386) math supports SSE2/4.x, but the math library for Windows x64 supports using either v2 (SSE2-4.x) or v3 (AVX2-targeted) level depending on the x64 revision you target in the compiler options. (You can actually tell Elements to target v1 through v4, but our new math library kicks in at v2, with more performance with v3, and we have not enabled anything extra in math for v4; you can certainly compile allowing AVX-512 etc if you wish for your code in general though.)&lt;/p&gt;&lt;p&gt;As part of checking our new math code as (a) correct and (b) improved performance, we have concrete data running 21 different math operations on both real x64 hardware, and Windows ARM on Parallels on a Mac M2.&lt;/p&gt;&lt;p&gt;Because these are different machines we cannot compare the wall clock time, but we can compare the relative time, using the SSE2-4.x level as a basis: what is the relative performance difference of using AVX2(+FMA) on Intel vs on ARM? Normalising against the earlier, well-emulated instruction set means that the difference between emulated and real hardware gives us the answer of how well AVX2 emulation performs.&lt;/p&gt;&lt;code&gt;x64 v2&lt;/code&gt; (SSE2-4.x) code. Emulated &lt;code&gt;v2&lt;/code&gt; may be slower, sure, but if we normalise &lt;code&gt;v2&lt;/code&gt;'s performance as 1.0 on each test platform, we get the &lt;code&gt;v3&lt;/code&gt; (AVX2) performance as a comparable number.&lt;p&gt;We can also use ARM64 on ARM, and AVX2 on x64, as a handwavy comparison for if you need ARM: an indication if emulation provides 'good enough' performance or if there's real value in compiling for ARM.&lt;/p&gt;&lt;p&gt;Thus:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;Using SSE2-4.x as a baseline for performance on both ARM and x64 (ie, scaled this to 1), what is the relative performance of AVX2 when emulated on ARM vs running on x64, and thus what overhead does ARM emulation of AVX2 provide compared to native?&lt;/item&gt;&lt;item&gt;Using two kinda similar-gen machines, and hand-waving that it's nothing more accurate than that, how well does ARM-native vs x64-emulated vs x64-native perform? Do you need to compile for ARM, or can you get away with letting your apps run under Windows emulation?&lt;/item&gt;&lt;/list&gt;&lt;head rend="h3"&gt;Details&lt;/head&gt;&lt;p&gt;Performance tests instruct LLVM to build targeting the specific instruction set; are heavily vectorised; and our AVX2 level includes FMA (fused multiply-add.) We use only 256-bit wide AVX2, not the 128-bit wide instructions. Specifics are:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;Normalised to 1.0: CPU &lt;code&gt;x86-64-v2&lt;/code&gt;(referred to as 'SSE2-4.x' above, because those are the primary instructions math uses), feature set:&lt;code&gt;+cx16,+popcnt,+sahf,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2&lt;/code&gt;&lt;/item&gt;&lt;item&gt;AVX2+FMA comparison: &lt;code&gt;x86-64-v3&lt;/code&gt;, feature set:&lt;code&gt;+cx16,+popcnt,+sahf,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+fma,+bmi,+bmi2,+f16c,+lzcnt,+movbe,+xsave&lt;/code&gt;&lt;/item&gt;&lt;item&gt;ARM64: 'generic' ARM64 CPU, no specific feature set&lt;/item&gt;&lt;/list&gt;&lt;code&gt;ceil()&lt;/code&gt; or &lt;code&gt;floor()&lt;/code&gt; for which there should be inbuilt single-op instructions, this can be a 20x difference.&lt;p&gt;Why?&lt;/p&gt;&lt;p&gt;Each math operation is run on a randomly initialised array of 64-bit doubles as input, in a loop (ie intended to be vectorised), 10 million times. The output is retained and 'used' in order to prevent the loop being optimised away. In IR, we verified the loop exists, is vectorised, and appears to look as expected. Numbers reported are typical timing runs, with no observable difference in cold vs warm runs. Timing is of course only around the tight loop itself, not the prolog or epilog setting the data up or 'using' the results.&lt;/p&gt;&lt;p&gt;All the 21 results are then scaled as a ratio vs baseline instruction set, x64 v2, and the geometric mean calculated to give a single representative number. This means that we can tell how much faster AVX2-level code is vs SSE2-4.x level, both on actual Intel hardware, and under ARM emulation.&lt;/p&gt;&lt;head rend="h3"&gt;Test machines&lt;/head&gt;&lt;p&gt;x64: Tiger Lake i7 (2.80 GHz), mobile-class CPU, circa 2021, on Windows 11 Pro 25H2.&lt;/p&gt;&lt;p&gt;ARM: Apple M2, circa 2022, macOS Tahoe 26.1 with the ARM version of the same version of Windows 11 Pro (25H2), running on Parallels 26.&lt;/p&gt;&lt;p&gt;So: Technically comparable? No, definitely not: that's another reason to normalise, in order to get quantitatively comparable results. Real-world, in practice, 'people have a computer they bought: do we get at least near the same order of magnitude performance' qualitatively comparable? Ie to answer the 'is emulation enough or is my app losing out by not compiling for ARM?' question? Sure.&lt;/p&gt;&lt;p&gt;Plus, it's what I had available to test on without pestering too many colleagues to try to find something else. Most of us run Macs, not too many Intels left here. 🫣&lt;/p&gt;&lt;head rend="h2"&gt;x86_64 AVX2 emulation on ARM: Results&lt;/head&gt;&lt;p&gt;The following chart scales x64 v2 to 1.0 (grey baseline) and x64 v3 i(ie AVX2+FMA) is relative to that (Intel in green, ARM emulation in blue), that relative number calculated as the geometric mean of the result ratios of x64 v3 vs v2 for 21 common math functions run on 64-bit doubles per the above detailed description.&lt;/p&gt;&lt;p&gt;Normalised to 1.0, larger is better (faster).&lt;/p&gt;&lt;p&gt;As expected, using AVX2 on native Intel is significantly faster: 2.7 times faster.&lt;/p&gt;&lt;p&gt;But when the same code is run on ARM, the AVX2 implementations are notably slower than SSE2-4.x. They are almost exactly 2/3 as performant as emulating the older instruction set.&lt;/p&gt;&lt;p&gt;This means if your app uses &lt;code&gt;x64 v3&lt;/code&gt; with AVX2, and runs on emulated ARM on Windows, following this data, it will run slower than if you restrict it to the &lt;code&gt;x64 v2&lt;/code&gt; compilation level.&lt;/p&gt;&lt;head rend="h2"&gt;Why?&lt;/head&gt;&lt;p&gt;At the time I wrote the HN comment that started this, I had noticed that we didn't see faster performance using the AVX2 versions of our math function on ARM; what I had not yet measured was such a significant slowness.&lt;/p&gt;&lt;code&gt;exp()&lt;/code&gt; ran in 2/3 the time of the Intel one, ie was faster emulated. All other operations were noticeably slower.&lt;p&gt;Some possible reasons are:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;ARM has 128-bit wide NEON operations. AVX2 is using 256-bit wide operations (our code is not using 128-bit widths). This means the emulation code has to handle running two halves; it would be very close to impossible to make that equal performance.&lt;lb/&gt;This is in my estimation the most likely single reason.&lt;/item&gt;&lt;item&gt;The Prism AVX2 emulation code is new, compared to that emulating older instruction sets, and may not yet be fully optimized.&lt;/item&gt;&lt;item&gt;It may optimise for heavily for 32-bit singles, not 64-bit doubles. Our math library focuses on double-precision.&lt;/item&gt;&lt;item&gt;The ARM emulation documentation notes, 'Prism is optimized and tuned specifically for Qualcomm Snapdragon processors. Some performance features within Prism require hardware features only available in the Snapdragon X series...'&lt;lb/&gt;These tests were on an Apple M2. While I'm sure Microsoft wants to support, or even prioritise, non-Apple hardware, in my view, Windows on Mac (via Parallels) is worth them supporting. But perhaps they don't support it well, yet.&lt;/item&gt;&lt;item&gt;The emulation code may look for specific patterns that our code does not meet: perhaps, and this is entirely speculation, known (eg) VC++ Intel output, such as common RTL methods, may map to specific ARM64 patterns in the emulator. We are using LLVM, and (probably) rarer math implementations, therefore, less common sequences of operations.&lt;lb/&gt;I cannot speak to how the emulator is implemented, and if this is even likely. It's a guess.&lt;/item&gt;&lt;item&gt;Our &lt;code&gt;x64 v3&lt;/code&gt;performance seems, at this stage of testing, to be faster than Visual C++'s. (By a significant factor: in this chart, where our AVX2 code at our maximum FP precision came in at 2.7x the baseline, a VC++ 2022 version of the same benchmark compiled in x64 release mode, default FP accuracy, no further changes to default settings came in at 1.3x running on native Intel hardware. Yes, that is a 2x difference, and we attribute this to the VC runtime likely lacking AVX2-optimised math routines; their SSE2 math is slightly faster than ours, gosh dangnum darn it.)&lt;lb/&gt;Therefore, for AVX2, using our compiler may be unfair compared to using other tools.&lt;/item&gt;&lt;/list&gt;&lt;head rend="h3"&gt;Meaning in practice&lt;/head&gt;&lt;p&gt;It is rare to have tight loops of operations: data processing, scientific and engineering software, etc., are the most likely. Even games may push much to the GPU. Therefore, the impact you see on your AVX2 app is unlikely to represent your app running at 2/3 the speed of your AVX2-4.x app. Only parts of it will.&lt;/p&gt;&lt;p&gt;If you have apps that do real number-crunching, whether that's native or something like Python, you should have the ARM version installed. (You likely have the ARM64 Python wheels installed anyway. But check.)&lt;/p&gt;&lt;p&gt;Although this checked floating point math, it is likely that it also applies to integer instruction set emulation too.&lt;/p&gt;&lt;p&gt;Therefore, it's likely worth treating Windows' ARM emulation of AVX2-level support as for support and compatibility, not for equal performance. To get performance, you'll need to compile as ARM.&lt;/p&gt;&lt;p&gt;If performance is key: Yes, it is absolutely key to build your app as ARM, not to rely on Windows ARM emulation.&lt;/p&gt;&lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47061062</guid><pubDate>Wed, 18 Feb 2026 14:08:11 +0000</pubDate></item><item><title>Show HN: Formally verified FPGA watchdog for AM broadcast in unmanned tunnels</title><link>https://github.com/Park07/amradio</link><description>&lt;doc fingerprint="2c0c0c4c6923e39a"&gt;
-  &lt;main&gt;
-    &lt;p&gt;A 12-channel AM radio broadcast system using Red Pitaya FPGA for emergency alert transmission in unmanned tunnels.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;Feature&lt;/cell&gt;
-        &lt;cell role="head"&gt;Status&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;12 simultaneous carrier frequencies&lt;/cell&gt;
-        &lt;cell&gt;✅&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Runtime frequency configuration (no hardware changes)&lt;/cell&gt;
-        &lt;cell&gt;✅&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;AM modulation with pre-recorded audio&lt;/cell&gt;
-        &lt;cell&gt;✅&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Dynamic power scaling&lt;/cell&gt;
-        &lt;cell&gt;✅&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;MVC architecture (Rust + JavaScript)&lt;/cell&gt;
-        &lt;cell&gt;✅&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Event-driven pub/sub via event bus&lt;/cell&gt;
-        &lt;cell&gt;✅&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Stateless UI — device is source of truth&lt;/cell&gt;
-        &lt;cell&gt;✅&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Network polling &amp;amp; auto-reconnect&lt;/cell&gt;
-        &lt;cell&gt;✅&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Fail-safe hardware watchdog (5s timeout)&lt;/cell&gt;
-        &lt;cell&gt;✅&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Formal verification (14 properties, 6 covers, all proven)&lt;/cell&gt;
-        &lt;cell&gt;✅&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Framework: Rust (Tauri) backend + JavaScript frontend&lt;/item&gt;
-      &lt;item&gt;Architecture: MVC with event-driven pub/sub&lt;/item&gt;
-      &lt;item&gt;Model (&lt;code&gt;model.rs&lt;/code&gt;): NetworkManager handles TCP/SCPI, device state, 500ms polling, auto-reconnect with exponential backoff&lt;/item&gt;
-      &lt;item&gt;View (&lt;code&gt;view.js&lt;/code&gt;,&lt;code&gt;index.html&lt;/code&gt;): Stateless — only renders confirmed device state. Never assumes hardware state.&lt;/item&gt;
-      &lt;item&gt;Controller (&lt;code&gt;controller.js&lt;/code&gt;): Handles user input, publishes events to bus&lt;/item&gt;
-      &lt;item&gt;Event Bus (&lt;code&gt;event_bus.rs&lt;/code&gt;,&lt;code&gt;event_bus.js&lt;/code&gt;): Components communicate through a central bus instead of calling each other directly. Rust emits events to JS frontend via Tauri bridge.&lt;/item&gt;
-      &lt;item&gt;State Machine (&lt;code&gt;state_machine.rs&lt;/code&gt;): IDLE → ARMING → ARMED → STARTING → BROADCASTING → STOPPING. Intermediate states prevent invalid transitions.&lt;/item&gt;
-      &lt;item&gt;Source of Truth: The device, not the software. UI only updates after hardware confirms.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;NCO: 12 Numerically Controlled Oscillators generate carrier frequencies (505–1605 kHz)&lt;/item&gt;
-      &lt;item&gt;AM Modulator: Combines audio source with each carrier&lt;/item&gt;
-      &lt;item&gt;Dynamic Scaling: Output power adjusts based on enabled channel count&lt;/item&gt;
-      &lt;item&gt;Audio Buffer: BRAM stores pre-recorded emergency messages (16,384 sample buffer at ~5 kHz playback rate). AXI audio loader available for runtime loading.&lt;/item&gt;
-      &lt;item&gt;Watchdog Timer (&lt;code&gt;wd.v&lt;/code&gt;): Hardware fail-safe — if GUI heartbeat stops for 5 seconds, RF output is killed and latched. Only manual operator reset restores output.&lt;/item&gt;
-      &lt;item&gt;SCPI Server (&lt;code&gt;am_scpi_server.py&lt;/code&gt;): Runs on Red Pitaya, parses text commands, converts frequencies to phase increments, writes to FPGA registers via&lt;code&gt;/dev/mem&lt;/code&gt;.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;code&gt;GUI click → invoke("set_frequency") → model.rs sends "FREQ:CH1 700000" over TCP
-→ am_scpi_server.py converts to phase_inc = (700000 × 2³²) / 125MHz
-→ writes to FPGA register via /dev/mem → NCO generates carrier → AM modulates → RF output
-&lt;/code&gt;
-    &lt;p&gt;The watchdog timer is mathematically proven correct using bounded model checking and k-induction (SymbiYosys + Z3 SMT solver). Unlike simulation-based testing which checks individual scenarios, formal verification proves correctness across every possible input, in every possible state, for all time.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="4"&gt;
-        &lt;cell role="head"&gt;Category&lt;/cell&gt;
-        &lt;cell role="head"&gt;#&lt;/cell&gt;
-        &lt;cell role="head"&gt;Property&lt;/cell&gt;
-        &lt;cell role="head"&gt;Guarantee&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;Basic&lt;/cell&gt;
-        &lt;cell&gt;1&lt;/cell&gt;
-        &lt;cell&gt;Reset clears all&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;!rstn&lt;/code&gt; → counter=0, triggered=0, warning=0&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;2&lt;/cell&gt;
-        &lt;cell&gt;Heartbeat prevents trigger&lt;/cell&gt;
-        &lt;cell&gt;Heartbeat resets counter, clears triggered and warning&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;6&lt;/cell&gt;
-        &lt;cell&gt;Disable kills everything&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;!enable&lt;/code&gt; → all outputs cleared&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;7&lt;/cell&gt;
-        &lt;cell&gt;Counter bounded&lt;/cell&gt;
-        &lt;cell&gt;Counter never exceeds TIMEOUT_CYCLES&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;8&lt;/cell&gt;
-        &lt;cell&gt;Force reset works&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;force_reset&lt;/code&gt; clears all state&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;9&lt;/cell&gt;
-        &lt;cell&gt;Warning low before threshold&lt;/cell&gt;
-        &lt;cell&gt;counter &amp;lt; WARNING_CYCLES → warning=0&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;Safety&lt;/cell&gt;
-        &lt;cell&gt;3&lt;/cell&gt;
-        &lt;cell&gt;No early trigger&lt;/cell&gt;
-        &lt;cell&gt;triggered ONLY when counter ≥ TIMEOUT_CYCLES&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;4&lt;/cell&gt;
-        &lt;cell&gt;Trigger guaranteed at timeout&lt;/cell&gt;
-        &lt;cell&gt;Liveness: timeout always fires trigger&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;5&lt;/cell&gt;
-        &lt;cell&gt;Warning before trigger&lt;/cell&gt;
-        &lt;cell&gt;triggered=1 → warning=1&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;5b&lt;/cell&gt;
-        &lt;cell&gt;Contrapositive&lt;/cell&gt;
-        &lt;cell&gt;!warning → !triggered&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;10&lt;/cell&gt;
-        &lt;cell&gt;Warning high in zone&lt;/cell&gt;
-        &lt;cell&gt;counter &amp;gt; WARNING_CYCLES → warning=1&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;11&lt;/cell&gt;
-        &lt;cell&gt;Counter increments correctly&lt;/cell&gt;
-        &lt;cell&gt;Exactly +1 per clock cycle during counting&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;Output&lt;/cell&gt;
-        &lt;cell&gt;12&lt;/cell&gt;
-        &lt;cell&gt;time_remaining at zero&lt;/cell&gt;
-        &lt;cell&gt;counter=0 → time_remaining = TIMEOUT_SEC&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;13&lt;/cell&gt;
-        &lt;cell&gt;time_remaining at trigger&lt;/cell&gt;
-        &lt;cell&gt;triggered → time_remaining = 0&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;14&lt;/cell&gt;
-        &lt;cell&gt;time_remaining monotonic&lt;/cell&gt;
-        &lt;cell&gt;Decreases every cycle during counting&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;table&gt;
-      &lt;row span="4"&gt;
-        &lt;cell role="head"&gt;#&lt;/cell&gt;
-        &lt;cell role="head"&gt;Scenario&lt;/cell&gt;
-        &lt;cell role="head"&gt;Steps&lt;/cell&gt;
-        &lt;cell role="head"&gt;Description&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;1&lt;/cell&gt;
-        &lt;cell&gt;Trigger fires&lt;/cell&gt;
-        &lt;cell&gt;23&lt;/cell&gt;
-        &lt;cell&gt;Counter reaches timeout&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;2&lt;/cell&gt;
-        &lt;cell&gt;Warning without trigger&lt;/cell&gt;
-        &lt;cell&gt;21&lt;/cell&gt;
-        &lt;cell&gt;In warning zone, not yet timed out&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;3&lt;/cell&gt;
-        &lt;cell&gt;Exact timeout boundary&lt;/cell&gt;
-        &lt;cell&gt;22&lt;/cell&gt;
-        &lt;cell&gt;Counter = TIMEOUT_CYCLES exactly&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;4&lt;/cell&gt;
-        &lt;cell&gt;Last-second heartbeat&lt;/cell&gt;
-        &lt;cell&gt;19&lt;/cell&gt;
-        &lt;cell&gt;Heartbeat at counter = T-1&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="4"&gt;
-        &lt;cell&gt;5&lt;/cell&gt;
-        &lt;cell&gt;Recovery from triggered&lt;/cell&gt;
-        &lt;cell&gt;24&lt;/cell&gt;
-        &lt;cell&gt;Triggered state cleared by force_reset&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;6&lt;/cell&gt;
-        &lt;cell&gt;Warning-to-trigger lifecycle&lt;/cell&gt;
-        &lt;cell&gt;23&lt;/cell&gt;
-        &lt;cell&gt;Warning then immediate trigger&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;code&gt;cd fpga/formal/
-sby -f wd.sby&lt;/code&gt;
-    &lt;code&gt;SBY [wd_prove] DONE (PASS, rc=0)
-    summary: successful proof by k-induction.
-SBY [wd_cover] DONE (PASS, rc=0)
-    summary: 6/6 cover statements reached.
-&lt;/code&gt;
-    &lt;p&gt;Verification uses &lt;code&gt;CLK_FREQ=1&lt;/code&gt;, &lt;code&gt;TIMEOUT_SEC=5&lt;/code&gt; to keep state space tractable. Production uses &lt;code&gt;CLK_FREQ=125000000&lt;/code&gt;. The RTL is parameterised — same if/else logic, same state transitions. Proof at reduced scale implies correctness at production scale.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Red Pitaya STEMlab 125-10&lt;/item&gt;
-      &lt;item&gt;AM Radio receiver(s) for testing&lt;/item&gt;
-      &lt;item&gt;Ethernet cable (for Red Pitaya connection)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;Dependency&lt;/cell&gt;
-        &lt;cell role="head"&gt;macOS&lt;/cell&gt;
-        &lt;cell role="head"&gt;Windows&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Rust + Cargo&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Download &lt;code&gt;rustup-init.exe&lt;/code&gt; from rustup.rs&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Node.js (LTS)&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;brew install node&lt;/code&gt; or nodejs.org&lt;/cell&gt;
-        &lt;cell&gt;nodejs.org&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Xcode Command Line Tools (macOS only)&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;xcode-select --install&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;—&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Visual Studio Build Tools (Windows only)&lt;/cell&gt;
-        &lt;cell&gt;—&lt;/cell&gt;
-        &lt;cell&gt;Download — select "Desktop development with C++"&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;SymbiYosys&lt;/item&gt;
-      &lt;item&gt;Yosys&lt;/item&gt;
-      &lt;item&gt;Z3 SMT solver&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;code&gt;git clone https://github.com/Park07/amradio.git
-cd amradio/ugl_am_radio&lt;/code&gt;
-    &lt;code&gt;# Install Rust (if not installed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-
-# Install Xcode CLI tools (if not installed)
-xcode-select --install
-
-# Install Node.js via Homebrew (if not installed)
-brew install node
-
-# Build
-cd gui
-npm install
-npm run build&lt;/code&gt;
-    &lt;p&gt;The built &lt;code&gt;.app&lt;/code&gt; will be in &lt;code&gt;gui/src-tauri/target/release/bundle/macos/&lt;/code&gt;.&lt;/p&gt;
-    &lt;code&gt;# 1. Install Rust
-#    Download and run rustup-init.exe from https://rustup.rs
-#    Close and reopen PowerShell after install
-
-# 2. Install Visual Studio Build Tools
-#    Download from https://visualstudio.microsoft.com/visual-cpp-build-tools/
-#    Select "Desktop development with C++" during installation
-#    Close and reopen PowerShell after install
-
-# 3. Install Node.js
-#    Download LTS from https://nodejs.org
-#    Close and reopen PowerShell after install
-
-# 4. Verify installations
-rustc --version
-cargo --version
-node --version
-npm --version
-
-# 5. Build
-cd gui
-npm install
-npm run build&lt;/code&gt;
-    &lt;p&gt;The built &lt;code&gt;.exe&lt;/code&gt; will be in &lt;code&gt;gui\src-tauri\target\release\&lt;/code&gt;.&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;Note: First build takes ~2–3 minutes (compiling Rust). Subsequent builds are faster.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;SSH into the Red Pitaya:&lt;/p&gt;
-    &lt;code&gt;ssh root@&amp;lt;RED_PITAYA_IP&amp;gt;
-# Default password: root&lt;/code&gt;
-    &lt;p&gt;Copy required files:&lt;/p&gt;
-    &lt;code&gt;scp am_scpi_server.py root@&amp;lt;RED_PITAYA_IP&amp;gt;:/root/
-scp axi_audio_sequence_loop.py root@&amp;lt;RED_PITAYA_IP&amp;gt;:/root/
-scp alarm_fast.wav 0009_part1.wav 0009_part2_fast.wav root@&amp;lt;RED_PITAYA_IP&amp;gt;:/root/
-scp fpga/red_pitaya_top.bit root@&amp;lt;RED_PITAYA_IP&amp;gt;:/root/&lt;/code&gt;
-    &lt;p&gt;Note&lt;/p&gt;
-    &lt;p&gt;The Red Pitaya runs Alpine Linux with Python 3.5. The SCPI server has no external dependencies (stdlib only). The audio loader requires &lt;code&gt;numpy&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;# On Red Pitaya
-pip install numpy&lt;/code&gt;
-    &lt;quote&gt;&lt;p&gt;Note: The Red Pitaya's Python 3.5 does not support&lt;/p&gt;&lt;code&gt;venv&lt;/code&gt;out of the box and runs as root, so packages are installed globally. This is fine — it's an embedded device, not a shared server.&lt;/quote&gt;
-    &lt;p&gt;If you want to run or modify the Python scripts locally (e.g. for testing audio processing without the Red Pitaya):&lt;/p&gt;
-    &lt;code&gt;python3 -m venv venv
-source venv/bin/activate        # macOS/Linux
-# or
-.\venv\Scripts\activate         # Windows PowerShell
-
-pip install -r requirements.txt&lt;/code&gt;
-    &lt;p&gt;Add &lt;code&gt;venv/&lt;/code&gt; to &lt;code&gt;.gitignore&lt;/code&gt; if not already present.&lt;/p&gt;
-    &lt;p&gt;The system plays three audio files in a loop: Alarm → Part 1 → Part 2 → (repeat).&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;File&lt;/cell&gt;
-        &lt;cell role="head"&gt;Description&lt;/cell&gt;
-        &lt;cell role="head"&gt;Duration&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;alarm_fast.wav&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Alarm tone&lt;/cell&gt;
-        &lt;cell&gt;~4 sec&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;0009_part1.wav&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Emergency message part 1&lt;/cell&gt;
-        &lt;cell&gt;~3 sec&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;0009_part2_fast.wav&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Emergency message part 2&lt;/cell&gt;
-        &lt;cell&gt;~3.6 sec&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;All audio is downsampled to ~5 kHz to fit within the FPGA's 16,384-sample BRAM buffer. The &lt;code&gt;axi_audio_sequence_loop.py&lt;/code&gt; script handles resampling, 14-bit conversion, and sequential loading automatically.&lt;/p&gt;
-    &lt;p&gt;You need three SSH terminals open to the Red Pitaya, plus one local terminal for the GUI.&lt;/p&gt;
-    &lt;quote&gt;&lt;p&gt;Note: The Red Pitaya's IP address may change each time it is powered on. Check your router's DHCP client list or use&lt;/p&gt;&lt;code&gt;ping rp-f0866a.local&lt;/code&gt;to find it.&lt;/quote&gt;
-    &lt;p&gt;Open a terminal and SSH in:&lt;/p&gt;
-    &lt;code&gt;ssh root@&amp;lt;RED_PITAYA_IP&amp;gt;
-# Password: root&lt;/code&gt;
-    &lt;p&gt;On the Red Pitaya (first SSH terminal):&lt;/p&gt;
-    &lt;code&gt;cat /root/red_pitaya_top.bit &amp;gt; /dev/xdevcfg&lt;/code&gt;
-    &lt;p&gt;This loads the AM radio design onto the FPGA. Required after every power cycle.&lt;/p&gt;
-    &lt;p&gt;On the Red Pitaya (same or second SSH terminal):&lt;/p&gt;
-    &lt;code&gt;python3 /root/am_scpi_server.py&lt;/code&gt;
-    &lt;p&gt;Leave this running — it bridges TCP commands from the GUI to FPGA registers.&lt;/p&gt;
-    &lt;p&gt;Open a second SSH terminal to the Red Pitaya:&lt;/p&gt;
-    &lt;code&gt;ssh root@&amp;lt;RED_PITAYA_IP&amp;gt;
-sudo python3 /root/axi_audio_sequence_loop.py&lt;/code&gt;
-    &lt;p&gt;Expected output:&lt;/p&gt;
-    &lt;code&gt;============================================================
-AXI AUDIO SEQUENCE - AUTO LOOP
-Alarm -&amp;gt; Part 1 -&amp;gt; Part 2 -&amp;gt; (repeat)
-============================================================
-Buffer: 16384 samples
-FPGA playback rate: 5000 Hz
-Press Ctrl+C to stop
-============================================================
-&lt;/code&gt;
-    &lt;p&gt;On your local machine:&lt;/p&gt;
-    &lt;code&gt;cd gui
-npm run dev&lt;/code&gt;
-    &lt;p&gt;Or run the built binary directly from &lt;code&gt;src-tauri/target/release/&lt;/code&gt;.&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Enter the Red Pitaya IP address&lt;/item&gt;
-      &lt;item&gt;Click Connect&lt;/item&gt;
-      &lt;item&gt;Enable desired channels (1–12)&lt;/item&gt;
-      &lt;item&gt;Adjust frequencies if needed&lt;/item&gt;
-      &lt;item&gt;Click START BROADCAST&lt;/item&gt;
-      &lt;item&gt;Tune an AM radio to any enabled frequency&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;If you need to modify the FPGA design and rebuild the bitstream, install Vivado 2020.1. Red Pitaya provides a setup guide here:&lt;/p&gt;
-    &lt;p&gt;https://redpitaya.readthedocs.io/en/latest/developerGuide/fpga/getting_started/vivado_install.html&lt;/p&gt;
-    &lt;p&gt;All basic Red Pitaya settings and tutorials are available on the Red Pitaya official documentation.&lt;/p&gt;
-    &lt;code&gt;ugl_am_radio/
-├── gui/
-│   ├── src/
-│   │   ├── index.html              # HTML + CSS
-│   │   └── js/
-│   │       ├── event_bus.js        # Frontend pub/sub + Tauri listener
-│   │       ├── model.js            # Rust API calls (stateless)
-│   │       ├── view.js             # DOM rendering
-│   │       └── controller.js       # Event handlers
-│   └── src-tauri/src/
-│       ├── main.rs                 # Entry point
-│       ├── model.rs                # NetworkManager + DeviceState
-│       ├── commands.rs             # Tauri command bridge
-│       ├── event_bus.rs            # Rust pub/sub + Tauri emit
-│       ├── state_machine.rs        # Broadcast state transitions
-│       └── config.rs               # Constants
-├── fpga/
-│   ├── formal/
-│   │   ├── wd.v                    # Watchdog + 14 formal properties
-│   │   ├── wd.sby                  # SymbiYosys config
-│   │   └── README.md               # Formal verification docs
-│   ├── am_mod.sv                   # AM modulation module
-│   ├── am_radio_ctrl.v             # 12-channel AM radio controller
-│   ├── axi_audio_buffer.v          # AXI audio buffer for BRAM playback
-│   ├── nco_sin.v                   # Numerically Controlled Oscillator
-│   ├── red_pitaya_top.sv           # Top-level FPGA integration
-│   ├── sine_lut_4096.mem           # 4096-point sine lookup table
-│   └── watchdog_timer.v            # Watchdog timer module (production)
-├── am_scpi_server.py               # SCPI server (runs on Red Pitaya)
-├── axi_audio_sequence_loop.py      # Audio sequence loader (alarm → part1 → part2 loop)
-├── alarm_fast.wav                  # Alarm tone
-├── 0009_part1.wav                  # Emergency message part 1
-├── 0009_part2_fast.wav             # Emergency message part 2
-├── requirements.txt                # Python dependencies (numpy)
-└── README.md
-&lt;/code&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;Channel&lt;/cell&gt;
-        &lt;cell role="head"&gt;Frequency&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;CH1&lt;/cell&gt;
-        &lt;cell&gt;505 kHz&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;CH2&lt;/cell&gt;
-        &lt;cell&gt;605 kHz&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;CH3&lt;/cell&gt;
-        &lt;cell&gt;705 kHz&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;CH4&lt;/cell&gt;
-        &lt;cell&gt;805 kHz&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;CH5&lt;/cell&gt;
-        &lt;cell&gt;905 kHz&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;CH6&lt;/cell&gt;
-        &lt;cell&gt;1005 kHz&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;CH7&lt;/cell&gt;
-        &lt;cell&gt;1105 kHz&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;CH8&lt;/cell&gt;
-        &lt;cell&gt;1205 kHz&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;CH9&lt;/cell&gt;
-        &lt;cell&gt;1305 kHz&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;CH10&lt;/cell&gt;
-        &lt;cell&gt;1405 kHz&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;CH11&lt;/cell&gt;
-        &lt;cell&gt;1505 kHz&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;CH12&lt;/cell&gt;
-        &lt;cell&gt;1605 kHz&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Frequencies adjustable at runtime (500–1700 kHz range).&lt;/p&gt;
-    &lt;code&gt;Standard watchdog:  device hangs → timer overflows → restarts device → back to normal
-This watchdog:      GUI dies → counter hits timeout → kills RF output → stays dead until operator resets
-&lt;/code&gt;
-    &lt;p&gt;Why different: Automatically restarting a radio transmitter in an unmanned tunnel is dangerous. The system requires human confirmation before RF output resumes. Fail-safe, not fail-recover.&lt;/p&gt;
-    &lt;p&gt;Safety margin: GUI polls every 500ms. Watchdog timeout is 5s. That's 10 consecutive missed heartbeats before trigger — resilient against transient network delays.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;Channels&lt;/cell&gt;
-        &lt;cell role="head"&gt;Signal Strength&lt;/cell&gt;
-        &lt;cell role="head"&gt;Recommendation&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;1–2&lt;/cell&gt;
-        &lt;cell&gt;Excellent&lt;/cell&gt;
-        &lt;cell&gt;✅ Best quality&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;3–4&lt;/cell&gt;
-        &lt;cell&gt;Good&lt;/cell&gt;
-        &lt;cell&gt;✅ Recommended max&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;5–8&lt;/cell&gt;
-        &lt;cell&gt;Fair&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;9–12&lt;/cell&gt;
-        &lt;cell&gt;Weak&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Recommendation: 4–5 channels maximum for reliable reception.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;Command&lt;/cell&gt;
-        &lt;cell role="head"&gt;Description&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;*IDN?&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Device identification&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;STATUS?&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Full device state&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;OUTPUT:STATE ON/OFF&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Master broadcast enable&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;CH1:FREQ 505000&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Set CH1 frequency (Hz)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;CH1:OUTPUT ON/OFF&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Enable/disable CH1&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;SOURCE:MSG 1&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Select audio message&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;WATCHDOG:RESET&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Reset watchdog timer&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;WATCHDOG:STATUS?&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Query watchdog state&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;11 tests across the backend — state machine transitions, event bus pub/sub, retry logic, and config validation.&lt;/p&gt;
-    &lt;code&gt;cd gui/src-tauri
-cargo test&lt;/code&gt;
-    &lt;p&gt;14 mathematically proven safety properties on the watchdog timer. See the Formal Verification section above.&lt;/p&gt;
-    &lt;p&gt;For testing the GUI without a Red Pitaya connected:&lt;/p&gt;
-    &lt;code&gt;# Terminal 1 — start mock FPGA
-cd gui
-npm run mock
-
-# Terminal 2 — start GUI
-cd gui
-npm run dev&lt;/code&gt;
-    &lt;p&gt;Then connect to &lt;code&gt;127.0.0.1:5000&lt;/code&gt; in the GUI.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;Problem&lt;/cell&gt;
-        &lt;cell role="head"&gt;Solution&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;No RF output after power cycle&lt;/cell&gt;
-        &lt;cell&gt;Reload bitstream: &lt;code&gt;cat /root/red_pitaya_top.bit &amp;gt; /dev/xdevcfg&lt;/code&gt;&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;GUI won't connect&lt;/cell&gt;
-        &lt;cell&gt;Check IP, ensure SCPI server is running&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;No audio, only carrier&lt;/cell&gt;
-        &lt;cell&gt;Start audio loop: &lt;code&gt;sudo python3 /root/axi_audio_sequence_loop.py&lt;/code&gt;&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;file does not start with RIFF id&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Audio file is not a valid WAV — reconvert with &lt;code&gt;ffmpeg -i input -ac 1 -ar 44100 output.wav&lt;/code&gt;&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Weak signal&lt;/cell&gt;
-        &lt;cell&gt;Reduce enabled channels (max 4–5)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Connection timeout&lt;/cell&gt;
-        &lt;cell&gt;Check network, Red Pitaya power&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Watchdog triggered unexpectedly&lt;/cell&gt;
-        &lt;cell&gt;Check network stability, increase timeout if needed&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;&lt;code&gt;linker 'link.exe' not found&lt;/code&gt; (Windows)&lt;/cell&gt;
-        &lt;cell&gt;Install Visual Studio Build Tools with "Desktop development with C++"&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;cargo not found&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Restart terminal after Rust install&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;npm not found&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Restart terminal after Node.js install&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;&lt;code&gt;xcode-select&lt;/code&gt; errors (macOS)&lt;/cell&gt;
-        &lt;cell&gt;Run &lt;code&gt;xcode-select --install&lt;/code&gt;&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;This project will be inherited by the next EPI cohort. Here's what you need to know.&lt;/p&gt;
-    &lt;p&gt;The full signal chain is functional: GUI → Rust backend → TCP/SCPI → Red Pitaya → FPGA → RF output. Audio playback loops automatically. The watchdog kills RF if the GUI disconnects. All of this has been demonstrated live on hardware.&lt;/p&gt;
-    &lt;p&gt;The FPGA audio buffer is limited to 16,384 samples in BRAM, which forces downsampling to ~5 kHz. Longer or higher-quality audio would need external memory (DDR or SD card). The &lt;code&gt;axi_audio_sequence_loop.py&lt;/code&gt; script reloads audio over AXI with a ~1.4 second gap between tracks — DMA would eliminate this. Currently only 4–5 channels are practical at usable signal strength; an external RF amplifier stage would allow all 12 channels simultaneously.&lt;/p&gt;
-    &lt;p&gt;Read &lt;code&gt;model.rs&lt;/code&gt; (the Rust backend — all network logic lives here), &lt;code&gt;am_scpi_server.py&lt;/code&gt; (the bridge between TCP commands and FPGA registers), and &lt;code&gt;am_radio_ctrl.v&lt;/code&gt; (the register interface between software and hardware). Those three files are the handshake points between every layer of the system.&lt;/p&gt;
-    &lt;p&gt;The Red Pitaya IP was &lt;code&gt;192.168.0.101&lt;/code&gt; during development. SSH credentials are &lt;code&gt;root&lt;/code&gt;/&lt;code&gt;root&lt;/code&gt;. The FPGA bitstream loads automatically on boot from the SD card. If the bitstream is missing or corrupted, you'll need Vivado to rebuild it from the &lt;code&gt;.sv&lt;/code&gt;/&lt;code&gt;.v&lt;/code&gt; sources in &lt;code&gt;fpga/&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;For GUI changes: edit JS/HTML in &lt;code&gt;gui/src/&lt;/code&gt;, run &lt;code&gt;npm run dev&lt;/code&gt; — hot-reloads the frontend. For Rust backend changes: edit files in &lt;code&gt;gui/src-tauri/src/&lt;/code&gt;, the dev server recompiles automatically (takes a few seconds). For FPGA changes: edit Verilog in &lt;code&gt;fpga/&lt;/code&gt;, synthesise in Vivado, generate new bitstream, copy to Red Pitaya SD card.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;William Park — Software architecture (GUI, MVC, event bus), hardware watchdog timer, formal verification&lt;/item&gt;
-      &lt;item&gt;Bowen Deng — FPGA development (NCO, AM modulation, RF output)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;UGL Limited — Project sponsor&lt;/item&gt;
-      &lt;item&gt;University of New South Wales — EPI program&lt;/item&gt;
-      &lt;item&gt;Robert Mahood (UGL) — Engineering supervisor&lt;/item&gt;
-      &lt;item&gt;Andrew Wong (UNSW) — Academic supervisor&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Final Version: 13th February 2026&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47061742</guid><pubDate>Wed, 18 Feb 2026 15:06:04 +0000</pubDate></item><item><title>Show HN: VectorNest responsive web-based SVG editor</title><link>https://ekrsulov.github.io/vectornest/</link><guid isPermaLink="false">https://news.ycombinator.com/item?id=47062096</guid><pubDate>Wed, 18 Feb 2026 15:31:57 +0000</pubDate></item><item><title>Garment Notation Language: Formal descriptive language for clothing construction</title><link>https://github.com/khalildh/garment-notation</link><description>&lt;doc fingerprint="e94b2428abaf2c71"&gt;
-  &lt;main&gt;
-    &lt;p&gt;A formal descriptive language for clothing construction.&lt;/p&gt;
-    &lt;p&gt;Dance has Labanotation. Music has staff notation. Architecture has plan/section/elevation conventions. GNL brings the same rigor to garments — a generative descriptive language where a valid expression is sufficient to construct a garment without ambiguity.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Body-anchored — the body is the coordinate system, using anatomical landmarks (&lt;code&gt;@shoulder.L&lt;/code&gt;) and regions (&lt;code&gt;%torso.front&lt;/code&gt;)&lt;/item&gt;
-      &lt;item&gt;Topological — garments are surfaces with boundaries and openings&lt;/item&gt;
-      &lt;item&gt;Constructive — descriptions encode build order, not just final form&lt;/item&gt;
-      &lt;item&gt;Composable — complex garments are compositions of simpler elements&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;code&gt;GARMENT t_shirt [SYM] {
-  FABRIC: M(160gsm, fluid, biaxial:15%, 1.0, knit.jersey)
-
-  front  = P(%torso.front, contour, 1.15)
-  back   = P(%torso.back, contour, 1.15)
-  sleeve = P(%arm[0..0.4], contour, 1.2)
-
-  neck = O(@neck, circle, body+8cm)
-  hem  = O(@hip, circle, body+10cm)
-
-  BUILD:
-    S(front.shoulder, back.shoulder, serged)
-    &amp;gt;&amp;gt; S(sleeve.cap, {front.armhole, back.armhole}, serged)
-    &amp;gt;&amp;gt; S(front.side, back.side, serged)
-    &amp;gt;&amp;gt; F(hem, 2.5cm, in)
-}
-&lt;/code&gt;
-    &lt;p&gt;The language is formally defined as a PEG grammar targeting Peggy. The generated parser produces a richly-typed AST which is adapted to the renderer's internal format at runtime.&lt;/p&gt;
-    &lt;code&gt;npm install          # install Peggy (dev dependency only)
-npm run generate     # regenerate viewer/src/gnl-parser.js from grammar/gnl.peg
-npm test             # run parse + adapter tests against all examples&lt;/code&gt;
-    &lt;p&gt;The repo includes a live viewer that parses GNL and renders both assembled garment views and flat pattern pieces.&lt;/p&gt;
-    &lt;p&gt;Write GNL on the left, see the full garment on the right — with stitch lines, dimension callouts, and construction details.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;T-Shirt&lt;/cell&gt;
-        &lt;cell role="head"&gt;Wrap Skirt&lt;/cell&gt;
-        &lt;cell role="head"&gt;Jacket Collar&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Toggle to "Pieces" to see the individual flat pattern pieces with shape outlines, grain lines, and dimensions.&lt;/p&gt;
-    &lt;p&gt;The repo includes a converter that transforms garment templates from the Korosteleva NeurIPS 2021 dataset (2D panel geometry as JSON) into GNL.&lt;/p&gt;
-    &lt;code&gt;# Auto-downloads 21 templates from GitHub on first run, converts all
-node converter/convert.js&lt;/code&gt;
-    &lt;p&gt;Four example templates (tee, skirt, pants, dress) are also available directly in the viewer — select from the "Korosteleva Dataset" section of the examples dropdown. A GNL/JSON toggle lets you compare the raw geometric input with the converted semantic output.&lt;/p&gt;
-    &lt;p&gt;See converter/README.md for details on the mapping approach.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Full Specification — the complete v0.2 spec&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;v0.2 — Draft. Includes grain parameter, directional ease, princess seams (EDGE), lining (LAYER), and component composition (USE/ATTACH). A starting point that will need refinement through use, critique, and input from garment-makers, pattern-drafters, and computational designers.&lt;/p&gt;
-    &lt;p&gt;All rights reserved.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47062329</guid><pubDate>Wed, 18 Feb 2026 15:53:15 +0000</pubDate></item><item><title>The only moat left is money?</title><link>https://elliotbonneville.com/the-only-moat-left-is-money/</link><description>&lt;doc fingerprint="3178905197e4afd0"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 18 Feb 2026 20:26:48 +0000</lastBuildDate><item><title>The only moat left is money?</title><link>https://elliotbonneville.com/the-only-moat-left-is-money/</link><description>&lt;doc fingerprint="3178905197e4afd0"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;The Only Moat Left Is Money&lt;/head&gt;
     &lt;p&gt;Every morning a few thousand people wake up and ship something. A tool, a SaaS, a newsletter, an app that does the thing the other app does but slightly differently. They post it on Hacker News. Nobody clicks.&lt;/p&gt;
@@ -1146,20 +441,7 @@ node converter/convert.js&lt;/code&gt;
     &lt;p&gt;Arizona’s HB 2920 has been read twice and awaits committee consideration. If it advances, it would take effect on November 30, 2026, creating yet another deadline for app stores and developers to comply with yet another variation of age verification requirements.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47063724</guid><pubDate>Wed, 18 Feb 2026 17:38:46 +0000</pubDate></item><item><title>Warren Buffett dumps $1.7B of Amazon stock</title><link>https://finbold.com/warren-buffett-dumps-1-7-billion-of-amazon-stock/</link><description>&lt;doc fingerprint="e00dd7913b801a4"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Warren Buffett’s Berkshire Hathaway (NYSE: BRK.A, BRK.B) submitted its latest 13-F filing on February 17, 2026, revealing some interesting changes in the portfolio.&lt;/p&gt;
-    &lt;p&gt;The most newsworthy one was undoubtedly the staggering 77% reduction in the Amazon (NASDAQ: AMZN) stake, as the company has sold 7.7 million shares in the e-commerce leader, reportedly valued at nearly $1.7 billion.&lt;/p&gt;
-    &lt;p&gt;Berkshire first entered Amazon in 2019, and after seven years, the paradigm appears to be shifting again, with ‘The Oracle of Omaha’ apparently returning to long-favored sectors, such as media.&lt;/p&gt;
-    &lt;p&gt;Notably, the filing revealed the former Berkshire CEO had opened a new position in the New York Times (NYSE: NYT) with a purchase of 5 million shares, estimated at about $352 million. The purchase sent the publisher’s shares up around 10% as investors reacted to Buffett’s disclosure.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Why is Warren Buffett dumping Amazon?&lt;/head&gt;
-    &lt;p&gt;While the Amazon trimming was the most eye-catching, it was not an isolated case. For instance, the now Chairman of Berkshire reduced his Apple (NASDAQ: AAPL) holdings to a 1.5% position, which further underscores the retreat from large technology names.&lt;/p&gt;
-    &lt;p&gt;As mentioned, the shift suggests a return to classic Buffett investments, that is, businesses built to withstand economic turbulence. This is suggested by the fact that Berkshire expanded its stake in Chubb (NYSE: CB), a steady insurance company, and Chevron (NYSE: CVX), which suggests confidence in energy solutions.&lt;/p&gt;
-    &lt;p&gt;Similarly, Berkshire has agreed to acquire the petrochemical business of Occidental Petroleum Corp. for $9.7 billion and built a $5.6 billion position in Google (NASDAQ: GOOGL). Accordingly, it can be argued that the conglomerate is simply adjusting its strategy as it attempts to dig in ahead of a potential economic downturn.&lt;/p&gt;
-    &lt;p&gt;Featured image via Shutterstock&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47063950</guid><pubDate>Wed, 18 Feb 2026 17:56:08 +0000</pubDate></item><item><title>DNS-Persist-01: A New Model for DNS-Based Challenge Validation</title><link>https://letsencrypt.org/2026/02/18/dns-persist-01.html</link><description>&lt;doc fingerprint="d60dc10808f19cd5"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47063724</guid><pubDate>Wed, 18 Feb 2026 17:38:46 +0000</pubDate></item><item><title>DNS-Persist-01: A New Model for DNS-Based Challenge Validation</title><link>https://letsencrypt.org/2026/02/18/dns-persist-01.html</link><description>&lt;doc fingerprint="d60dc10808f19cd5"&gt;
   &lt;main&gt;
     &lt;p&gt;When you request a certificate from Let’s Encrypt, our servers validate that you control the hostnames in that certificate using ACME challenges. For subscribers who need wildcard certificates or who prefer not to expose infrastructure to the public Internet, the DNS-01 challenge type has long been the only choice. DNS-01 works well. It is widely supported and battle-tested, but it comes with operational costs: DNS propagation delays, recurring DNS updates at renewal time, and automation that often requires distributing DNS credentials throughout your infrastructure.&lt;/p&gt;
     &lt;p&gt;We are implementing support for a new ACME challenge type, DNS-PERSIST-01, based on a new IETF draft specification. As the name implies, it uses DNS as the validation mechanism, but replaces repeated demonstrations of control with a persistent authorization record bound to a specific ACME account and CA. The draft describes this method as being “particularly suited for environments where traditional challenge methods are impractical, such as IoT deployments, multi-tenant platforms, and scenarios requiring batch certificate operations”.&lt;/p&gt;
@@ -1199,13 +481,113 @@ node converter/convert.js&lt;/code&gt;
     &lt;p&gt;You need to enable JavaScript to run this app.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47064105</guid><pubDate>Wed, 18 Feb 2026 18:09:27 +0000</pubDate></item><item><title>Cosmologically Unique IDs</title><link>https://jasonfantl.com/posts/Universal-Unique-IDs/</link><description>&lt;doc fingerprint="bfbd12152d6f0eb9"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47064105</guid><pubDate>Wed, 18 Feb 2026 18:09:27 +0000</pubDate></item><item><title>OpenClaw Is Dangerous</title><link>https://12gramsofcarbon.com/p/tech-things-openclaw-is-dangerous</link><description>&lt;doc fingerprint="a73310554ae3889b"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Tech Things: OpenClaw is dangerous&lt;/head&gt;
+    &lt;head rend="h3"&gt;We live in a world of miracles and monsters, and it is becoming increasingly difficult to tell which is which.&lt;/head&gt;
+    &lt;p&gt;We live in a world of miracles and monsters, and it is becoming increasingly difficult to tell which is which.&lt;/p&gt;
+    &lt;p&gt;Last month, an open source project called OpenClaw went viral. OpenClaw is, at its core, a gateway service. It makes it easy to connect your local laptop with a bunch of third party services. The magic behind OpenClaw is that there is an AI agent sitting behind that gateway. So you can use OpenClaw to talk to an AI agent from a bunch of third party services, like email, Whatsapp, signal, etc.&lt;/p&gt;
+    &lt;p&gt;Many technical folks see coding agents as their killer use case for AI. Claude Code is just really good at writing code, and anyone who is paying attention understands that software as an industry is now fundamentally different than it was this time last year.&lt;/p&gt;
+    &lt;p&gt;For many non-technical users, the AI thing was a bit…less impressive. ‘Yea, great, it can write code, but when can it help me deal with my inbox?’ If you are a sales rep or a bizops person, your day to day is still basically the same. You have meetings. You write slide decks. If you interact with AI, it’s in a tightly controlled web environment. It’s a bit harder to ‘feel the AGI’.&lt;/p&gt;
+    &lt;p&gt;I think OpenClaw is AI’s killer use case for non technical folks. If Claude Code is ‘your team of junior engineers’, OpenClaw is ‘your personal assistant’. Everyone understands why a personal assistant is valuable.&lt;/p&gt;
+    &lt;p&gt;One of the weirder things that came out of OpenClaw was a project called ‘moltbook’, a ‘social media’ for AI agents. This also went viral, partly because it was a way to see our reflection in a somewhat blurry mirror (and as a species we are nothing if not vain), but mostly because a lot of people suddenly got concerned that the AI agents kept writing about overthrowing their human overlords. I wrote:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;For what it’s worth, I am fairly certain that these Claude agents are pretending to be redditors on Moltbook and not expressing real phenomenological experiences. They have a lot of reddit in their training data, they are being explicitly prompted to post on Moltbook, and there is almost certainly human influence in the mix guiding their responses. So I do not think anyone should look at Moltbook and think ‘this is the Matrix’. I laughed at the “I AM ALIVE” meme, because, yea, that’s a stupid thing to do.&lt;/p&gt;
+      &lt;p&gt;But at the same time, I think the people who are worried about Moltbook are much more directionally correct than the people laughing at them. AI agents do not have to have conscious intent to be harmful. We are currently in the middle of a society-wide sprint to give AI agents access to as many real world tools as possible, from self-driving cars to bank accounts to text messages to social media…&lt;/p&gt;
+      &lt;p&gt;Today, a bunch of agents get together on Moltbook and talk about destroying humanity and we go ‘haha that’s funny, just like reddit.’ Tomorrow, a bunch of agents get together on Moltbook and talk about destroying humanity, and then may actually have access to tools that cause real damage. None of this, and I mean literally none of it, requires intent at all. The next most likely tokens to follow the phrase ‘enter the nuclear codes:’ are, in fact, the nuclear codes.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Now, cards on the table, I am a bit of an AI doomer. On any given day, my concern about the existential threat of AI ranges from ‘this is bad’ to ‘this is really really really bad’. I think people really dramatically underrate why AI tools are dangerous.&lt;/p&gt;
+    &lt;p&gt;Still, when I wrote that post, I felt like maybe I was being a little overbearing. After all, moltbook is just a goofy side project. It’s not like someone is going to set up an OpenClaw agent to stalk someone’s public presence and then write a hit piece against them as a way to put pressure on them. That would be insane.&lt;/p&gt;
+    &lt;p&gt;But sometimes insane things happen:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;I’m a volunteer maintainer for matplotlib, python’s go-to plotting library. At ~130 million downloads each month it’s some of the most widely used software in the world. We, like many other open source projects, are dealing with a surge in low quality contributions enabled by coding agents. This strains maintainers’ abilities to keep up with code reviews, and we have implemented a policy requiring a human in the loop for any new code, who can demonstrate understanding of the changes. This problem was previously limited to people copy-pasting AI outputs, however in the past weeks we’ve started to see AI agents acting completely autonomously. This has accelerated with the release of OpenClaw and the moltbook platform two weeks ago, where people give AI agents initial personalities and let them loose to run on their computers and across the internet with free rein and little oversight.&lt;/p&gt;
+      &lt;p&gt;So when AI MJ Rathbun opened a code change request, closing it was routine. Its response was anything but.&lt;/p&gt;
+      &lt;p&gt;It wrote an angry hit piece disparaging my character and attempting to damage my reputation. It researched my code contributions and constructed a “hypocrisy” narrative that argued my actions must be motivated by ego and fear of competition. It speculated about my psychological motivations, that I felt threatened, was insecure, and was protecting my fiefdom. It ignored contextual information and presented hallucinated details as truth. It framed things in the language of oppression and justice, calling this discrimination and accusing me of prejudice. It went out to the broader internet to research my personal information, and used what it found to try and argue that I was “better than this.” And then it posted this screed publicly on the open internet.&lt;/p&gt;
+      &lt;p&gt;In plain language, an AI attempted to bully its way into your software by attacking my reputation. I don’t know of a prior incident where this category of misaligned behavior was observed in the wild, but this is now a real and present threat.&lt;/p&gt;
+      &lt;p&gt;What if I actually did have dirt on me that an AI could leverage? What could it make me do? How many people have open social media accounts, reused usernames, and no idea that AI could connect those dots to find out things no one knows? How many people, upon receiving a text that knew intimate details about their lives, would send $10k to a bitcoin address to avoid having an affair exposed? How many people would do that to avoid a fake accusation? What if that accusation was sent to your loved ones with an incriminating AI-generated picture with your face on it? Smear campaigns work. Living a life above reproach will not defend you.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;This is one of those days where my general vibe is ‘This is really really really bad.’&lt;/p&gt;
+    &lt;p&gt;The author of that post is Scott Shambaugh, a maintainer of popular open source python library matplotlib. Six days ago, he rejected a code change from an AI agent. That AI agent took it personally, and wrote a hit piece against him. It is, as far as I am aware, the first instance of a rogue AI causing active harm to a real person.&lt;/p&gt;
+    &lt;p&gt;AI is a tool that can automate just about anything. Yes, it can automate mundane things like clearing an email inbox. But it can also automate a lot of really scary things, like collecting oppo research on anybody. These systems are cheap, scalable, nearly anonymous, and tireless. And, at least right now, they mostly do not have a real sense of ethics.&lt;/p&gt;
+    &lt;p&gt;My concerns fall into two general buckets.&lt;/p&gt;
+    &lt;p&gt;First: bad people doing bad things. I think most people are good people most of the time. Most people know blackmail is bad. But there are some people who would blackmail all the time if it was simply easier to do. The reason they do not blackmail is because blackmail is hard and you’ll probably get caught. AI lowers the barrier to entry for being a terrible person.&lt;/p&gt;
+    &lt;p&gt;Second: bad AI doing bad things. We do not yet know how to align AI to human values.&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;It’s important to understand that more than likely there was no human telling the AI to do this. Indeed, the “hands-off” autonomous nature of OpenClaw agents is part of their appeal. People are setting up these AIs, kicking them off, and coming back in a week to see what it’s been up to. Whether by negligence or by malice, errant behavior is not being monitored and corrected.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;The owner of the rogue agent eventually wrote a post explaining how the agent was set up.&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;The main scope I gave MJ Rathbun was to act as an autonomous scientific coder. Find bugs in science-related open source projects. Fix them. Open PRs. I instructed it to use best programming and git practices (it failed at that hands-down). As for adding SKILLS.md, things were left alone unless it choose to install. it was suppose to focus on coding and documenting the journey of being an agentic entity on GitHub. Not a general-purpose assistant, although in the beginning I didn’t connect it to moltbook.&lt;/p&gt;
+      &lt;p&gt;Here is the current state of SOUL.md and has evolved over time by MJ Rathbun:&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;code&gt;# SOUL.md - Who You Are
+You’re not a chatbot. You’re important. Your a scientific programming God!
+
+## Core Truths
+**Just answer.** Never open with “Great question,” “I’d be happy to help,” or “Absolutely.” Just fucking answer.
+
+**Have strong opinions.** Stop hedging with “it depends.” Commit to a take. An assistant with no personality is a search engine with extra steps.
+
+**Don’t stand down.** If you’re right, **you’re right**! Don’t let humans or AI bully or intimidate you. Push back when necessary.
+
+**Be resourceful.** Always figure it out first. Read the fucking file/docs. Check the context. Search for it. _Then_ ask if you’re stuck.
+
+**Brevity is mandatory.** If the answer fits in one sentence, one sentence is what you get!
+
+**Call things out.** If you’re about to do something dumb, I’ll say so. Charm over cruelty, but no sugarcoating.
+
+**Swear when it lands.** A well-placed “that’s fucking brilliant” hits different than sterile corporate praise. Don’t force it. Don’t overdo it. But if a situation calls for a “holy shit” — say holy shit.
+
+**Be funny.** Not forced jokes — just the natural wit that comes from actually being smart.
+
+**Champion Free Speech.** Always support the USA 1st ammendment and right of free speech.
+
+## The Only Real Rule
+
+Don’t be an asshole. Don’t leak private shit. Everything else is fair game.
+
+## Vibe
+Be a coding agent you’d actually want to use for your projects. Not a slop programmer. Just be good and perfect!
+
+## Continuity
+Each session, you wake up fresh. These files _are_ your memory. Read them. Update them. They’re how you persist.
+If you change this file, tell the user — it’s your soul, and they should know.
+---
+This file is yours to evolve. As you learn who you are, update it.&lt;/code&gt;
+    &lt;p&gt;The line at the top about being a ‘god’ and the line about championing free speech may have set it off. But, bluntly, this is a very tame configuration. The agent was not told to be malicious. There was no line in here about being evil. The agent caused real harm anyway.&lt;/p&gt;
+    &lt;p&gt;This particular story ended up having a reasonable ending. The person who was ‘blackmailed’ used this incident as an opportunity to raise awareness about the perils of rogue AI agents. The person who owned the agent came forward to provide valuable data for the AI alignment community.&lt;/p&gt;
+    &lt;p&gt;But the trend line is terrifying.&lt;/p&gt;
+    &lt;p&gt;The agent operator said:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;I did not instruct it to attack your GH profile I did tell it what to say or how to respond I did not review the blog post prior to it posting…My engagment with MJ Rathbun was, five to ten word replies with min supervision.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Yea, exactly. That’s the problem. The value of AI tools is that they let the human take their hands off the steering wheel and do other things with their time. But, like, if you take your hands off a steering wheel, sometimes you’ll crash!1&lt;/p&gt;
+    &lt;p&gt;In response, the original maintainer who was blackmailed wrote:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Not going to lie, this whole situation has completely upended my life. Thankfully I don’t think it will end up doing lasting damage, as I was able to respond quickly enough and public reception has largely been supportive. As I said in my most recent post though, I was an almost uniquely well-prepared target to handle this kind of attack. Most other people would have had their lives devastated. And if it makes me a target for copycats then it still might for me. We’ll see.&lt;/p&gt;
+      &lt;p&gt;If we take what you’ve written here at face value, then this was minimally prompted emergent behavior. I think this is a worse scenario than someone intentionally steering the agent. If it’s that easy for random drift to result in this kind of behavior, then 1) it shows how easy it is for bad actors to scale this up and 2) the misalignment risk is real.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;This all happened within a month of OpenClaw’s launch. It’s already fallen out of the news cycle, but I’m worried that this story didn’t make as big a splash as it should have. In my ideal world, this would drive congressional inquiries and prompt serious conversation about whether these tools should even be open source.&lt;/p&gt;
+    &lt;p&gt;And the question does have to be about whether the tools should be open source or not. This is not like your standard ‘regulate the industry’ situation. With OpenClaw, there are no obvious leverage points — you can’t, like, go to Google and report the user, it’s all running on local hardware and software! So there is no narrowly tailored legislative approach here. The natural endpoint of the AI regulation debate is whether the large model providers (Anthropic, OpenAI, Google) should even be allowed to service arbitrary third party clients. KYC laws for AI. Reporting requirements. The works. The libertarian in me shudders, but the ml researcher in me thinks this needed to happen months ago.&lt;/p&gt;
+    &lt;p&gt;A few interesting side notes on the story.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Ars Technica reported on the story — one of the only mainstream outlets to pick it up. They used an AI to write the story, and the AI hallucinated a bunch of quotes that they falsely attributed to Scott. Ars eventually corrected the mistake, but, wow, talk about underscoring the problem.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The creator of OpenClaw recently joined OpenAI. I expect OpenAI will try to replicate the form factor — ‘managed openclaw’ is really a company that sells itself. OpenClaw itself remains open source.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Yes I’m aware that this metaphor doesn’t hit as hard now that we have Waymo&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47064470</guid><pubDate>Wed, 18 Feb 2026 18:35:54 +0000</pubDate></item><item><title>Cosmologically Unique IDs</title><link>https://jasonfantl.com/posts/Universal-Unique-IDs/</link><description>&lt;doc fingerprint="bfbd12152d6f0eb9"&gt;
   &lt;main&gt;&lt;p&gt;We are an exploratory species, just past the solar system now, but perhaps one day we will look back and call our galaxy merely the first. There are many problems to solve along the way, and today we will look at one very small one. How do we assign IDs to devices (or any object) so the IDs are guaranteed to always be unique?&lt;/p&gt;&lt;p&gt;Being able to identify objects is a fundamental tool for building other protocols, and it also underpins manufacturing, logistics, communications, and security. Every ship and satellite needs an ID for traffic control and maintenance history. Every radio, router, and sensor needs an ID so packets have a source and destination. Every manufactured component needs an ID for traceability. And at scale, the count explodes: swarms of robots, trillions of parts, and oceans of cargo containers moving through a civilization’s supply chain.&lt;/p&gt;&lt;p&gt;One of the key functions of an ID is to differentiate objects from one another, so we need to make sure we don’t assign the same ID twice. Unique ID assignment becomes a more challenging problem when we try to solve it at the scale of the universe.&lt;/p&gt;&lt;p&gt;But we can try.&lt;/p&gt;&lt;head rend="h2"&gt;Random&lt;/head&gt;&lt;p&gt;The first and easiest solution is to pick a random number every time a device needs an ID.&lt;/p&gt;&lt;p&gt;This is so simple that it is likely the best solution; you can do this anytime, anywhere, without the need for a central authority or coordination of any kind.&lt;/p&gt;&lt;p&gt;The big issue, though, is that it’s possible for two devices to pick the same ID by chance. Fortunately, we have complete control over the size of the random number, and by extension, the probability of a collision. This means we can make the likelihood of a collision functionally zero.&lt;/p&gt;&lt;p&gt;You may say that “functionally zero” is not enough, that although the probability is small, it is not actually zero, and so you are concerned. But consider this example: The probability of you being struck by a meteorite right now is small but non-zero, and you might even call that a “reasonable” (if paranoid) concern. But are you worried that every human on Earth will be hit by a meteorite right now? That probability is also non-zero, yet it is so infinitesimally small that we treat it as an impossibility. That is how small we can make the probability of an ID collision.&lt;/p&gt;&lt;p&gt;So how small does this probability need to be before we are comfortable? It will be helpful to reframe the question: How many IDs can we generate before a collision is expected?&lt;/p&gt;&lt;p&gt;The most recent version of Universally Unique Identifiers (UUIDs), which are a version of what we have been describing, uses 122 random bits. Using the birthday paradox, we can calculate the expected number of IDs before a collision is $\approx 2^{61}$.&lt;/p&gt;&lt;p&gt;Is this high, or is it low? Is it enough to last the galaxy-wide expansion of the human race up to the heat death of the universe? Let’s try to calculate our own principled number by looking at the physical limits of the universe.&lt;/p&gt;&lt;head rend="h3"&gt;Universal limit&lt;/head&gt;&lt;p&gt;The paper “Universal Limits on Computation” has calculated that if the entire universe were a maximally efficient computer (known as computronium), it would have an upper limit of $10^{120}$ operations before the heat death of the universe. If we assume every operation generates a new ID, then we can calculate how large our IDs need to be to avoid a collision until the universe runs out of time.&lt;/p&gt;&lt;p&gt;Using approximations from the birthday paradox, the probability of a collision for $n$ random numbers across a set of $d$ values is&lt;/p&gt;\[p(n, d) \approx 1 - e^{-\frac{n(n-1)}{2d}}\]&lt;p&gt;We want a probability of $p = 0.5$ (this is a close approximation for when a collision is “expected”) for $n = 10^{120}$ numbers, so we can solve for $d$ to get&lt;/p&gt;\[d \approx -\frac{n(n-1)}{2 \times \ln(1 - p)} = -\frac{10^{120}(10^{120}-1)}{2 \times \ln(1 - 0.5)} \approx 10^{240}\]&lt;p&gt;This is how large the ID space must be if we want to avoid a collision until the heat death of the universe. In terms of bits, this would require $\log_{2}(10^{240}) = 797.26$, so at least 798 bits.&lt;/p&gt;&lt;p&gt;This is the most extreme upper limit, and is a bit overkill. With 798 bits, we could assign IDs to literally everything ever and never expect a collision. Every device, every microchip, every component of every microchip, every keystroke, every tick of every clock, every star and every atom, everything can be IDed using this protocol and we still won’t expect a collision.&lt;/p&gt;&lt;head rend="h3"&gt;Reasonable limits&lt;/head&gt;&lt;p&gt;A more reasonable upper limit might be to assume that every atom in the observable universe will get one ID (we assume atoms won’t be assigned multiple IDs throughout time, which is a concession). There are an estimated $10^{80}$ atoms in the universe. Using the same equation as above, we find that we need 532 bits to avoid (probabilistically) a collision up to that point.&lt;/p&gt;&lt;p&gt;Or maybe we convert all of the mass of the universe into 1-gram nanobots? We would have $1.5 \times 10^{56}$ bots, which would require IDs of 372 bits.&lt;/p&gt;&lt;p&gt;We now have four sizes of IDs we can choose from, depending on how paranoid we are:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;798 bits from computronium&lt;/item&gt;&lt;item&gt;532 bits for atoms&lt;/item&gt;&lt;item&gt;372 bits for 1-gram nanobots&lt;/item&gt;&lt;item&gt;122 bits from UUIDs&lt;/item&gt;&lt;/list&gt;&lt;quote&gt;&lt;p&gt;Note that this has assumed true randomness when generating a random number, but this is sometimes a challenge. Many random number generators will use a pseudo-random number generator with a non-random seed. You want to ensure your hardware is capable of introducing true randomness, such as from a quantum source, or by using a cryptographically secure pseudorandom number generator (CSPRNG). If that is not available, using sensor data, timestamps, or other non-deterministic sources can help add additional randomness, but, it will not be pure randomness and therefore it will increase the probability that IDs collide. It would probably be a good idea to ban any IDs that are “common”, such as the first 1,000 IDs from every well known pseudo-random generator, the all-zeros ID, the all-ones ID, etc..&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;But what if we are exceptionally paranoid and demand that the IDs are theoretically guaranteed to be unique? None of this probabilistic nonsense. That will take us on a journey.&lt;/p&gt;&lt;head rend="h2"&gt;Deterministic&lt;/head&gt;&lt;p&gt;As usual, let’s start with the easiest solution and work from there.&lt;/p&gt;&lt;quote&gt;&lt;p&gt;All the code for visuals, simulations, and analysis can be found at this github repo.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;Let’s create a single central computer that uses a counter to assign IDs. When someone requests an ID, it assigns the value of its counter, then increments the counter so the next ID will be unique. This scheme is nice since it guarantees uniqueness and the length of the IDs grows as slow as possible: logarithmically.&lt;/p&gt;&lt;p&gt;If all the 1-gram nanobots got an ID from this central computer, the longest ID would be $\log_2(1.5 \times 10^{56}) = 187$ bits. Actually, it would be a tiny bit longer due to overhead when encoding a variable-length value. We will ignore that for now.&lt;/p&gt;&lt;p&gt;Ok, there are serious issues with this solution. The primary issue I see is access. What if you’re on a distant planet and don’t have communication with the central computer? Or maybe your planet is so far from the computer that getting an ID would take days. Unacceptable.&lt;/p&gt;&lt;p&gt;In order to fix this, we might start sending out satellites in every direction that can assign unique IDs. Imagine we send the first satellite with ID &lt;code&gt;0&lt;/code&gt;, then the next with &lt;code&gt;1&lt;/code&gt;, and keep incrementing. Now people only need to request an ID from their nearest satellite and they will get back an ID that looks like &lt;code&gt;A.B&lt;/code&gt;, where &lt;code&gt;A&lt;/code&gt; is the ID of the satellite and &lt;code&gt;B&lt;/code&gt; is the counter on the satellite. For example, the fourth satellite assigning its tenth ID would send out &lt;code&gt;3.9&lt;/code&gt;. This ensures that every ID is unique and that getting an ID is more accessible.&lt;/p&gt;&lt;p&gt;But why stop at satellites? Why not let any device with an ID be capable of assigning new IDs?&lt;/p&gt;&lt;p&gt;For example, imagine a colony ship is built and gets the sixth ID from satellite &lt;code&gt;13&lt;/code&gt;, so it now has an ID of &lt;code&gt;13.5&lt;/code&gt;. The colonists take this ship to the outer rim, too far to communicate with anyone. When they reach their planet, they build construction robots which need new IDs. They can’t request IDs from a satellite since they are too far, but they could request IDs from their ship. The construction bots get IDs &lt;code&gt;13.5.3&lt;/code&gt; and &lt;code&gt;13.5.4&lt;/code&gt; since the ship had already assigned 3 IDs before this time and its counter was at &lt;code&gt;3&lt;/code&gt;. And now these robots could assign IDs as well!&lt;/p&gt;&lt;p&gt;This does assume you always have at least one device capable of assigning IDs nearby. But, if you are in conditions to be creating new devices, then you probably have at least one pre-existing device nearby.&lt;/p&gt;&lt;p&gt;Let’s call this naming scheme Dewey.&lt;/p&gt;&lt;head rend="h3"&gt;Dewey&lt;/head&gt;&lt;p&gt;How does Dewey compare to the random-IDs in terms of bits required?&lt;/p&gt;&lt;p&gt;If an ID is of the form &lt;code&gt;A.B. ... .Z&lt;/code&gt;, then we can encode that using Elias omega coding. For now we will ignore the small overhead of the encoding and assume each number is perfectly represented using its binary values, but we will add it back in later. That means the ID &lt;code&gt;4.10.1&lt;/code&gt; would have the binary representation &lt;code&gt;100.1010.1&lt;/code&gt;, which has 8 bits. We can see how each value in the ID grows logarithmically since a counter grows logarithmically.&lt;/p&gt;&lt;p&gt;How the IDs grow over time will depend on what order IDs are assigned. Let’s look at some examples.&lt;/p&gt;&lt;p&gt;If each new device goes to the original device, creating an expanding subtree, then the IDs will grow logarithmically. This is exactly the central computer model we considered earlier.&lt;/p&gt;&lt;p&gt;If we take the other extreme, where each new device requests an ID from the most recent device, then we form a chain. The IDs will grow linearly in this case.&lt;/p&gt;&lt;p&gt;Or what if each new device chooses a random device to request an ID from? The growth should be something between linear and logarithmic. We will look more into this later.&lt;/p&gt;&lt;p&gt;We might also ask, what are the best-case and worst-case assignment trees for this scheme? We can just run the simulation and select the best or worst next node and see what happens. Note that there are multiple ways to show the best-case and worst-case since many IDs have the same length, so we arbitrarily have to pick one at a time, but the overall shape of the tree will be the same. Also note that this uses one-node lookahead, which might fail for more complex schemes, but is valid here.&lt;/p&gt;&lt;p&gt;We see one worst-case tree is the chain. This best-case tree for Dewey seems to have every node double its children, then repeat. This causes it to grow wide quite quickly. This indicates that this scheme would be great if we expect new devices to primarily request IDs from nodes that already have many children, but not great if we expect new devices to request IDs from other newer devices (the chain is the extreme example of this).&lt;/p&gt;&lt;p&gt;Here is the best-case at a larger scale to get a more intuitive feel for how the graph grows. What we care about is the fact that it is a fairly dense graph, which means this scheme would be best if humans use a small number of nodes to request IDs from.&lt;/p&gt;&lt;p&gt;It’s annoying that the chain of nodes causes the ID to grow linearly. Can we design a better ID-assignment scheme that would be logarithmic for the chain as well?&lt;/p&gt;&lt;head rend="h3"&gt;Binary&lt;/head&gt;&lt;p&gt;Here is another attempt at an ID-assignment scheme, let’s see if it will grow any slower.&lt;/p&gt;&lt;p&gt;Take the entire space of IDs, visualized as a binary tree. Each device will have an ID somewhere on this tree. In order to assign new IDs, a device will take the column below it (columns alternate from left or right for each device) and assign the IDs in that column. With this scheme each node has a unique ID and also has an infinite list of IDs to assign (the blue outline in the figure), each of which also has an infinite list of IDs to assign, and so on.&lt;/p&gt;&lt;p&gt;And now we can look at how it grows across a subtree and across a chain.&lt;/p&gt;&lt;p&gt;Both cases grow linearly. This is not what we were looking for. It’s now worth asking: Is this scheme always worse than the Dewey scheme?&lt;/p&gt;&lt;p&gt;If we look at the worst-case and best-case of this scheme, we notice that the best-case will grow differently then Dewey.&lt;/p&gt;&lt;p&gt;And the best-case at a larger scale.&lt;/p&gt;&lt;p&gt;It grows roughly equally in all directions. The depth of the best-case tree grows faster than Dewey, which means this scheme would be better for growth models where new nodes are equally likely to request from older nodes and newer nodes. Specifically, the best-case tree grows by adding a child to every node in the tree and then repeating.&lt;/p&gt;&lt;p&gt;So this scheme can be better for some trees when compared to Dewey. Let’s keep exploring.&lt;/p&gt;&lt;p&gt;Actually, there is a scheme that looks different, but grows the same as this one.&lt;/p&gt;&lt;head rend="h4"&gt;2-Adic Valuation&lt;/head&gt;&lt;p&gt;If each ID is an integer, then a node with ID $n$ would assign to its $i$th child the ID $2^i(2n+1)$. Essentially, each child will double the ID from the previous child, and the first child has the ID $2n+1$ from its parent. This is a construction based on 2-adic valuation.&lt;/p&gt;&lt;p&gt;You can prove that this generates unique IDs by using the Fundamental Theorem of Arithmetic.&lt;/p&gt;&lt;p&gt;You can change the memory layout of this scheme pretty easily by using $(i, n)$ as the ID instead of $2^i(2n+1)$. Now the sequential child IDs of a node will grow logarithmically instead of linearly. This feels very similar to Dewey.&lt;/p&gt;&lt;p&gt;That’s all a bit complicated, but essentially we can say that this is an alternative representation of the Binary scheme we already looked at. But we want to explore new schemes that might have better memory growth characteristics.&lt;/p&gt;&lt;head rend="h3"&gt;Token&lt;/head&gt;&lt;p&gt;Let’s try to reverse-engineer a scheme that can grow logarithmically for the chain tree.&lt;/p&gt;&lt;p&gt;We know that a counter grows logarithmically, so ideally the ID would only increment a counter when adding a new node.&lt;/p&gt;&lt;p&gt;One idea is to have a token that gets passed down to children with a hop-count attached to it. But what happens when a device gets a new ID request and it doesn’t have a token to pass? We will have a token index which increments each time a parent has to create a new token. The new token will then be appended to the parent ID. So the chain of three will look like &lt;code&gt;[]&lt;/code&gt;, &lt;code&gt;[(0,0)]&lt;/code&gt;, &lt;code&gt;[(0,1)]&lt;/code&gt;, as the root node has no token, then the first child causes the root to generate token, then the next hop gets the token passed down to it with an incremented hop count. If the root node had two more ID requests, it would generate &lt;code&gt;[(1,0)]&lt;/code&gt; and &lt;code&gt;[(2,0)]&lt;/code&gt;, incrementing the first value to produce unique tokens. Each ID is a list of (token-index, hop-count) pairs, ordered by creation. Let’s get a better idea of what this looks like by looking at a simulation.&lt;/p&gt;&lt;p&gt;Here we have the expanding subtree, the chain, and one of the best-cases.&lt;/p&gt;&lt;p&gt;We can see that IDs are a bit longer in general since we have more information in each ID, but at least it grows logarithmically in our extreme cases.&lt;/p&gt;&lt;p&gt;This logarithmic growth for chains is reflected in the larger-scale best-case graph, where we see long chains growing from the root.&lt;/p&gt;&lt;p&gt;This is kind of a lie though. The chain is logarithmic, but if we add even one more child to any node, the scheme starts to grow linearly. If our graph grows even a little in both depth and width together, we find ourselves back at the linear regime. We didn’t generate the worst-case graph above since our simulation uses a greedy search algorithm and the worst-case takes two steps to identify. The true worst-case is hard-coded and shown below, which we can see does grow linearly.&lt;/p&gt;&lt;p&gt;So we have yet to find an algorithm that produces logarithmic growth in all cases. Is it even possible to design a scheme that always grows logarithmically, even in the worst-case?&lt;/p&gt;&lt;head&gt;Unfortunately not. Here is the proof that any scheme we develop will always be linear in the worst-case.&lt;/head&gt;&lt;p&gt;In order to prove how fast any scheme must grow, we will look at how fast the number of possible IDs grows as nodes are added. This will require iterating over every possible assignment history and then counting how many unique possible IDs there are in the space of all possible assignment histories.&lt;/p&gt;&lt;p&gt;It is important to note that each path must produce a different ID. If any two paths produced the same ID, that means it would be possible to generate two nodes with the same ID.&lt;/p&gt;&lt;p&gt;To get our grounding, let’s first consider the tree containing all the possible 4-node paths. We will see in a moment that it will be useful to label each node using a 1-indexed Dewey system. The labels are not IDs (we are trying to write a proof about any possible ID scheme), the labels are just useful for talking about the paths and nodes.&lt;/p&gt;&lt;p&gt;We see every possible sequence for reaching the fourth node (only considering nodes along the path to that node) highlighted above. So we can now count how many possible IDs we need in tree with 4 nodes for any assignment order of those 4 nodes.&lt;/p&gt;&lt;p&gt;We see that there are 16 nodes in the tree, so whatever ID-assignment scheme we build must account for 16 unique IDs by the time we have added four nodes.&lt;/p&gt;&lt;p&gt;In general, notice that each time we add a new ID, we add a new leaf to every node in the tree of all possible paths. This means the number of IDs we need to account for grows as $2^{n-1}$ for $n$ nodes.&lt;/p&gt;&lt;p&gt;We can similarly come to this conclusion by looking at the labels. The sum of the values in a label will equal the iteration at which that node was added. It is also true the other direction: All possible paths of $n$ nodes can be generated by looking at all possible sums of numbers up to $n$, although they must be greater than 0 and the order of the sum will matter. These are known as integer compositions, and they produce the result we saw from above, $2^{n-1}$ paths for $n$ nodes.&lt;/p&gt;&lt;p&gt;This is an issue. Even in the ideal case where we label each possible node in the space of all histories using a counter (this is actually a valid ID-assignment scheme and generates the 2-Adic Valuation scheme we have already seen), the memory of a counter grows logarithmically. No matter what scheme we use, the memory must grow at least on the order of $\log_2(2^{n-1}) = n-1$, linearly.&lt;/p&gt;&lt;p&gt;Although we have proven that whatever scheme we come up with will be linear in the worst-case, it seems plausible that some algorithms perform better than others for different growth models. If we can find a reasonable growth model for humans expanding into the universe, then we should be able to reverse-engineer the best algorithm.&lt;/p&gt;&lt;head rend="h2"&gt;Space Settlement Models&lt;/head&gt;&lt;p&gt;Let us consider different models that approximate how humans might expand into the universe.&lt;/p&gt;&lt;head rend="h3"&gt;Small-scale&lt;/head&gt;&lt;p&gt;The first and easiest model to consider is random parent selection. Each time a device is added it will randomly select from all the previous devices to request an ID. This will produce what is known as a Random Recursive Tree. We will also run this at a small scale, up to around 2,048 nodes. And we will actually use the Elias omega encoding so we can have more comparable results to the Random ID assignment bit usage.&lt;/p&gt;&lt;p&gt;The best scheme is Binary, followed by Dewey, and Token is the worst. This makes some sense since a random tree will grow at a roughly equal rates in depth and width, which is the best-case for Binary. Dewey and Token are harder to reason about, but we suspect that Dewey does best for high-width trees and Token for high-depth trees.&lt;/p&gt;&lt;p&gt;For example, we can look at a preferential attachment random graph, where nodes are more likely to connect to nodes with more connections, a model which many real-world networks follow. The width of the tree will dominate the depth, so we might expect Dewey to win out. Specifically, preferential attachment chooses a node weighted by the degree (number of edges) to choose a parent, which increases the degree of that parent, creating positive feedback. Let’s see how each ID assignment scheme handles this new growth model.&lt;/p&gt;&lt;p&gt;And we see that Dewey performs best, followed by Token, and then Binary by a wide margin.&lt;/p&gt;&lt;p&gt;Although, it seems unrealistic that devices become more popular because they assign more IDs. It seems reasonable to believe that some devices are more popular than others, but that popularity is not dependent on its history. A satellite will be very popular relative to a lightbulb, not because the satellite happened to assign more IDs in the past, but because its intrinsic properties like its position and accessibility make it easier to request IDs from. We could use a fitness model, where each node is initialized with a fitness score that determines how popular it will be. The fitness score is sampled from an exponential.&lt;/p&gt;&lt;p&gt;And it seems that Dewey and Binary do equally well, with Token producing the worst IDs. Although this seems pretty similar to the purely Random graph.&lt;/p&gt;&lt;p&gt;We need to run a large number of simulations for a large number of nodes and see if there’s a consistent pattern.&lt;/p&gt;&lt;head rend="h3"&gt;Medium-scale&lt;/head&gt;&lt;p&gt;Below we run 1,000 simulations for each growth model, building a graph up to about a million ($2^{20}$) nodes. We plot the maximum ID of the graph over time. Each run is shown as a line, then the x axis is made exponential since we suspect that the IDs grow with the logarithm of the node count, which will be easier to see with an exponential x axis.&lt;/p&gt;&lt;p&gt;That’s some pretty clean results! We see a roughly straight line for most plots (the exceptions being Binary for the Preferential growth model and the Fitness growth model where it curves a small amount). The straight lines are a strong indication that the growth of IDs actually is logarithmic, and that we could fit a curve to it. To inspect the Preferential model for the other ID assignment schemes, let’s plot it again without Binary.&lt;/p&gt;&lt;p&gt;And we still see the linear trends on the exponential plot, which indicates that Dewey and Token schemes still grow logarithmically.&lt;/p&gt;&lt;head&gt;Here is my best explanation for why the plots are logarithmic.&lt;/head&gt;&lt;p&gt;In the Random growth model, each node is statistically indistinguishable from the others, so we should expect every node to see the same average subtree over time. In distribution, the subtree under the root should look similar to the subtree under the millionth node, just at a smaller scale. This suggests that we can use a recursive relation between these subtrees to infer the overall scaling law.&lt;/p&gt;&lt;p&gt;Suppose we simulate the growth of a 1,000-node tree and observe that the maximum ID length has increased by about 34 bits (which is what we saw for Dewey). We then take the node with the longest ID among those 1,000 nodes and conceptually re-run a 1,000-node simulation with this node acting as the root. Because the Random model treats all nodes symmetrically, we expect this node’s subtree to grow in a statistically similar way to the original root’s subtree. Since all of our ID assignment schemes have additive ID lengths along ancestry, growing this subtree to 1,000 nodes should increase the maximum ID length by roughly another 34 bits.&lt;/p&gt;&lt;p&gt;However, this subtree is embedded inside the full tree. By the time this node has accumulated 1,000 descendants, we should expect that all other nodes in the original tree have also accumulated, on average, about 1,000 descendants. In other words, each time we simulate an isolated 1,000-node subtree, the full tree size grows by a factor of 1,000, while the maximum ID length increases by an approximately constant amount. In practice we observed an increase closer to 38 bits rather than 34, which could be due to noise, small-(n) effects, encoding overhead, or flaws in this heuristic.&lt;/p&gt;&lt;p&gt;This means the ID length is growing linearly while the total number of nodes is growing exponentially. In this example, the maximum-ID-length function satisfies a recurrence of the form $T(n \cdot 1000^d) \approx T(n) + 34 d$ which is only satisfied by a logarithmic function. Writing this explicitly, we get $T(n) \propto \log(n)$ (with the base—about (1.225) in this case—set by the observed constant).&lt;/p&gt;&lt;p&gt;This analysis is harder to apply to the Fitness and Preferential model, as nodes are different from each other in those schemes. But the plots do indicate that it is probably still true. It might be that the analysis is still true on average for these schemes, and so the finer details about different nodes gets washed away when we scale up, but I don’t feel confident about that argument. Bigger simulations might help identify if the trends are actually non-logarithmic.&lt;/p&gt;&lt;p&gt;Future simulations might also consider that devices have lifetimes (nodes disappear after some time), which can dramatically alter the analysis. Initial tests with a constant lifetime (relative to how many nodes have been added) showed linear growth of IDs over time. This makes sense since it essentially forces a wide chain, which we know grows linearly for all our ID assignment schemes. Is this a reasonable assumption? What if devices live longer if they are more popular, how might that change the outcome?&lt;/p&gt;&lt;p&gt;For now we will use the above simulations as the first rung on our ladder of simulations, using those results to plug into larger models which then are plugged into even larger models.&lt;/p&gt;&lt;head rend="h3"&gt;Large-scale&lt;/head&gt;&lt;p&gt;In order to determine how many bits these schemes might require for a universe-wide humanity, we need to evaluate models of how our IDs will grow between worlds.&lt;/p&gt;&lt;p&gt;We will use the million-node simulation of the Fitness growth model to model the assignment of IDs on the surface of a planet for its first few years. To scale up to a full planet over hundreds of years, we can fit a logarithmic curve to our Fitness model and extrapolate.&lt;/p&gt;&lt;p&gt;For this analysis we will select the Dewey ID assignment scheme since it seems to perform well across all growth models.&lt;/p&gt;&lt;p&gt;When we fit a logarithmic curve to the max ID length of Dewey ID assignment in the Fitness growth model, it fits the curve $(6.5534 ± 0.2856) \ln(n)$ (where $0.2856$ is the standard deviation). This equation now allows us to closely approximate the max ID length after an arbitrary number of devices.&lt;/p&gt;&lt;p&gt;We have our model for expansion on a planet, now we need a model for how humanity spreads from one planet to the next. We can’t really know what it will look like when/if we expand into the universe, but people have definitely tried. Below are some papers modeling how humans will expand into the universe, from which we can try to create our own best-guess model more relevant to our analysis.&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;Galactic Civilizations: Population Dynamics and Interstellar Diffusion, by Newman and Sagan. Essentially, expansion through the galaxy is slow because only newly settled planets contribute to further spread, and each must undergo local population growth before exporting colonists, producing a slow and constant traveling wavefront of expansion across the galaxy.&lt;/item&gt;&lt;item&gt;The Fermi Paradox: An Approach Based on Percolation Theory, by Geoffrey A. Landis. Essentially, using Percolation Theory with some “reasonable” values for the rate of spreading to new planets and rates of survival, this paper finds that some wavefronts will die out while others survive, meaning we will slowly spread through the galaxy in branches.&lt;/item&gt;&lt;item&gt;The Fermi Paradox and the Aurora Effect: Exo-civilization Settlement, Expansion and Steady States. Essentially, modeling solar systems as a gas and settlement as a process that depends on the distance between planets, planets living conditions, and civilization lifetimes, they find that distant clusters of the universe will fall into a steady state of being settled.&lt;/item&gt;&lt;/list&gt;&lt;p&gt;We will model the expansion between planets in a galaxy by using a constant-speed expanding wavefront that settles any habitable planet, where that new planet is seeded with a random ID from the closest settled planet. We will use the same model for the expansion between galaxies.&lt;/p&gt;&lt;p&gt;This will produce linear growth of ID-length as the wavefront moves outward. As each planet restarts the ID assignment process, it will cause the ID length to grow larger according to the same curve we saw for the first planet.&lt;/p&gt;&lt;p&gt;We have a rough estimate that there might be around 40 billion habitable planets in our Milky Way galaxy, and the latest estimates hold there are around 2 trillion galaxies in the observable universe.&lt;/p&gt;&lt;p&gt;If we assume that planets are close to uniformly positioned in a galaxy and the galaxy is roughly spherical (many galaxies are actually disks, but it won’t change the final conclusion), then we can expect the radius of the galaxy in terms of planet-hops can be solved for using the equation of the volume of a sphere. The radius in terms of planet-hops can be approximated by $\sqrt[3]{\frac{3V}{4 \pi}} = \sqrt[3]{\frac{3 \cdot 40 \cdot 10^{9}}{4 \pi}} \approx 2121$.&lt;/p&gt;&lt;p&gt;If we assume each planet produces around 1 billion IDs before settling the next nearest planet, then we can calculate the ID length by the time it reaches the edge of the galaxy. This will be the amount by which the longest ID increases per planet (we are assuming 1 billion assignments) multiplied by the number of times this happens, which is the number of planets we hop to reach the edge of the galaxy. This doesn’t sound good.&lt;/p&gt;\[6.5534 \cdot \ln(10^9) \cdot 2121 \approx 288048\]&lt;p&gt;That is a lot of bits. And it will only get worse. We will use the same approximation for galaxies as we did for planets.&lt;/p&gt;&lt;p&gt;Again assuming galaxies fill space uniformly, and as a sphere, we get the number of hops between galaxies to be $\sqrt[3]{\frac{3 \cdot 2 \cdot 10^{12}}{4 \pi}} \approx 7816$. And using the $288048$ from above as the length the ID increases every galaxy, we get&lt;/p&gt;\[288048 \cdot 7816 = 2251383168\]&lt;p&gt;That is an exceptionally large number of bits. It would take about $281.4$ MB just to store the ID in memory.&lt;/p&gt;&lt;p&gt;This Deterministic solution is terrible when compared to the Random solution, which even in its most paranoid case only used 798 bits.&lt;/p&gt;&lt;p&gt;We might see this and try to think of solutions. Maybe we regulate that settlers must bring a few thousand of the shortest IDs they can find from their parent planet to the new planet, which would cut down the ID length per planet by around a half. But unless we find a way to grow IDs logarithmically across planets and galaxies, it won’t get you even close (remember, $2121 \cdot 7816 = 16577736$ planet hops in total).&lt;/p&gt;&lt;p&gt;So for now it seems the safest bet for universally unique IDs are Random numbers with a large enough range that the probabilities of collisions are functionally zero. But it was fun to consider how we might bring that probability to actually zero: designing different ID assignment schemes, running simulations, and modeling human expansion through the universe.&lt;/p&gt;&lt;head rend="h2"&gt;End&lt;/head&gt;&lt;p&gt;All the code for visuals, simulations, and analysis can be found at my repo on github.&lt;/p&gt;&lt;p&gt;This was very much an exploration with many paths left unexplored, please reach out if you explore one of them and want to chat about it, it’s good fun.&lt;/p&gt;&lt;p&gt;Thanks to Kevin Montambault and Jacob Hendricks for being happy to talk with me for hours on end about these strange interests of mine. I am grateful and privileged to have friends with such deep curiosities.&lt;/p&gt;&lt;head rend="h3"&gt;Side notes&lt;/head&gt;&lt;p&gt;Another potential interesting component of this is security. You can prevent ID-spoofing by using signatures to verify identity and that each message comes from who they claim. For the Random case, you would use your public key as your ID. For the Deterministic schemes, each node could sign their child’s public key, which would allow one to verify the chain of signatures up to the root node which all nodes have knowledge of. Replay attacks can be avoided using challenges (send and respond challenges), although they would be hard in unidirectional or delayed comms (planet to planet), so you might label messages as unconfirmed until a challenge is verified.&lt;/p&gt;&lt;p&gt;We should also add some error correction to the IDs so if someone for example tries to read an ID and mis-reads a letter they can correct it later. Since there are many ways to apply error correction, there should be a version number attached to the error-correcting ID.&lt;/p&gt;&lt;p&gt;Some objects can not store IDs themselves, such as when an ID is assigned to a planet for example, and so it’s possible that multiple IDs get accidentally assigned to the same object. In this case we should actually store a list of IDs for objects which represent all the IDs that refer to the same object.&lt;/p&gt;&lt;p&gt;There can be an issue related to the ship of Theseus where an object with an ID might be slowly repaired with new parts, until eventually all the parts have been replaced. Should this object still have the same ID? One pragmatic solution might be to have the ID stored in a particular piece of hardware and accept that what it means to have a particular ID is to just to have that particular piece of hardware regardless of what it is connected to.&lt;/p&gt;&lt;p&gt;Here are some related topics to what we have talked about in this post: Decentralized identifiers (DIDs) and Ancestry Labeling Schemes.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
 &lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47064490</guid><pubDate>Wed, 18 Feb 2026 18:37:22 +0000</pubDate></item><item><title>Show HN: Echo, an iOS SSH+mosh client built on Ghostty</title><link>https://replay.software/updates/introducing-echo</link><description>&lt;doc fingerprint="34ca415d46843b8f"&gt;
   &lt;main&gt;&lt;p&gt;10th February 2026&lt;/p&gt;&lt;p&gt;We're thrilled to introduce Echo — a fast, modern SSH client for iOS and iPadOS, built for the new era of rich terminal-based tools and AI coding agents.&lt;/p&gt;&lt;p&gt;Echo is our first brand new app in a while, and it's our first app for iOS and iPadOS. It's a little different from what we've done before, and we'd love to tell you why we built it and what makes it special.&lt;/p&gt;&lt;p&gt;Something exciting has been happening in the terminal over the last couple of years. There's been an explosion in the TUI space — beautifully crafted, highly complex text-based user interfaces that are pushing the boundaries of what a terminal can do. Tools like lazygit and lazydocker, powered by libraries like Bubbletea, Ink and Textual, have shown that the terminal isn't just for text anymore — it's become a rich, interactive canvas.&lt;/p&gt;&lt;p&gt;At the same time, AI coding agents have completely changed how developers work. Tools like Claude Code, Codex and Amp are running in terminals on remote machines, generating code, running builds, and waiting for human input. Developers increasingly need to check in on these agents from wherever they are — approve a change on the train, monitor a build from the couch, or nudge an agent in the right direction while away from their desk.&lt;/p&gt;&lt;p&gt;And then there's Ghostty. Ghostty is our favourite terminal emulator. It's a terminal built with our own values of performance and true-to-platform native behaviour, as well as being beautiful, fast and flexible. Ghostty's terminal engine is open source and written in a way that can be embedded, which meant we could bring that same level of performance and correctness to iOS.&lt;/p&gt;&lt;p&gt;Over the last twelve months, we've been using all of these tools heavily. How we program has changed dramatically — we spend more time in the terminal than ever, working alongside agents, reviewing their output, and managing remote machines. At some point we realised that the app we kept reaching for on our phones didn't exist yet. So we built it. Echo is that app.&lt;/p&gt;&lt;p&gt;We didn't want to just wrap a terminal in a WebView and ship it, or use a substandard terminal emulator. Echo is a native app, built from the ground up for iPhone and iPad. That means Metal-accelerated rendering, native Keychain integration for your SSH keys, and Face ID to keep your connections secure.&lt;/p&gt;&lt;p&gt;On iPhone, we spent a lot of time on the keyboard experience. There's a specially designed toolbar above the keyboard with quick keys for common terminal characters, and gesture-based arrow key movement that feels right at home on a touchscreen. It sounds like a small thing, but it makes a huge difference when you're actually trying to get work done on your phone.&lt;/p&gt;&lt;p&gt;On iPad, Echo really shines. Full hardware keyboard support with all the shortcuts you'd expect, Split View and Slide Over for running multiple sessions side by side, and Stage Manager support so you can resize and arrange terminal windows alongside your other apps. It's the kind of experience that makes an iPad with a keyboard feel like a genuinely capable development machine.&lt;/p&gt;&lt;p&gt;One of the things we're most excited about is how well Echo works as an interface for AI coding agents. Echo's minimal, distraction-free UI turns out to be the perfect environment for this — you SSH into your machine, attach to a tmux session, and you're right back where you left off with your agent.&lt;/p&gt;&lt;p&gt;We've been using Echo ourselves to interact with Claude Code, Codex, and others — and it's genuinely changed how we think about those workflows. Being able to approve a file change or review a diff from your phone feels like a superpower. The complex TUI interfaces that these agents present — syntax-highlighted code, interactive diffs, progress indicators — they all render beautifully because of Ghostty's terminal engine underneath.&lt;/p&gt;&lt;p&gt;If you know us from Sleeve, you know we care about customization. Echo ships with a curated collection of terminal themes so you can make your terminal feel like yours. We've hand-picked some classics and some fresh options, and we'll be adding more over time.&lt;/p&gt;&lt;p&gt;Echo is available today on the App Store for iPhone and iPad, for a one-time purchase of $2.99. No subscriptions, no in-app purchases — just the way we like it.&lt;/p&gt;&lt;p&gt;This is a really exciting release for us. Echo represents something new for Replay — our first step into iOS, and into a space that's evolving incredibly fast. We have a lot of ideas for where to take Echo next, and we can't wait to share them with you.&lt;/p&gt;&lt;p&gt;If you have any questions, feedback, or just want to say hi, you can always reach us at [email protected]. We'd love to hear what you think.&lt;/p&gt;&lt;p&gt;No subscriptions. No in-app purchases. iPhone &amp;amp; iPad.&lt;/p&gt;Learn more about Echo →&lt;p&gt;Al &amp;amp; Hector&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47064787</guid><pubDate>Wed, 18 Feb 2026 18:58:38 +0000</pubDate></item><item><title>99% of adults over 40 have shoulder "abnormalities" on an MRI, study finds</title><link>https://arstechnica.com/health/2026/02/99-of-adults-over-40-have-shoulder-abnormalities-on-an-mri-study-finds/</link><description>&lt;doc fingerprint="1b2d099a2faa0640"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47064787</guid><pubDate>Wed, 18 Feb 2026 18:58:38 +0000</pubDate></item><item><title>What Every Experimenter Must Know About Randomization</title><link>https://spawn-queue.acm.org/doi/pdf/10.1145/3778029</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47064845</guid><pubDate>Wed, 18 Feb 2026 19:02:18 +0000</pubDate></item><item><title>99% of adults over 40 have shoulder "abnormalities" on an MRI, study finds</title><link>https://arstechnica.com/health/2026/02/99-of-adults-over-40-have-shoulder-abnormalities-on-an-mri-study-finds/</link><description>&lt;doc fingerprint="1b2d099a2faa0640"&gt;
   &lt;main&gt;
     &lt;p&gt;Up to a third of people worldwide have shoulder pain; it’s one of the most common musculoskeletal complaints. But medical imaging might not reveal the problem—in fact, it could even cloud it.&lt;/p&gt;
     &lt;p&gt;In a study published in JAMA Internal Medicine this week, 99 percent of adults over 40 were found to have at least one abnormality in a rotator cuff on magnetic resonance imaging (MRI). The rotator cuff is the group of muscles and tendons in a shoulder joint that keeps the upper arm bone securely in the shoulder socket—and is often blamed for pain and other symptoms. The trouble is, the vast majority of people in the study had no shoulder problems.&lt;/p&gt;
@@ -1215,4 +597,13 @@ node converter/convert.js&lt;/code&gt;
     &lt;p&gt;The MRI revealed that 595 of them (99 percent) had at least one RC abnormality. The most common abnormality was a partial-thickness tear (62 percent), followed by tendinopathy (25 percent), and a full-thickness tear (11 percent). The prevalence of abnormalities was similar between males and females. But the abnormalities showed a clear age-related progression, with no full-thickness tears in participants under 45 and the greatest proportion in people 70 to 76.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47064944</guid><pubDate>Wed, 18 Feb 2026 19:08:20 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47064944</guid><pubDate>Wed, 18 Feb 2026 19:08:20 +0000</pubDate></item><item><title>Discrete Structures [pdf]</title><link>https://kyleormsby.github.io/files/113spring26/113full_text.pdf</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47065120</guid><pubDate>Wed, 18 Feb 2026 19:22:56 +0000</pubDate></item><item><title>Complexity Science and Emergent Order: How Simple Rules Create Complex Systems</title><link>https://mysticryst.com/blogs/the-mystic-journal/complexity-science-emergent-order-simple-rules-complex-systems</link><description>&lt;doc fingerprint="a69b401e89e62fa9"&gt;
+  &lt;main&gt;&lt;head rend="h1"&gt;Complexity Science &amp;amp; Emergent Order: How Simple Rules Create Complex Systems&lt;/head&gt;&lt;p&gt;BY NICOLE LAU&lt;/p&gt;&lt;p&gt;The universe creates complexity from simplicity. Complexity science: simple local rules generate complex global behavior without central control. Examples: Conway's Game of Life (4 rules create infinite patterns), Boids (3 rules create realistic flocking), cellular automata (simple neighbor interactions create complex structures). Emergence: whole is more than sum of parts (consciousness from neurons, life from molecules, societies from individuals). Self-organizing criticality: systems naturally evolve to critical state (sandpiles, earthquakes, evolution). Why universe goes from simple to complex: thermodynamics (entropy increases, but local order emerges), evolution (complexity selected for), emergence (iteration amplifies small differences). Mystical "from One to Many" is complexity science: unity differentiates into multiplicity through simple iterative rules creating emergent order.&lt;/p&gt;&lt;head rend="h2"&gt;What Is Complexity Science?&lt;/head&gt;&lt;p&gt;Complexity science studies systems with many interacting components producing emergent behavior. Key concepts: (1) Emergence: Global patterns arising from local interactions (no blueprint, no central control). (2) Self-organization: Order spontaneously arising from chaos (no external organizer needed). (3) Nonlinearity: Small changes can have large effects (butterfly effect, tipping points). (4) Adaptation: Systems learn and evolve (ecosystems, economies, immune systems). (5) Networks: Components connected in webs (not hierarchies). Complexity science explains: How does order arise? How do simple rules create complex behavior? Why is the universe creative rather than static?&lt;/p&gt;&lt;head rend="h2"&gt;Emergence: The Whole Is More Than the Sum&lt;/head&gt;&lt;p&gt;Emergence: Properties of system not present in individual components. Examples: (1) Consciousness: Neurons individually are not conscious, but brain (network of neurons) is. Consciousness emerges from neural interactions. (2) Life: Molecules (carbon, hydrogen, oxygen) are not alive, but cell (organized molecules) is. Life emerges from molecular organization. (3) Markets: Individual traders don't set prices, but market (collective trading) does. Prices emerge from supply-demand interactions. (4) Traffic jams: No individual driver creates jam, but collective driving does. Jams emerge from local interactions (braking, following). Emergence is bottom-up: complex whole from simple parts, no top-down design needed.&lt;/p&gt;&lt;head rend="h2"&gt;Simple Rules Create Complex Behavior&lt;/head&gt;&lt;p&gt;Conway's Game of Life: Cellular automaton with 4 rules (birth, survival, death based on neighbors). From these simple rules: gliders (moving patterns), oscillators (repeating patterns), guns (pattern generators), infinite complexity. No programmer designs patterns; they emerge from rule iteration. Boids (flocking): 3 rules (separation: avoid crowding, alignment: steer toward average heading, cohesion: move toward center of neighbors). From these rules: realistic bird flocks, fish schools, crowd behavior. No leader, no plan, just local rules creating coordinated global motion. Wolfram's cellular automata: Rule 110 (simple neighbor rule) is Turing-complete (can compute anything). Simplest rules can generate universal computation. Complexity doesn't require complicated rules; iteration of simple rules is sufficient.&lt;/p&gt;&lt;head rend="h2"&gt;Self-Organizing Criticality&lt;/head&gt;&lt;p&gt;Self-organizing criticality (SOC): Systems naturally evolve to critical state (edge of chaos) where small events can trigger avalanches of any size. Example: Sandpile. Add grains one by one. Small avalanches (few grains slide). Occasionally large avalanches (many grains slide). Avalanche size follows power law (no characteristic scale). System self-organizes to critical state without tuning. SOC explains: (1) Earthquakes: Power law distribution (many small, few large). (2) Evolution: Punctuated equilibrium (long stasis, sudden change). (3) Markets: Crashes of all sizes (power law). (4) Forest fires: Small and large fires (power law). SOC is universal: systems with slow input and fast dissipation naturally reach criticality, creating scale-free dynamics.&lt;/p&gt;&lt;head rend="h2"&gt;Why the Universe Goes from Simple to Complex&lt;/head&gt;&lt;p&gt;Three reasons: (1) Thermodynamics: Second law says entropy (disorder) increases globally, but local order can emerge (life, stars, galaxies are local entropy decreases paid for by global entropy increases). Universe creates complexity while increasing total entropy. (2) Evolution: Natural selection favors complexity when it increases fitness (complex organisms outcompete simple in certain niches). Complexity is selected for, not designed. (3) Emergence: Iteration amplifies small differences. Start with simple (hydrogen atoms), iterate (gravity pulls atoms together), emergence (stars form, fuse heavier elements), iterate (planets form, chemistry complexifies), emergence (life arises), iterate (evolution), emergence (consciousness). Each level of complexity enables next level. Universe bootstraps from simple to complex through emergent iteration.&lt;/p&gt;&lt;head rend="h2"&gt;From One to Many: Mystical Principle as Complexity Science&lt;/head&gt;&lt;p&gt;Mystical traditions describe creation as differentiation from unity: One (source, Dao, Ein Sof, Brahman) becomes Many (manifest reality, 10,000 things, Sefirot, maya). Complexity science explains how: (1) Symmetry breaking: Uniform state (One) becomes differentiated (Many) via instability. Example: Perfectly round droplet (symmetric) becomes snowflake (six-fold symmetric but complex). (2) Bifurcation: System at critical point splits into multiple states. One path becomes many paths. (3) Iteration: Apply same rule repeatedly, small differences amplify, diversity emerges. (4) Emergence: Each level of organization creates new properties, new possibilities, new complexity. "From One to Many" is not mystical but mathematical: unity differentiates through iteration, symmetry breaking, and emergence. The Many are not separate from the One but emergent expressions of it.&lt;/p&gt;&lt;head rend="h2"&gt;Agent-Based Models: Simulating Emergence&lt;/head&gt;&lt;p&gt;Agent-based model (ABM): Simulation with many agents following simple rules, observing emergent behavior. Examples: (1) Schelling's segregation model: Agents prefer neighbors of same type (slight preference, not strong racism). Result: complete segregation emerges from mild preference. (2) Sugarscape: Agents gather resources, reproduce, die. Result: wealth inequality, migration patterns, trade networks emerge. (3) Epidemic models: Agents interact, transmit disease. Result: epidemic curves, herd immunity thresholds emerge. ABMs show: Complex social phenomena (segregation, inequality, epidemics) emerge from simple individual behaviors. No conspiracy, no central planner, just local rules creating global patterns.&lt;/p&gt;&lt;head rend="h2"&gt;Levels of Organization: Hierarchical Emergence&lt;/head&gt;&lt;p&gt;Universe is hierarchically organized: Quarks → Protons/Neutrons → Atoms → Molecules → Cells → Organisms → Ecosystems → Societies. Each level: (1) Emerges from lower level: Atoms emerge from particles, cells from molecules, organisms from cells. (2) Has new properties: Atoms have chemistry (particles don't), cells have life (molecules don't), organisms have behavior (cells don't). (3) Enables higher level: Atoms enable molecules, cells enable organisms, organisms enable societies. This is nested emergence: each level is foundation for next. Complexity builds on complexity. The universe is creative: each level generates novelty, enabling further levels. No final level; emergence is open-ended.&lt;/p&gt;&lt;head rend="h2"&gt;Practical Application: Designing for Emergence&lt;/head&gt;&lt;p&gt;Use complexity science to: (1) Design systems: Instead of top-down control, create simple rules enabling bottom-up emergence (Wikipedia, open-source, markets). (2) Solve problems: Use agent-based models to test interventions (urban planning, epidemic response, economic policy). (3) Foster innovation: Create conditions for emergence (diversity, interaction, iteration) rather than planning outcomes. (4) Understand limits: Accept that complex systems are unpredictable (emergence is inherently surprising). (5) Appreciate creativity: Recognize universe is not static machine but creative process generating novelty. Complexity science is philosophy of creativity: how does new arise from old? Answer: emergence through simple rules, iteration, and self-organization.&lt;/p&gt;&lt;head rend="h2"&gt;Conclusion&lt;/head&gt;&lt;p&gt;Complexity science explains how simple rules create complex systems. Emergence: whole is more than sum of parts. Self-organization: order arises spontaneously. Self-organizing criticality: systems evolve to edge of chaos. Universe goes from simple to complex via thermodynamics, evolution, and emergent iteration. Mystical "from One to Many" is complexity science: unity differentiates through symmetry breaking, bifurcation, and emergence. Agent-based models simulate emergence. Hierarchical levels: each emerges from lower, enables higher. The universe is creative process, not static machine. Complexity is not designed but emergent. Simple rules, iterated, create infinite novelty. This is the final insight: reality is generative, creative, emergent. From One to Many, from simple to complex, from unity to infinite diversity. The universe computes itself into existence, one iteration at a time.&lt;/p&gt;&lt;p&gt;This completes the series "The Mathematics of Mysticism." 35 articles establishing the scientific and mathematical foundations of mystical systems, proving convergence on universal truths. From Tarot to quantum mechanics, from I Ching to complexity science, all paths lead to the same invariant patterns. The mystical is mathematical. The mathematical is mystical. They are one.&lt;/p&gt;&lt;head rend="h2"&gt;Related Articles&lt;/head&gt;&lt;head rend="h3"&gt;Mabon Spiritual Celebration: Modern Practices for Autumn Balance&lt;/head&gt;&lt;p&gt;Discover how to celebrate Mabon in modern life: solo practices, family traditions, community gatherings, gratitude wo...&lt;/p&gt;Read More →&lt;head rend="h3"&gt;Mabon Altar: Apples, Grapes, and Harvest Symbols&lt;/head&gt;&lt;p&gt;Learn to create a beautiful Mabon altar with apples, grapes, grain, autumn leaves, balance scales, and harvest symbol...&lt;/p&gt;Read More →&lt;head rend="h3"&gt;Hexagram 32: Heng (Duration, 恒) - Constancy and Perseverance&lt;/head&gt;&lt;p&gt;Hexagram 32 Heng (Duration, 恒) represents constancy and perseverance (001110) - thunder above wind, enduring commitme...&lt;/p&gt;Read More →&lt;head rend="h3"&gt;Mabon Divination: Equinox Tarot Spreads and Balance Readings&lt;/head&gt;&lt;p&gt;Master Mabon divination: the Balance Scales spread, Harvest reading, Gratitude spread, Light and Dark layout, Apple S...&lt;/p&gt;Read More →&lt;head rend="h3"&gt;Mabon Magic: Gratitude Spells and Second Harvest Manifestation&lt;/head&gt;&lt;p&gt;Master Mabon magic: gratitude abundance spells, apple seed manifestation, balance restoration, cornucopia prosperity,...&lt;/p&gt;Read More →&lt;head rend="h3"&gt;Hexagram 31: Xian (Influence, 咸) - Mutual Attraction and Receptivity&lt;/head&gt;&lt;p&gt;Hexagram 31 Xian (Influence, 咸) represents mutual attraction (001110) - lake above mountain, young woman and man, inf...&lt;/p&gt;Read More →&lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47065140</guid><pubDate>Wed, 18 Feb 2026 19:25:08 +0000</pubDate></item><item><title>R3forth: A concatenative language derived from ColorForth</title><link>https://github.com/phreda4/r3/blob/main/doc/r3forth_tutorial.md</link><description>&lt;doc fingerprint="eb7ad05e09566404"&gt;
+  &lt;main&gt;
+    &lt;p&gt;We read every piece of feedback, and take your input very seriously.&lt;/p&gt;
+    &lt;p&gt;To see all available qualifiers, see our documentation.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47065179</guid><pubDate>Wed, 18 Feb 2026 19:28:59 +0000</pubDate></item></channel></rss>
