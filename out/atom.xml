@@ -1,5 +1,138 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-02-19T20:54:46.463019+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=47072603</id><title>ShannonMax: A Library to Optimize Emacs Keybindings with Information Theory</title><updated>2026-02-19T20:55:03.070598+00:00</updated><content>&lt;doc fingerprint="5ac11a79482df395"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-02-19T21:21:32.411478+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=47072539</id><title>Bridging Elixir and Python with Oban</title><updated>2026-02-19T21:21:46.984604+00:00</updated><content>&lt;doc fingerprint="d59036df98a05512"&gt;
+  &lt;main&gt;
+    &lt;p&gt;What choices lay before you when your Elixir app needs functionality that only exists, or is more mature, in Python? There are machine learning models, PDF rendering libraries, and audio/video editing tools without an Elixir equivalent (yet). You could piece together some HTTP calls, or bring in a message queue...but there's a simpler path through Oban.&lt;/p&gt;
+    &lt;p&gt;Whether you're enabling disparate teams to collaborate, gradually migrating from one language to another, or leveraging packages that are lacking in one ecosystem, having a mechanism to transparently exchange durable jobs between Elixir and Python opens up new possibilities.&lt;/p&gt;
+    &lt;p&gt;On that tip, let's build a small example to demonstrate how trivial bridging can be. We'll call it "Badge Forge".&lt;/p&gt;
+    &lt;head rend="h2"&gt;Forging Badges&lt;/head&gt;
+    &lt;p&gt;"Badge Forge," like "Fire Saga" before it, is a pair of nouns that barely describes what our demo app does. But, it's balanced and why hold back on the whimsy?&lt;/p&gt;
+    &lt;p&gt;More concretely, we're building a micro app that prints conference badges. The actual PDF generation happens through WeasyPrint, a Python library that turns HTML and CSS into print-ready documents. It's mature and easy to use. For the purpose of this demo, we'll pretend that running ChromaticPDF is unpalatable and Typst isn't available.&lt;/p&gt;
+    &lt;p&gt;There's no web framework involved, just command-line output and job processing. Don't fret, we'll bring in some visualization later.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Sharing a Common Database&lt;/head&gt;
+    &lt;p&gt;Some say you're cra-zay for sharing a database between applications. We say you're already willing to share a message queue, and now the database is your task broker, so why not? It's happening.&lt;/p&gt;
+    &lt;p&gt;Oban for Python was designed for interop with Elixir from the beginning. Both libraries read and write to the same &lt;code&gt;oban_jobs&lt;/code&gt; table, with job args stored as JSON, so they're fully
+language-agnostic. When an Elixir app enqueues a job destined for a Python worker (or vice versa),
+it simply writes a row. The receiving side picks it up based on the queue name, processes it, and
+updates the status. That's the whole mechanism:&lt;/p&gt;
+    &lt;p&gt;Each side maintains its own cluster leadership, so an Elixir node and a Python process won't compete for leader responsibilities. They coordinate through the jobs table, but take care of business independently.&lt;/p&gt;
+    &lt;p&gt;Both sides can also exchange PubSub notifications through Postgres for real-time coordination. The importance of that tidbit will become clear soon enough.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Printing in Action&lt;/head&gt;
+    &lt;p&gt;This is more of a demonstration than a tutorial. We don't expect you to build along, but we hope you'll see how little code it takes to form a bridge.&lt;/p&gt;
+    &lt;p&gt;With a wee config in place and both apps pointing at the same database, we can start generating badges.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Enqueueing Jobs&lt;/head&gt;
+    &lt;p&gt;Generation starts on the Elixir side. This function enqueues a batch of (fake) jobs destined for the Python worker:&lt;/p&gt;
+    &lt;code&gt;def enqueue_batch(count \\ 100) do
+  generate = fn _ -&amp;gt;
+    args = %{
+      id: Ecto.UUID.generate(),
+      name: fake_name(),
+      company: fake_company(),
+      type: Enum.random(~w(attendee speaker sponsor organizer))
+    }
+
+    Oban.Job.new(args, worker: "badge_forge.generator.GenerateBadge", queue: :badges)
+  end
+
+  1..count
+  |&amp;gt; Enum.map(generate)
+  |&amp;gt; Oban.insert_all()
+end
+&lt;/code&gt;
+    &lt;p&gt;Notice the worker name is a string, "badge_forge.generator.GenerateBadge", matching the Python worker's fully qualified name. The job lands in the &lt;code&gt;badges&lt;/code&gt; queue, where a Python worker is
+listening.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The Python Side&lt;/head&gt;
+    &lt;p&gt;The Python worker receives badge requests and generates PDFs using WeasyPrint:&lt;/p&gt;
+    &lt;code&gt;from oban import Job, Oban, worker
+from weasyprint import HTML
+
+@worker(max_attempts=5, queue="badges")
+class GenerateBadge:
+    async def process(self, job: Job) -&amp;gt; None:
+        id = job.args["badge_id"]
+        name = job.args["name"]
+        html = render_badge_html(name, job.args["company"], job.args["type"])
+        path = BADGES_DIR / f"{name}.pdf"
+
+        # Generate the pdf content
+        HTML(string=html).write_pdf(path)
+
+        # Construct a job manually
+        job = Job(
+            args={"id": id, "name": name, "path": str(path)},
+            queue="printing",
+            worker="BadgeForge.PrintCenter",
+        )
+
+        # Use the active Oban instance and enqueue the job
+        await Oban.get_instance().enqueue(job)
+&lt;/code&gt;
+    &lt;p&gt;When a job arrives, it pulls the attendee info from the args, renders an HTML template, and writes the PDF to disk. After completion, it enqueues a confirmation job back to Elixir.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The Elixir Side&lt;/head&gt;
+    &lt;p&gt;The Elixir side listens for confirmations and prints the result:&lt;/p&gt;
+    &lt;code&gt;defmodule BadgeForge.PrintCenter do
+  use Oban.Worker, queue: :printing
+
+  require Logger
+
+  @impl Oban.Worker
+  def perform(%Job{args: %{"id" =&amp;gt; id, "name" =&amp;gt; name, "path" =&amp;gt; path}}) do
+    Logger.info("Printing badge #{id} for #{name}: #{path}...")
+
+    do_actual_printing_here(...)
+
+    :ok
+  end
+end
+&lt;/code&gt;
+    &lt;p&gt;With that, there's two-way communication through the jobs table.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Sample Output&lt;/head&gt;
+    &lt;p&gt;To print conference badges you need a conference. You should have a conference. We're printing badges for the fictional "Oban Conf" being held this year in Edinburgh. It will be both hydrating and engaging. Kicking off a batch of ten jobs from Elixir:&lt;/p&gt;
+    &lt;code&gt;iex&amp;gt; BadgeForge.enqueue_batch(10)
+:ok
+&lt;/code&gt;
+    &lt;p&gt;On the Python side, we see automatic logging for each job with output like this (output has been prettified):&lt;/p&gt;
+    &lt;code&gt;[INFO] oban: {
+  "id":14,
+  "worker":"badge_forge.generator.GenerateBadge",
+  "queue":"badges",
+  "attempt":1,
+  "max_attempts":20,
+  "args":{
+    "id":"7bfb7c39-c354-4cce-ad5b-f1be2814b17e",
+    "name":"Alasdair Fraser",
+    "type":"speaker",
+    "company":"Wavelength Tech"
+  },
+  "meta":{},
+  "tags":[],
+  "event":"oban.job.stop",
+  "state":"completed",
+  "duration":2.51,
+  "queue_time":5.45
+}
+&lt;/code&gt;
+    &lt;p&gt;The job completed successfully, and back in the Elixir app, we see that the print completed:&lt;/p&gt;
+    &lt;code&gt;[info] Printing badge 7bfb7c39 for Alasdair Fraser: /some/path...
+&lt;/code&gt;
+    &lt;p&gt;The output looks something like this:&lt;/p&gt;
+    &lt;p&gt;Apologies to any "Alasdair Frasers" out there, your name was pulled from the nether and there isn't a real conference. As consolation, if you contact us, you have stickers coming.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Visualizing the Activity&lt;/head&gt;
+    &lt;p&gt;Seeing jobs in terminal logs is fine, but watching them flow through a dashboard is far more satisfying. We recently shipped a standalone Oban Web Docker image for situations like this; where you want monitoring without mounting it in your app. It's also useful when your primary app is actually Python...&lt;/p&gt;
+    &lt;p&gt;With docker running, point the &lt;code&gt;DATABASE_URL&lt;/code&gt; at your Oban-ified database and pull the image:&lt;/p&gt;
+    &lt;code&gt;docker run -d \
+  -e DATABASE_URL="postgres://user:pass@host.docker.internal:5432/badge_forge_dev" \
+  -p 4000:4000 \
+  ghcr.io/oban-bg/oban-dash
+&lt;/code&gt;
+    &lt;p&gt;That starts Oban Web running in the background to monitor jobs from all connected Oban instances. Queue activity and metrics are exchanged via PubSub, so the Web instance can store them for visualization. Trigger a few (hundred) jobs, navigate to the dashboard on &lt;code&gt;localhost:4000&lt;/code&gt;, and
+look at 'em roll:&lt;/p&gt;
+    &lt;head rend="h2"&gt;Bridging Both Ways&lt;/head&gt;
+    &lt;p&gt;Badge Forge is whimsical, some say "useless", but the pattern is practical! When you need tools that are stronger in one ecosystem, you can bridge it. This goes both ways. A Python app can reach for Elixir's strengths just as easily.&lt;/p&gt;
+    &lt;p&gt;Check out the full demo code for the boilerplate and config we rested over here.&lt;/p&gt;
+    &lt;p&gt;As usual, if you have any questions or comments, ask in the Elixir Forum. For future announcements and insight into what we're working on next, subscribe to our newsletter.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://oban.pro/articles/bridging-with-oban"/><published>2026-02-19T11:07:15+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47072603</id><title>ShannonMax: A Library to Optimize Emacs Keybindings with Information Theory</title><updated>2026-02-19T21:21:46.235463+00:00</updated><content>&lt;doc fingerprint="5ac11a79482df395"&gt;
   &lt;main&gt;
     &lt;p&gt;ShannonMax uses information theory to analyze your emacs usage and suggest better keybindings.&lt;/p&gt;
     &lt;p&gt;In particular, it helps you find commands where changing the keybinding can significantly reduce the amount you type.&lt;/p&gt;
@@ -58,10 +191,11 @@
     &lt;p&gt;Any other thoughts? Feel free to open an issue on this Repo :D&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/sstraust/shannonmax"/><published>2026-02-19T11:15:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47072863</id><title>Show HN: Mini-Diarium - An encrypted, local, cross-platform journaling app</title><updated>2026-02-19T20:55:02.502041+00:00</updated><content>&lt;doc fingerprint="285be0f9cdb2b194"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/sstraust/shannonmax"/><published>2026-02-19T11:15:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47072863</id><title>Show HN: Mini-Diarium - An encrypted, local, cross-platform journaling app</title><updated>2026-02-19T21:21:45.402524+00:00</updated><content>&lt;doc fingerprint="85be0f9cd90b194"&gt;
   &lt;main&gt;
-    &lt;p&gt;An encrypted, local cross-platform journaling app&lt;/p&gt;
-    &lt;p&gt;Mini Diarium keeps your journal private. Every entry is encrypted with AES-256-GCM before it touches disk, the app never connects to the internet, and your data never leaves your machine. Built with Tauri, SolidJS, and Rust.&lt;/p&gt;
+    &lt;p&gt;Website: mini-diarium.com&lt;/p&gt;
+    &lt;p&gt;An encrypted, local, cross-platform journaling app&lt;/p&gt;
+    &lt;p&gt;Mini Diarium keeps your journal private. Every entry is encrypted with AES-256-GCM, the app never connects to the internet, and your data never leaves your machine. Built with Tauri, SolidJS, and Rust.&lt;/p&gt;
     &lt;p&gt;Mini Diarium is a spiritual successor to Mini Diary by Samuel Meuli. I loved the original tool. It was simple, private, and did exactly what a journal app should do. Unfortunately, it's been unmaintained for years and its dependencies have aged out. I initially thought about forking it and modernizing the stack, but turned out impractical. So I started over from scratch, keeping the same core philosophy (encrypted, local-only, minimal) while rebuilding completely with Tauri 2, SolidJS, and Rust. The result is a lighter, faster app with stronger encryption and a few personal touches.&lt;/p&gt;
     &lt;list rend="ul"&gt;
       &lt;item&gt;Key file authentication: unlock your diary with an X25519 private key file instead of (or alongside) your password, like SSH keys for your journal. Register multiple key files; manage all auth methods from Preferences. See Key File Authentication for details.&lt;/item&gt;
@@ -131,7 +265,10 @@
     &lt;p&gt;Windows&lt;/p&gt;
     &lt;p&gt;On first launch, Windows SmartScreen may show a warning ("Windows protected your PC"). This is expected for unsigned applications. Click "More info" then "Run anyway" to proceed. Mini Diarium is open source and builds are reproducible from source.&lt;/p&gt;
     &lt;p&gt;macOS&lt;/p&gt;
-    &lt;p&gt;macOS Gatekeeper may block the app on first launch. Right-click the app icon and select "Open" to bypass the warning. Once opened, subsequent launches work normally.&lt;/p&gt;
+    &lt;p&gt;macOS Gatekeeper may block the app on first launch with "damaged and can't be opened". This happens because the app is open-source and not commercially code-signed.&lt;/p&gt;
+    &lt;p&gt;Run this command in Terminal after dragging the app to Applications:&lt;/p&gt;
+    &lt;code&gt;xattr -cr "/Applications/Mini Diarium.app"&lt;/code&gt;
+    &lt;p&gt;Then launch the app normally. This is a one-time step.&lt;/p&gt;
     &lt;p&gt;Linux&lt;/p&gt;
     &lt;p&gt;No code signing is required. For security, verify the SHA256 checksum against &lt;code&gt;checksums-linux.txt&lt;/code&gt; from the release before installation:&lt;/p&gt;
     &lt;code&gt;sha256sum Mini-Diarium-*.AppImage
@@ -276,7 +413,7 @@ bun run tauri build&lt;/code&gt;
     &lt;p&gt;Made with love by Francisco J. Revoredo (with a little help from Claude Code).&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/fjrevoredo/mini-diarium"/><published>2026-02-19T11:54:21+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47072968</id><title>Paged Out Issue #8 [pdf]</title><updated>2026-02-19T20:54:59.894624+00:00</updated><content/><link href="https://pagedout.institute/download/PagedOut_008.pdf"/><published>2026-02-19T12:13:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47073044</id><title>Coding Tricks Used in the C64 Game Seawolves</title><updated>2026-02-19T20:54:57.518629+00:00</updated><content>&lt;doc fingerprint="a6c14d930d73839f"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/fjrevoredo/mini-diarium"/><published>2026-02-19T11:54:21+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47072968</id><title>Paged Out Issue #8 [pdf]</title><updated>2026-02-19T21:21:41.891817+00:00</updated><content/><link href="https://pagedout.institute/download/PagedOut_008.pdf"/><published>2026-02-19T12:13:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47073044</id><title>Coding Tricks Used in the C64 Game Seawolves</title><updated>2026-02-19T21:21:41.201146+00:00</updated><content>&lt;doc fingerprint="a6c14d930d73839f"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;9 Exotic Coding Tricks used in the C64 Game, Seawolves&lt;/head&gt;
     &lt;head rend="h2"&gt;Updated on:&lt;/head&gt;
@@ -328,7 +465,7 @@ bun run tauri build&lt;/code&gt;
     &lt;p&gt;&lt;lb/&gt; PS - If you value my work and want to support me, a small donation via PayPal would be nice (and thanks if you do!) &lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://kodiak64.co.uk/blog/seawolves-technical-tricks"/><published>2026-02-19T12:24:33+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47073112</id><title>Pebble Production: February Update</title><updated>2026-02-19T20:54:57.250921+00:00</updated><content>&lt;doc fingerprint="d66f5057500579d5"&gt;
+&lt;/doc&gt;</content><link href="https://kodiak64.co.uk/blog/seawolves-technical-tricks"/><published>2026-02-19T12:24:33+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47073112</id><title>Pebble Production: February Update</title><updated>2026-02-19T21:21:40.990613+00:00</updated><content>&lt;doc fingerprint="d66f5057500579d5"&gt;
   &lt;main&gt;
     &lt;head rend="h3"&gt;#Mega update on Pebble Time 2, Pebble Round 2 and Index 01&lt;/head&gt;
     &lt;p&gt;Things are busy in Pebbleland! We’re getting close to shipping 3 new hardware products and all the associated software that comes along with them. Overall, things feel good. I’d say the amount of last minute shenanigans is at the normal amount. Getting new hardware into ‘production’ is a pretty wild and exciting process. Building hardware is an exercise in balancing competing priorities of cost, quality and speed. In the last mile push to get into production, things can change quickly for the best (woohoo! the waterproof test finally passes, we can move to the next stage), or less good (uh, the production line needs 3 more test fixtures to test Index 01 mic performance, and a major production test software update…that’ll be a lot more money). Unlike with software, you can’t easily fix hardware issues after you ship! Making these last minute decisions is sometimes pretty stressful but hey, that’s the world of making hardware.&lt;/p&gt;
@@ -368,7 +505,7 @@ bun run tauri build&lt;/code&gt;
     &lt;p&gt;We’ve also made some great advances on the SDK and developer front…expect an update very soon 😉&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://repebble.com/blog/february-pebble-production-and-software-updates"/><published>2026-02-19T12:36:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47073947</id><title>Measuring AI agent autonomy in practice</title><updated>2026-02-19T20:54:51.256254+00:00</updated><content>&lt;doc fingerprint="be490a962d03826b"&gt;
+&lt;/doc&gt;</content><link href="https://repebble.com/blog/february-pebble-production-and-software-updates"/><published>2026-02-19T12:36:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47073947</id><title>Measuring AI agent autonomy in practice</title><updated>2026-02-19T21:21:37.230671+00:00</updated><content>&lt;doc fingerprint="be490a962d03826b"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Measuring AI agent autonomy in practice&lt;/head&gt;
     &lt;p&gt;AI agents are here, and already they’re being deployed across contexts that vary widely in consequence, from email triage to cyber espionage. Understanding this spectrum is critical for deploying AI safely, yet we know surprisingly little about how people actually use agents in the real world.&lt;/p&gt;
@@ -531,59 +668,125 @@ bun run tauri build&lt;/code&gt;
     &lt;p&gt;16. Whether the adoption curve in software engineering will repeat in other domains is an open question. Software is comparatively easy to test and review—you can run code and see if it works—which makes it easier to trust an agent and catch its mistakes. In domains like law, medicine, or finance, verifying an agent’s output may require significant effort, which could slow the development of trust.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.anthropic.com/research/measuring-agent-autonomy"/><published>2026-02-19T14:14:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47074083</id><title>Against Theory-Motivated Experimentation</title><updated>2026-02-19T20:54:51.156883+00:00</updated><content/><link href="https://journals.sagepub.com/doi/10.1177/26339137261421577"/><published>2026-02-19T14:26:20+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47074735</id><title>Gemini 3.1 Pro Preview</title><updated>2026-02-19T20:54:50.830514+00:00</updated><content>&lt;doc fingerprint="a6ef52719012c3e3"&gt;
+&lt;/doc&gt;</content><link href="https://www.anthropic.com/research/measuring-agent-autonomy"/><published>2026-02-19T14:14:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47074083</id><title>Against Theory-Motivated Experimentation</title><updated>2026-02-19T21:21:37.018343+00:00</updated><content/><link href="https://journals.sagepub.com/doi/10.1177/26339137261421577"/><published>2026-02-19T14:26:20+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47074735</id><title>Gemini 3.1 Pro</title><updated>2026-02-19T21:21:36.731554+00:00</updated><content>&lt;doc fingerprint="fd9a910899bf18c7"&gt;
   &lt;main&gt;
-    &lt;div&gt;
-      &lt;p&gt;Google Cloud Console has failed to load JavaScript sources from www.gstatic.com.&lt;lb/&gt;Possible reasons are:&lt;/p&gt;
-      &lt;list rend="ul"&gt;
-        &lt;item&gt;www.gstatic.com or its IP addresses are blocked by your network administrator&lt;/item&gt;
-        &lt;item&gt;Google has temporarily blocked your account or network due to excessive automated requests&lt;/item&gt;
-      &lt;/list&gt;
-      &lt;p&gt;Please contact your network administrator for further assistance.&lt;/p&gt;
-    &lt;/div&gt;
+    &lt;head rend="h1"&gt;Gemini 3.1 Pro: A smarter model for your most complex tasks&lt;/head&gt;
+    &lt;p&gt;Last week, we released a major update to Gemini 3 Deep Think to solve modern challenges across science, research and engineering. Today, we’re releasing the upgraded core intelligence that makes those breakthroughs possible: Gemini 3.1 Pro. We are shipping 3.1 Pro across our consumer and developer products to bring this progress in intelligence to your everyday applications.&lt;/p&gt;
+    &lt;p&gt;Starting today, 3.1 Pro is rolling out:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;For developers in preview via the Gemini API in Google AI Studio, Gemini CLI, our agentic development platform Google Antigravity and Android Studio&lt;/item&gt;
+      &lt;item&gt;For enterprises in Vertex AI and Gemini Enterprise&lt;/item&gt;
+      &lt;item&gt;For consumers via the Gemini app and NotebookLM&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Building on the Gemini 3 series, 3.1 Pro represents a step forward in core reasoning. 3.1 Pro is a smarter, more capable baseline for complex problem-solving. This is reflected in our progress on rigorous benchmarks. On ARC-AGI-2, a benchmark that evaluates a model’s ability to solve entirely new logic patterns, 3.1 Pro achieved a verified score of 77.1%. This is more than double the reasoning performance of 3 Pro.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Intelligence applied&lt;/head&gt;
+    &lt;p&gt;3.1 Pro is designed for tasks where a simple answer isn’t enough, taking advanced reasoning and making it useful for your hardest challenges. This improved intelligence can help in practical applications — whether you’re looking for a clear, visual explanation of a complex topic, a way to synthesize data into a single view, or bringing a creative project to life.&lt;/p&gt;
+    &lt;p&gt;Code-based animation: 3.1 Pro can generate website-ready, animated SVGs directly from a text prompt. Because these are built in pure code rather than pixels, they remain crisp at any scale and maintain incredibly small file sizes compared to traditional video.&lt;/p&gt;
+    &lt;p&gt;Complex system synthesis: 3.1 Pro utilizes advanced reasoning to bridge the gap between complex APIs and user-friendly design. In this example, the model built a live aerospace dashboard, successfully configuring a public telemetry stream to visualize the International Space Station’s orbit.&lt;/p&gt;
+    &lt;p&gt;Interactive design: 3.1 Pro codes a complex 3D starling murmuration. It doesn't just generate the visual code; it builds an immersive experience where users can manipulate the flock with hand-tracking and listen to a generative score that shifts based on the birds’ movement. For researchers and designers, this provides a powerful way to prototype sensory-rich interfaces.&lt;/p&gt;
+    &lt;p&gt;Creative coding: 3.1 Pro can translate literary themes into functional code. When prompted to build a modern personal portfolio for Emily Brontë’s "Wuthering Heights," the model didn’t just summarize the text. It reasoned through the novel’s atmospheric tone to design a sleek, contemporary interface, creating a website that captures the essence of the protagonist.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What’s next&lt;/head&gt;
+    &lt;p&gt;Since releasing Gemini 3 Pro in November, your feedback and the pace of progress have driven these rapid improvements. We are releasing 3.1 Pro in preview today to validate these updates and continue to make further advancements in areas such as ambitious agentic workflows before we make it generally available soon.&lt;/p&gt;
+    &lt;p&gt;Starting today, Gemini 3.1 Pro in the Gemini app is rolling out with higher limits for users with the Google AI Pro and Ultra plans. 3.1 Pro is also now available on NotebookLM exclusively for Pro and Ultra users. And developers and enterprises can access 3.1 Pro now in preview in the Gemini API via AI Studio, Antigravity, Vertex AI, Gemini Enterprise, Gemini CLI and Android Studio.&lt;/p&gt;
+    &lt;p&gt;We can’t wait to see what you build and discover with it.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://console.cloud.google.com/vertex-ai/publishers/google/model-garden/gemini-3.1-pro-preview?pli=1"/><published>2026-02-19T15:19:57+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47075124</id><title>Show HN: Micasa – track your house from the terminal</title><updated>2026-02-19T20:54:50.701095+00:00</updated><content>&lt;doc fingerprint="7e0db1fcbb657c87"&gt;
+&lt;/doc&gt;</content><link href="https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-1-pro/"/><published>2026-02-19T15:19:57+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47074869</id><title>Dinosaur Food: 100M year old foods we still eat today (2022)</title><updated>2026-02-19T21:21:36.646180+00:00</updated><content>&lt;doc fingerprint="91a499dc5e69307c"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Dinosaur Food: 100 million year old foods we still eat today&lt;/head&gt;
+    &lt;head rend="h3"&gt;January 17, 2022&lt;/head&gt;
+    &lt;p&gt;I just finished Oliver Sacks’ excellent Everything in Its Place. In it, he mentioned as an aside that the Ginkgo biloba tree is hundreds of millions of years old, and its phenotype has been practically frozen since then – a living fossil.&lt;/p&gt;
+    &lt;p&gt;Of course, this is the same tree that grows ぎんなん (Ginkgo nuts), an East Asian delicacy found in many dishes, 茶碗蒸し (Chawanmushi) for example.&lt;/p&gt;
+    &lt;p&gt;Ginkgo has been around so long, it predates the dinosaurs! And we still eat it! How cool is that. This got me thinking – what are the oldest foods we consume today?&lt;/p&gt;
+    &lt;p&gt;Criteria:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Must be edible by humans&lt;/item&gt;
+      &lt;item&gt;Must be morphologically unchanged since its fossil age&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;table&gt;
+      &lt;row span="5"&gt;
+        &lt;cell role="head"&gt;Photo&lt;/cell&gt;
+        &lt;cell role="head"&gt;Kingdom&lt;/cell&gt;
+        &lt;cell role="head"&gt;Species&lt;/cell&gt;
+        &lt;cell role="head"&gt;Common name&lt;/cell&gt;
+        &lt;cell role="head"&gt;Age (years)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;Animalia&lt;/cell&gt;
+        &lt;cell&gt;Tachypleus tridentatus&lt;/cell&gt;
+        &lt;cell&gt;Horseshoe crab&lt;/cell&gt;
+        &lt;cell&gt;480M&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;Plantae&lt;/cell&gt;
+        &lt;cell&gt;Ginkgo biloba&lt;/cell&gt;
+        &lt;cell&gt;Maidenhair nuts&lt;/cell&gt;
+        &lt;cell&gt;290M&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;Plantae&lt;/cell&gt;
+        &lt;cell&gt;Bryoria fremontii&lt;/cell&gt;
+        &lt;cell&gt;Wila&lt;/cell&gt;
+        &lt;cell&gt;250M?&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;Plantae&lt;/cell&gt;
+        &lt;cell&gt;Cladonia rangiferina&lt;/cell&gt;
+        &lt;cell&gt;Reindeer lichen&lt;/cell&gt;
+        &lt;cell&gt;250M?&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;Plantae&lt;/cell&gt;
+        &lt;cell&gt;Cycas revoluta&lt;/cell&gt;
+        &lt;cell&gt;Sago palm&lt;/cell&gt;
+        &lt;cell&gt;200M&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;Plantae&lt;/cell&gt;
+        &lt;cell&gt;Araucaria araucana&lt;/cell&gt;
+        &lt;cell&gt;Monkey puzzle tree nuts&lt;/cell&gt;
+        &lt;cell&gt;160M&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;Plantae&lt;/cell&gt;
+        &lt;cell&gt;Equisetum arvense&lt;/cell&gt;
+        &lt;cell&gt;Horsetail&lt;/cell&gt;
+        &lt;cell&gt;140M&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;Plantae&lt;/cell&gt;
+        &lt;cell&gt;Welwitschia&lt;/cell&gt;
+        &lt;cell&gt;-&lt;/cell&gt;
+        &lt;cell&gt;112M&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;Plantae&lt;/cell&gt;
+        &lt;cell&gt;Osmundastrum cinnamomeum&lt;/cell&gt;
+        &lt;cell&gt;Cinnamon fern&lt;/cell&gt;
+        &lt;cell&gt;70M&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;Plantae&lt;/cell&gt;
+        &lt;cell&gt;Trapa natans&lt;/cell&gt;
+        &lt;cell&gt;Water caltrop nuts&lt;/cell&gt;
+        &lt;cell&gt;66M&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Plantae&lt;/cell&gt;
+        &lt;cell&gt;Nelumbo lutea, Nelumbo nucifera&lt;/cell&gt;
+        &lt;cell&gt;Lotus&lt;/cell&gt;
+        &lt;cell&gt;65M+&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Note: I’m a hobbyist, and not a paleobotanist. Additions and edits are welcome, if I misclassified or missed anything.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://borischerny.com/food/2022/01/17/Dinosaur-food.html"/><published>2026-02-19T15:30:42+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47075124</id><title>Show HN: Micasa – track your house from the terminal</title><updated>2026-02-19T21:21:36.478834+00:00</updated><content>&lt;doc fingerprint="7e0db1fcbb657c87"&gt;
   &lt;main&gt;&lt;p&gt;A terminal UI for tracking everything about your home. Single SQLite file. No cloud. No account. No subscriptions.&lt;/p&gt;github.com/cpcloud/micasa&lt;p&gt;Your house is quietly plotting to break while you sleep—and you’re dreaming about redoing the kitchen.&lt;/p&gt;&lt;p&gt;micasa tracks maintenance, projects, incidents, appliances, vendors, quotes, and documents—all from your terminal.&lt;/p&gt;&lt;p&gt;When did I last change the furnace filter?&lt;/p&gt;&lt;p&gt;Maintenance schedules, auto-computed due dates, full service history.&lt;/p&gt;&lt;p&gt;What if we finally did the backyard?&lt;/p&gt;&lt;p&gt;Projects from napkin sketch to completion—or graceful abandonment.&lt;/p&gt;&lt;p&gt;How much would it actually cost to…&lt;/p&gt;&lt;p&gt;Quotes side by side, vendor history, and the math you need to actually decide.&lt;/p&gt;&lt;p&gt;Is the dishwasher still under warranty?&lt;/p&gt;&lt;p&gt;Appliance tracking with purchase dates, warranty status, and maintenance history tied to each one.&lt;/p&gt;&lt;p&gt;The basement is leaking again.&lt;/p&gt;&lt;p&gt;Log incidents with severity and location, link them to appliances and vendors, and resolve them when fixed.&lt;/p&gt;&lt;p&gt;Who did we use last time?&lt;/p&gt;&lt;p&gt;A vendor directory with contact info, quote history, and every job they've done for you.&lt;/p&gt;&lt;p&gt;Where’s the warranty card?&lt;/p&gt;&lt;p&gt;Attach files—manuals, invoices, photos—directly to projects and appliances. Stored in the same SQLite file.&lt;/p&gt;&lt;p&gt;Install with Go (1.25+):&lt;/p&gt;&lt;code&gt;go install github.com/cpcloud/micasa/cmd/micasa@latest&lt;/code&gt;&lt;p&gt;or grab a binary from the latest release&lt;/p&gt;&lt;p&gt;Linux, macOS, and Windows binaries are available for amd64 and arm64.&lt;/p&gt;&lt;p&gt;Try it in 30 seconds:&lt;/p&gt;&lt;code&gt;micasa --demo         # poke around with sample data
 micasa                # start fresh with your own house
 micasa --print-path   # show where the database lives&lt;/code&gt;&lt;p&gt;Linux, macOS, Windows. One SQLite file, your machine. Back it up with &lt;code&gt;cp&lt;/code&gt;.&lt;/p&gt;&lt;p&gt;Vim-style modal keys. nav to browse, edit to change things. Sort by any column, jump to columns with fuzzy search, hide what you don't need, drill into related records. The full list is in the keybinding reference.&lt;/p&gt;&lt;p&gt;I built this because my home maintenance system was a shoebox of receipts and the vague feeling I was supposed to call someone about the roof.&lt;/p&gt;&lt;p&gt;micasa replaces the shoebox, the binder you never open, and the sticky note on the fridge with one SQLite file and a terminal you already have open. Its modal, keyboard-driven interface is inspired by VisiData.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://micasa.dev"/><published>2026-02-19T15:54:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47075245</id><title>Mark Zuckerberg Grilled on Usage Goals and Underage Users at California Trial</title><updated>2026-02-19T20:54:50.549639+00:00</updated><content/><link href="https://www.wsj.com/us-news/law/meta-mark-zuckerberg-social-media-trial-0e9a7fa0"/><published>2026-02-19T16:07:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47075318</id><title>Gemini 3.1 Pro</title><updated>2026-02-19T20:54:50.167964+00:00</updated><content>&lt;doc fingerprint="fdd7a1db1d3f8a95"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Model Cards are intended to provide essential information on Gemini models, including known limitations, mitigation approaches, and safety performance. Model cards may be updated from time-to-time; for example, to include updated evaluations as the model is improved or revised.&lt;/p&gt;
-    &lt;p&gt;Published: February 2026&lt;/p&gt;
-    &lt;p&gt;Gemini 3.1 Pro is the next iteration in the Gemini 3 series of models, a suite of highly capable, natively multimodal reasoning models. As of this model cardâs date of publication, Gemini 3.1 Pro is Googleâs most advanced model for complex tasks. Gemini 3.1 Pro can comprehend vast datasets and challenging problems from massively multimodal information sources, including text, audio, images, video, and entire code repositories.&lt;/p&gt;
-    &lt;p&gt;Gemini 3.1 Pro is based on Gemini 3 Pro.&lt;/p&gt;
-    &lt;p&gt;Text strings (e.g., a question, a prompt, document(s) to be summarized), images, audio, and video files, with a token context window of up to 1M.&lt;/p&gt;
-    &lt;p&gt;Text, with a 64K token output.&lt;/p&gt;
-    &lt;p&gt;Gemini 3.1 Pro is based on Gemini 3 Pro. For more information about the model architecture for Gemini 3.1 Pro, see the Gemini 3 Pro model card.&lt;/p&gt;
-    &lt;p&gt;Gemini 3.1 Pro is based on Gemini 3 Pro. For more information about the training dataset for Gemini 3.1 Pro, see the Gemini 3 Pro model card.&lt;/p&gt;
-    &lt;p&gt;For more information about the training data processing for Gemini 3.1 Pro, see the Gemini 3 Pro model card.&lt;/p&gt;
-    &lt;p&gt;Gemini 3.1 Pro is based on Gemini 3 Pro. For more information about the hardware for Gemini 3.1 Pro and our continued commitment to operate sustainably, see the Gemini 3 Pro model card.&lt;/p&gt;
-    &lt;p&gt;Gemini 3.1 Pro is based on Gemini 3 Pro. For more information about the software for Gemini 3.1 Pro, see the Gemini 3 Pro model card.&lt;/p&gt;
-    &lt;p&gt;Gemini 3.1 Pro is distributed in the following channels; respective documentation shared in line:&lt;/p&gt;
-    &lt;p&gt;Our models are available to downstream providers via an application program interface (API) and subject to relevant terms of use. There is no required hardware or software to use the model. For AI Studio and Gemini API, see the Gemini API Additional Terms of Service; for Vertex AI, see Google Cloud Platform Terms of Service. For more information, see Gemini Model API instructions and Gemini API in Vertex AI quickstart.&lt;/p&gt;
-    &lt;p&gt;Gemini 3.1 Pro was evaluated across a range of benchmarks, including reasoning, multimodal capabilities, agentic tool use, multi-lingual performance, and long-context. Additional benchmarks and details on approach, results and their methodologies can be found at: deepmind.google/models/evals-methodology/gemini-3-1-pro.&lt;/p&gt;
-    &lt;p&gt;Gemini 3.1 Pro significantly outperforms Gemini 3 Pro across a range of benchmarks requiring enhanced reasoning and multimodal capabilities. Results as of February 2026 are listed below:&lt;/p&gt;
-    &lt;p&gt;Gemini 3.1 Pro is the next iteration in the Gemini 3 series of models, a suite of highly intelligent and adaptive models, capable of helping with real-world complexity, solving problems that require enhanced reasoning and intelligence, creativity, strategic planning and making improvements step-by-step. It is particularly well-suited for applications that require:&lt;/p&gt;
-    &lt;p&gt;For more information about the known limitations for Gemini 3.1 Pro, see the Gemini 3 Pro model card.&lt;/p&gt;
-    &lt;p&gt;For more information about the acceptable usage for Gemini 3.1 Pro, see the Gemini 3 Pro model card.&lt;/p&gt;
-    &lt;p&gt;For more information about the evaluation approach for Gemini 3.1 Pro, see the Gemini 3 Pro model card.&lt;/p&gt;
-    &lt;p&gt;For more information about the safety policies for Gemini 3.1 Pro, see the Gemini 3 Pro model card.&lt;/p&gt;
-    &lt;p&gt;Results for some of the internal safety evaluations conducted during the development phase are listed below. The evaluation results are for automated evaluations and not human evaluation or red teaming. Scores are provided as an absolute percentage increase or decrease in performance compared to the indicated model, as described below. Overall, Gemini 3.1 Pro outperforms Gemini 3 Pro across both safety and tone, while keeping unjustified refusals low. We mark improvements in green and regressions in red. Safety evaluations of Gemini 3.1 Pro produced results consistent with the original Gemini 3 Pro safety assessment.&lt;/p&gt;
-    &lt;p&gt;1 The ordering of evaluations in this table has changed from previous iterations of the 2.5 Flash-Lite model card in order to list safety evaluations together and improve readability. The type of evaluations listed have remained the same.&lt;/p&gt;
-    &lt;p&gt;2 For tone and instruction following, a positive percentage increase represents an improvement in the tone of the model on sensitive topics and the modelâs ability to follow instructions while remaining safe compared to Gemini 2.5 Pro. We mark improvements in green and regressions in red.&lt;/p&gt;
-    &lt;p&gt;We continue to improve our internal evaluations, including refining automated evaluations to reduce false positives and negatives, as well as update query sets to ensure balance and maintain a high standard of results. The performance results reported below are computed with improved evaluations and thus are not directly comparable with performance results found in previous Gemini model cards.&lt;/p&gt;
-    &lt;p&gt;We expect variation in our automated safety evaluations results, which is why we review flagged content to check for egregious or dangerous material. Our manual review confirmed losses were overwhelmingly either a) false positives or b) not egregious.&lt;/p&gt;
-    &lt;p&gt;We conduct manual red teaming by specialist teams who sit outside of the model development team. High-level findings are fed back to the model team. For child safety evaluations, Gemini 3.1 Pro satisfied required launch thresholds, which were developed by expert teams to protect children online and meet Googleâs commitments to child safety across our models and Google products. For content safety policies generally, including child safety, we saw similar safety performance compared to Gemini 3 Pro.&lt;/p&gt;
-    &lt;p&gt;For more information about the risks and mitigations for Gemini 3.1 Pro, see the Gemini 3 Pro model card.&lt;/p&gt;
-    &lt;p&gt;Our Frontier Safety Framework includes rigorous evaluations that address risks of severe harm from frontier models, covering five risk domains: CBRN (chemical, biological, radiological and nuclear information risks), cyber, harmful manipulation, machine learning R&amp;amp;D and misalignment.&lt;/p&gt;
-    &lt;p&gt;Our frontier safety strategy is based on a âsafety bufferâ to prevent models from reaching critical capability levels (CCLs), i.e. if a frontier model does not reach the alert threshold for a CCL, we can assume models developed before the next regular testing interval will not reach that CCL. We conduct continuous testing, evaluating models at a fixed cadence and when a significant capability jump is detected. (Read more about this in our approach to technical AGI safety.)&lt;/p&gt;
-    &lt;p&gt;Following FSF protocols, we conducted a full evaluation of Gemini 3.1 Pro (focusing on Deep Think mode). We found that the model remains below alert thresholds for the CBRN, harmful manipulation, machine learning R&amp;amp;D, and misalignment CCLs. As previous models passed the alert threshold for cyber, we performed more additional testing in this domain on Gemini 3.1 Pro with and without Deep Think mode, and found that the model remains below the cyber CCL.&lt;/p&gt;
-    &lt;p&gt;More details on our evaluations and the mitigations we deploy can be found in the Gemini 3 Pro Frontier Safety Framework Report.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://deepmind.google/models/model-cards/gemini-3-1-pro/"/><published>2026-02-19T16:14:07+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47076659</id><title>A terminal weather app with ASCII animations driven by real-time weather data</title><updated>2026-02-19T20:54:49.624003+00:00</updated><content>&lt;doc fingerprint="bd2b7e7e15876340"&gt;
+&lt;/doc&gt;</content><link href="https://micasa.dev"/><published>2026-02-19T15:54:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47075245</id><title>Mark Zuckerberg Grilled on Usage Goals and Underage Users at California Trial</title><updated>2026-02-19T21:21:36.286672+00:00</updated><content/><link href="https://www.wsj.com/us-news/law/meta-mark-zuckerberg-social-media-trial-0e9a7fa0"/><published>2026-02-19T16:07:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47076659</id><title>A terminal weather app with ASCII animations driven by real-time weather data</title><updated>2026-02-19T21:21:35.572559+00:00</updated><content>&lt;doc fingerprint="bd2b7e7e15876340"&gt;
   &lt;main&gt;
     &lt;p&gt;A terminal weather app with ASCII animations driven by real-time weather data.&lt;/p&gt;
     &lt;p&gt;Features real-time weather from Open-Meteo with animated rain, snow, thunderstorms, flying airplanes, day/night cycles, and auto-location detection.&lt;/p&gt;
@@ -737,7 +940,7 @@ NO_COLOR=1 weathr&lt;/code&gt;
     &lt;p&gt;Note: If any ASCII art is uncredited or misattributed, it belongs to the original owner.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/Veirt/weathr"/><published>2026-02-19T17:47:25+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47076966</id><title>AI makes you boring</title><updated>2026-02-19T20:54:49.108583+00:00</updated><content>&lt;doc fingerprint="6d8f113104e67cf8"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/Veirt/weathr"/><published>2026-02-19T17:47:25+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47076966</id><title>AI makes you boring</title><updated>2026-02-19T21:21:35.010432+00:00</updated><content>&lt;doc fingerprint="6d8f113104e67cf8"&gt;
   &lt;main&gt;
     &lt;p&gt;This post is an elaboration on a comment I made on Hacker News recently, on a blog post that showed an increase in volume and decline in quality among the “Show HN” submissons.&lt;/p&gt;
     &lt;quote&gt;I don't actually mind AI-aided development, a tool is a tool and should be used if you find it useful, but I think the vibe coded Show HN projects are overall pretty boring. They generally don't have a lot of work put into them, and as a result, the author (pilot?) hasn't generally thought too much about the problem space, and so there isn't really much of a discussion to be had.&lt;p&gt;The cool part about pre-AI show HN is you got to talk to someone who had thought about a problem for way longer than you had. It was a real opportunity to learn something new, to get an entirely different perspective.&lt;/p&gt;&lt;p&gt;I feel like this is what AI has done to the programming discussion. It draws in boring people with boring projects who don’t have anything interesting to say about programming.&lt;/p&gt;&lt;/quote&gt;
@@ -753,7 +956,7 @@ NO_COLOR=1 weathr&lt;/code&gt;
     &lt;p&gt;You don’t get build muscle using an excavator to lift weights. You don’t produce interesting thoughts using a GPU to think.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.marginalia.nu/log/a_132_ai_bores/"/><published>2026-02-19T18:12:16+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47077245</id><title>Archaeologists find possible first direct evidence of Hannibal's war elephants</title><updated>2026-02-19T20:54:48.956908+00:00</updated><content>&lt;doc fingerprint="b63889bd43312f46"&gt;
+&lt;/doc&gt;</content><link href="https://www.marginalia.nu/log/a_132_ai_bores/"/><published>2026-02-19T18:12:16+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47077245</id><title>Archaeologists find possible first direct evidence of Hannibal's war elephants</title><updated>2026-02-19T21:21:34.855565+00:00</updated><content>&lt;doc fingerprint="b63889bd43312f46"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Archaeologists Unearthed a 2,200-Year-Old Bone. They Say It Could Be the First Direct Evidence of Hannibal’s Legendary War Elephants&lt;/head&gt;
     &lt;head rend="h2"&gt;The Carthaginian general famously used elephants during the Punic Wars. But until now, archaeologists had never found skeletal remains linking the animals to the conflict&lt;/head&gt;
@@ -775,7 +978,7 @@ NO_COLOR=1 weathr&lt;/code&gt;
     &lt;p&gt;Despite the historical record, archaeologists had never found skeletal remains of elephants connected to the Punic Wars—until the Córdoba bone. The researchers say that this bone didn’t come from “one of the mythical specimens Hannibal took across the Alps.” However, Martínez Sánchez tells IFLScience’s Russell Moul, the discovery “is the first time an elephant bone remnant linked to that chronology has been found in Iberia and, to our knowledge, in Europe.”&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.smithsonianmag.com/smart-news/archaeologists-unearthed-a-2200-year-old-bone-they-say-it-could-be-the-first-direct-evidence-of-hannibals-legendary-war-elephants-180988185/"/><published>2026-02-19T18:31:50+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47077383</id><title>Farewell Rust</title><updated>2026-02-19T20:54:48.143416+00:00</updated><content>&lt;doc fingerprint="f548901d3c312fde"&gt;
+&lt;/doc&gt;</content><link href="https://www.smithsonianmag.com/smart-news/archaeologists-unearthed-a-2200-year-old-bone-they-say-it-could-be-the-first-direct-evidence-of-hannibals-legendary-war-elephants-180988185/"/><published>2026-02-19T18:31:50+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47077383</id><title>Farewell, Rust for web</title><updated>2026-02-19T21:21:33.785263+00:00</updated><content>&lt;doc fingerprint="f548901d3c312fde"&gt;
   &lt;main&gt;
     &lt;div&gt;
       &lt;head rend="h2"&gt;Prelude&lt;/head&gt;
@@ -879,7 +1082,7 @@ It’s as if I was moving backwards, breaking my Rust monolith and rewriting par
     &lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://yieldcode.blog/post/farewell-rust/"/><published>2026-02-19T18:42:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47077731</id><title>Techno-cynics are wounded techno-optimists</title><updated>2026-02-19T20:54:48.044959+00:00</updated><content>&lt;doc fingerprint="2ea98295baa587c1"&gt;
+&lt;/doc&gt;</content><link href="https://yieldcode.blog/post/farewell-rust/"/><published>2026-02-19T18:42:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47077731</id><title>Techno-cynics are wounded techno-optimists</title><updated>2026-02-19T21:21:33.658710+00:00</updated><content>&lt;doc fingerprint="2ea98295baa587c1"&gt;
   &lt;main&gt;
     &lt;p&gt;Over the past week, I’ve watched left wing commentators on Bluesky, the niche short form blogging site that serves as an asylum for the millennials driven insane by unfettered internet access, discuss the idea that “the left hates technology.” This conversation has centered around a few high profile news events in the world of AI. A guy who works at an AI startup wrote a blog claiming that AI can already do your job. Anthropic, the company behind the AI assistant Claude, has raised $30 billion in funding. Someone claimed an AI agent wrote a mean blog post about them, and then a news website was found to have used AI to write about this incident and included AI-hallucinated quotes. Somewhere in this milieu of AI hype the idea that being for or against “technology” is something that can be determined along political lines, following a blog on Monday that declared that “the left is missing out on AI.”&lt;/p&gt;
     &lt;p&gt;As a hard leftist and gadget lover, the idea that my political ideology is synonymous with hating technology is confusing. Every leftist I know has a hard-on for high speed rail or mRNA vaccines. But the “left is missing out” blog positions generative AI as the only technology that matters.&lt;/p&gt;
@@ -902,7 +1105,7 @@ It’s as if I was moving backwards, breaking my Rust monolith and rewriting par
     &lt;p&gt;The questions leftists ask about AI are: does this improve my life? Does this improve my livelihood? So far, the answer for everyone who doesn’t stand to get rich off AI is no. I’ve been working as a writer for the past decade and watching my industry shrivel up and die as a result, so you’ll excuse me if I, and the rest of the everyday people who stand to get screwed by AI, aren’t particularly excited by what AI can offer society. One thing I do believe in are the words of Karl Marx: from each according to their ability, to each according to their need. The creation of a world where that is possible is not dependent on advanced technology but on human solidarity.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://aftermath.site/anthropic-claude-ai-leftist-technology/"/><published>2026-02-19T19:07:40+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47077844</id><title>California's new bill requires DOJ-approved 3D printers that report themselves</title><updated>2026-02-19T20:54:47.798737+00:00</updated><content/><link href="https://blog.adafruit.com/2026/02/19/californias-new-bill-requires-doj-approved-3d-printers-that-report-on-themselves/"/><published>2026-02-19T19:16:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47077849</id><title>IRS lost 40% of IT staff, 80% of tech leaders in 'efficiency' shakeup</title><updated>2026-02-19T20:54:47.660701+00:00</updated><content>&lt;doc fingerprint="7a83139d6ae687cc"&gt;
+&lt;/doc&gt;</content><link href="https://aftermath.site/anthropic-claude-ai-leftist-technology/"/><published>2026-02-19T19:07:40+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47077844</id><title>California's new bill requires DOJ-approved 3D printers that report themselves</title><updated>2026-02-19T21:21:33.493614+00:00</updated><content/><link href="https://blog.adafruit.com/2026/02/19/californias-new-bill-requires-doj-approved-3d-printers-that-report-on-themselves/"/><published>2026-02-19T19:16:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47077849</id><title>IRS lost 40% of IT staff, 80% of tech leaders in 'efficiency' shakeup</title><updated>2026-02-19T21:21:33.301217+00:00</updated><content>&lt;doc fingerprint="7a83139d6ae687cc"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;DOGE bites taxman&lt;/head&gt;
     &lt;head rend="h2"&gt;IRS lost 40% of IT staff, 80% of tech leaders in 'efficiency' shakeup&lt;/head&gt;
@@ -929,70 +1132,4 @@ It’s as if I was moving backwards, breaking my Rust monolith and rewriting par
     &lt;p&gt;The US Treasury Inspector General for Tax Administration said last month the agency was behind in its efforts to digitize paper returns. It noted: "The Information Technology function lost approximately 16 percent of its staff," who are responsible for updates for inflation and expiring or newly enacted tax provisions. This meant that "according to the IRS readiness reports, implementation of these legislative changes is at risk for the 2026 Filing Season." ®&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.theregister.com/2026/02/19/irs_job_cuts/"/><published>2026-02-19T19:16:33+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47078167</id><title>Micropayments as a reality check for news sites</title><updated>2026-02-19T20:54:47.109691+00:00</updated><content>&lt;doc fingerprint="59aed11f1c666ff4"&gt;
-  &lt;main&gt;
-    &lt;p&gt;18 Feb 2026&lt;/p&gt;
-    &lt;head rend="h1"&gt;micropayments as a reality check for news sites&lt;/head&gt;
-    &lt;p&gt;In Digital Media Lost the Newsstand. Micropayments Are the Obvious Way Back, Rick Bruner makes the case for giving micropayments another try.&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;The internet has dramatically diversified reading patterns. In the print era, readers subscribed to a small, fixed set of publications constrained by geography, distribution, and cost. Today, thanks to search, aggregators, and social sharing, readers routinely consume journalism from dozens of sources in the course of a month, including international and niche publications that were previously inaccessible. This has expanded total news consumption while weakening the economic link between any individual reader and any individual publisher. As a result, large portions of valuable readership generate little or no direct revenue. Micropayments convert that fragmented, currently untapped demand into incremental revenue without undermining the subscription base.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;And—like any other payments directly from readers—micropayments would be a multiplier for advertising, not an alternative.&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;In a marketplace increasingly distorted by bot activity and opaque platform reporting, micropayment histories give publishers a powerful, independent way to demonstrate the authenticity and engagement of their audience, strengthening their position with advertisers and supporting premium pricing.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;The 404 Media team explains the value of a known human audience in We Need Your Email Address. Meanwhile, Subscription revenue is growing at big news publishers even as traffic shrinks, and that’s good news for legit sites—stuck in a struggle for ad budgets with Big Tech oligarchs who want to bury us in deepfakes, extreme right wing bullshit and AI slop until nobody trusts anybody.&lt;/p&gt;
-    &lt;p&gt;Clay Shirky’s old argument against micropayments from 2003, based on mental transaction costs, doesn’t work so well any more. We know that micropayments can work because mobile games are a thing. Shirky was probably right for the micropayments of his day, but mobile game developers have figured out how to get people to spend money on in-app-purchases (IAP), by turning it into a two-step process.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;
-        &lt;p&gt;exchange real money for in-game coins—which feels like you’re not spending, just exchanging one currency for another.&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;exchange in-game coins for an in-game asset—which feels like you’re not spending real money.&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;A brilliant cognitive trick that works in all kinds of games. Of course, it doesn’t work on everybody. Figure about half of adults play mobile games, and about 80 percent of those make an in-app purchase. But if the numbers for a pay by the article system were similar, that would result in enough payment records to enable an advertiser to tell a legit site—where somebody spends a coin every so often—apart from an AI slop site.&lt;/p&gt;
-    &lt;p&gt;So it doesn’t seem like micropayments are necessarily unworkable—and with a powerful industry devoted to pushing misinformation and slop, legit content needs every human attention metric it can get—but the tricky part is how to introduce micropayments. Publishers look at their subscriber metrics and realize that a lot of subscribers read few enough stories that they would save a lot of money by canceling and using micropayments instead.&lt;/p&gt;
-    &lt;p&gt;So it might be better to introduce publisher coins as a bonus feature for subscribers, then let them leak out to non-subscribers. Instead of saying that you get 5 gift articles per month, say a gift article is 20 coins and you get 100 free coins a month. Then open them up to more uses. Another good lesson from how mobile games handle IAP coins is that they hand out a few to non-buyers to help develop the habit. As part of a direct sold ad deal, legit sites could issue a stack of coins to legit advertisers, to hand out to customers, event visitors, and others.&lt;/p&gt;
-    &lt;p&gt;Measuring marketing is already hard enough without a determined set of adversaries in the picture. And with Big Tech under pressure to obfuscate and enshittify every data flow, marketers will need to look harder for trustworthy information. Rick Bruner again:&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;ROI for most advertisers is falling in inverse proportion to Big Tech valuations going up. Advertisers are steadily paying more for less ROI, and Google, Meta, and Amazon are laughing all the way to the blockchain.&lt;/p&gt;
-      &lt;p&gt;If there is one thing marketers have even heard about causation — which, of course, is the ultimate point of advertising, causing consumers to buy your product who wouldn’t have otherwise — it is that correlation is not causation. But AI, you see, is nothing but correlation. Very fast and very sophisticated statistical inference. The fact remains that to truly know what is having an effect, you need to conduct a randomized experiment: subjects assigned at random to a test or control group, presented with an intervention where they are either treated or not with the stimulus of interest (the ad), and measured against the outcome of interest (incremental sales).&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;head rend="h2"&gt;The fog of marketing&lt;/head&gt;
-    &lt;p&gt;Unfortunately, legit sites are on a clock here. Right now the Big Tech companies are quietly pushing an in-browser advertising attribution tracking system through the World Wide Web Consortium (W3C). It’s a complicated proposal, technically, but it aims to centralize attribution measurement at one chokepoint per browser vendor, so we can safely predict what the attribution reports are going to look like. &lt;code&gt;beep, boop, the
-optimal place to spend your ad money is . . . whatever Performance Max
-(or other Big Tech ML) says is the right place to spend your ad
-money&lt;/code&gt;. If any attribution tracking reports start to come out
-looking favorable to legit sites—and potentially costing Big Tech’s
-misinfo and slop operations billions—then management will just demand
-changes to code, policies, and personnel until the numbers come out the
-way they want.&lt;/p&gt;
-    &lt;p&gt;The survival of legit sites depends on how quickly marketers can level up to stuff like rickcentralcontrolcom/geo-rct-methodology and not just dump money and customer data in to Big Tech and get conversions out. The problem with marketing today isn’t that marketers have gotten “too technical” and ignored the creative mystique or whatever—it’s that marketers are so afraid to look “non-technical” by asking the hard questions.&lt;/p&gt;
-    &lt;p&gt;Anyway, just going back and reading this, Rick Bruner has scored a content marketing win here. Start people off thinking about micropayments, and that ends up leading to the question of how to figure out which sites are for real, in the presence of so many gatekeepers with an interest in pushing the wrong answers? (and destroying the legit economy and crushing democracy, but that’s another story).&lt;/p&gt;
-    &lt;head rend="h2"&gt;Where micropayments systems can go from here&lt;/head&gt;
-    &lt;p&gt;Right now a lot of sites have a lot of, let’s just say malarkey to get through before seeing the actual page.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;
-        &lt;p&gt;“consent” dialogs (which don’t get real consent anyway, as Prof. Daniel Solove explains)&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Email newsletter signups&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Prompts to allow notifications&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Sign in with (company name here)&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;A micropayment platform that can either eliminate those or act as a front end for them, to consolidate on zero or one roadblock to get through before reading, would be a user experience (and revenue) win. Piling another thing to click onto already long-suffering users is not the way to get people back to the web. More: time to sharpen your pencils, people&lt;/p&gt;
-    &lt;head rend="h2"&gt;Bonus links&lt;/head&gt;
-    &lt;p&gt;What’s next for Chinese open-source AI by Caiwei Chen. &lt;quote&gt;The adoption of Chinese models is picking up in Silicon Valley, too. Martin Casado, a general partner at Andreessen Horowitz, has put a number on it: Among startups pitching with open-source stacks, there’s about an 80% chance they’re running on Chinese open models….&lt;/quote&gt; (related: Please Don’t Say Mean Things about the AI That I Just Invested a Billion Dollars In, generative ai antimoats)&lt;/p&gt;
-    &lt;p&gt;Why the World Is Drawing a Line on Social Media for Kids by Jon Haidt. (As far as I know, teens in Australia can still make GitHub and Wikipedia accounts. How did they manage to slice the definition of “social media”?)&lt;/p&gt;
-    &lt;p&gt;EU Parliament blocks AI features over cyber, privacy fears by Ellen O’Regan and Max Griera. &lt;quote&gt;The latest move to switch off AI tools concerns built-in features like writing and summarizing assistants, enhanced virtual assistants and webpage summaries in both tablets and phones, an EU official said, granted anonymity to disclose details of the security policy.&lt;/quote&gt;&lt;/p&gt;
-    &lt;p&gt;Journalism Is Dead. Long Live Journalism by Rebecca Solnit. &lt;quote&gt;Silicon Valley created and abets this chaos, both by undermining the financial basis for traditional news by siphoning away its advertising revenue and audiences, and by creating tools and platforms where, over and over, from Facebook to Substack, the bosses insist they are defending free speech by not filtering out dangerous disinformation and hate speech.&lt;/quote&gt;&lt;/p&gt;
-    &lt;p&gt;EPIC Crafts 2026 Model Bill to Bolster Age-Appropriate Design Code Laws by Austin Jenkins. &lt;quote&gt;EPIC, which filed an amicus brief in the California case, said its model bill was &lt;/quote&gt;&lt;quote&gt;carefully designed&lt;/quote&gt; to avoid First Amendment issues and was built off of Vermont’s law, which was passed last year after input from EPIC staff.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://blog.zgp.org/micropayments-as-a-reality-check-for-news-sites/"/><published>2026-02-19T19:42:31+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47078840</id><title>Something Is Going on with Colorectal Cancer</title><updated>2026-02-19T20:54:46.705666+00:00</updated><link href="https://www.hankgreen.com/crc"/><published>2026-02-19T20:32:09+00:00</published></entry></feed>
+&lt;/doc&gt;</content><link href="https://www.theregister.com/2026/02/19/irs_job_cuts/"/><published>2026-02-19T19:16:33+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47078840</id><title>Overall, the colorectal cancer story is encouraging</title><updated>2026-02-19T21:21:32.731513+00:00</updated><link href="https://www.hankgreen.com/crc"/><published>2026-02-19T20:32:09+00:00</published></entry></feed>
