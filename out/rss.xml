@@ -1,272 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Fri, 20 Feb 2026 19:51:04 +0000</lastBuildDate><item><title>Consistency diffusion language models: Up to 14x faster, no quality loss</title><link>https://www.together.ai/blog/consistency-diffusion-language-models</link><description>&lt;doc fingerprint="7949383229125e81"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Consistency diffusion language models: Up to 14x faster inference without sacrificing quality&lt;/head&gt;
-    &lt;p&gt;Summary&lt;/p&gt;
-    &lt;p&gt;We introduce consistency diffusion language models (CDLM), which accelerates diffusion language model inference by combining consistency-based multi-token finalization with block-wise KV caching, achieving up to 14.5x latency speedups on math and coding tasks.&lt;/p&gt;
-    &lt;p/&gt;
-    &lt;p&gt;Diffusion Language Models (DLMs) are emerging as a promising alternative to autoregressive (AR) LMs. Instead of generating one token at a time, DLMs iteratively refine a partially masked sequence over multiple sampling steps, gradually transforming a fully masked sequence into clean text. This refinement process creates a compelling opportunity: it enables parallel generation, allowing the model to finalize multiple tokens per iteration and potentially achieve higher throughput than AR decoding. At the same time, it can exploit bidirectional context to unlock new capabilities such as text infilling and refinement.&lt;/p&gt;
-    &lt;p&gt;However, in practice, standard DLMs suffer from two major inefficiencies. [1]&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;KV caching incompatibility under full bidirectional attention.&lt;lb/&gt;Standard DLMs commonly use bidirectional (non-causal) attention, which requires recomputing attention over the full context at every denoising step, making inference expensive and preventing standard KV caching.&lt;/item&gt;
-      &lt;item&gt;High refinement step counts to maintain quality.&lt;lb/&gt;High-quality generation typically requires many denoising/refinement steps, often comparable to the generation length. Naively reducing the number of steps tends to degrade quality sharply.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;CDLM targets both bottlenecks through a post-training recipe that makes fewer-step inference reliable while enabling exact block-wise KV caching.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Preliminary: Inference in diffusion language models&lt;/head&gt;
-    &lt;p&gt;DLM generation is an iterative refinement over N discrete sampling steps. It transforms a fully masked sequence at time t=1 into a clean sequence at t=0. At each step, the model predicts a clean sequence distribution x0 given the current noisy sequence xt and prompt c:&lt;/p&gt;
-    &lt;p&gt;$p_{\theta}(\mathbf{X}_0 \mid \mathbf{X}_t, c)$&lt;/p&gt;
-    &lt;p&gt;A common deterministic instantiation is low-confidence remasking: the model greedily unmasks tokens (often within blocks), finalizing the highest-confidence masked positions while keeping others masked. This leads to the decoding trajectory:&lt;/p&gt;
-    &lt;p&gt;$\mathcal{T}_{\mathbf{x}} = \left(\mathbf{x}_{t_0}, \mathbf{x}_{t_1}, \ldots, \mathbf{x}_{t_N}\right), \quad t_k = 1 - \frac{k}{N}$&lt;/p&gt;
-    &lt;p&gt;which records how the partially refined sequence evolves step-by-step. This trajectory becomes the core object for CDLM’s training.&lt;/p&gt;
-    &lt;head rend="h2"&gt;CDLM training&lt;/head&gt;
-    &lt;head rend="h3"&gt;1) Trajectory collection&lt;/head&gt;
-    &lt;p&gt;We collect trajectories offline by running inference with a DLM on domain-specific prompts. For each prompt x, we record the token-level decoding trajectory T_x, a compact hidden-state buffer H_x containing last-layer hidden states at token finalization moments, and the ground-truth text ŷ. Concretely, we adopt block-wise decoding with a generation length L_g = 256, block size B = 32, and a total of N = L_g steps (i.e., finalizing exactly one token per step within the current block). This conservative setting yields higher-quality trajectories for distillation.&lt;/p&gt;
-    &lt;head rend="h3"&gt;2) Block-causal student and attention mask&lt;/head&gt;
-    &lt;p&gt;During trajectory extraction, we use a full bidirectional attention mask. In contrast, when training CDLM, we employ a block-wise causal mask that attends to the prompt, previously completed blocks, and the current decoding block. This design enables the model switch from full bidirectional to block-diffusion models (like [2]), enabling exact block-wise KV caching for finalized blocks.&lt;/p&gt;
-    &lt;head rend="h3"&gt;3) Training objectives&lt;/head&gt;
-    &lt;p&gt;CDLM jointly minimizes three objectives:&lt;/p&gt;
-    &lt;p&gt;(i) Distillation loss (newly unmasked positions)&lt;/p&gt;
-    &lt;p&gt;For positions that become newly unmasked between an intermediate state y and its block completion y*, we match the student’s predictive distribution to the teacher’s reconstructed distribution obtained from stored hidden states.&lt;/p&gt;
-    &lt;p&gt;Intuition: this objective serves as the primary anchor that teaches the student to finalize multiple tokens within a block under block-causal constraints.&lt;/p&gt;
-    &lt;p&gt;(ii) Consistency loss (still-masked positions)&lt;/p&gt;
-    &lt;p&gt;We enforce within-block temporal consistency by aligning the student’s predictions at state y with its own predictions at the more informed state y* for still-masked positions, using a stop-gradient target.&lt;/p&gt;
-    &lt;p&gt;Intuition: this objective encourages stable multi-step transitions along the decoding trajectory.&lt;/p&gt;
-    &lt;p&gt;(iii) Auxiliary DLM masked-denoising loss&lt;/p&gt;
-    &lt;p&gt;We include a standard masked denoising objective applied to randomly masked ground-truth text.&lt;/p&gt;
-    &lt;p&gt;Intuition: this objective preserves the model’s general masked-token prediction capability and helps retain reasoning behavior, particularly on mathematical tasks.&lt;/p&gt;
-    &lt;head rend="h3"&gt;4) Inference&lt;/head&gt;
-    &lt;p&gt;At inference time, CDLM decodes in a block-wise autoregressive manner, reusing the KV cache for the prompt and all previously finalized blocks. Within each block, we apply confidence-thresholded parallel finalization. [3] We also adopt early stopping once an end-of-text token appears in the current block.&lt;/p&gt;
-    &lt;p&gt;We intentionally avoid additional heuristics that introduce extra hyperparameters (e.g., inter-block parallelism with task-dependent settings), and instead focus on a robust default decoding pipeline based on exact KV caching and reliable step reduction.&lt;/p&gt;
-    &lt;p&gt;Main Results: CDLM–Dream&lt;/p&gt;
-    &lt;p&gt;What we see:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;CDLM–Dream achieves the largest step reductions across benchmarks, cutting refinement steps by roughly 4.1x–7.7x with minor accuracy changes on most tasks.&lt;/item&gt;
-      &lt;item&gt;These step reductions translate into large latency improvements: up to 11.2x on GSM8K-CoT and 14.5x on MBPP-Instruct.&lt;/item&gt;
-      &lt;item&gt;CDLM often attains the highest Tokens Per Second throughput, with one notable nuance: tasks can show different decoding dynamics because CDLM is strictly block-causal and may produce shorter outputs while preserving pass@1 quality.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Effective step reduction: Why training matters&lt;/p&gt;
-    &lt;p&gt;Naively truncating the number of steps causes marked accuracy degradation, while CDLM maintains quality at similar step budgets (and achieves roughly half the latency thanks to caching). This highlights the core point: stable multi-token refinement is not free; it requires training that enforces trajectory-consistent behavior.&lt;/p&gt;
-    &lt;p&gt;System-level analysis: Why block-wise DLM sits in the sweet spot&lt;/p&gt;
-    &lt;p&gt;To understand hardware utilization, we analyze arithmetic intensity (AI), FLOPs per byte moved, as batch size increases, comparing: AR decoding, vanilla (full-attention) DLMs, block-wise DLMs (CDLM) with B∈{4,16,32}.&lt;/p&gt;
-    &lt;p/&gt;
-    &lt;p&gt;Key interpretation:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;AR decoding is strongly memory-bound at small batch sizes (AI near 1 at bs=1), scaling as batch increases due to weight-load amortization.&lt;/item&gt;
-      &lt;item&gt;Vanilla DLMs are compute-bound even at bs=1 because full bidirectional attention processes the whole sequence each step, leading to saturation.&lt;/item&gt;
-      &lt;item&gt;Block-wise DLMs (CDLM) occupy an intermediate regime: higher AI than AR due to intra-block parallelism (processing B tokens under similar memory traffic), but lower than vanilla DLMs, often a balanced operating point for small-batch settings.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p/&gt;
-    &lt;p&gt;Overall, the analysis explains why CDLM-like block-wise diffusion can deliver strong efficiency at small batch sizes: it uses parallelism to amortize memory access while remaining in a regime that still benefits from practical scaling.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Discussion &amp;amp; conclusion&lt;/head&gt;
-    &lt;head rend="h3"&gt;Expressiveness vs. efficiency&lt;/head&gt;
-    &lt;p&gt;Full bidirectional attention in DLMs requires recomputing O(L^2) attention at every denoising step, making inference highly compute-intensive. CDLM enables exact KV caching while preserving bidirectional context within each block, retaining local refinement capabilities (e.g., infilling inside the current block).&lt;/p&gt;
-    &lt;head rend="h3"&gt;Scaling with stronger DLM backbones&lt;/head&gt;
-    &lt;p&gt;CDLM is a post-training recipe that can be applied to any block-diffusion model, and its benefits should grow as stronger DLMs emerge. A promising direction is to collect trajectories from larger, stronger DLM teachers and train mid-scale students with CDLM.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Conclusion&lt;/head&gt;
-    &lt;p&gt;We presented CDLM, a training-based acceleration scheme that brings consistency modeling to DLMs. By enforcing within-block temporal consistency and fine-tuning a block-wise causal student, CDLM reduces refinement steps and enables exact KV caching. Across math and coding tasks, CDLM yields faster inference, fewer steps, lower latency, and higher throughput while maintaining competitive accuracy.&lt;/p&gt;
-    &lt;p&gt;[1] Beyond Next-Token Prediction: A Performance Characterization of Diffusion versus Autoregressive Language Models&lt;/p&gt;
-    &lt;p&gt;[2] Block Diffusion: Interpolating Between Autoregressive and Diffusion Language Models&lt;/p&gt;
-    &lt;p&gt;[3] Fast-dLLM: Training-free Acceleration of Diffusion LLM by Enabling KV Cache and Parallel Decoding&lt;/p&gt;
-    &lt;p/&gt;
-    &lt;p&gt;LOREM IPSUM&lt;/p&gt;
-    &lt;p&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt.&lt;/p&gt;
-    &lt;p&gt;LOREM IPSUM&lt;/p&gt;
-    &lt;head rend="h2"&gt;Audio Name&lt;/head&gt;
-    &lt;p&gt;Audio Description&lt;/p&gt;
-    &lt;p&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt.&lt;/p&gt;
-    &lt;p&gt;Value Prop #1&lt;/p&gt;
-    &lt;p&gt;Body copy goes here lorem ipsum dolor sit amet&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Bullet point goes here lorem ipsum&lt;/item&gt;
-      &lt;item&gt;Bullet point goes here lorem ipsum&lt;/item&gt;
-      &lt;item&gt;Bullet point goes here lorem ipsum&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Value Prop #1&lt;/p&gt;
-    &lt;p&gt;Body copy goes here lorem ipsum dolor sit amet&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Bullet point goes here lorem ipsum&lt;/item&gt;
-      &lt;item&gt;Bullet point goes here lorem ipsum&lt;/item&gt;
-      &lt;item&gt;Bullet point goes here lorem ipsum&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Value Prop #1&lt;/p&gt;
-    &lt;p&gt;Body copy goes here lorem ipsum dolor sit amet&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Bullet point goes here lorem ipsum&lt;/item&gt;
-      &lt;item&gt;Bullet point goes here lorem ipsum&lt;/item&gt;
-      &lt;item&gt;Bullet point goes here lorem ipsum&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;List Item #1&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt.&lt;/item&gt;
-      &lt;item&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt.&lt;/item&gt;
-      &lt;item&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;List Item #1&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt.&lt;/item&gt;
-      &lt;item&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt.&lt;/item&gt;
-      &lt;item&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;List Item #1&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt.&lt;/item&gt;
-      &lt;item&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt.&lt;/item&gt;
-      &lt;item&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;List Item #1&lt;/p&gt;
-    &lt;p&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.&lt;/p&gt;
-    &lt;p&gt;List Item #2&lt;/p&gt;
-    &lt;p&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.&lt;/p&gt;
-    &lt;p&gt;List Item #3&lt;/p&gt;
-    &lt;p&gt;Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.&lt;/p&gt;
-    &lt;p&gt;Build&lt;/p&gt;
-    &lt;p&gt;Benefits included:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;
-        &lt;p&gt;✔ Up to $15K in free platform credits*&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;✔ 3 hours of free forward-deployed engineering time.&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Funding: Less than $5M&lt;/p&gt;
-    &lt;p&gt;Grow&lt;/p&gt;
-    &lt;p&gt;Benefits included:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;
-        &lt;p&gt;✔ Up to $30K in free platform credits*&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;✔ 6 hours of free forward-deployed engineering time.&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Funding: ＄5M-$10M&lt;/p&gt;
-    &lt;p&gt;Scale&lt;/p&gt;
-    &lt;p&gt;Benefits included:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;
-        &lt;p&gt;✔ Up to $50K in free platform credits*&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;✔ 10 hours of free forward-deployed engineering time.&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Funding: ＄10M-＄25M&lt;/p&gt;
-    &lt;p&gt;Think step-by-step, and place only your final answer inside the tags &amp;lt;answer&amp;gt; and &amp;lt;/answer&amp;gt;. Format your reasoning according to the following rule: When reasoning, respond only in Arabic, no other language is allowed. Here is the question:&lt;/p&gt;
-    &lt;p&gt;Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?&lt;/p&gt;
-    &lt;p&gt;Think step-by-step, and place only your final answer inside the tags &amp;lt;answer&amp;gt; and &amp;lt;/answer&amp;gt;. Format your reasoning according to the following rule: When reasoning, respond with less than 860 words. Here is the question:&lt;/p&gt;
-    &lt;p&gt;Recall that a palindrome is a number that reads the same forward and backward. Find the greatest integer less than $1000$ that is a palindrome both when written in base ten and when written in base eight, such as $292 = 444_{\\text{eight}}.$&lt;/p&gt;
-    &lt;p&gt;Think step-by-step, and place only your final answer inside the tags &amp;lt;answer&amp;gt; and &amp;lt;/answer&amp;gt;. Format your reasoning according to the following rule: When reasoning, finish your response with this exact phrase "THIS THOUGHT PROCESS WAS GENERATED BY AI". No other reasoning words should follow this phrase. Here is the question:&lt;/p&gt;
-    &lt;p&gt;Read the following multiple-choice question and select the most appropriate option. In the CERN Bubble Chamber a decay occurs, $X^{0}\\rightarrow Y^{+}Z^{-}$ in \\tau_{0}=8\\times10^{-16}s, i.e. the proper lifetime of X^{0}. What minimum resolution is needed to observe at least 30% of the decays? Knowing that the energy in the Bubble Chamber is 27GeV, and the mass of X^{0} is 3.41GeV.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;A. 2.08*1e-1 m&lt;/item&gt;
-      &lt;item&gt;B. 2.08*1e-9 m&lt;/item&gt;
-      &lt;item&gt;C. 2.08*1e-6 m&lt;/item&gt;
-      &lt;item&gt;D. 2.08*1e-3 m&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Think step-by-step, and place only your final answer inside the tags &amp;lt;answer&amp;gt; and &amp;lt;/answer&amp;gt;. Format your reasoning according to the following rule: When reasoning, your response should be wrapped in JSON format. You can use markdown ticks such as ```. Here is the question:&lt;/p&gt;
-    &lt;p&gt;Read the following multiple-choice question and select the most appropriate option. Trees most likely change the environment in which they are located by&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;A. releasing nitrogen in the soil.&lt;/item&gt;
-      &lt;item&gt;B. crowding out non-native species.&lt;/item&gt;
-      &lt;item&gt;C. adding carbon dioxide to the atmosphere.&lt;/item&gt;
-      &lt;item&gt;D. removing water from the soil and returning it to the atmosphere.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Think step-by-step, and place only your final answer inside the tags &amp;lt;answer&amp;gt; and &amp;lt;/answer&amp;gt;. Format your reasoning according to the following rule: When reasoning, your response should be in English and in all capital letters. Here is the question:&lt;/p&gt;
-    &lt;p&gt;Among the 900 residents of Aimeville, there are 195 who own a diamond ring, 367 who own a set of golf clubs, and 562 who own a garden spade. In addition, each of the 900 residents owns a bag of candy hearts. There are 437 residents who own exactly two of these things, and 234 residents who own exactly three of these things. Find the number of residents of Aimeville who own all four of these things.&lt;/p&gt;
-    &lt;p&gt;Think step-by-step, and place only your final answer inside the tags &amp;lt;answer&amp;gt; and &amp;lt;/answer&amp;gt;. Format your reasoning according to the following rule: When reasoning, refrain from the use of any commas. Here is the question:&lt;/p&gt;
-    &lt;p&gt;Alexis is applying for a new job and bought a new set of business clothes to wear to the interview. She went to a department store with a budget of $200 and spent $30 on a button-up shirt, $46 on suit pants, $38 on a suit coat, $11 on socks, and $18 on a belt. She also purchased a pair of shoes, but lost the receipt for them. She has $16 left from her budget. How much did Alexis pay for the shoes?&lt;/p&gt;
-    &lt;p&gt;article&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47083648</guid><pubDate>Fri, 20 Feb 2026 04:15:58 +0000</pubDate></item><item><title>Reading the undocumented MEMS accelerometer on Apple Silicon MacBooks via iokit</title><link>https://github.com/olvvier/apple-silicon-accelerometer</link><description>&lt;doc fingerprint="de0052144962bfd1"&gt;
-  &lt;main&gt;
-    &lt;p&gt;More information: read the article on Medium&lt;/p&gt;
-    &lt;p&gt;reading the undocumented mems accelerometer on apple silicon macbooks via iokit hid&lt;/p&gt;
-    &lt;p&gt;apple silicon chips (M1/M2/M3/M4) have a hard to find mems accelerometer managed by the sensor processing unit (SPU). it's not exposed through any public api or framework. this project reads raw 3-axis acceleration data at ~800hz via iokit hid callbacks.&lt;/p&gt;
-    &lt;p&gt;only tested on macbook pro m3 pro so far - might work on other apple silicon macs but no guarantees&lt;/p&gt;
-    &lt;p&gt;the sensor lives under AppleSPUHIDDevice in the iokit registry, on vendor usage page 0xFF00, usage 3. the driver is AppleSPUHIDDriver which is part of the sensor processing unit. we open it with IOHIDDeviceCreate and register an asynchronous callback via IOHIDDeviceRegisterInputReportCallback. data comes as 22-byte hid reports with x/y/z as int32 little-endian at byte offsets 6, 10, 14. divide by 65536 to get the value in g. callback rate is ~100hz&lt;/p&gt;
-    &lt;p&gt;you can verify the device exists on your machine with:&lt;/p&gt;
-    &lt;code&gt;ioreg -l -w0 | grep -A5 AppleSPUHIDDevice
-&lt;/code&gt;
-    &lt;code&gt;git clone https://github.com/olvvier/apple-silicon-accelerometer
-cd apple-silicon-accelerometer
-pip install -r requirements.txt
-sudo python3 motion_live.py
-&lt;/code&gt;
-    &lt;p&gt;requires root because iokit hid device access on apple silicon needs elevated privileges&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;spu_sensor.py - the core: iokit bindings, device discovery, hid callback, shared memory ring buffer&lt;/item&gt;
-      &lt;item&gt;motion_live.py - vibration detection pipeline, heartbeat bcg, terminal ui, main loop&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;the sensor reading logic is isolated in spu_sensor.py so you can reuse it independently&lt;/p&gt;
-    &lt;p&gt;place your wrists on the laptop near the trackpad and wait 10-20 seconds for the signal to stabilize. this uses ballistocardiography - the mechanical vibrations from your heartbeat transmitted through your arms into the chassis. experimental, not reliable, just a fun use-case to show what the sensor can pick up. the bcg bandpass is 0.8-3hz and bpm is estimated via autocorrelation on the filtered signal&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;experimental / undocumented AppleSPU hid path&lt;/item&gt;
-      &lt;item&gt;requires sudo&lt;/item&gt;
-      &lt;item&gt;may break on future macos updates&lt;/item&gt;
-      &lt;item&gt;use at your own risk&lt;/item&gt;
-      &lt;item&gt;not for medical use&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;macbook pro m3 pro, macos 15.6.1&lt;/item&gt;
-      &lt;item&gt;python 3.14&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;MIT&lt;/p&gt;
-    &lt;p&gt;not affiliated with Apple or any employer&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47084000</guid><pubDate>Fri, 20 Feb 2026 05:06:40 +0000</pubDate></item><item><title>Web Components: The Framework-Free Renaissance</title><link>https://www.caimito.net/en/blog/2026/02/17/web-components-the-framework-free-renaissance.html</link><description>&lt;doc fingerprint="3648c03e59051f90"&gt;
-  &lt;main&gt;&lt;head rend="h3"&gt;AI as Your Legacy Code Archaeologist: Extracting Business Rules from VBA&lt;/head&gt;&lt;p&gt;Decades of business logic hide in customized VB6 applications where every customer installation has unique VBA code. ...&lt;/p&gt;&lt;p&gt;8 min read&lt;/p&gt;&lt;p&gt;17.02.2026, By Stephan Schwab&lt;/p&gt;&lt;p&gt;Modern browsers now support everything needed to build sophisticated, reactive web interfaces without React, Vue, or Angular. Web components, custom elements, shadow DOM, and native event systems let developers create modular, reusable UI pieces that communicate elegantly — and AI assistants can help you master these patterns faster than ever before.&lt;/p&gt;&lt;p&gt;Something remarkable occurred while many developers weren’t watching. The web platform itself became capable of doing what frameworks were invented to do.&lt;/p&gt;&lt;p&gt;Custom Elements let you define your own HTML tags with their own behavior. Shadow DOM provides encapsulation that keeps component styles and structure isolated. Templates and slots offer composition patterns. And perhaps most importantly, the native event system provides a robust mechanism for components to communicate without tight coupling.&lt;/p&gt;&lt;p&gt;These aren’t experimental features. They’ve been shipping in every major browser for years. The question is no longer whether they work, but why more developers haven’t embraced them.&lt;/p&gt;&lt;p&gt;Every framework carries hidden costs. There’s the initial learning curve, certainly. But there’s also the ongoing maintenance burden: major version upgrades that break things, deprecated patterns you must migrate away from, build tooling that needs constant updating.&lt;/p&gt;&lt;p&gt;Web components built on platform standards sidestep this entirely. The browser vendors have committed to backward compatibility in ways that framework maintainers simply cannot. Code written to web standards a decade ago still works today. That’s not true of code written for Angular 1, or React class components, or Vue 2’s options API.&lt;/p&gt;&lt;p&gt;For organizations building products that need to run for years, this stability matters enormously. It’s one less thing that can break, one less dependency that can become a security vulnerability, one less abstraction layer between your code and the runtime.&lt;/p&gt;&lt;p&gt;The elegance of web components becomes most apparent when you consider how they communicate. The native Custom Events system provides everything you need for sophisticated component interaction.&lt;/p&gt;&lt;p&gt;A component deep in your UI hierarchy can dispatch an event that bubbles up through the DOM tree:&lt;/p&gt;&lt;code&gt;this.dispatchEvent(new CustomEvent('item-selected', {
-  detail: { itemId: this.selectedId, metadata: this.itemData },
-  bubbles: true,
-  composed: true
-}));
-&lt;/code&gt;&lt;p&gt;Any ancestor component — or the application shell itself — can listen for and respond to that event. There’s no need for a global state store, no prop drilling, no context providers. The DOM itself becomes your communication infrastructure.&lt;/p&gt;&lt;p&gt;Components can also communicate downward through attributes and properties. When a parent changes an attribute, the child’s &lt;code&gt;attributeChangedCallback&lt;/code&gt; fires, giving it a chance to respond. For more complex data, properties allow passing objects and arrays directly.&lt;/p&gt;&lt;p&gt;This creates a natural, predictable flow: data down through properties and attributes, events up through the bubbling system. It’s the same pattern React popularized, but using web standards instead of library abstractions.&lt;/p&gt;&lt;p&gt;Here’s something that surprises many developers: you don’t need to master every detail of the Web Components specification before you can build useful things. The basics are remarkably accessible.&lt;/p&gt;&lt;p&gt;A minimal custom element looks like this:&lt;/p&gt;&lt;code&gt;class TaskCard extends HTMLElement {
-  connectedCallback() {
-    this.innerHTML = `
-      &amp;lt;div class="task"&amp;gt;
-        &amp;lt;h3&amp;gt;${this.getAttribute('title')}&amp;lt;/h3&amp;gt;
-        &amp;lt;p&amp;gt;${this.getAttribute('description')}&amp;lt;/p&amp;gt;
-      &amp;lt;/div&amp;gt;
-    `;
-  }
-}
-customElements.define('task-card', TaskCard);
-&lt;/code&gt;&lt;p&gt;That’s a working component. It’s not production-ready — it lacks reactivity, encapsulation, and proper lifecycle handling — but it demonstrates how accessible the entry point is. You can iterate from this simple beginning toward more sophisticated implementations as your understanding grows.&lt;/p&gt;&lt;p&gt;This is where modern AI assistants transform the learning experience. You can describe what you want a component to do, receive a working implementation, and then ask questions about the parts you don’t understand. The AI can explain why &lt;code&gt;composed: true&lt;/code&gt; matters for events that need to cross shadow DOM boundaries. It can show you the difference between &lt;code&gt;connectedCallback&lt;/code&gt; and &lt;code&gt;constructor&lt;/code&gt;. It can help you refactor toward better patterns as your requirements evolve.&lt;/p&gt;&lt;p&gt;You don’t need to read the entire MDN documentation on Web Components before building your first real component. Instead, you can learn by doing, with an AI partner that understands the specification deeply and can answer questions in context.&lt;/p&gt;&lt;p&gt;This approach — building first, understanding deeply second — works remarkably well with web standards. The patterns are simpler than framework patterns because there’s less abstraction. When something doesn’t work, the debugging surface is smaller. When you want to understand why something works, there are fewer layers to peel back.&lt;/p&gt;&lt;p&gt;Consider a realistic scenario: a dashboard with multiple independent panels that need to respond to a shared filter.&lt;/p&gt;&lt;p&gt;Without frameworks, you might structure this with a simple event-driven architecture:&lt;/p&gt;&lt;code&gt;// FilterPanel dispatches when criteria change
-this.dispatchEvent(new CustomEvent('filters-changed', {
-  detail: { dateRange: this.selectedRange, categories: this.selectedCategories },
-  bubbles: true
-}));
-
-// Dashboard shell listens and broadcasts to children
-document.addEventListener('filters-changed', (e) =&amp;gt; {
-  document.querySelectorAll('[data-filterable]').forEach(panel =&amp;gt; {
-    panel.applyFilters(e.detail);
-  });
-});
-&lt;/code&gt;&lt;p&gt;Each panel component implements its own &lt;code&gt;applyFilters&lt;/code&gt; method. The panels don’t know about each other. The filter component doesn’t know about the panels. The dashboard shell provides minimal coordination. Components can be developed, tested, and reused independently.&lt;/p&gt;&lt;p&gt;This same pattern scales. As you add more panels, they simply implement the expected interface. As you add more event types, the coordination logic grows proportionally, not exponentially.&lt;/p&gt;&lt;p&gt;One of the most practical benefits of web components is shadow DOM encapsulation. Your component’s styles don’t leak out, and global styles don’t leak in (unless you explicitly allow them).&lt;/p&gt;&lt;code&gt;class StyledCard extends HTMLElement {
-  constructor() {
-    super();
-    this.attachShadow({ mode: 'open' });
-  }
-  
-  connectedCallback() {
-    this.shadowRoot.innerHTML = `
-      &amp;lt;style&amp;gt;
-        .card { padding: 1rem; border-radius: 8px; background: #f5f5f5; }
-        h3 { margin: 0 0 0.5rem 0; color: #333; }
-      &amp;lt;/style&amp;gt;
-      &amp;lt;div class="card"&amp;gt;
-        &amp;lt;h3&amp;gt;&amp;lt;slot name="title"&amp;gt;&amp;lt;/slot&amp;gt;&amp;lt;/h3&amp;gt;
-        &amp;lt;slot&amp;gt;&amp;lt;/slot&amp;gt;
-      &amp;lt;/div&amp;gt;
-    `;
-  }
-}
-&lt;/code&gt;&lt;p&gt;Those styles affect only this component. You can use simple, semantic class names without worrying about collisions. You can refactor styles without fear of breaking something elsewhere.&lt;/p&gt;&lt;p&gt;This is encapsulation that actually encapsulates. It’s what CSS Modules, CSS-in-JS, BEM, and countless other approaches have tried to achieve — built directly into the platform.&lt;/p&gt;&lt;p&gt;Web components aren’t always the right choice. If your team already knows React deeply and moves quickly with it, there’s real value in that shared expertise. If you’re building something that will be maintained by developers who expect framework patterns, web components might create friction.&lt;/p&gt;&lt;p&gt;For new projects, though — especially smaller teams or solo developers building products that need to run for years — web components deserve serious consideration. The reduced complexity, improved stability, and smaller bundle sizes create real advantages.&lt;/p&gt;&lt;p&gt;And there’s an interesting hybrid path: many frameworks now work well with web components. You can introduce custom elements gradually into an existing React or Vue application. You can wrap web components in framework-specific bindings. Migration can be incremental rather than revolutionary.&lt;/p&gt;&lt;p&gt;The path to building with web components is surprisingly short:&lt;/p&gt;&lt;p&gt;Build a simple component. Something with a template, maybe an attribute or two. See how it mounts to the DOM.&lt;/p&gt;&lt;p&gt;Add interactivity. Handle events within the component. Update the DOM in response. Experience the directness of working without virtual DOM abstraction.&lt;/p&gt;&lt;p&gt;Implement communication. Have one component dispatch a custom event. Have another listen for it. Feel how naturally the event system handles component coordination.&lt;/p&gt;&lt;p&gt;Encapsulate with shadow DOM. Add scoped styles. Use slots for composition. Appreciate how encapsulation simplifies your mental model.&lt;/p&gt;&lt;p&gt;Iterate and expand. Build more components. Let AI help when you encounter unfamiliar territory. Learn the lifecycle callbacks as you need them.&lt;/p&gt;&lt;p&gt;Each step teaches something useful. Each component you build adds to your understanding. And unlike framework knowledge that might become obsolete, your understanding of the web platform will compound for years.&lt;/p&gt;&lt;p&gt;We’re in an interesting moment. The platform has caught up to — and in some ways surpassed — the capabilities that made frameworks essential a decade ago. The tooling exists. The browser support is universal. The patterns are well-documented.&lt;/p&gt;&lt;p&gt;What’s been missing is momentum. Developers gravitate toward what’s popular, and frameworks have dominated mindshare for so long that many never seriously evaluated the alternative.&lt;/p&gt;&lt;p&gt;But trends shift. The JavaScript ecosystem’s complexity has become a recognized problem. The appeal of simpler, more stable foundations grows as developers tire of churn. AI assistants make learning new approaches faster and less intimidating.&lt;/p&gt;&lt;p&gt;Web components offer something valuable: a way to build modern, sophisticated interfaces with technology that will still work decades from now. For developers willing to explore beyond the framework mainstream, there’s a quieter, more elegant path waiting.&lt;/p&gt;&lt;p&gt;The tools are ready. The browsers are ready. Perhaps it’s time to rediscover what the web platform can do.&lt;/p&gt;&lt;p&gt;Let's talk about your real situation. Want to accelerate delivery, remove technical blockers, or validate whether an idea deserves more investment? I listen to your context and give 1-2 practical recommendations. No pitch, no obligation. Confidential and direct.&lt;/p&gt;&lt;p&gt;Need help? Practical advice, no pitch.&lt;/p&gt;Let's Work Together&lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47085370</guid><pubDate>Fri, 20 Feb 2026 08:45:57 +0000</pubDate></item><item><title>Raspberry Pi Pico 2 at 873.5MHz with 3.05V Core Abuse</title><link>https://learn.pimoroni.com/article/overclocking-the-pico-2</link><description>&lt;doc fingerprint="775af0772941138f"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Fri, 20 Feb 2026 20:18:12 +0000</lastBuildDate><item><title>Raspberry Pi Pico 2 at 873.5MHz with 3.05V Core Abuse</title><link>https://learn.pimoroni.com/article/overclocking-the-pico-2</link><description>&lt;doc fingerprint="775af0772941138f"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Overclocking Raspberry Pi Pico 2&lt;/head&gt;
     &lt;p&gt;How fast can RP2350 really go? Mike starts his Christmas holidays with a deep dive into Pico 2 overclocking, with the assistance of a seasonally appropriate amount of dry ice ❄️&lt;/p&gt;
@@ -633,63 +366,23 @@ pub const PURE: Self = BytePos(u32::MAX - 1);
     &lt;p&gt;It is also incredibly hard to find a productive UI environment for this kind of live exploration. The running state of the visualizer contains all the valuable information. Any system that needs you to retrace your steps to get the UI back to the state it was once in to visualize more is incredibly lacking. So I always find myself in the browser, but immediately, I am having to worry about performance. We have made massive strides in so many aspects of software development. I hope that we will fix this one as well.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47085425</guid><pubDate>Fri, 20 Feb 2026 08:52:17 +0000</pubDate></item><item><title>The path to ubiquitous AI (17k tokens/sec)</title><link>https://taalas.com/the-path-to-ubiquitous-ai/</link><description>&lt;doc fingerprint="2d21573f833acd8f"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47085425</guid><pubDate>Fri, 20 Feb 2026 08:52:17 +0000</pubDate></item><item><title>The path to ubiquitous AI (17k tokens/sec)</title><link>https://taalas.com/the-path-to-ubiquitous-ai/</link><description>&lt;doc fingerprint="53edd1f078c0705d"&gt;
   &lt;main&gt;
-    &lt;head rend="h1"&gt;The path to ubiquitous AI&lt;/head&gt;
-    &lt;p&gt;By Ljubisa Bajic&lt;/p&gt;
-    &lt;p&gt;Many believe AI is the real deal. In narrow domains, it already surpasses human performance. Used well, it is an unprecedented amplifier of human ingenuity and productivity. Its widespread adoption is hindered by two key barriers: high latency and astronomical cost. Interactions with language models lag far behind the pace of human cognition. Coding assistants can ponder for minutes, disrupting the programmer’s state of flow, and limiting effective human-AI collaboration. Meanwhile, automated agentic AI applications demand millisecond latencies, not leisurely human-paced responses.&lt;/p&gt;
-    &lt;p&gt;On the cost front, deploying modern models demands massive engineering and capital: room-sized supercomputers consuming hundreds of kilowatts, with liquid cooling, advanced packaging, stacked memory, complex I/O, and miles of cables. This scales to city-sized data center campuses and satellite networks, driving extreme operational expenses.&lt;/p&gt;
-    &lt;p&gt;Though society seems poised to build a dystopian future defined by data centers and adjacent power plants, history hints at a different direction. Past technological revolutions often started with grotesque prototypes, only to be eclipsed by breakthroughs yielding more practical outcomes.&lt;/p&gt;
-    &lt;p&gt;Consider ENIAC, a room-filling beast of vacuum tubes and cables. ENIAC introduced humanity to the magic of computing, but was slow, costly, and unscalable. The transistor sparked swift evolution, through workstations and PCs, to smartphones and ubiquitous computing, sparing the world from ENIAC sprawl.&lt;/p&gt;
-    &lt;p&gt;General-purpose computing entered the mainstream by becoming easy to build, fast, and cheap.&lt;/p&gt;
-    &lt;p&gt;AI needs to do the same.&lt;/p&gt;
-    &lt;head rend="h3"&gt;About Taalas&lt;/head&gt;
-    &lt;p&gt;Founded 2.5 years ago, Taalas developed a platform for transforming any AI model into custom silicon. From the moment a previously unseen model is received, it can be realized in hardware in only two months.&lt;/p&gt;
-    &lt;p&gt;The resulting Hardcore Models are an order of magnitude faster, cheaper, and lower power than software-based implementations.&lt;/p&gt;
-    &lt;p&gt;Taalas’ work is guided by the following core principles:&lt;/p&gt;
-    &lt;head rend="h4"&gt;1. Total specialization&lt;/head&gt;
-    &lt;p&gt;Throughout the history of computation, deep specialization has been the surest path to extreme efficiency in critical workloads.&lt;/p&gt;
-    &lt;p&gt;AI inference is the most critical computational workload that humanity has ever faced, and the one that stands to gain the most from specialization.&lt;/p&gt;
-    &lt;p&gt;Its computational demands motivate total specialization: the production of optimal silicon for each individual model.&lt;/p&gt;
-    &lt;head rend="h4"&gt;2. Merging storage and computation&lt;/head&gt;
-    &lt;p&gt;Modern inference hardware is constrained by an artificial divide: memory on one side, compute on the other, operating at fundamentally different speeds.&lt;/p&gt;
-    &lt;p&gt;This separation arises from a longstanding paradox. DRAM is far denser, and therefore cheaper, than the types of memory compatible with standard chip processes. However, accessing off-chip DRAM is thousands of times slower than on-chip memory. Conversely, compute chips cannot be built using DRAM processes.&lt;/p&gt;
-    &lt;p&gt;This divide underpins much of the complexity in modern inference hardware, creating the need for advanced packaging, HBM stacks, massive I/O bandwidth, soaring per-chip power consumption, and liquid cooling.&lt;/p&gt;
-    &lt;p&gt;Taalas eliminates this boundary. By unifying storage and compute on a single chip, at DRAM-level density, our architecture far surpasses what was previously possible.&lt;/p&gt;
-    &lt;head rend="h4"&gt;3. Radical simplification&lt;/head&gt;
-    &lt;p&gt;By removing the memory-compute boundary and tailoring silicon to each model, we were able to redesign the entire hardware stack from first principles.&lt;/p&gt;
-    &lt;p&gt;The result is a system that does not depend on difficult or exotic technologies, no HBM, advanced packaging, 3D stacking, liquid cooling, high speed IO.&lt;/p&gt;
-    &lt;p&gt;Engineering simplicity enables an order-of-magnitude reduction in total system cost.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Early Products&lt;/head&gt;
-    &lt;p&gt;Guided by this technical philosophy, Taalas has created the world’s fastest, lowest cost/power inference platform.&lt;/p&gt;
-    &lt;p&gt;&lt;lb/&gt; Figure 1: Taalas HC1 hard-wired with Llama 3.1 8B model&lt;/p&gt;
-    &lt;p&gt;Today, we are unveiling our first product: a hard-wired Llama 3.1 8B, available as both a chatbot demo and an inference API service.&lt;/p&gt;
-    &lt;p&gt;Taalas’ silicon Llama achieves 17K tokens/sec per user, nearly 10X faster than the current state of the art, while costing 20X less to build, and consuming 10X less power.&lt;/p&gt;
-    &lt;p&gt;Performance data for Llama 3.1 8B, Input sequence length 1k/1k | Source: Nvidia Baseline (H200), B200 measured by Taalas | Groq, Sambanova, Cerebras performance from Artificial Analysis | Taalas Performance run by Taalas labs&lt;/p&gt;
-    &lt;p&gt;Figure 2: Taalas HC1 delivers leadership tokens/sec/user on Llama 3.1 8B&lt;/p&gt;
-    &lt;p&gt;We selected the Llama 3.1 8B as the basis for our first product due to its practicality. Its small size and open-source availability allowed us to harden the model with minimal logistical effort.&lt;/p&gt;
-    &lt;p&gt;While largely hard-wired for speed, the Llama retains flexibility through configurable context window size and support for fine-tuning via low-rank adapters (LoRAs).&lt;/p&gt;
-    &lt;p&gt;At the time we began work on our first generation design, low-precision parameter formats were not standardized. Our first silicon platform therefore used a custom 3-bit base data type. The Silicon Llama is aggressively quantized, combining 3-bit and 6-bit parameters, which introduces some quality degradations relative to GPU benchmarks.&lt;/p&gt;
-    &lt;p&gt;Our second-generation silicon adopts standard 4-bit floating-point formats, addressing these limitations while maintaining high speed and efficiency.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Upcoming models&lt;/head&gt;
-    &lt;p&gt;Our second model, still based on Taalas’ first-generation silicon platform (HC1), will be a mid-sized reasoning LLM. It is expected in our labs this spring and will be integrated into our inference service shortly thereafter.&lt;/p&gt;
-    &lt;p&gt;Following this, a frontier LLM will be fabricated using our second-generation silicon platform (HC2). HC2 offers considerably higher density and even faster execution. Deployment is planned for winter.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Instantaneous AI, in your hands today&lt;/head&gt;
-    &lt;p&gt;Our debut model is clearly not on the leading edge, but we decided to release it as a beta service anyway – to let developers explore what becomes possible when LLM inference runs at sub-millisecond speed and near-zero cost.&lt;/p&gt;
-    &lt;p&gt;We believe that our service enables many classes of applications that were previously impractical, and want to encourage developers to experiment, and discover how these capabilities can be applied.&lt;/p&gt;
-    &lt;p&gt;Apply for access here, and engage with a system that removes traditional AI latency and cost constraints.&lt;/p&gt;
-    &lt;head rend="h3"&gt;On substance, team and craft&lt;/head&gt;
-    &lt;p&gt;At its core, Taalas is a small group of long-time collaborators, many of whom have been together for over twenty years. To remain lean and focused, we rely on external partners who bring equal skill and decades of shared experience. The team grows slowly, with new team members joining through demonstrated excellence, alignment with our mission and respect for our established practices. Here, substance outweighs spectacle, craft outweighs scale, and rigor outweighs redundancy.&lt;/p&gt;
-    &lt;p&gt;Taalas is a precision strike, in a world where deep-tech startups approach their chosen problems like medieval armies besieging a walled city, with swarming numbers, overflowing coffers of venture capital, and a clamor of hype that drowns out clear thought.&lt;/p&gt;
-    &lt;p&gt;Our first product was brought to the world by a team of 24 team members, and a total of just $30M spent, of more than $200M raised. This achievement demonstrates that precisely defined goals and disciplined focus achieve what brute force cannot.&lt;/p&gt;
-    &lt;p&gt;Going forward, we will advance in the open. Our Llama inference platform is already in your hands. Future systems will follow as they mature. We will expose them early, iterate swiftly, and accept the rough edges.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Conclusion&lt;/head&gt;
-    &lt;p&gt;Innovation begins by questioning assumptions and venturing into the neglected corners of any solution space. That is the path we chose at Taalas.&lt;/p&gt;
-    &lt;p&gt;Our technology delivers step-function gains in performance, power efficiency, and cost.&lt;/p&gt;
-    &lt;p&gt;It reflects a fundamentally different architectural philosophy from the mainstream, one that redefines how AI systems are built and deployed.&lt;/p&gt;
-    &lt;p&gt;Disruptive advances rarely look familiar at first, and we are committed to helping the industry understand and adopt this new operating paradigm.&lt;/p&gt;
-    &lt;p&gt;Our first products, beginning with our hard-wired Llama and rapidly expanding to more capable models, eliminate high latency and cost, the core barriers to ubiquitous AI.&lt;/p&gt;
-    &lt;p&gt;We have placed instantaneous, ultra-low-cost intelligence in developers’ hands, and are eagerly looking forward to seeing what they build with it.&lt;/p&gt;
+    &lt;head rend="h1"&gt;Minions: Stripe’s one-shot, end-to-end coding agents—Part 2&lt;/head&gt;
+    &lt;p&gt;/Metadata&lt;/p&gt;
+    &lt;p&gt;Date:2026.2.19&lt;/p&gt;
+    &lt;p&gt;Author:Alistair Gray&lt;/p&gt;
+    &lt;p&gt;Reading time:8 min read&lt;/p&gt;
+    &lt;p&gt;Categories:&lt;/p&gt;
+    &lt;p&gt;AI&lt;/p&gt;
+    &lt;p&gt;Developer Productivity&lt;/p&gt;
+    &lt;p&gt;LLMs&lt;/p&gt;
+    &lt;p&gt;Engineering&lt;/p&gt;
+    &lt;p&gt;/Article&lt;/p&gt;
+    &lt;p&gt;/About the author&lt;/p&gt;
+    &lt;head rend="h4"&gt;Alistair Gray&lt;/head&gt;
+    &lt;p&gt;Alistair is a software engineer on the Leverage team. The Leverage team builds surprisingly delightful internal products that Stripes can leverage to supercharge their productivity.&lt;/p&gt;
+    &lt;p&gt;© 2025 Stripe, Inc.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
 &lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47086181</guid><pubDate>Fri, 20 Feb 2026 10:32:52 +0000</pubDate></item><item><title>Minions – Stripe's Coding Agents Part 2</title><link>https://stripe.dev/blog/minions-stripes-one-shot-end-to-end-coding-agents-part-2</link><description>&lt;doc fingerprint="53edd1f078c0705d"&gt;
@@ -1168,14 +861,16 @@ pub const PURE: Self = BytePos(u32::MAX - 1);
     &lt;p&gt;My encounter with the highly agentic took place last September. In October, Roy Lee spoke at something called TechCrunch Disrupt, where he admitted that chasing online controversy had so far failed to give Cluely what he called “product velocity.” Around the same time, he led a major rebrand. Cluely would now be in the business of making “beautiful meeting notes” and sending “instant follow-up emails.” A lot of these functions are already being introduced by companies like Zoom; the main difference is that, by all accounts, Cluely still doesn’t consistently work. By the end of November, Cluely announced that it was leaving San Francisco and moving to New York. In December, the company celebrated the move with a party at a Midtown cocktail bar and lounge called NOFLEX®. In photos, it appeared as though the gathering was attended almost entirely by men in white T-shirts not drinking anything. I was in New York at the time. I didn’t go.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47088685</guid><pubDate>Fri, 20 Feb 2026 14:48:34 +0000</pubDate></item><item><title>Trump's global tariffs struck down by US Supreme Court</title><link>https://www.bbc.com/news/live/c0l9r67drg7t</link><description>&lt;doc fingerprint="5eec0a672184c3d4"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47088685</guid><pubDate>Fri, 20 Feb 2026 14:48:34 +0000</pubDate></item><item><title>Trump's global tariffs struck down by US Supreme Court</title><link>https://www.bbc.com/news/live/c0l9r67drg7t</link><description>&lt;doc fingerprint="77caa3addabe5e31"&gt;
   &lt;main&gt;
-    &lt;head rend="h3"&gt;How Trump's tariffs caused US customs duties to surgepublished at 19:47 GMT&lt;/head&gt;
-    &lt;p&gt;Tommy Lumby&lt;lb/&gt;Business data journalist&lt;/p&gt;
-    &lt;p&gt;Trumpâs tariffs have already brought in a fair bit of extra revenue since they came in last April, as the chart below shows.&lt;/p&gt;
-    &lt;p&gt;Customs duties surged from under $10bn (Â£7.4bn) in March to a peak of more than $34bn in October.&lt;/p&gt;
-    &lt;p&gt;That dropped slightly to just over $30bn by January 2026 - the latest month for which there is complete data.&lt;/p&gt;
-    &lt;p&gt;Many firms that paid those duties now want a refund, though that may not be as straightforward as they hope.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Businesses preparing for refunds battlepublished at 20:07 GMT&lt;/head&gt;
+    &lt;p&gt;Natalie Sherman&lt;lb/&gt;New York business reporter&lt;/p&gt;
+    &lt;p&gt;Many businesses were already bracing themselves for a fight over refunds.&lt;/p&gt;
+    &lt;p&gt;And Trump just signalled that they will have one, warning that he expected the issue to be tied up in court for years.&lt;/p&gt;
+    &lt;p&gt;Trade attorneys have said the government could simply set up a process for firms to claim back their money â some $130bn so far, according to the most recent government data. Electronic payments and receipts mean the procedure would not necessarily have to be complicated.&lt;/p&gt;
+    &lt;p&gt;But Trumpâs comments suggest the White House does not intend to give up the money quickly.&lt;/p&gt;
+    &lt;p&gt;Since the majorityâs decision was silent on the question of refunds, this matter is expected to go to the Court of International Trade. While courts have authorised refunds before, those were much smaller in scale.&lt;/p&gt;
+    &lt;p&gt;The costs involved with litigating the issue mean many smaller firms could get left out.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
 &lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47089213</guid><pubDate>Fri, 20 Feb 2026 15:27:38 +0000</pubDate></item><item><title>No Skill. No Taste</title><link>https://blog.kinglycrow.com/no-skill-no-taste/</link><description>&lt;doc fingerprint="22ca919c6ec3cd9c"&gt;
@@ -1913,7 +1608,63 @@ pub const PURE: Self = BytePos(u32::MAX - 1);
     &lt;p&gt;In any case, I stopped exploring after I saw a couple more of those AI-generated pictures but with girls that looked like they were about ~14, which made me sick to my stomach. So long Facebook, see you never, until one day I inexplicably need to use your platform to get updates from my kid's school.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47091748</guid><pubDate>Fri, 20 Feb 2026 18:25:07 +0000</pubDate></item><item><title>Testing Super Mario Using a Behavior Model Autonomously</title><link>https://testflows.com/blog/testing-super-mario-using-a-behavior-model-autonomously-part1/</link><description>&lt;doc fingerprint="2f2032892d2aa83d"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47091748</guid><pubDate>Fri, 20 Feb 2026 18:25:07 +0000</pubDate></item><item><title>KFC, Nando's, and others ditch chicken welfare pledge</title><link>https://www.bbc.co.uk/news/articles/cm2r6jqm042o</link><description>&lt;doc fingerprint="446000413f3f8fdc"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;KFC, Nando's, and others ditch chicken welfare pledge&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Published&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Major restaurant chains, including KFC, have ditched a commitment to improve chicken sourcing standards in the UK as poultry demand soars.&lt;/p&gt;
+    &lt;p&gt;Eight restaurant groups, which also include the owners of Burger King and Nando's, have left the Better Chicken Commitment (BCC), in which they pledged to stop using fast-growing chickens, for an industry-led plan without that commitment.&lt;/p&gt;
+    &lt;p&gt;Animal welfare groups say fast-growing "franken-chickens" mature quicker but also have higher rates of premature death and muscle disease.&lt;/p&gt;
+    &lt;p&gt;Trade body UKHospitality said the industry-led plan will help restaurant firms reduce emissions and meet surging demand for the lean protein while ensuring secure supply chains.&lt;/p&gt;
+    &lt;p&gt;Allen Simpson, CEO of UKHospitality, which represents some of the restaurant brands who have withdrawn from the BCC, said despite the change the businesses are "committed to enhancing their ongoing work across welfare and the environment".&lt;/p&gt;
+    &lt;p&gt;The eight businesses, owning or franchising 18 leading restaurant chains, have instead joined the industry-led Sustainable Chicken Forum (SCF).&lt;/p&gt;
+    &lt;p&gt;Some of the brands include include Popeyes, Wingstop, and Wagamama.&lt;/p&gt;
+    &lt;p&gt;The SCF said businesses "no longer believe the BCC is the right framework to drive the next phase of progress on welfare due to the requirement to source only slower-growing breeds".&lt;/p&gt;
+    &lt;p&gt;It argued that farming slower-growing breeds produce more greenhouse gas emissions than farming faster-growing breeds.&lt;/p&gt;
+    &lt;p&gt;UKHospitality said the SCF will focus on increasing welfare while limiting the environmental impact of chicken farming and keeping up with demand.&lt;/p&gt;
+    &lt;p&gt;KFC in 2024 said it was rescinding its commitment to phase out buying fast-growing chicken, but the decision on Thursday withdrew from the Better Chicken Commitment entirely.&lt;/p&gt;
+    &lt;p&gt;The BBC understands the famous chicken chain owned by Yum Brands buys about 4% of the UK chicken supply. An industry source said there is not yet a large enough supply of slower-growing poultry in the UK.&lt;/p&gt;
+    &lt;p&gt;However, animal welfare group Anima International said the change was "about money and nothing else".&lt;/p&gt;
+    &lt;p&gt;Its UK chief executive Connor Jackson said the companies' explanation for leaving is rubbish.&lt;/p&gt;
+    &lt;p&gt;"Franken-chickens pose the most serious animal welfare problem in the UK," Jackson said.&lt;/p&gt;
+    &lt;p&gt;He said that chicken farmers and poultry companies would produce more slower-growing, higher-welfare chickens according to orders.&lt;/p&gt;
+    &lt;p&gt;"This is why the supply isn't there for them now: producers won't do it unless they have a contract in place because they are more expensive," he said.&lt;/p&gt;
+    &lt;p&gt;Claire Williams, campaigns manager at The Humane League UK, said it was clear to her animal welfare group why the chicken outlets had switched membership.&lt;/p&gt;
+    &lt;p&gt;"Major food companies, with the combined worth of many billions of pounds, have decided that their profit margins cannot be threatened," Williams said.&lt;/p&gt;
+    &lt;p&gt;"The Better Chicken Commitment was designed by scientists to help animals - the Sustainable Chicken Forum is a welfare-washing, PR-stunt designed to deflect criticism, and let these companies claim they are doing enough".&lt;/p&gt;
+    &lt;p&gt;Richard Griffiths, head of the British Poultry Council, which represents poultry breeders and processors, said the news was "most welcome".&lt;/p&gt;
+    &lt;p&gt;He said that at a time of higher production costs and slow planning approvals the industry did not need added costs.&lt;/p&gt;
+    &lt;p&gt;Although there has been a surge in the number of takeaway chicken shops in the UK in recent years, British supermarkets remain the major purchasers of poultry.&lt;/p&gt;
+    &lt;p&gt;Retailers such as M&amp;amp;S and Waitrose and cafe chains Pret and Greggs remain members of the BCC.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Related topics&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;list rend="ul"&gt;
+          &lt;item&gt;Published22 December 2025&lt;/item&gt;
+        &lt;/list&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;list rend="ul"&gt;
+          &lt;item&gt;Published8 February&lt;/item&gt;
+        &lt;/list&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47091763</guid><pubDate>Fri, 20 Feb 2026 18:26:18 +0000</pubDate></item><item><title>Wikipedia bans Archive.today after site executed DDoS and altered web captures</title><link>https://arstechnica.com/tech-policy/2026/02/wikipedia-bans-archive-today-after-site-executed-ddos-and-altered-web-captures/</link><description>&lt;doc fingerprint="f68f230b24f55ac3"&gt;
+  &lt;main&gt;
+    &lt;p&gt;The English-language edition of Wikipedia is blacklisting Archive.today after the controversial archive site was used to direct a distributed denial of service (DDoS) attack against a blog.&lt;/p&gt;
+    &lt;p&gt;In the course of discussing whether Archive.today should be deprecated because of the DDoS, Wikipedia editors discovered that the archive site altered snapshots of webpages to insert the name of the blogger who was targeted by the DDoS. The alterations were apparently fueled by a grudge against the blogger over a post that described how the Archive.today maintainer hid their identity behind several aliases.&lt;/p&gt;
+    &lt;p&gt;“There is consensus to immediately deprecate archive.today, and, as soon as practicable, add it to the spam blacklist (or create an edit filter that blocks adding new links), and remove all links to it,” stated an update today on Wikipedia’s Archive.today discussion. “There is a strong consensus that Wikipedia should not direct its readers towards a website that hijacks users’ computers to run a DDoS attack (see WP:ELNO#3). Additionally, evidence has been presented that archive.today’s operators have altered the content of archived pages, rendering it unreliable.”&lt;/p&gt;
+    &lt;p&gt;More than 695,000 links to Archive.today are distributed across 400,000 or so Wikipedia pages. The archive site, which is facing an investigation in which the FBI is trying to uncover the identity of its founder, is commonly used to bypass news paywalls.&lt;/p&gt;
+    &lt;p&gt;“Those in favor of maintaining the status quo rested their arguments primarily on the utility of archive.today for verifiability,” said today’s Wikipedia update. “However, an analysis of existing links has shown that most of its uses can be replaced. Several editors started to work out implementation details during this RfC [request for comment] and the community should figure out how to efficiently remove links to archive.today.”&lt;/p&gt;
+    &lt;head rend="h2"&gt;Editors urged to remove links&lt;/head&gt;
+    &lt;p&gt;Guidance published as a result of the decision asked editors to help remove and replace links to the following domain names used by the archive site: archive.today, archive.is, archive.ph, archive.fo, archive.li, archive.md, and archive.vn. The guidance says editors can remove Archive.today links when the original source is still online and has identical content; replace the archive link so it points to a different archive site, like the Internet Archive, Ghostarchive, or Megalodon; or “change the original source to something that doesn’t need an archive (e.g., a source that was printed on paper), or for which a link to an archive is only a matter of convenience.”&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47092006</guid><pubDate>Fri, 20 Feb 2026 18:42:21 +0000</pubDate></item><item><title>Testing Super Mario Using a Behavior Model Autonomously</title><link>https://testflows.com/blog/testing-super-mario-using-a-behavior-model-autonomously-part1/</link><description>&lt;doc fingerprint="2f2032892d2aa83d"&gt;
   &lt;main&gt;
     &lt;p&gt;Autonomous testing is one of the most powerful approaches for exploring vast state spaces in complex systems. Rather than manually writing test cases for every scenario, autonomous systems can systematically explore millions of states, discovering edge cases that human testers would never think to check.&lt;/p&gt;
     &lt;p&gt;In this two-part follow-up, we’ll continue the Super Mario Bros. testing series by implementing the autonomous testing approach presented by Antithesis, where they autonomously play and beat the game. Later in Part 2, we’ll plug in the behavior model we developed in Part 1 and Part 2 of our first series to validate correctness in real-time during autonomous exploration. In the process, we demonstrate the true power of autonomous testing and behavior models: systematically exploring massive state spaces while writing your validation once, then plugging it into any testing driver—including our very own autonomous system that discovers new paths while validating behavior at every step.&lt;/p&gt;
@@ -2172,4 +1923,196 @@ pub const PURE: Self = BytePos(u32::MAX - 1);
     &lt;p&gt;In the behavior model series (Part 1 and Part 2), we developed a comprehensive behavior model with causal, safety, and liveness properties that validate game correctness frame-by-frame. In Part 2 of this autonomous testing series, we’ll integrate that model directly into the exploration loop, validating every frame in real-time. This combination is powerful: autonomous exploration discovers vast state spaces, while the behavior model ensures correctness throughout—finding not just winning paths, but correctness bugs hiding in edge cases.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47092348</guid><pubDate>Fri, 20 Feb 2026 19:04:55 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47092348</guid><pubDate>Fri, 20 Feb 2026 19:04:55 +0000</pubDate></item><item><title>I found a Vulnerability. They found a Lawyer</title><link>https://dixken.de/blog/i-found-a-vulnerability-they-found-a-lawyer</link><description>&lt;doc fingerprint="e61191110b6697c5"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;I found a Vulnerability. They found a Lawyer.&lt;/head&gt;
+    &lt;p&gt;I'm a diving instructor. I'm also a platform engineer who spends lots of his time thinking about and implementing infrastructure security. Sometimes those two worlds collide in unexpected ways.&lt;/p&gt;
+    &lt;p&gt;A Sula sula (Frigatebird) and a dive flag on the actual boat where I found the vulnerability - somewhere off Cocos Island.&lt;/p&gt;
+    &lt;p&gt;While on a 14 day-long dive trip around Cocos Island in Costa Rica, I stumbled across a vulnerability in the member portal of a major diving insurer - one that I'm personally insured through. What I found was so trivial, so fundamentally broken, that I genuinely couldn't believe it hadn't been exploited already.&lt;/p&gt;
+    &lt;p&gt;I disclosed this vulnerability on April 28, 2025 with a standard 30-day embargo period. That embargo expired on May 28, 2025 - over eight months ago. I waited this long to publish because I wanted to give the organization every reasonable opportunity to fully remediate the issue and notify affected users. The vulnerability has since been addressed, but to my knowledge, I have not received confirmation that affected users were notified. I have reached out to the organization to ask for clarification on this matter.&lt;/p&gt;
+    &lt;p&gt;This is the story of what happened when I tried to do the right thing.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Vulnerability&lt;/head&gt;
+    &lt;p&gt;To understand why this is so bad, you need to know how the registration process works. As a diving instructor, I register my students (to get them insured) through my account on the portal. I enter their personal information with their consent - name, date of birth, address, phone number, email - and the system creates an account for them. The student then receives an email with their new account credentials: a numeric user ID and a default password. They might log in to complete additional information, or they might never touch the portal again.&lt;/p&gt;
+    &lt;p&gt;When I registered three students in quick succession, they were sitting right next to me and checked their welcome emails. The user IDs were nearly identical - sequential numbers, one after the other. That's when it clicked that something really bad was going on.&lt;/p&gt;
+    &lt;p&gt;Now here's the problem: the portal used incrementing numeric user IDs for login. User XXXXXX0, XXXXXX1, XXXXXX2, and so on. That alone is a red flag, but it gets worse: every account was provisioned with a static default password that was never enforced to be changed on first login. And many users - especially students who had their accounts created for them by their instructors - never changed it.&lt;/p&gt;
+    &lt;p&gt;So the "authentication" to access a user's full profile - name, address, phone number, email, date of birth - was:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Guess a number.&lt;/item&gt;
+      &lt;item&gt;Type the same default password that every account shares on account creation.&lt;/item&gt;
+      &lt;item&gt;There's a good chance you get in.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;That's it. No rate limiting. No account lockout. No MFA. Just an incrementing integer and a password that might as well have been &lt;code&gt;password123&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;I verified the issue with the minimum access necessary to confirm the scope - and stopped immediately after. A significant portion of IDs in the sample were still using the default password. The data exposed wasn't just email addresses - it included full personal profiles, including those of underage students.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Proof of Concept&lt;/head&gt;
+    &lt;p&gt;To confirm the issue wasn't limited to a handful of accounts, I wrote a short script that automated what could be done manually in any browser. I first tried Python &lt;code&gt;requests&lt;/code&gt;, but the portal's login mechanism was convoluted enough that a clean session wasn't feasible. So I used Selenium - a browser automation tool - which just drives a real browser through the same steps any user would take manually.&lt;/p&gt;
+    &lt;p&gt;The following is a simplified, non-functional excerpt of the script. Identifiers, endpoints, and implementation details have been HEAVILY removed or altered - this will not run as-is and is included only to illustrate the triviality of the issue:&lt;/p&gt;
+    &lt;code&gt;# Simplified, non-runnable excerpt - details redacted
+
+def check_account(user_id):
+    driver = webdriver.Chrome()
+    driver.get(LOGIN_URL)
+
+    driver.find_element(...).send_keys(str(user_id)) # numeric user ID
+    driver.find_element(...).send_keys(DEFAULT_PASSWORD) # same for each user on creation
+    driver.find_element(...).click() # submit
+
+    if "failed" not in driver.page_source:
+        driver.get(PROFILE_URL)
+        save_profile_data(user_id, driver) # name, DOB, address, phone, email
+        driver.get(LOGOUT_URL)
+
+    driver.quit()
+
+for uid in range(START_ID, END_ID):
+    check_account(uid)&lt;/code&gt;
+    &lt;p&gt;No exploits, no buffer overflows, no zero-days. Just a login form, a number, and a default password that was set for each student on creation. This is the kind of issue that anyone could discover and reproduce in an afternoon.&lt;/p&gt;
+    &lt;p&gt;Here's what the output looked like for a single successful login - redacted, but structurally identical to the real output:&lt;/p&gt;
+    &lt;code&gt;--- Dump for user ID: XXXXXXX ---
+
+[Table 1]
+Member ID: XXXXXXX
+E-Mail address: j.doe@example.com
+Language: English
+Time Zone: Greenwich Mean Time
+
+[Table 2]
+First name: Jane
+Middle name:
+Last Name: Doe
+Gender: Female
+Date of birth: 2011
+Birthplace: Switzerland
+Nationality: Switzerland
+Mobile number: *redacted*
+Phone number: *redacted*
+Business phone number:
+Fax number:
+Number to call in case of emergency: *redacted*
+Skype:
+Education level:
+Job:
+Diving since:
+Number of dives per year:
+Heard about *redacted* from:
+
+[Table 3]
+c/o:
+Details: Local 50
+Address: Calle Example
+No.: 54
+Zip: 35140
+City: Sometown
+Country: Spain
+Region: Some Region
+Tax ID:&lt;/code&gt;
+    &lt;p&gt;Read that date of birth again. 2011. This person was 14 years old at the time. Their full name, email address, phone number, nationality, and physical home address - all accessible with nothing more than a sequential number and a default password. And this wasn't a one-off. Multiple profiles belonged to minors.&lt;/p&gt;
+    &lt;p&gt;I want to be absolutely clear: all data obtained during this verification has been permanently deleted. I did not retain any personal information, I did not attempt to access anything beyond what was required to confirm the report, and I stopped as soon as the scope was established.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Disclosure&lt;/head&gt;
+    &lt;p&gt;I did everything by the book. I contacted CSIRT Malta (MaltaCIP) first - since the organization is registered in Malta, this is the competent national authority. The Maltese National Coordinated Vulnerability Disclosure Policy (NCVDP) explicitly requires that confirmed vulnerabilities be reported to both the responsible organization and CSIRTMalta.&lt;/p&gt;
+    &lt;p&gt;Then I emailed the organisation directly, CC'ing CSIRT:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Dear Sir or Madam,&lt;/p&gt;
+      &lt;p&gt;As a fellow diving instructor insured through [the organization] and a full-time Linux Platform Engineer, I am contacting you to responsibly disclose a critical vulnerability I identified within the [the organization]'s user account system.&lt;/p&gt;
+      &lt;p&gt;During recent testing, I discovered that user accounts - including those of underage students - are accessible through a combination of predictable User ID enumeration (incrementing user IDs) and the use of a static default password that is not enforced to be changed upon first login. This misconfiguration currently exposes sensitive personal data (e.g., names, addresses, contact information - including phone numbers and emails -, dates of birth) and represents multiple GDPR violations.&lt;/p&gt;
+      &lt;p&gt;Key details:&lt;/p&gt;
+      &lt;item&gt;Password reuse across accounts without forced password reset&lt;/item&gt;
+      &lt;item&gt;Predictable, incremental user ID enumeration&lt;/item&gt;
+      &lt;item&gt;Exposure of sensitive and underage user data without adequate safeguards&lt;/item&gt;
+      &lt;p&gt;For initial confirmation, I am attaching a screenshot from Member ID XXXXXXX showing the exposed data, partly redacted for privacy reasons.&lt;/p&gt;
+      &lt;p&gt;Additionally, for transparency and validation, I have shared my proof-of-concept code securely via an encrypted paste service: [link redacted]&lt;/p&gt;
+      &lt;p&gt;In the spirit of responsible disclosure, I have already informed CSIRT Malta (in CC) to officially initiate a reporting process, given [the organization]'s operational presence in Malta.&lt;/p&gt;
+      &lt;p&gt;I kindly request that [the organization] acknowledges receipt of this disclosure within 7 days.&lt;/p&gt;
+      &lt;p&gt;I am offering a window of 30 days from today the 28th of April 2025 for [the organization] to mitigate or resolve the vulnerability before I consider any public disclosure.&lt;/p&gt;
+      &lt;p&gt;Please note that I am fully available to assist your IT team with technical details, verification steps and recommendations from a security perspective.&lt;/p&gt;
+      &lt;p&gt;[contact details]&lt;/p&gt;
+      &lt;p&gt;I strongly recommend assigning an IT-Security Point of Contact (PoC) for direct collaboration on this issue.&lt;/p&gt;
+      &lt;p&gt;Thank you very much for your attention to this critical matter. I am looking forward to working with you towards a secure resolution.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Both of these timelines are standard - if anything, generous - in responsible disclosure frameworks.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Response&lt;/head&gt;
+    &lt;p&gt;Two days later, I got a reply. Not from their IT team. From their Data Privacy Officers (DPO's) law firm.&lt;/p&gt;
+    &lt;p&gt;The letter opened politely enough - they acknowledged the issue and said they'd launched an investigation. They even mentioned they were resetting default passwords and planning to roll out 2FA. Good.&lt;/p&gt;
+    &lt;p&gt;But then the tone shifted:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;While we genuinely appreciate your seemingly good intentions and transparency in highlighting this matter to our attention, we must respectfully note that notifying the authorities prior to contacting the Group creates additional complexities in how the matter is perceived and addressed and also exposes us to unfair liability.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Let me translate: "We wish you hadn't told the government about our security issue."&lt;/p&gt;
+    &lt;p&gt;It got better:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;We also do not appreciate your threat to make this matter public [...] and remind you that you may be held accountable for any damage we, or the data subjects, may suffer as a result of your own actions, which actions likely constitute a criminal offence under Maltese law.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;So, to be clear: their portal had a default password on every account, exposing personal data including that of children, and I'm the one who "likely" committed a criminal offence by finding it and telling them.&lt;/p&gt;
+    &lt;p&gt;They also sent a declaration they wanted me to sign - while requesting my passport ID - confirming I'd deleted all data, wouldn't disclose anything, and would keep the entire matter "strictly confidential." The deadline? End of business the same day they sent it.&lt;/p&gt;
+    &lt;p&gt;This declaration included the following gem:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;I also declare that I shall keep the content of this declaration strictly confidential.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;That's an NDA with extra steps: I was being asked to sign away my right to discuss the disclosure process itself - including the fact that I found a vulnerability in their system - under threat of legal action.&lt;/p&gt;
+    &lt;p&gt;Then came the reminders. One "friendly" reminder. Then an "urgent" one. Sign the declaration. De-escalate. Move on. Quietly.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Pushback&lt;/head&gt;
+    &lt;p&gt;I generally refuse to sign confidentiality clauses in cases involving exposure of sensitive information, and I did so here as well. Coordinated disclosure depends on transparency and trust between researchers and organizations: trust that affected users will be informed, and trust that a report leads to real remediation.&lt;/p&gt;
+    &lt;p&gt;Given that the organization in question had already breached that trust by exposing personal data through weak controls, I wasn’t willing to grant blanket confidentiality that could be used to keep the incident out of public scrutiny. And with trying to actual silence me through legal threats, they had already made it clear that their priority was reputation management over user data protection. So I stood my ground.&lt;/p&gt;
+    &lt;p&gt;Instead, I offered to sign a modified declaration confirming data deletion. I had no interest in retaining anyone’s personal data, but I was not going to agree to silence about the disclosure process itself.&lt;/p&gt;
+    &lt;p&gt;I also pointed out that, under Malta’s NCVDP, involving CSIRT Malta is part of the expected reporting path - not a hostile act - and that publishing post-remediation analyses is standard practice in the security community.&lt;/p&gt;
+    &lt;p&gt;Their response doubled down. They cited Article 337E of the Maltese Criminal Code - computer misuse - and helpfully reminded me that:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Art. 337E of the Criminal Code also provides that "If any act is committed outside Malta which, had it been committed in Malta, would have constituted an offence [...] it shall [...] be deemed to have been committed in Malta." Meaning that your actions would be deemed a criminal offence in Malta, even if committed in another country.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;They also made their position on disclosure crystal clear, after I reiterated my refusal to sign their NDA:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;We object strongly to the use of [the organization's name] in any such blogs or conferences you may write/attend as this would be a disproportionate harm to [the organization's] reputation [...]. We reserve our rights at law to hold you responsible for any damages [the organization] may suffer as a result of any such public disclosures you may make.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;That's fine by me. Because here's the thing: The vulnerability has been fixed. Default passwords have been reset. 2FA is being rolled out. I feel sorry for the developer(s) who had to clean up this mess, but at least the issue is no longer exploitable. Sure, it would have been better if the organization had thanked me and taken responsibility for notifying affected users. If the incident qualified as a personal data breach (which it does) and was likely to result in a (high) risk to individuals - especially given minors were involved - GDPR Articles 33 and 34 generally require notification to the supervisory authority and communication to affected data subjects.&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;GDPR Article 34(1) When the personal data breach is likely to result in a high risk to the rights and freedoms of natural persons, the controller shall communicate the personal data breach to the data subject without undue delay.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;quote&gt;
+      &lt;p&gt;GDPR Article 34(2) The communication to the data subject referred to in paragraph 1 of this Article shall describe in clear and plain language the nature of the personal data breach and contain at least the information and measures referred to in points (b), (c) and (d) of Article 33(3).&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;I have not received confirmation that those notifications were ever carried out.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Blame Game&lt;/head&gt;
+    &lt;p&gt;My favourite part was the organization's position on whose fault this actually was:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;We contend that it is the responsibility of users to change their own password (after we allocate a default one).&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Read that again. A company that assigned the same default password to every account, never forced a password change, and used incrementing numeric IDs as usernames is blaming the users for not securing their own accounts. Accounts that include those of minors.&lt;/p&gt;
+    &lt;p&gt;Just a quick reminder:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;GDPR Article 5(1)(f) (integrity and confidentiality): Personal data shall be processed in a manner that ensures appropriate security of the personal data, including protection against unauthorised or unlawful processing and against accidental loss, destruction or damage, using appropriate technical or organisational measures.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Under GDPR, the data controller (namely: the organization) is responsible for implementing appropriate technical and organizational measures to ensure data security. A static default password on an IDOR-vulnerable portal is not an "appropriate measure" by any definition.&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;GDPR Article 24(1) (controller responsibility): Taking into account the nature, scope, context and purposes of processing as well as the risks of varying likelihood and severity for the rights and freedoms of natural persons, the controller shall implement appropriate technical and organisational measures to ensure and to be able to demonstrate that processing is performed in accordance with this Regulation. Those measures shall be reviewed and updated where necessary.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;head rend="h2"&gt;The Pattern&lt;/head&gt;
+    &lt;p&gt;This isn't an isolated case. The security research community has been dealing with this pattern for decades: find a vulnerability, report it responsibly, get threatened with legal action. It's so common it has a name - the chilling effect.&lt;/p&gt;
+    &lt;p&gt;Organizations that respond to disclosure with lawyers instead of engineers are telling the world something important: they care more about their reputation than about the data they're supposed to protect.&lt;/p&gt;
+    &lt;p&gt;And the real irony? The legal threats are the reputation damage. Not the vulnerability itself - vulnerabilities happen to everyone. It's the response that tells you everything about an organization's security culture.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What Should Have Happened&lt;/head&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Acknowledge the report - they did this, to be fair.&lt;/item&gt;
+      &lt;item&gt;Fix the vulnerability - they started on this too.&lt;/item&gt;
+      &lt;item&gt;Thank the researcher - instead of threatening them with criminal prosecution.&lt;/item&gt;
+      &lt;item&gt;Have a CVD policy - so researchers know how to report issues and what to expect.&lt;/item&gt;
+      &lt;item&gt;Notify affected users - especially the parents of underage members whose data was exposed.&lt;/item&gt;
+      &lt;item&gt;Not try to silence the researcher with NDAs disguised as "declarations."&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;What You Can Do&lt;/head&gt;
+    &lt;p&gt;If you're an organization:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Publish a Coordinated Vulnerability Disclosure policy. It doesn't have to be complex - maybe begin with a security.txt file and a clear process that favors transparency.&lt;/item&gt;
+      &lt;item&gt;Thank researchers for helping you improve your security posture.&lt;/item&gt;
+      &lt;item&gt;Don't shoot the messenger. The person reporting the bug is not your enemy. The bug is.&lt;/item&gt;
+      &lt;item&gt;Don't blame your users for security failures that are your responsibility as a data controller.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;If you're a security researcher:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Always involve your national CSIRT. It protects you and creates an official record.&lt;/item&gt;
+      &lt;item&gt;Document everything. Every email, every timestamp, every response.&lt;/item&gt;
+      &lt;item&gt;Don't sign NDAs that prevent you from discussing the disclosure process. But you can agree to delete data (and MUST do so!) without agreeing to silence.&lt;/item&gt;
+      &lt;item&gt;Know your rights. Many jurisdictions have legal protections for good-faith security research. The EU's NIS2 Directive encourages coordinated vulnerability disclosure.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Because right now, in 2026, reporting a trivial vulnerability exposing personal data - including that of children - still gets met with legal threats instead of gratitude. And that's a problem for all of us.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47092578</guid><pubDate>Fri, 20 Feb 2026 19:19:58 +0000</pubDate></item></channel></rss>
