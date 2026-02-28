@@ -1,869 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Fri, 27 Feb 2026 23:43:26 +0000</lastBuildDate><item><title>A better streams API is possible for JavaScript</title><link>https://blog.cloudflare.com/a-better-web-streams-api/</link><description>&lt;doc fingerprint="e652bf00c8188f8e"&gt;
-  &lt;main&gt;
-    &lt;div&gt;
-      &lt;p&gt;Handling data in streams is fundamental to how we build applications. To make streaming work everywhere, the WHATWG Streams Standard (informally known as "Web streams") was designed to establish a common API to work across browsers and servers. It shipped in browsers, was adopted by Cloudflare Workers, Node.js, Deno, and Bun, and became the foundation for APIs like fetch(). It's a significant undertaking, and the people who designed it were solving hard problems with the constraints and tools they had at the time.&lt;/p&gt;
-      &lt;p&gt;But after years of building on Web streams â implementing them in both Node.js and Cloudflare Workers, debugging production issues for customers and runtimes, and helping developers work through far too many common pitfalls â I've come to believe that the standard API has fundamental usability and performance issues that cannot be fixed easily with incremental improvements alone. The problems aren't bugs; they're consequences of design decisions that may have made sense a decade ago, but don't align with how JavaScript developers write code today.&lt;/p&gt;
-      &lt;p&gt;This post explores some of the fundamental issues I see with Web streams and presents an alternative approach built around JavaScript language primitives that demonstrate something better is possible.Â &lt;/p&gt;
-      &lt;p&gt;In benchmarks, this alternative can run anywhere between 2x to 120x faster than Web streams in every runtime I've tested it on (including Cloudflare Workers, Node.js, Deno, Bun, and every major browser). The improvements are not due to clever optimizations, but fundamentally different design choices that more effectively leverage modern JavaScript language features. I'm not here to disparage the work that came before; I'm here to start a conversation about what can potentially come next.&lt;/p&gt;
-      &lt;p&gt;The Streams Standard was developed between 2014 and 2016 with an ambitious goal to provide "APIs for creating, composing, and consuming streams of data that map efficiently to low-level I/O primitives." Before Web streams, the web platform had no standard way to work with streaming data.&lt;/p&gt;
-      &lt;p&gt;Node.js already had its own streaming API at the time that was ported to also work in browsers, but WHATWG chose not to use it as a starting point given that it is chartered to only consider the needs of Web browsers. Server-side runtimes only adopted Web streams later, after Cloudflare Workers and Deno each emerged with first-class Web streams support and cross-runtime compatibility became a priority.&lt;/p&gt;
-      &lt;p&gt;The design of Web streams predates async iteration in JavaScript. The &lt;code&gt;for await...of&lt;/code&gt; syntax didn't land until ES2018, two years after the Streams Standard was initially finalized. This timing meant the API couldn't initially leverage what would eventually become the idiomatic way to consume asynchronous sequences in JavaScript. Instead, the spec introduced its own reader/writer acquisition model, and that decision rippled through every aspect of the API.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;Excessive ceremony for common operations&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;The most common task with streams is reading them to completion. Here's what that looks like with Web streams:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;// First, we acquire a reader that gives an exclusive lock
-// on the stream...
-const reader = stream.getReader();
-const chunks = [];
-try {
-  // Second, we repeatedly call read and await on the returned
-  // promise to either yield a chunk of data or indicate we're
-  // done.
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-  }
-} finally {
-  // Finally, we release the lock on the stream
-  reader.releaseLock();
-}&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;You might assume this pattern is inherent to streaming. It isn't. The reader acquisition, the lock management, and the &lt;code&gt;{ value, done }&lt;/code&gt; protocol are all just design choices, not requirements. They are artifacts of how and when the Web streams spec was written. Async iteration exists precisely to handle sequences that arrive over time, but async iteration did not yet exist when the streams specification was written. The complexity here is pure API overhead, not fundamental necessity.&lt;/p&gt;
-      &lt;p&gt;Consider the alternative approach now that Web streams do support &lt;code&gt;for await...of&lt;/code&gt;:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;const chunks = [];
-for await (const chunk of stream) {
-  chunks.push(chunk);
-}&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;This is better in that there is far less boilerplate, but it doesn't solve everything. Async iteration was retrofitted onto an API that wasn't designed for it, and it shows. Features like BYOB (bring your own buffer) reads aren't accessible through iteration. The underlying complexity of readers, locks, and controllers are still there, just hidden. When something does go wrong, or when additional features of the API are needed, developers find themselves back in the weeds of the original API, trying to understand why their stream is "locked" or why &lt;code&gt;releaseLock()&lt;/code&gt; didn't do what they expected or hunting down bottlenecks in code they don't control.&lt;/p&gt;
-      &lt;p&gt;Web streams use a locking model to prevent multiple consumers from interleaving reads. When you call &lt;code&gt;getReader()&lt;/code&gt;, the stream becomes locked. While locked, nothing else can read from the stream directly, pipe it, or even cancel it â only the code that is actually holding the reader can.&lt;/p&gt;
-      &lt;p&gt;This sounds reasonable until you see how easily it goes wrong:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;async function peekFirstChunk(stream) {
-  const reader = stream.getReader();
-  const { value } = await reader.read();
-  // Oops â forgot to call reader.releaseLock()
-  // And the reader is no longer available when we return
-  return value;
-}
-
-const first = await peekFirstChunk(stream);
-// TypeError: Cannot obtain lock â stream is permanently locked
-for await (const chunk of stream) { /* never runs */ }&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;Forgetting &lt;code&gt;releaseLock()&lt;/code&gt; permanently breaks the stream. The &lt;code&gt;locked&lt;/code&gt;&lt;code&gt; &lt;/code&gt;property tells you that a stream is locked, but not why, by whom, or whether the lock is even still usable. Piping internally acquires locks, making streams unusable during pipe operations in ways that aren't obvious.&lt;/p&gt;
-      &lt;p&gt;The semantics around releasing locks with pending reads were also unclear for years. If you called read() but didn't await it, then called releaseLock(), what happened? The spec was recently clarified to cancel pending reads on lock release â but implementations varied, and code that relied on the previous unspecified behavior can break.&lt;/p&gt;
-      &lt;p&gt;That said, it's important to recognize that locking in itself is not bad. It does, in fact, serve an important purpose to ensure that applications properly and orderly consume or produce data. The key challenge is with the original manual implementation of it using APIs like &lt;code&gt;getReader() &lt;/code&gt;and &lt;code&gt;releaseLock()&lt;/code&gt;. With the arrival of automatic lock and reader management with async iterables, dealing with locks from the users point of view became a lot easier.&lt;/p&gt;
-      &lt;p&gt;For implementers, the locking model adds a fair amount of non-trivial internal bookkeeping. Every operation must check lock state, readers must be tracked, and the interplay between locks, cancellation, and error states creates a matrix of edge cases that must all be handled correctly.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;BYOB: complexity without payoff&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;BYOB (bring your own buffer) reads were designed to let developers reuse memory buffers when reading from streams, an important optimization intended for high-throughput scenarios. The idea is sound: instead of allocating new buffers for each chunk, you provide your own buffer and the stream fills it.&lt;/p&gt;
-      &lt;p&gt;In practice, (and yes, there are always exceptions to be found) BYOB is rarely used to any measurable benefit. The API is substantially more complex than default reads, requiring a separate reader type (&lt;code&gt;ReadableStreamBYOBReader&lt;/code&gt;) and other specialized classes (e.g. &lt;code&gt;ReadableStreamBYOBRequest&lt;/code&gt;), careful buffer lifecycle management, and understanding of &lt;code&gt;ArrayBuffer&lt;/code&gt; detachment semantics. When you pass a buffer to a BYOB read, the buffer becomes detached â transferred to the stream â and you get back a different view over potentially different memory. This transfer-based model is error-prone and confusing:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;const reader = stream.getReader({ mode: 'byob' });
-const buffer = new ArrayBuffer(1024);
-let view = new Uint8Array(buffer);
-
-const result = await reader.read(view);
-// 'view' should now be detached and unusable
-// (it isn't always in every impl)
-// result.value is a NEW view, possibly over different memory
-view = result.value; // Must reassign&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;BYOB also can't be used with async iteration or TransformStreams, so developers who want zero-copy reads are forced back into the manual reader loop.&lt;/p&gt;
-      &lt;p&gt;For implementers, BYOB adds significant complexity. The stream must track pending BYOB requests, handle partial fills, manage buffer detachment correctly, and coordinate between the BYOB reader and the underlying source. The Web Platform Tests for readable byte streams include dedicated test files just for BYOB edge cases: detached buffers, bad views, response-after-enqueue ordering, and more.&lt;/p&gt;
-      &lt;p&gt;BYOB ends up being complex for both users and implementers, yet sees little adoption in practice. Most developers stick with default reads and accept the allocation overhead.&lt;/p&gt;
-      &lt;p&gt;Most userland implementations of custom ReadableStream instances do not typically bother with all the ceremony required to correctly implement both default and BYOB read support in a single stream â and for good reason. It's difficult to get right and most of the time consuming code is typically going to fallback on the default read path. The example below shows what a "correct" implementation would need to do. It's big, complex, and error prone, and not a level of complexity that the typical developer really wants to have to deal with:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;new ReadableStream({
-    type: 'bytes',
-    
-    async pull(controller: ReadableByteStreamController) {      
-      if (offset &amp;gt;= totalBytes) {
-        controller.close();
-        return;
-      }
-      
-      // Check for BYOB request FIRST
-      const byobRequest = controller.byobRequest;
-      
-      if (byobRequest) {
-        // === BYOB PATH ===
-        // Consumer provided a buffer - we MUST fill it (or part of it)
-        const view = byobRequest.view!;
-        const bytesAvailable = totalBytes - offset;
-        const bytesToWrite = Math.min(view.byteLength, bytesAvailable);
-        
-        // Create a view into the consumer's buffer and fill it
-        // not critical but safer when bytesToWrite != view.byteLength
-        const dest = new Uint8Array(
-          view.buffer,
-          view.byteOffset,
-          bytesToWrite
-        );
-        
-        // Fill with sequential bytes (our "data source")
-        // Can be any thing here that writes into the view
-        for (let i = 0; i &amp;lt; bytesToWrite; i++) {
-          dest[i] = (offset + i) &amp;amp; 0xFF;
-        }
-        
-        offset += bytesToWrite;
-        
-        // Signal how many bytes we wrote
-        byobRequest.respond(bytesToWrite);
-        
-      } else {
-        // === DEFAULT READER PATH ===
-        // No BYOB request - allocate and enqueue a chunk
-        const bytesAvailable = totalBytes - offset;
-        const chunkSize = Math.min(1024, bytesAvailable);
-        
-        const chunk = new Uint8Array(chunkSize);
-        for (let i = 0; i &amp;lt; chunkSize; i++) {
-          chunk[i] = (offset + i) &amp;amp; 0xFF;
-        }
-        
-        offset += chunkSize;
-        controller.enqueue(chunk);
-      }
-    },
-    
-    cancel(reason) {
-      console.log('Stream canceled:', reason);
-    }
-  });&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;When a host runtime provides a byte-oriented ReadableStream from the runtime itself, for instance, as the &lt;code&gt;body &lt;/code&gt;of a fetch &lt;code&gt;Response&lt;/code&gt;, it is often far easier for the runtime itself to provide an optimized implementation of BYOB reads, but those still need to be capable of handling both default and BYOB reading patterns and that requirement brings with it a fair amount of complexity.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;Backpressure: good in theory, broken in practice&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;Backpressure â the ability for a slow consumer to signal a fast producer to slow down â is a first-class concept in Web streams. In theory. In practice, the model has some serious flaws.&lt;/p&gt;
-      &lt;p&gt;The primary signal is &lt;code&gt;desiredSize&lt;/code&gt; on the controller. It can be positive (wants data), zero (at capacity), negative (over capacity), or null (closed). Producers are supposed to check this value and stop enqueueing when it's not positive. But there's nothing enforcing this: &lt;code&gt;controller.enqueue()&lt;/code&gt; always succeeds, even when desiredSize is deeply negative.&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;new ReadableStream({
-  start(controller) {
-    // Nothing stops you from doing this
-    while (true) {
-      controller.enqueue(generateData()); // desiredSize: -999999
-    }
-  }
-});&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;Stream implementations can and do ignore backpressure; and some spec-defined features explicitly break backpressure. &lt;code&gt;tee()&lt;/code&gt;, for instance, creates two branches from a single stream. If one branch reads faster than the other, data accumulates in an internal buffer with no limit. A fast consumer can cause unbounded memory growth while the slow consumer catches up, and there's no way to configure this or opt out beyond canceling the slower branch.&lt;/p&gt;
-      &lt;p&gt;Web streams do provide clear mechanisms for tuning backpressure behavior in the form of the &lt;code&gt;highWaterMark&lt;/code&gt; option and customizable size calculations, but these are just as easy to ignore as &lt;code&gt;desiredSize&lt;/code&gt;, and many applications simply fail to pay attention to them.&lt;/p&gt;
-      &lt;p&gt;The same issues exist on the &lt;code&gt;WritableStream&lt;/code&gt; side. A &lt;code&gt;WritableStream&lt;/code&gt; has a &lt;code&gt;highWaterMark&lt;/code&gt; and &lt;code&gt;desiredSize&lt;/code&gt;. There is a &lt;code&gt;writer.ready&lt;/code&gt; promise that producers of data are supposed to pay attention but often don't.&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;const writable = getWritableStreamSomehow();
-const writer = writable.getWriter();
-
-// Producers are supposed to wait for the writer.ready
-// It is a promise that, when resolves, indicates that
-// the writables internal backpressure is cleared and
-// it is ok to write more data
-await writer.ready;
-await writer.write(...);&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;For implementers, backpressure adds complexity without providing guarantees. The machinery to track queue sizes, compute &lt;code&gt;desiredSize&lt;/code&gt;, and invoke &lt;code&gt;pull()&lt;/code&gt; at the right times must all be implemented correctly. However, since these signals are advisory, all that work doesn't actually prevent the problems backpressure is supposed to solve.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;The hidden cost of promises&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;The Web streams spec requires promise creation at numerous points, often in hot paths and often invisible to users. Each &lt;code&gt;read()&lt;/code&gt; call doesn't just return a promise; internally, the implementation creates additional promises for queue management, &lt;code&gt;pull()&lt;/code&gt; coordination, and backpressure signaling.&lt;/p&gt;
-      &lt;p&gt;This overhead is mandated by the spec's reliance on promises for buffer management, completion, and backpressure signals. While some of it is implementation-specific, much of it is unavoidable if you're following the spec as written. For high-frequency streaming â video frames, network packets, real-time data â this overhead is significant.&lt;/p&gt;
-      &lt;p&gt;The problem compounds in pipelines. Each &lt;code&gt;TransformStream&lt;/code&gt; adds another layer of promise machinery between source and sink. The spec doesn't define synchronous fast paths, so even when data is available immediately, the promise machinery still runs.&lt;/p&gt;
-      &lt;p&gt;For implementers, this promise-heavy design constrains optimization opportunities. The spec mandates specific promise resolution ordering, making it difficult to batch operations or skip unnecessary async boundaries without risking subtle compliance failures. There are many hidden internal optimizations that implementers do make but these can be complicated and difficult to get right.&lt;/p&gt;
-      &lt;p&gt;While I was writing this blog post, Vercel's Malte Ubl published their own blog post describing some research work Vercel has been doing around improving the performance of Node.js' Web streams implementation. In that post they discuss the same fundamental performance optimization problem that every implementation of Web streams face:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;p&gt;"Or consider pipeTo(). Each chunk passes through a full Promise chain: read, write, check backpressure, repeat. An {value, done} result object is allocated per read. Error propagation creates additional Promise branches.&lt;/p&gt;
-        &lt;p&gt;None of this is wrong. These guarantees matter in the browser where streams cross security boundaries, where cancellation semantics need to be airtight, where you do not control both ends of a pipe. But on the server, when you are piping React Server Components through three transforms at 1KB chunks, the cost adds up.&lt;/p&gt;
-        &lt;p&gt;We benchmarked native WebStream pipeThrough at 630 MB/s for 1KB chunks. Node.js pipeline() with the same passthrough transform: ~7,900 MB/s. That is a 12x gap, and the difference is almost entirely Promise and object allocation overhead." - Malte Ubl, https://vercel.com/blog/we-ralph-wiggumed-webstreams-to-make-them-10x-faster&lt;/p&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;As part of their research, they have put together a set of proposed improvements for Node.js' Web streams implementation that will eliminate promises in certain code paths which can yield a significant performance boost up to 10x faster, which only goes to prove the point: promises, while useful, add significant overhead. As one of the core maintainers of Node.js, I am looking forward to helping Malte and the folks at Vercel get their proposed improvements landed!&lt;/p&gt;
-      &lt;p&gt;In a recent update made to Cloudflare Workers, I made similar kinds of modifications to an internal data pipeline that reduced the number of JavaScript promises created in certain application scenarios by up to 200x. The result is several orders of magnitude improvement in performance in those applications.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;Exhausting resources with unconsumed bodies&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;When &lt;code&gt;fetch()&lt;/code&gt; returns a response, the body is a &lt;code&gt;ReadableStream&lt;/code&gt;. If you only check the status and don't consume or cancel the body, what happens? The answer varies by implementation, but a common outcome is resource leakage.&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;async function checkEndpoint(url) {
-  const response = await fetch(url);
-  return response.ok; // Body is never consumed or cancelled
-}
-
-// In a loop, this can exhaust connection pools
-for (const url of urls) {
-  await checkEndpoint(url);
-}&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;This pattern has caused connection pool exhaustion in Node.js applications using undici (the &lt;code&gt;fetch() &lt;/code&gt;implementation built into Node.js), and similar issues have appeared in other runtimes. The stream holds a reference to the underlying connection, and without explicit consumption or cancellation, the connection may linger until garbage collection â which may not happen soon enough under load.&lt;/p&gt;
-      &lt;p&gt;The problem is compounded by APIs that implicitly create stream branches. &lt;code&gt;Request.clone()&lt;/code&gt; and &lt;code&gt;Response.clone()&lt;/code&gt; perform implicit &lt;code&gt;tee()&lt;/code&gt; operations on the body stream â a detail that's easy to miss. Code that clones a request for logging or retry logic may unknowingly create branched streams that need independent consumption, multiplying the resource management burden.&lt;/p&gt;
-      &lt;p&gt;Now, to be certain, these types of issues are implementation bugs. The connection leak was definitely something that undici needed to fix in its own implementation, but the complexity of the specification does not make dealing with these types of issues easy.&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;p&gt;"Cloning streams in Node.js's fetch() implementation is harder than it looks. When you clone a request or response body, you're calling tee() - which splits a single stream into two branches that both need to be consumed. If one consumer reads faster than the other, data buffers unbounded in memory waiting for the slow branch. If you don't properly consume both branches, the underlying connection leaks. The coordination required between two readers sharing one source makes it easy to accidentally break the original request or exhaust connection pools. It's a simple API call with complex underlying mechanics that are difficult to get right." - Matteo Collina, Ph.D. - Platformatic Co-Founder &amp;amp; CTO, Node.js Technical Steering Committee Chair&lt;/p&gt;
-      &lt;/quote&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;Falling headlong off the tee() memory cliff&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;&lt;code&gt;tee()&lt;/code&gt; splits a stream into two branches. It seems straightforward, but the implementation requires buffering: if one branch is read faster than the other, the data must be held somewhere until the slower branch catches up.&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;const [forHash, forStorage] = response.body.tee();
-
-// Hash computation is fast
-const hash = await computeHash(forHash);
-
-// Storage write is slow â meanwhile, the entire stream
-// may be buffered in memory waiting for this branch
-await writeToStorage(forStorage);&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;The spec does not mandate buffer limits for &lt;code&gt;tee()&lt;/code&gt;. And to be fair, the spec allows implementations to implement the actual internal mechanisms for &lt;code&gt;tee()&lt;/code&gt;and other APIs in any way they see fit so long as the observable normative requirements of the specification are met. But if an implementation chooses to implement &lt;code&gt;tee()&lt;/code&gt; in the specific way described by the streams specification, then &lt;code&gt;tee()&lt;/code&gt; will come with a built-in memory management issue that is difficult to work around.&lt;/p&gt;
-      &lt;p&gt;Implementations have had to develop their own strategies for dealing with this. Firefox initially used a linked-list approach that led to O&lt;code&gt;(n)&lt;/code&gt; memory growth proportional to the consumption rate difference. In Cloudflare Workers, we opted to implement a shared buffer model where backpressure is signaled by the slowest consumer rather than the fastest.&lt;/p&gt;
-      &lt;p&gt;&lt;code&gt;TransformStream&lt;/code&gt; creates a &lt;code&gt;readable/writable&lt;/code&gt; pair with processing logic in between. The &lt;code&gt;transform()&lt;/code&gt; function executes on write, not on read. Processing of the transform happens eagerly as data arrives, regardless of whether any consumer is ready. This causes unnecessary work when consumers are slow, and the backpressure signaling between the two sides has gaps that can cause unbounded buffering under load. The expectation in the spec is that the producer of the data being transformed is paying attention to the &lt;code&gt;writer.ready&lt;/code&gt; signal on the writable side of the transform but quite often producers just simply ignore it.&lt;/p&gt;
-      &lt;p&gt;If the transform's &lt;code&gt;transform() &lt;/code&gt;operation is synchronous and always enqueues output immediately, it never signals backpressure back to the writable side even when the downstream consumer is slow. This is a consequence of the spec design that many developers completely overlook. In browsers, where there's only a single user and typically only a small number of stream pipelines active at any given time, this type of foot gun is often of no consequence, but it has a major impact on server-side or edge performance in runtimes that serve thousands of concurrent requests.&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;const fastTransform = new TransformStream({
-  transform(chunk, controller) {
-    // Synchronously enqueue â this never applies backpressure
-    // Even if the readable side's buffer is full, this succeeds
-    controller.enqueue(processChunk(chunk));
-  }
-});
-
-// Pipe a fast source through the transform to a slow sink
-fastSource
-  .pipeThrough(fastTransform)
-  .pipeTo(slowSink);  // Buffer grows without bound&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;What TransformStreams are supposed to do is check for backpressure on the controller and use promises to communicate that back to the writer:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;const fastTransform = new TransformStream({
-  async transform(chunk, controller) {
-    if (controller.desiredSize &amp;lt;= 0) {
-      // Wait on the backpressure to clear somehow
-    }
-
-    controller.enqueue(processChunk(chunk));
-  }
-});&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;A difficulty here, however, is that the &lt;code&gt;TransformStreamDefaultController&lt;/code&gt; does not have a ready promise mechanism like Writers do; so the &lt;code&gt;TransformStream&lt;/code&gt; implementation would need to implement a polling mechanism to periodically check when &lt;code&gt;controller.desiredSize&lt;/code&gt;Â becomes positive again.&lt;/p&gt;
-      &lt;p&gt;The problem gets worse in pipelines. When you chain multiple transforms â say, parse, transform, then serialize â each &lt;code&gt;TransformStream&lt;/code&gt; has its own internal readable and writable buffers. If implementers follow the spec strictly, data cascades through these buffers in a push-oriented fashion: the source pushes to transform A, which pushes to transform B, which pushes to transform C, each accumulating data in intermediate buffers before the final consumer has even started pulling. With three transforms, you can have six internal buffers filling up simultaneously.&lt;/p&gt;
-      &lt;p&gt;Developers using the streams API are expected to remember to use options like &lt;code&gt;highWaterMark&lt;/code&gt; when creating their sources, transforms, and writable destinations but often they either forget or simply choose to ignore it.&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;source
-  .pipeThrough(parse)      // buffers filling...
-  .pipeThrough(transform)  // more buffers filling...
-  .pipeThrough(serialize)  // even more buffers...
-  .pipeTo(destination);    // consumer hasn't started yet&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;Implementations have found ways to optimize transform pipelines by collapsing identity transforms, short-circuiting non-observable paths, deferring buffer allocation, or falling back to native code that does not run JavaScript at all. Deno, Bun, and Cloudflare Workers have all successfully implemented "native path" optimizations that can help eliminate much of the overhead, and Vercel's recent fast-webstreams research is working on similar optimizations for Node.js. But the optimizations themselves add significant complexity and still can't fully escape the inherently push-oriented model that TransformStream uses.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;GC thrashing in server-side rendering&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;Streaming server-side rendering (SSR) is a particularly painful case. A typical SSR stream might render thousands of small HTML fragments, each passing through the streams machinery:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;// Each component enqueues a small chunk
-function renderComponent(controller) {
-  controller.enqueue(encoder.encode(`&amp;lt;div&amp;gt;${content}&amp;lt;/div&amp;gt;`));
-}
-
-// Hundreds of components = hundreds of enqueue calls
-// Each one triggers promise machinery internally
-for (const component of components) {
-  renderComponent(controller);  // Promises created, objects allocated
-}&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;Every fragment means promises created for &lt;code&gt;read()&lt;/code&gt; calls, promises for backpressure coordination, intermediate buffer allocations, and &lt;code&gt;{ value, done } &lt;/code&gt;result objects â most of which become garbage almost immediately.&lt;/p&gt;
-      &lt;p&gt;Under load, this creates GC pressure that can devastate throughput. The JavaScript engine spends significant time collecting short-lived objects instead of doing useful work. Latency becomes unpredictable as GC pauses interrupt request handling. I've seen SSR workloads where garbage collection accounts for a substantial portion (up to and beyond 50%) of total CPU time per request. That's time that could be spent actually rendering content.&lt;/p&gt;
-      &lt;p&gt;The irony is that streaming SSR is supposed to improve performance by sending content incrementally. But the overhead of the streams machinery can negate those gains, especially for pages with many small components. Developers sometimes find that buffering the entire response is actually faster than streaming through Web streams, defeating the purpose entirely.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h3"&gt;The optimization treadmill&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;To achieve usable performance, every major runtime has resorted to non-standard internal optimizations for Web streams. Node.js, Deno, Bun, and Cloudflare Workers have all developed their own workarounds. This is particularly true for streams wired up to system-level I/O, where much of the machinery is non-observable and can be short-circuited.&lt;/p&gt;
-      &lt;p&gt;Finding these optimization opportunities can itself be a significant undertaking. It requires end-to-end understanding of the spec to identify which behaviors are observable and which can safely be elided. Even then, whether a given optimization is actually spec-compliant is often unclear. Implementers must make judgment calls about which semantics they can relax without breaking compatibility. This puts enormous pressure on runtime teams to become spec experts just to achieve acceptable performance.&lt;/p&gt;
-      &lt;p&gt;These optimizations are difficult to implement, frequently error-prone, and lead to inconsistent behavior across runtimes. Bun's "Direct Streams" optimization takes a deliberately and observably non-standard approach, bypassing much of the spec's machinery entirely. Cloudflare Workers' &lt;code&gt;IdentityTransformStream&lt;/code&gt; provides a fast-path for pass-through transforms but is Workers-specific and implements behaviors that are not standard for a &lt;code&gt;TransformStream&lt;/code&gt;. Each runtime has its own set of tricks and the natural tendency is toward non-standard solutions, because that's often the only way to make things fast.&lt;/p&gt;
-      &lt;p&gt;This fragmentation hurts portability. Code that performs well on one runtime may behave differently (or poorly) on another, even though it's using "standard" APIs. The complexity burden on runtime implementers is substantial, and the subtle behavioral differences create friction for developers trying to write cross-runtime code, particularly those maintaining frameworks that must be able to run efficiently across many runtime environments.&lt;/p&gt;
-      &lt;p&gt;It is also necessary to emphasize that many optimizations are only possible in parts of the spec that are unobservable to user code. The alternative, like Bun "Direct Streams", is to intentionally diverge from the spec-defined observable behaviors. This means optimizations often feel "incomplete". They work in some scenarios but not in others, in some runtimes but not others, etc. Every such case adds to the overall unsustainable complexity of the Web streams approach which is why most runtime implementers rarely put significant effort into further improvements to their streams implementations once the conformance tests are passing.&lt;/p&gt;
-      &lt;p&gt;Implementers shouldn't need to jump through these hoops. When you find yourself needing to relax or bypass spec semantics just to achieve reasonable performance, that's a sign something is wrong with the spec itself. A well-designed streaming API should be efficient by default, not require each runtime to invent its own escape hatches.&lt;/p&gt;
-      &lt;p&gt;A complex spec creates complex edge cases. The Web Platform Tests for streams span over 70 test files, and while comprehensive testing is a good thing, what's telling is what needs to be tested.&lt;/p&gt;
-      &lt;p&gt;Consider some of the more obscure tests that implementations must pass:&lt;/p&gt;
-      &lt;list rend="ul"&gt;
-        &lt;item&gt;
-          &lt;p&gt;Prototype pollution defense: One test patches &lt;code&gt;Object.prototype.&lt;/code&gt;then to intercept promise resolutions, then verifies that &lt;code&gt;pipeTo()&lt;/code&gt; and &lt;code&gt;tee()&lt;/code&gt; operations don't leak internal values through the prototype chain. This tests a security property that only exists because the spec's promise-heavy internals create an attack surface.&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;WebAssembly memory rejection: BYOB reads must explicitly reject ArrayBuffers backed by WebAssembly memory, which look like regular buffers but can't be transferred. This edge case exists because of the spec's buffer detachment model â a simpler API wouldn't need to handle it.&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;Crash regression for state machine conflicts: A test specifically checks that calling &lt;code&gt;byobRequest.respond()&lt;/code&gt; after &lt;code&gt;enqueue()&lt;/code&gt; doesn't crash the runtime. This sequence creates a conflict in the internal state machine â the &lt;code&gt;enqueue()&lt;/code&gt; fulfills the pending read and should invalidate the &lt;code&gt;byobRequest&lt;/code&gt;, but implementations must gracefully handle the subsequent &lt;code&gt;respond()&lt;/code&gt; rather than corrupting memory in order to cover the very likely possibility that developers are not using the complex API correctly.&lt;/p&gt;
-        &lt;/item&gt;
-      &lt;/list&gt;
-      &lt;p&gt;These aren't contrived scenarios invented by test authors in total vacuum. They're consequences of the spec's design and reflect real world bugs.&lt;/p&gt;
-      &lt;p&gt;For runtime implementers, passing the WPT suite means handling intricate corner cases that most application code will never encounter. The tests encode not just the happy path but the full matrix of interactions between readers, writers, controllers, queues, strategies, and the promise machinery that connects them all.&lt;/p&gt;
-      &lt;p&gt;A simpler API would mean fewer concepts, fewer interactions between concepts, and fewer edge cases to get right resulting in more confidence that implementations actually behave consistently.&lt;/p&gt;
-      &lt;p&gt;Web streams are complex for users and implementers alike. The problems with the spec aren't bugs. They emerge from using the API exactly as designed. They aren't issues that can be fixed solely through incremental improvements. They're consequences of fundamental design choices. To improve things we need different foundations.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h2"&gt;A better streams API is possible&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;After implementing the Web streams spec multiple times across different runtimes and seeing the pain points firsthand, I decided it was time to explore what a better, alternative streaming API could look like if designed from first principles today.&lt;/p&gt;
-      &lt;p&gt;What follows is a proof of concept: it's not a finished standard, not a production-ready library, not even necessarily a concrete proposal for something new, but a starting point for discussion that demonstrates the problems with Web streams aren't inherent to streaming itself; they're consequences of specific design choices that could be made differently. Whether this exact API is the right answer is less important than whether it sparks a productive conversation about what we actually need from a streaming primitive.&lt;/p&gt;
-      &lt;p&gt;Before diving into API design, it's worth asking: what is a stream?&lt;/p&gt;
-      &lt;p&gt;At its core, a stream is just a sequence of data that arrives over time. You don't have all of it at once. You process it incrementally as it becomes available.&lt;/p&gt;
-      &lt;p&gt;Unix pipes are perhaps the purest expression of this idea:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;cat access.log | grep "error" | sort | uniq -c&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt; Data flows left to right. Each stage reads input, does its work, writes output. There's no pipe reader to acquire, no controller lock to manage. If a downstream stage is slow, upstream stages naturally slow down as well. Backpressure is implicit in the model, not a separate mechanism to learn (or ignore).&lt;/p&gt;
-      &lt;p&gt;In JavaScript, the natural primitive for "a sequence of things that arrive over time" is already in the language: the async iterable. You consume it with &lt;code&gt;for await...of&lt;/code&gt;. You stop consuming by stopping iteration.&lt;/p&gt;
-      &lt;p&gt;This is the intuition the new API tries to preserve: streams should feel like iteration, because that's what they are. The complexity of Web streams â readers, writers, controllers, locks, queuing strategies â obscures this fundamental simplicity. A better API should make the simple case simple and only add complexity where it's genuinely needed.&lt;/p&gt;
-      &lt;p&gt;I built the proof-of-concept alternative around a different set of principles.&lt;/p&gt;
-      &lt;p&gt;No custom &lt;code&gt;ReadableStream&lt;/code&gt; class with hidden internal state. A readable stream is just an &lt;code&gt;AsyncIterable&amp;lt;Uint8Array[]&amp;gt;&lt;/code&gt;. You consume it with &lt;code&gt;for await...of&lt;/code&gt;. No readers to acquire, no locks to manage.&lt;/p&gt;
-      &lt;p&gt;Transforms don't execute until the consumer pulls. There's no eager evaluation, no hidden buffering. Data flows on-demand from source, through transforms, to the consumer. If you stop iterating, processing stops.&lt;/p&gt;
-      &lt;p&gt;Backpressure is strict by default. When a buffer is full, writes reject rather than silently accumulating. You can configure alternative policies â block until space is available, drop oldest, drop newest â but you have to choose explicitly. No more silent memory growth.&lt;/p&gt;
-      &lt;p&gt;Instead of yielding one chunk per iteration, streams yield &lt;code&gt;Uint8Array[]:&lt;/code&gt; arrays of chunks. This amortizes the async overhead across multiple chunks, reducing promise creation and microtask latency in hot paths.&lt;/p&gt;
-      &lt;p&gt;The API deals exclusively with bytes (&lt;code&gt;Uint8Array&lt;/code&gt;). Strings are UTF-8 encoded automatically. There's no "value stream" vs "byte stream" dichotomy. If you want to stream arbitrary JavaScript values, use async iterables directly. While the API uses &lt;code&gt;Uint8Array&lt;/code&gt;, it treats chunks as opaque. There is no partial consumption, no BYOB patterns, no byte-level operations within the streaming machinery itself. Chunks go in, chunks come out, unchanged unless a transform explicitly modifies them.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;Synchronous fast paths matter&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;The API recognizes that synchronous data sources are both necessary and common. The application should not be forced to always accept the performance cost of asynchronous scheduling simply because that's the only option provided. At the same time, mixing sync and async processing can be dangerous. Synchronous paths should always be an option and should always be explicit.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;Creating and consuming streams&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;In Web streams, creating a simple producer/consumer pair requires &lt;code&gt;TransformStream&lt;/code&gt;, manual encoding, and careful lock management:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;const { readable, writable } = new TransformStream();
-const enc = new TextEncoder();
-const writer = writable.getWriter();
-await writer.write(enc.encode("Hello, World!"));
-await writer.close();
-writer.releaseLock();
-
-const dec = new TextDecoder();
-let text = '';
-for await (const chunk of readable) {
-  text += dec.decode(chunk, { stream: true });
-}
-text += dec.decode();&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;Even this relatively clean version requires: a &lt;code&gt;TransformStream&lt;/code&gt;, manual &lt;code&gt;TextEncoder&lt;/code&gt; and &lt;code&gt;TextDecoder&lt;/code&gt;, and explicit lock release.&lt;/p&gt;
-      &lt;p&gt;Here's the equivalent with the new API:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;import { Stream } from 'new-streams';
-
-// Create a push stream
-const { writer, readable } = Stream.push();
-
-// Write data â backpressure is enforced
-await writer.write("Hello, World!");
-await writer.end();
-
-// Consume as text
-const text = await Stream.text(readable);&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;The readable is just an async iterable. You can pass it to any function that expects one, including &lt;code&gt;Stream.text()&lt;/code&gt; which collects and decodes the entire stream.&lt;/p&gt;
-      &lt;p&gt;The writer has a simple interface: &lt;code&gt;write(), writev()&lt;/code&gt; for batched writes, &lt;code&gt;end()&lt;/code&gt; to signal completion, and &lt;code&gt;abort()&lt;/code&gt; for errors. That's essentially it.&lt;/p&gt;
-      &lt;p&gt;The Writer is not a concrete class. Any object that implements &lt;code&gt;write()&lt;/code&gt;, &lt;code&gt;end()&lt;/code&gt;, and &lt;code&gt;abort()&lt;/code&gt; can be a writer making it easy to adapt existing APIs or create specialized implementations without subclassing. There's no complex &lt;code&gt;UnderlyingSink&lt;/code&gt; protocol with &lt;code&gt;start()&lt;/code&gt;, &lt;code&gt;write()&lt;/code&gt;, &lt;code&gt;close()&lt;/code&gt;, &lt;code&gt;and abort() &lt;/code&gt;callbacks that must coordinate through a controller whose lifecycle and state are independent of the &lt;code&gt;WritableStream&lt;/code&gt; it is bound to.&lt;/p&gt;
-      &lt;p&gt;Here's a simple in-memory writer that collects all written data:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;// A minimal writer implementation â just an object with methods
-function createBufferWriter() {
-  const chunks = [];
-  let totalBytes = 0;
-  let closed = false;
-
-  const addChunk = (chunk) =&amp;gt; {
-    chunks.push(chunk);
-    totalBytes += chunk.byteLength;
-  };
-
-  return {
-    get desiredSize() { return closed ? null : 1; },
-
-    // Async variants
-    write(chunk) { addChunk(chunk); },
-    writev(batch) { for (const c of batch) addChunk(c); },
-    end() { closed = true; return totalBytes; },
-    abort(reason) { closed = true; chunks.length = 0; },
-
-    // Sync variants return boolean (true = accepted)
-    writeSync(chunk) { addChunk(chunk); return true; },
-    writevSync(batch) { for (const c of batch) addChunk(c); return true; },
-    endSync() { closed = true; return totalBytes; },
-    abortSync(reason) { closed = true; chunks.length = 0; return true; },
-
-    getChunks() { return chunks; }
-  };
-}
-
-// Use it
-const writer = createBufferWriter();
-await Stream.pipeTo(source, writer);
-const allData = writer.getChunks();&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;No base class to extend, no abstract methods to implement, no controller to coordinate with. Just an object with the right shape.&lt;/p&gt;
-      &lt;p&gt;Under the new API design, transforms should not perform any work until the data is being consumed. This is a fundamental principle.&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;// Nothing executes until iteration begins
-const output = Stream.pull(source, compress, encrypt);
-
-// Transforms execute as we iterate
-for await (const chunks of output) {
-  for (const chunk of chunks) {
-    process(chunk);
-  }
-}&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;&lt;code&gt;Stream.pull()&lt;/code&gt; creates a lazy pipeline. The &lt;code&gt;compress&lt;/code&gt; and &lt;code&gt;encrypt&lt;/code&gt; transforms don't run until you start iterating output. Each iteration pulls data through the pipeline on demand.&lt;/p&gt;
-      &lt;p&gt;This is fundamentally different from Web streams' &lt;code&gt;pipeThrough()&lt;/code&gt;, which starts actively pumping data from the source to the transform as soon as you set up the pipe. Pull semantics mean you control when processing happens, and stopping iteration stops processing.&lt;/p&gt;
-      &lt;p&gt;Transforms can be stateless or stateful. A stateless transform is just a function that takes chunks and returns transformed chunks:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;// Stateless transform â a pure function
-// Receives chunks or null (flush signal)
-const toUpperCase = (chunks) =&amp;gt; {
-  if (chunks === null) return null; // End of stream
-  return chunks.map(chunk =&amp;gt; {
-    const str = new TextDecoder().decode(chunk);
-    return new TextEncoder().encode(str.toUpperCase());
-  });
-};
-
-// Use it directly
-const output = Stream.pull(source, toUpperCase);&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;Stateful transforms are simple objects with member functions that maintain state across calls:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;// Stateful transform â a generator that wraps the source
-function createLineParser() {
-  // Helper to concatenate Uint8Arrays
-  const concat = (...arrays) =&amp;gt; {
-    const result = new Uint8Array(arrays.reduce((n, a) =&amp;gt; n + a.length, 0));
-    let offset = 0;
-    for (const arr of arrays) { result.set(arr, offset); offset += arr.length; }
-    return result;
-  };
-
-  return {
-    async *transform(source) {
-      let pending = new Uint8Array(0);
-      
-      for await (const chunks of source) {
-        if (chunks === null) {
-          // Flush: yield any remaining data
-          if (pending.length &amp;gt; 0) yield [pending];
-          continue;
-        }
-        
-        // Concatenate pending data with new chunks
-        const combined = concat(pending, ...chunks);
-        const lines = [];
-        let start = 0;
-
-        for (let i = 0; i &amp;lt; combined.length; i++) {
-          if (combined[i] === 0x0a) { // newline
-            lines.push(combined.slice(start, i));
-            start = i + 1;
-          }
-        }
-
-        pending = combined.slice(start);
-        if (lines.length &amp;gt; 0) yield lines;
-      }
-    }
-  };
-}
-
-const output = Stream.pull(source, createLineParser());&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;For transforms that need cleanup on abort, add an abort handler:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;// Stateful transform with resource cleanup
-function createGzipCompressor() {
-  // Hypothetical compression API...
-  const deflate = new Deflater({ gzip: true });
-
-  return {
-    async *transform(source) {
-      for await (const chunks of source) {
-        if (chunks === null) {
-          // Flush: finalize compression
-          deflate.push(new Uint8Array(0), true);
-          if (deflate.result) yield [deflate.result];
-        } else {
-          for (const chunk of chunks) {
-            deflate.push(chunk, false);
-            if (deflate.result) yield [deflate.result];
-          }
-        }
-      }
-    },
-    abort(reason) {
-      // Clean up compressor resources on error/cancellation
-    }
-  };
-}&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;For implementers, there's no Transformer protocol with &lt;code&gt;start()&lt;/code&gt;, &lt;code&gt;transform()&lt;/code&gt;, &lt;code&gt;flush()&lt;/code&gt; methods and controller coordination passed into a &lt;code&gt;TransformStream&lt;/code&gt; class that has its own hidden state machine and buffering mechanisms. Transforms are just functions or simple objects: far simpler to implement and test.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;Explicit backpressure policies&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;When a bounded buffer fills up and a producer wants to write more, there are only a few things you can do:&lt;/p&gt;
-      &lt;list rend="ol"&gt;
-        &lt;item&gt;
-          &lt;p&gt;Reject the write: refuse to accept more data&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;Wait: block until space becomes available&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;Discard old data: evict what's already buffered to make room&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;Discard new data: drop what's incoming&lt;/p&gt;
-        &lt;/item&gt;
-      &lt;/list&gt;
-      &lt;p&gt;That's it. Any other response is either a variation of these (like "resize the buffer," which is really just deferring the choice) or domain-specific logic that doesn't belong in a general streaming primitive. Web streams currently always choose Wait by default.&lt;/p&gt;
-      &lt;p&gt;The new API makes you choose one of these four explicitly:&lt;/p&gt;
-      &lt;list rend="ul"&gt;
-        &lt;item&gt;
-          &lt;p&gt;&lt;code&gt;strict&lt;/code&gt; (default): Rejects writes when the buffer is full and too many writes are pending. Catches "fire-and-forget" patterns where producers ignore backpressure.&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;&lt;code&gt;block&lt;/code&gt;: Writes wait until buffer space is available. Use when you trust the producer to await writes properly.&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;&lt;code&gt;drop-oldest&lt;/code&gt;: Drops the oldest buffered data to make room. Useful for live feeds where stale data loses value.&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;&lt;code&gt;drop-newest&lt;/code&gt;: Discards incoming data when full. Useful when you want to process what you have without being overwhelmed.&lt;/p&gt;
-        &lt;/item&gt;
-      &lt;/list&gt;
-      &lt;quote&gt;
-        &lt;code&gt;const { writer, readable } = Stream.push({
-  highWaterMark: 10,
-  backpressure: 'strict' // or 'block', 'drop-oldest', 'drop-newest'
-});&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;No more hoping producers cooperate. The policy you choose determines what happens when the buffer fills.&lt;/p&gt;
-      &lt;p&gt;Here's how each policy behaves when a producer writes faster than the consumer reads:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;// strict: Catches fire-and-forget writes that ignore backpressure
-const strict = Stream.push({ highWaterMark: 2, backpressure: 'strict' });
-strict.writer.write(chunk1);  // ok (not awaited)
-strict.writer.write(chunk2);  // ok (fills slots buffer)
-strict.writer.write(chunk3);  // ok (queued in pending)
-strict.writer.write(chunk4);  // ok (pending buffer fills)
-strict.writer.write(chunk5);  // throws! too many pending writes
-
-// block: Wait for space (unbounded pending queue)
-const blocking = Stream.push({ highWaterMark: 2, backpressure: 'block' });
-await blocking.writer.write(chunk1);  // ok
-await blocking.writer.write(chunk2);  // ok
-await blocking.writer.write(chunk3);  // waits until consumer reads
-await blocking.writer.write(chunk4);  // waits until consumer reads
-await blocking.writer.write(chunk5);  // waits until consumer reads
-
-// drop-oldest: Discard old data to make room
-const dropOld = Stream.push({ highWaterMark: 2, backpressure: 'drop-oldest' });
-await dropOld.writer.write(chunk1);  // ok
-await dropOld.writer.write(chunk2);  // ok
-await dropOld.writer.write(chunk3);  // ok, chunk1 discarded
-
-// drop-newest: Discard incoming data when full
-const dropNew = Stream.push({ highWaterMark: 2, backpressure: 'drop-newest' });
-await dropNew.writer.write(chunk1);  // ok
-await dropNew.writer.write(chunk2);  // ok
-await dropNew.writer.write(chunk3);  // silently dropped&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;Explicit Multi-consumer patterns&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;quote&gt;
-        &lt;code&gt;// Share with explicit buffer management
-const shared = Stream.share(source, {
-  highWaterMark: 100,
-  backpressure: 'strict'
-});
-
-const consumer1 = shared.pull();
-const consumer2 = shared.pull(decompress);&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;Instead of &lt;code&gt;tee()&lt;/code&gt; with its hidden unbounded buffer, you get explicit multi-consumer primitives. &lt;code&gt;Stream.share()&lt;/code&gt; is pull-based: consumers pull from a shared source, and you configure the buffer limits and backpressure policy upfront.&lt;/p&gt;
-      &lt;p&gt;There's also &lt;code&gt;Stream.broadcast()&lt;/code&gt; for push-based multi-consumer scenarios. Both require you to think about what happens when consumers run at different speeds, because that's a real concern that shouldn't be hidden.&lt;/p&gt;
-      &lt;p&gt;Not all streaming workloads involve I/O. When your source is in-memory and your transforms are pure functions, async machinery adds overhead without benefit. You're paying for coordination of "waiting" that adds no benefit.&lt;/p&gt;
-      &lt;p&gt;The new API has complete parallel sync versions: &lt;code&gt;Stream.pullSync()&lt;/code&gt;, &lt;code&gt;Stream.bytesSync()&lt;/code&gt;, &lt;code&gt;Stream.textSync()&lt;/code&gt;, and so on. If your source and transforms are all synchronous, you can process the entire pipeline without a single promise.&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;// Async â when source or transforms may be asynchronous
-const textAsync = await Stream.text(source);
-
-// Sync â when all components are synchronous
-const textSync = Stream.textSync(source);&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;Here's a complete synchronous pipeline â compression, transformation, and consumption with zero async overhead:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;// Synchronous source from in-memory data
-const source = Stream.fromSync([inputBuffer]);
-
-// Synchronous transforms
-const compressed = Stream.pullSync(source, zlibCompressSync);
-const encrypted = Stream.pullSync(compressed, aesEncryptSync);
-
-// Synchronous consumption â no promises, no event loop trips
-const result = Stream.bytesSync(encrypted);&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;The entire pipeline executes in a single call stack. No promises are created, no microtask queue scheduling occurs, and no GC pressure from short-lived async machinery. For CPU-bound workloads like parsing, compression, or transformation of in-memory data, this can be significantly faster than the equivalent Web streams code â which would force async boundaries even when every component is synchronous.&lt;/p&gt;
-      &lt;p&gt;Web streams has no synchronous path. Even if your source has data ready and your transform is a pure function, you still pay for promise creation and microtask scheduling on every operation. Promises are fantastic for cases in which waiting is actually necessary, but they aren't always necessary. The new API lets you stay in sync-land when that's what you need.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;Bridging the gap between this and web streams&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;The async iterator based approach provides a natural bridge between this alternative approach and Web streams. When coming from a ReadableStream to this new approach, simply passing the readable in as input works as expected when the ReadableStream is set up to yield bytes:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;const readable = getWebReadableStreamSomehow();
-const input = Stream.pull(readable, transform1, transform2);
-for await (const chunks of input) {
-  // process chunks
-}&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;When adapting to a ReadableStream, a bit more work is required since the alternative approach yields batches of chunks, but the adaptation layer is as easily straightforward:&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;code&gt;async function* adapt(input) {
-  for await (const chunks of input) {
-    for (const chunk of chunks) {
-      yield chunk;
-    }
-  }
-}
-
-const input = Stream.pull(source, transform1, transform2);
-const readable = ReadableStream.from(adapt(input));&lt;/code&gt;
-      &lt;/quote&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;How this addresses the real-world failures from earlier&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;list rend="ul"&gt;
-        &lt;item&gt;
-          &lt;p&gt;Unconsumed bodies: Pull semantics mean nothing happens until you iterate. No hidden resource retention. If you don't consume a stream, there's no background machinery holding connections open.&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;The &lt;code&gt;tee()&lt;/code&gt; memory cliff: &lt;code&gt;Stream.share()&lt;/code&gt; requires explicit buffer configuration. You choose the &lt;code&gt;highWaterMark&lt;/code&gt; and backpressure policy upfront: no more silent unbounded growth when consumers run at different speeds.&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;Transform backpressure gaps: Pull-through transforms execute on-demand. Data doesn't cascade through intermediate buffers; it flows only when the consumer pulls. Stop iterating, stop processing.&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;GC thrashing in SSR: Batched chunks (&lt;code&gt;Uint8Array[]&lt;/code&gt;) amortize async overhead. Sync pipelines via &lt;code&gt;Stream.pullSync()&lt;/code&gt; eliminate promise allocation entirely for CPU-bound workloads.&lt;/p&gt;
-        &lt;/item&gt;
-      &lt;/list&gt;
-      &lt;p&gt;The design choices have performance implications. Here are benchmarks from the reference implementation of this possible alternative compared to Web streams (Node.js v24.x, Apple M1 Pro, averaged over 10 runs):&lt;/p&gt;
-      &lt;table&gt;
-        &lt;row&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Scenario&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Alternative&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Web streams&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Difference&lt;/p&gt;
-          &lt;/cell&gt;
-        &lt;/row&gt;
-        &lt;row&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Small chunks (1KB Ã 5000)&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~13 GB/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~4 GB/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~3Ã faster&lt;/p&gt;
-          &lt;/cell&gt;
-        &lt;/row&gt;
-        &lt;row&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Tiny chunks (100B Ã 10000)&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~4 GB/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~450 MB/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~8Ã faster&lt;/p&gt;
-          &lt;/cell&gt;
-        &lt;/row&gt;
-        &lt;row&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Async iteration (8KB Ã 1000)&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~530 GB/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~35 GB/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~15Ã faster&lt;/p&gt;
-          &lt;/cell&gt;
-        &lt;/row&gt;
-        &lt;row&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Chained 3Ã transforms (8KB Ã 500)&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~275 GB/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~3 GB/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~80â90Ã faster&lt;/p&gt;
-          &lt;/cell&gt;
-        &lt;/row&gt;
-        &lt;row&gt;
-          &lt;cell&gt;
-            &lt;p&gt;High-frequency (64B Ã 20000)&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~7.5 GB/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~280 MB/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~25Ã faster&lt;/p&gt;
-          &lt;/cell&gt;
-        &lt;/row&gt;
-      &lt;/table&gt;
-      &lt;p&gt;The chained transform result is particularly striking: pull-through semantics eliminate the intermediate buffering that plagues Web streams pipelines. Instead of each &lt;code&gt;TransformStream&lt;/code&gt; eagerly filling its internal buffers, data flows on-demand from consumer to source.&lt;/p&gt;
-      &lt;p&gt;Now, to be fair, Node.js really has not yet put significant effort into fully optimizing the performance of its Web streams implementation. There's likely significant room for improvement in Node.js' performance results through a bit of applied effort to optimize the hot paths there. That said, running these benchmarks in Deno and Bun also show a significant performance improvement with this alternative iterator based approach than in either of their Web streams implementations as well.&lt;/p&gt;
-      &lt;p&gt;Browser benchmarks (Chrome/Blink, averaged over 3 runs) show consistent gains as well:&lt;/p&gt;
-      &lt;table&gt;
-        &lt;row&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Scenario&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Alternative&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Web streams&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Difference&lt;/p&gt;
-          &lt;/cell&gt;
-        &lt;/row&gt;
-        &lt;row&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Push 3KB chunks&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~135k ops/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~24k ops/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~5â6Ã faster&lt;/p&gt;
-          &lt;/cell&gt;
-        &lt;/row&gt;
-        &lt;row&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Push 100KB chunks&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~24k ops/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~3k ops/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~7â8Ã faster&lt;/p&gt;
-          &lt;/cell&gt;
-        &lt;/row&gt;
-        &lt;row&gt;
-          &lt;cell&gt;
-            &lt;p&gt;3 transform chain&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~4.6k ops/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~880 ops/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~5Ã faster&lt;/p&gt;
-          &lt;/cell&gt;
-        &lt;/row&gt;
-        &lt;row&gt;
-          &lt;cell&gt;
-            &lt;p&gt;5 transform chain&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~2.4k ops/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~550 ops/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~4Ã faster&lt;/p&gt;
-          &lt;/cell&gt;
-        &lt;/row&gt;
-        &lt;row&gt;
-          &lt;cell&gt;
-            &lt;p&gt;bytes() consumption&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~73k ops/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~11k ops/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~6â7Ã faster&lt;/p&gt;
-          &lt;/cell&gt;
-        &lt;/row&gt;
-        &lt;row&gt;
-          &lt;cell&gt;
-            &lt;p&gt;Async iteration&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~1.1M ops/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~10k ops/s&lt;/p&gt;
-          &lt;/cell&gt;
-          &lt;cell&gt;
-            &lt;p&gt;~40â100Ã faster&lt;/p&gt;
-          &lt;/cell&gt;
-        &lt;/row&gt;
-      &lt;/table&gt;
-      &lt;p&gt;These benchmarks measure throughput in controlled scenarios; real-world performance depends on your specific use case. The difference between Node.js and browser gains reflects the distinct optimization paths each environment takes for Web streams.&lt;/p&gt;
-      &lt;p&gt;It's worth noting that these benchmarks compare a pure TypeScript/JavaScript implementation of the new API against the native (JavaScript/C++/Rust) implementations of Web streams in each runtime. The new API's reference implementation has had no performance optimization work; the gains come entirely from the design. A native implementation would likely show further improvement.&lt;/p&gt;
-      &lt;p&gt;The gains illustrate how fundamental design choices compound: batching amortizes async overhead, pull semantics eliminate intermediate buffering, and the freedom for implementations to use synchronous fast paths when data is available immediately all contribute.&lt;/p&gt;
-      &lt;quote&gt;
-        &lt;p&gt;"Weâve done a lot to improve performance and consistency in Node streams, but thereâs something uniquely powerful about starting from scratch. New streamsâ approach embraces modern runtime realities without legacy baggage, and that opens the door to a simpler, performant and more coherent streams model." - Robert Nagy, Node.js TSC member and Node.js streams contributor&lt;/p&gt;
-      &lt;/quote&gt;
-      &lt;p&gt;I'm publishing this to start a conversation. What did I get right? What did I miss? Are there use cases that don't fit this model? What would a migration path for this approach look like? The goal is to gather feedback from developers who've felt the pain of Web streams and have opinions about what a better API should look like.&lt;/p&gt;
-      &lt;p&gt;A reference implementation for this alternative approach is available now and can be found at https://github.com/jasnell/new-streams.&lt;/p&gt;
-      &lt;p&gt;I welcome issues, discussions, and pull requests. If you've run into Web streams problems I haven't covered, or if you see gaps in this approach, let me know. But again, the idea here is not to say "Let's all use this shiny new object!"; it is to kick off a discussion that looks beyond the current status quo of Web Streams and returns back to first principles.&lt;/p&gt;
-      &lt;p&gt;Web streams was an ambitious project that brought streaming to the web platform when nothing else existed. The people who designed it made reasonable choices given the constraints of 2014 â before async iteration, before years of production experience revealed the edge cases.&lt;/p&gt;
-      &lt;p&gt;But we've learned a lot since then. JavaScript has evolved. A streaming API designed today can be simpler, more aligned with the language, and more explicit about the things that matter, like backpressure and multi-consumer behavior.&lt;/p&gt;
-      &lt;p&gt;We deserve a better stream API. So let's talk about what that could look like.&lt;/p&gt;
-    &lt;/div&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47180569</guid><pubDate>Fri, 27 Feb 2026 14:02:53 +0000</pubDate></item><item><title>A new California law says all operating systems need to have age verification</title><link>https://www.pcgamer.com/software/operating-systems/a-new-california-law-says-all-operating-systems-including-linux-need-to-have-some-form-of-age-verification-at-account-setup/</link><description>&lt;doc fingerprint="e598a0950acfb3f4"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 28 Feb 2026 00:58:53 +0000</lastBuildDate><item><title>A new California law says all operating systems need to have age verification</title><link>https://www.pcgamer.com/software/operating-systems/a-new-california-law-says-all-operating-systems-including-linux-need-to-have-some-form-of-age-verification-at-account-setup/</link><description>&lt;doc fingerprint="e598a0950acfb3f4"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;A new California law says all operating systems, including Linux, need to have some form of age verification at account setup&lt;/head&gt;
     &lt;p&gt;I wonder how the government of California plans to enforce it?&lt;/p&gt;
@@ -981,7 +117,319 @@ const readable = ReadableStream.from(adapt(input));&lt;/code&gt;
 &lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47181391</guid><pubDate>Fri, 27 Feb 2026 15:09:04 +0000</pubDate></item><item><title>Open source calculator firmware DB48X forbids CA/CO use due to age verification</title><link>https://github.com/c3d/db48x/commit/7819972b641ac808d46c54d3f5d1df70d706d286</link><description>&lt;doc fingerprint="767d6f2f455839b2"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;Commit 7819972&lt;/head&gt;&lt;p&gt;committed&lt;/p&gt;&lt;p&gt;license: Add legal notice regarding California and Colorado bills&lt;/p&gt;As a consequence of recent legislative activity in [California][cal] and [Colororado][col]: * California residents may no longer use DB48x after Jan 1st, 2027. * Colorado residents may no longer use DB48x after Jan 1st, 2028. DB48x is probably an operating system under these laws. However, it does not, cannot and will not implement age verification. [cal]: https://leginfo.legislature.ca.gov/faces/billTextClient.xhtml?bill_id=202520260AB1043 [col]: https://leg.colorado.gov/bill_files/111670/download Signed-off-by: Christophe de Dinechin &amp;lt;christophe@dinechin.org&amp;gt;&lt;quote&gt;1 parent f8e3948 commit 7819972&lt;/quote&gt;&lt;head rend="h2"&gt;1 file changed&lt;/head&gt;&lt;p&gt;+13&lt;/p&gt;&lt;p&gt;-0&lt;/p&gt;lines changed&lt;table&gt;&lt;row span="4"&gt;&lt;cell role="head"&gt;Original file line number&lt;/cell&gt;&lt;cell role="head"&gt;Diff line number&lt;/cell&gt;&lt;cell role="head"&gt;Diff line change&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"/&gt;&lt;row span="4"&gt;&lt;cell&gt;&lt;code&gt;1&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;+&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;&lt;code&gt;2&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;+&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;&lt;code&gt;3&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;+&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;&lt;code&gt;4&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;+&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;&lt;code&gt;5&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;+&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;&lt;code&gt;6&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;+&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;&lt;code&gt;7&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;+&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;&lt;code&gt;8&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;+&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;&lt;code&gt;9&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;+&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;&lt;code&gt;10&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;+&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;&lt;code&gt;11&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;+&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;&lt;code&gt;12&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;+&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;&lt;code&gt;13&lt;/code&gt;&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;+&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;head rend="h2"&gt;0 commit comments&lt;/head&gt;&lt;p&gt;Comments&lt;/p&gt; (0)&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47181753</guid><pubDate>Fri, 27 Feb 2026 15:37:53 +0000</pubDate></item><item><title>A Chinese official’s use of ChatGPT revealed an intimidation operation</title><link>https://www.cnn.com/2026/02/25/politics/chatgpt-china-intimidation-operation</link><description>&lt;doc fingerprint="fd1485ccb0964efd"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47181753</guid><pubDate>Fri, 27 Feb 2026 15:37:53 +0000</pubDate></item><item><title>We gave terabytes of CI logs to an LLM</title><link>https://www.mendral.com/blog/llms-are-good-at-sql</link><description>&lt;doc fingerprint="649ced016fb9429a"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Last week, our agent traced a flaky test to a dependency bump three weeks prior. It did this by writing its own SQL queries, scanning hundreds of millions of log lines across a dozen queries, and following a trail from job metadata to raw log output. The whole investigation took seconds.&lt;/p&gt;
+    &lt;p&gt;To do this, the agent needs context: not one log file, but every build, every test, every log line, across months of history. Every week, about 1.5 billion CI log lines and 700K jobs flow through our system. All of it lands in ClickHouse, compressed at 35:1. All of it is queryable in milliseconds.&lt;/p&gt;
+    &lt;head rend="h2"&gt;A SQL interface for the agent&lt;/head&gt;
+    &lt;p&gt;We expose a SQL interface to the agent, scoped to the organization it's investigating. The agent constructs its own queries based on the question. No predefined query library, no rigid tool API.&lt;/p&gt;
+    &lt;p&gt;LLMs are good at SQL. There's an enormous amount of SQL in training data, and the syntax maps well to natural-language questions about data. A constrained tool API like &lt;code&gt;get_failure_rate(workflow, days)&lt;/code&gt; would limit the agent to the questions we anticipated. A SQL interface lets it ask questions we never thought of, which matters when you're debugging novel failures.&lt;/p&gt;
+    &lt;p&gt;The agent queries two main targets:&lt;/p&gt;
+    &lt;p&gt;Job metadata: a materialized view with one row per CI job execution. The agent uses this 63% of the time for questions like "how often does this fail?", "what's the success rate?", "which jobs are slowest?", "when did this start failing?"&lt;/p&gt;
+    &lt;p&gt;Raw log lines: one row per log line. The agent uses this 37% of the time for questions like "show me the error output for this job", "when did this log pattern first appear?", "how often does this error message occur across runs?"&lt;/p&gt;
+    &lt;head rend="h3"&gt;52,000 queries across 8,500 investigations&lt;/head&gt;
+    &lt;p&gt;We analyzed 8,534 agent sessions and 52,312 queries from our observability pipeline.&lt;/p&gt;
+    &lt;p&gt;The agent doesn't stop at one query. It investigates. Starts broad, then drills in. Total rows scanned across all queries to answer one question:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="6"&gt;
+        &lt;cell role="head"&gt;Target&lt;/cell&gt;
+        &lt;cell role="head"&gt;Sessions&lt;/cell&gt;
+        &lt;cell role="head"&gt;Avg queries&lt;/cell&gt;
+        &lt;cell role="head"&gt;Median rows&lt;/cell&gt;
+        &lt;cell role="head"&gt;P75&lt;/cell&gt;
+        &lt;cell role="head"&gt;P95&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="6"&gt;
+        &lt;cell&gt;Job metadata&lt;/cell&gt;
+        &lt;cell&gt;8,210&lt;/cell&gt;
+        &lt;cell&gt;4.0&lt;/cell&gt;
+        &lt;cell&gt;164K&lt;/cell&gt;
+        &lt;cell&gt;563K&lt;/cell&gt;
+        &lt;cell&gt;4.4M&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="6"&gt;
+        &lt;cell&gt;Raw log lines&lt;/cell&gt;
+        &lt;cell&gt;5,413&lt;/cell&gt;
+        &lt;cell&gt;3.5&lt;/cell&gt;
+        &lt;cell&gt;4.4M&lt;/cell&gt;
+        &lt;cell&gt;69M&lt;/cell&gt;
+        &lt;cell&gt;4.3B&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Combined&lt;/cell&gt;
+        &lt;cell&gt;8,534&lt;/cell&gt;
+        &lt;cell&gt;4.4&lt;/cell&gt;
+        &lt;cell&gt;335K&lt;/cell&gt;
+        &lt;cell&gt;5.2M&lt;/cell&gt;
+        &lt;cell&gt;940M&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;The typical question scans 335K rows across about 3 queries. At P75 it's 5.2 million rows. At P95 it's 940 million rows. The heaviest raw-log sessions, deep investigations tracing error patterns across months of history, scan 4.3 billion rows.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The search pattern&lt;/head&gt;
+    &lt;p&gt;The agent starts broad and narrows. A typical investigation begins with job metadata: "what's the failure rate for this workflow?", "which jobs failed on this commit?" These are cheap queries (median 47K rows) against a compact, pre-aggregated materialized view.&lt;/p&gt;
+    &lt;p&gt;When it finds something interesting, it drills into raw logs: "show me the stack trace for this specific failure", "has this error message appeared before?" These are the expensive queries (median 1.1M rows), full-text scans across log output. But this is exactly the kind of search that would take a human minutes of scrolling through GitHub Actions log viewers.&lt;/p&gt;
+    &lt;p&gt;The agent averages 4.4 queries per session, but heavy investigations issue many more. A P95 session isn't one big query. It's the agent following a trail, query after query, as it narrows in on a root cause.&lt;/p&gt;
+    &lt;head rend="h2"&gt;5 TiB uncompressed, 154 GiB on disk&lt;/head&gt;
+    &lt;p&gt;For the agent to query this fast, the data needs to be structured for it. Up to 300 million log lines flow through on a busy day. We use ClickHouse.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The denormalization bet&lt;/head&gt;
+    &lt;p&gt;Every log line in our system carries 48 columns of metadata: the full context of the CI run it belongs to. Commit SHA, author, branch, PR title, workflow name, job name, step name, runner info, timestamps, and more.&lt;/p&gt;
+    &lt;p&gt;In a traditional row-store, this would be insane. You'd normalize. Run-level metadata in one table, job metadata in another, join at query time. Denormalizing 48 columns onto every single log line sounds like a storage disaster.&lt;/p&gt;
+    &lt;p&gt;In ClickHouse's columnar format, it's essentially free.&lt;/p&gt;
+    &lt;p&gt;A column like &lt;code&gt;commit_message&lt;/code&gt; has the same value for every log line in a CI run, and a single run can produce thousands of log lines. ClickHouse stores those thousands of identical values in sequence. The compression algorithm sees the repetition and compresses it to almost nothing.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;Column&lt;/cell&gt;
+        &lt;cell role="head"&gt;Compression ratio&lt;/cell&gt;
+        &lt;cell role="head"&gt;Why&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;commit_message&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;301:1&lt;/cell&gt;
+        &lt;cell&gt;Same message for every line in a run (thousands of lines)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;display_title&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;160:1&lt;/cell&gt;
+        &lt;cell&gt;Same PR/commit title across all lines&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;workflow_path&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;79:1&lt;/cell&gt;
+        &lt;cell&gt;Same &lt;code&gt;.github/workflows/foo.yml&lt;/code&gt; path&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;step_name&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;52:1&lt;/cell&gt;
+        &lt;cell&gt;Same step name across hundreds of lines&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;
+          &lt;code&gt;job_name&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;48:1&lt;/cell&gt;
+        &lt;cell&gt;Same job name across hundreds/thousands of lines&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;The agent asks arbitrary questions. One might filter by commit author, the next by runner label, the next by step name. Without denormalization, every one of those requires a join. With it, they're all column predicates.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The numbers&lt;/head&gt;
+    &lt;table&gt;
+      &lt;row span="2"&gt;
+        &lt;cell role="head"&gt;Layer&lt;/cell&gt;
+        &lt;cell role="head"&gt;Size&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;Raw log text (&lt;code&gt;line_content&lt;/code&gt; uncompressed)&lt;/cell&gt;
+        &lt;cell&gt;664 GiB&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;All 48 columns uncompressed&lt;/cell&gt;
+        &lt;cell&gt;5.31 TiB&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;On disk (compressed)&lt;/cell&gt;
+        &lt;cell&gt;154 GiB&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Compression ratio&lt;/cell&gt;
+        &lt;cell&gt;35:1&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;The raw log text alone is 664 GiB. Adding all 48 columns of metadata inflates it to 5.31 TiB uncompressed, 8x the raw text. On disk, the whole thing compresses to 154 GiB. ClickHouse stores 8x more data (all the enriched metadata) in a quarter of the size of the raw text alone.&lt;/p&gt;
+    &lt;p&gt;That's about 21 bytes per log line on disk, including all 48 columns. Yes, really. 21 bytes for a log line plus its commit SHA, author, branch, job name, step name, runner info, and 41 other fields.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Where the storage actually goes&lt;/head&gt;
+    &lt;p&gt;Not all columns compress equally. The unique-per-row columns (log text, timestamp, line number) compress modestly and dominate storage. The metadata columns, which repeat across thousands of lines, are nearly free.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="4"&gt;
+        &lt;cell role="head"&gt;Column&lt;/cell&gt;
+        &lt;cell role="head"&gt;On disk&lt;/cell&gt;
+        &lt;cell role="head"&gt;% of total&lt;/cell&gt;
+        &lt;cell role="head"&gt;Compression ratio&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;&lt;code&gt;line_content&lt;/code&gt; (log text)&lt;/cell&gt;
+        &lt;cell&gt;53.2 GiB&lt;/cell&gt;
+        &lt;cell&gt;34.7%&lt;/cell&gt;
+        &lt;cell&gt;12.5:1&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;&lt;code&gt;ts&lt;/code&gt; (nanosecond timestamp)&lt;/cell&gt;
+        &lt;cell&gt;15.7 GiB&lt;/cell&gt;
+        &lt;cell&gt;10.2%&lt;/cell&gt;
+        &lt;cell&gt;3.7:1&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;line_number&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;12.4 GiB&lt;/cell&gt;
+        &lt;cell&gt;8.1%&lt;/cell&gt;
+        &lt;cell&gt;2.3:1&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;job_name&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;8.2 GiB&lt;/cell&gt;
+        &lt;cell&gt;5.4%&lt;/cell&gt;
+        &lt;cell&gt;48:1&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;runner_name&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;4.5 GiB&lt;/cell&gt;
+        &lt;cell&gt;2.9%&lt;/cell&gt;
+        &lt;cell&gt;31:1&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;job_id&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;3.9 GiB&lt;/cell&gt;
+        &lt;cell&gt;2.5%&lt;/cell&gt;
+        &lt;cell&gt;15:1&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;runner_labels&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;3.8 GiB&lt;/cell&gt;
+        &lt;cell&gt;2.5%&lt;/cell&gt;
+        &lt;cell&gt;52:1&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Everything else (41 columns)&lt;/cell&gt;
+        &lt;cell&gt;~51 GiB&lt;/cell&gt;
+        &lt;cell&gt;~33%&lt;/cell&gt;
+        &lt;cell&gt;varies&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;The top three (&lt;code&gt;line_content&lt;/code&gt;, &lt;code&gt;ts&lt;/code&gt;, &lt;code&gt;line_number&lt;/code&gt;) account for 53% of all storage. Everything else is repeated metadata that compresses to almost nothing.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Query performance&lt;/head&gt;
+    &lt;p&gt;We use a few ClickHouse patterns that keep things fast:&lt;/p&gt;
+    &lt;p&gt;Primary key design means the data is physically sorted for our access pattern. The sort order is &lt;code&gt;(org, ts, repository, run_id, ...)&lt;/code&gt;, so every query is scoped to one organization and a time range, and ClickHouse skips everything else without reading it.&lt;/p&gt;
+    &lt;p&gt;Skip indexes let ClickHouse avoid scanning data it doesn't need. We use bloom filters on 14 columns (org, repository, job name, branch, commit SHA, etc.) and an ngram bloom filter on &lt;code&gt;line_content&lt;/code&gt; for full-text search. When the agent searches for an error message across billions of log lines, ClickHouse checks the ngram index to skip granules that can't contain the search term, turning a full table scan into a targeted read.&lt;/p&gt;
+    &lt;p&gt;Materialized views pre-compute aggregations on insert. When the agent asks "what's the failure rate for this workflow over the last 30 days?", the answer is already computed. The aggregation happened when the data was written.&lt;/p&gt;
+    &lt;p&gt;Async inserts give us high write throughput without building our own batching layer. We fire-and-forget individual inserts, and ClickHouse batches them internally.&lt;/p&gt;
+    &lt;p&gt;Query latency across 52K queries:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="5"&gt;
+        &lt;cell role="head"&gt;Target&lt;/cell&gt;
+        &lt;cell role="head"&gt;Queries&lt;/cell&gt;
+        &lt;cell role="head"&gt;Median&lt;/cell&gt;
+        &lt;cell role="head"&gt;P75&lt;/cell&gt;
+        &lt;cell role="head"&gt;P95&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;Job metadata&lt;/cell&gt;
+        &lt;cell&gt;33K&lt;/cell&gt;
+        &lt;cell&gt;20ms&lt;/cell&gt;
+        &lt;cell&gt;30ms&lt;/cell&gt;
+        &lt;cell&gt;80ms&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Raw log lines&lt;/cell&gt;
+        &lt;cell&gt;19K&lt;/cell&gt;
+        &lt;cell&gt;110ms&lt;/cell&gt;
+        &lt;cell&gt;780ms&lt;/cell&gt;
+        &lt;cell&gt;18.1s&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Job metadata queries return in 20ms at the median. Raw log queries, scanning a million rows at the median, come back in 110ms.&lt;/p&gt;
+    &lt;p&gt;Latency scales roughly linearly with rows scanned:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="4"&gt;
+        &lt;cell role="head"&gt;Rows scanned&lt;/cell&gt;
+        &lt;cell role="head"&gt;Queries&lt;/cell&gt;
+        &lt;cell role="head"&gt;Median latency&lt;/cell&gt;
+        &lt;cell role="head"&gt;P95 latency&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;&amp;lt; 1K&lt;/cell&gt;
+        &lt;cell&gt;1,621&lt;/cell&gt;
+        &lt;cell&gt;10ms&lt;/cell&gt;
+        &lt;cell&gt;50ms&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;1K-10K&lt;/cell&gt;
+        &lt;cell&gt;2,608&lt;/cell&gt;
+        &lt;cell&gt;20ms&lt;/cell&gt;
+        &lt;cell&gt;50ms&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;10K-100K&lt;/cell&gt;
+        &lt;cell&gt;27,044&lt;/cell&gt;
+        &lt;cell&gt;20ms&lt;/cell&gt;
+        &lt;cell&gt;50ms&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;100K-1M&lt;/cell&gt;
+        &lt;cell&gt;8,515&lt;/cell&gt;
+        &lt;cell&gt;40ms&lt;/cell&gt;
+        &lt;cell&gt;390ms&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;1M-10M&lt;/cell&gt;
+        &lt;cell&gt;7,199&lt;/cell&gt;
+        &lt;cell&gt;90ms&lt;/cell&gt;
+        &lt;cell&gt;1.2s&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;10M-100M&lt;/cell&gt;
+        &lt;cell&gt;2,630&lt;/cell&gt;
+        &lt;cell&gt;690ms&lt;/cell&gt;
+        &lt;cell&gt;6.8s&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;100M-1B&lt;/cell&gt;
+        &lt;cell&gt;1,814&lt;/cell&gt;
+        &lt;cell&gt;6.8s&lt;/cell&gt;
+        &lt;cell&gt;30.6s&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;1B+&lt;/cell&gt;
+        &lt;cell&gt;1,029&lt;/cell&gt;
+        &lt;cell&gt;31s&lt;/cell&gt;
+        &lt;cell&gt;82s&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;10x more rows ≈ 10x more latency. 60% of all queries scan under 100K rows and return in under 50ms, fast enough that the agent can fire off several per second without breaking stride. At the extreme end, the agent occasionally scans over a billion rows in a single query; even those complete in about 30 seconds at the median.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Ingesting through GitHub's rate limit&lt;/head&gt;
+    &lt;p&gt;None of the above works without fresh data. The agent needs to reason about the build that just failed, not one from an hour ago.&lt;/p&gt;
+    &lt;head rend="h3"&gt;The rate limit constraint&lt;/head&gt;
+    &lt;p&gt;GitHub's API gives you 15,000 requests per hour per App installation (5,000 on non-Enterprise plans). That sounds generous until you're continuously polling workflow runs, jobs, steps, and log output across dozens of active repositories. A single commit can spawn hundreds of parallel jobs, each producing logs you need to fetch.&lt;/p&gt;
+    &lt;p&gt;And ingestion isn't the only thing hitting the API. When the agent investigates a failure, it pulls PR metadata, reads file diffs, posts comments, and opens pull requests. All of that counts against the same 15,000-request budget. Throttle ingestion too aggressively and your data goes stale. Throttle too little and you starve the agent of the API access it needs to do its job.&lt;/p&gt;
+    &lt;p&gt;Early on, we hit this. Our ingestion would slam into the rate limit, get blocked for the remainder of the hour, and fall behind. By the time it caught up, we were ingesting logs from 30+ minutes ago. For an agent that needs to reason about the build that just failed, that's useless. If an engineer has to wait for the agent to catch up, they've already context-switched to investigating manually.&lt;/p&gt;
+    &lt;p&gt;The fix was throttling: spreading requests evenly across the rate limit window instead of bursting. We cap ingestion at roughly 3 requests per second, keeping about 4,000 requests per hour free for the agent.&lt;/p&gt;
+    &lt;p&gt;Our sustained request rate:&lt;/p&gt;
+    &lt;p&gt;Our rate limit budget over time:&lt;/p&gt;
+    &lt;p&gt;That sawtooth is the steady state. Each downward slope is us consuming API calls; each vertical jump is the hourly limit resetting. At peak, we burn through most of the budget before the window resets, with headroom left for the agent.&lt;/p&gt;
+    &lt;p&gt;Once we trusted the throttling, we pushed the ingestion rate about 20% higher:&lt;/p&gt;
+    &lt;p&gt;The dashed line marks the deployment. The budget draws down more aggressively after the change. We're consuming more of the available headroom per window, while still never fully exhausting it. Fresher data, acceptable margin.&lt;/p&gt;
+    &lt;p&gt;We target under 5 minutes at P95 for ingestion delay, the time between an event happening on GitHub and it being queryable in our system. Most of the time, we're at a few seconds.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Durable execution&lt;/head&gt;
+    &lt;p&gt;Both our ingestion pipeline and our agent run on Inngest, a durable execution engine. When either one hits a rate limit, it doesn't crash, retry blindly, or spin in a loop. It suspends.&lt;/p&gt;
+    &lt;p&gt;GitHub's rate limit response headers tell you exactly how long you need to wait. We read that value, add 10% jitter to avoid a thundering herd when the limit resets, and suspend the execution. The full state is checkpointed: progress through the workflow, which jobs have been fetched, where we are in the log pagination.&lt;/p&gt;
+    &lt;p&gt;When the wait is over, execution resumes at exactly the point it left off. No re-initialization, no duplicate work. It picks up the next API call as if nothing happened.&lt;/p&gt;
+    &lt;p&gt;Compare this to the alternative: retry logic, state recovery, deduplication. Every function needs to be idempotent. Every interrupted batch needs to be reconciled. With durable execution, the rate limit is just a pause button.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Absorbing traffic spikes&lt;/head&gt;
+    &lt;p&gt;CI activity is bursty. Someone merges a big PR, a release branch gets cut, three teams push at the same time. Our function throughput:&lt;/p&gt;
+    &lt;p&gt;The grey line is queued work. It spikes to 3,000+ during bursts of CI activity. The blue and green lines (started and ended) stay smooth at 800-1,000. The execution engine absorbs the spikes and processes work at a steady rate.&lt;/p&gt;
+    &lt;p&gt;Ingestion delay over time:&lt;/p&gt;
+    &lt;p&gt;Spikes during peak activity, but the system recovers. The 5-minute P95 target holds: bursts push delay up briefly, then it drops back to seconds once the queue drains.&lt;/p&gt;
+    &lt;p&gt;Nobody puts "we built a really good rate limiter" on their landing page. But without fresh, queryable data, your agent can't answer the question that actually matters: did I break this, or was it already broken?&lt;/p&gt;
+    &lt;p&gt;We're building Mendral (YC W26). We spent a decade building and scaling CI systems at Docker and Dagger, and the work was always the same: stare at logs, correlate failures, figure out what changed. Now we're automating it.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47181801</guid><pubDate>Fri, 27 Feb 2026 15:41:13 +0000</pubDate></item><item><title>A Chinese official’s use of ChatGPT revealed an intimidation operation</title><link>https://www.cnn.com/2026/02/25/politics/chatgpt-china-intimidation-operation</link><description>&lt;doc fingerprint="fd1485ccb0964efd"&gt;
   &lt;main&gt;
     &lt;p&gt;A sprawling Chinese influence operation — accidentally revealed by a Chinese law enforcement official’s use of ChatGPT — focused on intimidating Chinese dissidents abroad, including by impersonating US immigration officials, according to a new report from ChatGPT-maker OpenAI.&lt;/p&gt;
     &lt;p&gt;The Chinese law enforcement official used ChatGPT like a diary to document the alleged covert campaign of suppression, OpenAI said. In one instance, Chinese operators allegedly disguised themselves as US immigration officials to warn a US-based Chinese dissident that their public statements had supposedly broken the law, according to the ChatGPT user. In another case, they describe an effort to use forged documents from a US county court to try to get a Chinese dissident’s social media account taken down.&lt;/p&gt;
@@ -1422,7 +870,7 @@ sized.&lt;/p&gt;
     &lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47183907</guid><pubDate>Fri, 27 Feb 2026 18:37:53 +0000</pubDate></item><item><title>Let's discuss sandbox isolation</title><link>https://www.shayon.dev/post/2026/52/lets-discuss-sandbox-isolation/</link><guid isPermaLink="false">https://news.ycombinator.com/item?id=47184049</guid><pubDate>Fri, 27 Feb 2026 18:49:50 +0000</pubDate></item><item><title>Leaving Google has actively improved my life</title><link>https://pseudosingleton.com/leaving-google-improved-my-life/</link><description>&lt;doc fingerprint="3b20906313b611e9"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47183907</guid><pubDate>Fri, 27 Feb 2026 18:37:53 +0000</pubDate></item><item><title>Let's discuss sandbox isolation</title><link>https://www.shayon.dev/post/2026/52/lets-discuss-sandbox-isolation/</link><guid isPermaLink="false">https://news.ycombinator.com/item?id=47184049</guid><pubDate>Fri, 27 Feb 2026 18:49:50 +0000</pubDate></item><item><title>Leaving Google has actively improved my life</title><link>https://pseudosingleton.com/leaving-google-improved-my-life/</link><description>&lt;doc fingerprint="3b20906313b631e9"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Leaving Google has actively improved my life&lt;/head&gt;
     &lt;p&gt;In May of 2023, Google introduced “AI overviews” into their search engine.1 This followed years of decisions leading to worse search quality and the consummation of their mission to answer every query on Google instead of sending you to outside sites. This was upsetting but something I groaned about and then moved on.&lt;/p&gt;
@@ -1442,7 +890,7 @@ sized.&lt;/p&gt;
     &lt;p&gt;That’s a fun and fulfilling decision to make. You might still end up searching (on Brave or DuckDuckGo or Kagi or wherever, not Google), but you also may find yourself going directly to IMDB or Wikipedia or Reddit or your local news org or who knows where.&lt;/p&gt;
     &lt;p&gt;Taking Google out of things has brought me back to the yesteryears of “surfing the web” instead of just “Googling.”&lt;/p&gt;
     &lt;p&gt;It’s better.&lt;/p&gt;
-    &lt;head rend="h2"&gt;My conscious is a tiny bit cleaner&lt;/head&gt;
+    &lt;head rend="h2"&gt;My conscience is a tiny bit cleaner&lt;/head&gt;
     &lt;p&gt;I do my best to boycott bad things. And I fail pretty often. I still use Amazon on occasion and I can’t get off Spotify. I use Uber and DoorDash a lot more than I’d like. And I have too many Apple products/services.&lt;/p&gt;
     &lt;p&gt;Individual actions probably will not save the world, but big tech is bad, and Google is one of the worst. So it feels pretty good to have completely* cut out one of these bad companies. And it legitimately has made my life better.&lt;/p&gt;
     &lt;head rend="h2"&gt;Why isn’t everyone doing this?&lt;/head&gt;
@@ -1490,7 +938,7 @@ sized.&lt;/p&gt;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47184288</guid><pubDate>Fri, 27 Feb 2026 19:08:25 +0000</pubDate></item><item><title>Rob Grant, creator of Red Dwarf, has died</title><link>https://www.beyondthejoke.co.uk/content/17193/red-dwarf-rob-grant</link><description>&lt;doc fingerprint="6ed4d29f1fe61ea2"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47184288</guid><pubDate>Fri, 27 Feb 2026 19:08:25 +0000</pubDate></item><item><title>Rob Grant, creator of Red Dwarf, has died</title><link>https://www.beyondthejoke.co.uk/content/17193/red-dwarf-rob-grant</link><description>&lt;doc fingerprint="6edcd29f1fc61aa2"&gt;
   &lt;main&gt;
     &lt;p&gt;Tributes have been paid to Rob Grant, the comedy writer best known as the co-creator of long running hit sitcom Red Dwarf. Grant was also one of the main writers on Spitting IMage for many years, writing regularly with Doug Naylor.&lt;/p&gt;
     &lt;p&gt;The news was broken by the Red Dwarf fan site, Ganymede and Titan. (note - at the time of writing the site has gone down due, presumably, to so many fans trying to find out more details).&lt;/p&gt;
@@ -1502,411 +950,10 @@ sized.&lt;/p&gt;
     &lt;p&gt;His first Red Dwarf novel for thirty years, Titan, co-credited to Andrew Marshall, had recently been announced and is due to be published in July. Details here.&lt;/p&gt;
     &lt;p&gt;Grant was 70. A cause of death has not been made public.&lt;/p&gt;
     &lt;p&gt;On a personal note, I worked with Rob and Doug to write The Official Red Dwarf Companion. I found them both to be great company, a great double act, and, above all, devoted to the art of making people laugh.&lt;/p&gt;
-    &lt;p&gt;This is a breaking story, more will follow...&lt;/p&gt;
+    &lt;p&gt;picture credit: CC BY-SA 2.0&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47184480</guid><pubDate>Fri, 27 Feb 2026 19:26:38 +0000</pubDate></item><item><title>The Robotic Dexterity Deadlock</title><link>https://www.origami-robotics.com/blog/dexterity-deadlocks.html</link><description>&lt;doc fingerprint="859c92174905c6d7"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;The Dexterity Deadlock&lt;/head&gt;
-    &lt;quote&gt;
-      &lt;p&gt;TL;DR: Robot dexterity is stuck behind many unsolved problems. This post focuses on one that we think is underappreciated: the gearbox. High-ratio gearboxes break sim-to-real transfer, destroy force transparency, and are the first thing to wear out. We explain why, and what we did about it.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;You’ve probably seen the video: dozens of humanoid robots dancing in sync at the 2026 Chinese New Year celebration. Pretty cool. While legged robots can sprint across rough terrains and do all those fancy flips, the locomotion problem isn’t entirely solved; but clearly it’s on the trajectory.&lt;/p&gt;
-    &lt;p&gt;But we haven’t seen anything close to that for manipulation. Why? Watch what human hands do every day:&lt;/p&gt;
-    &lt;p&gt;Think about what folding an origami actually requires: crease the paper along an exact line without tearing, apply just enough force to make a sharp fold, coordinate multiple fingers to hold and guide simultaneously, and constantly adjust based on tactile feedback as the paper’s stiffness changes with each fold. You do this without thinking. A robot hand slowly struggles with every single step. And that’s just paper; forget about soldering tiny wires, tying shoelaces, threading needles, or basically anything your eight-year-old does without thinking. The gap between locomotion and manipulation isn’t just large. It’s widening. We kept asking ourselves: why? There are many deadlocks standing in the way of true dexterity: occlusions, multi-finger coordination and planning, contact modeling. We started calling the whole tangle the Dexterity Deadlock. Today we want to look at one specific piece of it: the gearbox.&lt;/p&gt;
-    &lt;p&gt;Why mount motors in the fingers at all? You could place motors on the forearm and route power through cables, as human anatomy does. Tendon-driven designs have real advantages: low reflected inertia, fast response, and they keep the heavy actuators off the hand. Many recent systems take this path. But robot tendons introduce friction and play at every guide point, and they stretch over time, making the system fundamentally unreliable. Cable-driven hands need constant recalibration as tension drifts, friction varies with temperature and wear, and backlash accumulates in the routing. We won’t address tendon-driven architectures in this post; they deserve their own deep dive. The other common path: mount small motors directly in the fingers, then use high-ratio gearboxes to amplify their weak torque. But those gearboxes destroy the very things dexterous manipulation needs: accurate simulation, force transparency, mechanical reliability. You can’t get dexterity with the gearbox. You can’t get torque without it.&lt;/p&gt;
-    &lt;p&gt;Nearly every robot hand on the market is stuck in this trap: packed with 100:1, 200:1, sometimes 288:1 gearboxes that poison everything downstream. They make simulation inaccurate. They block force information from reaching the motor. And they’re the first thing to break.&lt;/p&gt;
-    &lt;p&gt;When a learned policy fails to transfer from sim to real, the instinct is to blame the algorithm. Train a bigger network. Crank up domain randomization. Those approaches have made real progress; we don’t deny that. But at some point we started wondering: are we treating the symptom or the disease? What if the transmission itself is the bottleneck?&lt;/p&gt;
-    &lt;p&gt;At Origami, we’re taking a different approach: instead of patching the software to work around bad hardware, we’re redesigning the hardware to need less patching. A key part of this is dramatically reducing the gear ratio. What follows is the story of why that matters, what we had to invent to make it possible, and what it unlocked.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The Problem&lt;/head&gt;
-    &lt;head rend="h3"&gt;The Geometric Curse&lt;/head&gt;
-    &lt;p&gt;First, you have to understand why the gearbox is there in the first place. Nobody wants a 288:1 gearbox in a finger. So why do nearly all robot hands have one?&lt;/p&gt;
-    &lt;p&gt;Look at a leg motor. Big radius, big lever arm, \(\tau = F \times r\). It’s naturally strong. Barely needs gearing. Ratio 6:1. Transparent. Now look at a finger. There’s no room. You have to shrink the motor until it fits, and torque collapses.&lt;/p&gt;
-    &lt;p&gt;Here is the cruel math: for geometrically similar motors (where all dimensions including length shrink equally, like comparing a 1cm³ motor to a 10cm³ motor), torque scales with the cube of the linear dimension (\(r^3\)). Both the cross-sectional area and the lever arm shrink together. Make a motor 10× smaller in each dimension and it gets roughly 1,000× weaker. Torque doesn’t just drop. It vanishes. (Clever winding and magnet choices can soften the blow, but the scaling trend is real and punishing.)&lt;/p&gt;
-    &lt;p&gt;So engineers compensate with massive gear ratios: 200:1, 288:1. The motor fits. The finger moves. Problem solved? No. This is where the problems start. This trade-off is the birthplace of the sim-to-real gap.&lt;/p&gt;
-    &lt;head rend="h3"&gt;The Sim-to-Real Gap&lt;/head&gt;
-    &lt;p&gt;In simulation, motors are ideal torque sources. You command 5 Newton-meters, the joint applies exactly 5 Newton-meters, instantly. Clean:&lt;/p&gt;
-    &lt;p&gt;\[\tau_{out} = \tau_{in}\]&lt;/p&gt;
-    &lt;p&gt;But inside a real gearbox, physics fights back:&lt;/p&gt;
-    &lt;p&gt;\[\tau_{out} = \tau_{in} - \underbrace{f(\dot{\theta})}_{\text{Friction}} - \underbrace{\delta(\theta)}_{\text{Backlash}} - \epsilon_{\text{chaos}}\]&lt;/p&gt;
-    &lt;p&gt;(We’re even omitting the reflected inertia term \(N^2 J_{rotor}\ddot{\theta}\), which we’ll get to; the static losses alone are enough to break the sim-to-real bridge.) Every one of these terms is a nail in the coffin.&lt;/p&gt;
-    &lt;p&gt;Play with the chart below. The black curve is the real friction characteristic (a Stribeck curve) with a sharp discontinuity at zero velocity where stiction kicks in. The dashed red curve is what simulators use: a smooth approximation. Toggle each and watch how they diverge, especially near velocity reversals where the sim completely misses the stiction jump.&lt;/p&gt;
-    &lt;p&gt;The Structural Gap \(f(\cdot)\). Here’s what took us a while to see. Stiction and backlash aren’t just “noise”; they’re discontinuous functions. Step changes. Dead zones. Continuous approximations exist (see bristle models of friction), but these sharp discontinuities remain difficult to model in simulation and nearly impossible for neural networks to learn accurately. You’re trying to approximate a jagged cliff with a smooth curve. A policy trained on smooth physics will hallucinate when it hits the jagged reality of a gearbox. Software fixes introduce side-effects and approximations that compound over time. A hardware fix (reducing the discontinuity at the source) is more fundamental.&lt;/p&gt;
-    &lt;p&gt;Seeing It in Motion. Equations are one thing. Now watch what a gear train actually does. Toggle between low-ratio and high-ratio: dead zones appear, energy vanishes into friction, and backdrivability dies.&lt;/p&gt;
-    &lt;p&gt;The \(N^2\) Impedance Mismatch. This one is brutal. Reflected inertia doesn’t scale linearly with the gear ratio. It scales with the square:&lt;/p&gt;
-    &lt;p&gt;\[J_{reflected} = N^2 \cdot J_{rotor}\]&lt;/p&gt;
-    &lt;p&gt;As Russ Tedrake explains in his MIT Robotic Manipulation course, this is why most commercial robots are position-controlled rather than torque-controlled: the gearbox makes the motor’s dynamics dominate the world’s dynamics.&lt;/p&gt;
-    &lt;p&gt;Standard hands use \(N \approx 100\). That means \(N^2 \approx 10{,}000\). The simulator thinks the finger is light and backdrivable. The real finger hits with the momentum of a sledgehammer. Delicate manipulation becomes very difficult when the finger itself has that much inertia.&lt;/p&gt;
-    &lt;p&gt;The Chaos Term \(\epsilon_{\text{chaos}}\). This one might be the most insidious. It represents time-variant dynamics that no static model can capture: grease viscosity changing as the motor heats up mid-experiment, microscopic wear on gear teeth after 100 hours of operation, manufacturing tolerances that make every single unit slightly different from the last. It’s difficult to simulate because it’s a moving target. It’s difficult to calibrate away because it drifts. It’s not noise. It’s entropy.&lt;/p&gt;
-    &lt;p&gt;Consider OpenAI’s Rubik’s Cube project: a policy trained on a Shadow Hand (tendon-driven, high-ratio) that took thousands of years of simulated experience and Automatic Domain Randomization (ADR). The task is genuinely hard; but ADR exists because the sim-to-real gap is massive, and much of that gap traces back to the tendon transmission. The hardware didn’t cause the entire problem, but it made it vastly more expensive to brute-force through.&lt;/p&gt;
-    &lt;p&gt;The broader response follows the same pattern: model the gearbox, add domain randomization, or train a compensation network like the Unsupervised Actuator Net from Fey et al. at MIT. These approaches can work; but they’re specific to one physical unit and drift as the gearbox wears. What works in the lab may need retuning on the next unit off the line. For a prototype, that’s manageable. For a fleet, it’s a maintenance problem disguised as a modeling problem.&lt;/p&gt;
-    &lt;p&gt;The visualization below shows why. With a low-ratio transmission (left), even modest domain randomization covers the sim-to-real gap. With a high-ratio gearbox (right), friction, backlash, and chaos push reality far from the simulation’s mean output. Crank the DR width to maximum; reality stays stubbornly outside, and the training cost explodes.&lt;/p&gt;
-    &lt;p&gt;We think there’s a simpler path: reduce the hardware complexity so there’s less to model in the first place.&lt;/p&gt;
-    &lt;head rend="h3"&gt;The Information Wall&lt;/head&gt;
-    &lt;p&gt;Everything above focuses on actuation: commanding forces and motions. But manipulation requires information flow in both directions. The hand must also sense: read contact forces, detect slip, feel compliance.&lt;/p&gt;
-    &lt;p&gt;The DDHand project at CMU framed this explicitly: “We view the gripper as a signal transmission channel, and seek high-bandwidth, high-fidelity transmission of force and motion signals in both directions.” A hand is a full-duplex communication channel. It receives information from the world through torque feedback, informing the policy how to act. It transmits information to the world, instructing how the environment should evolve in response.&lt;/p&gt;
-    &lt;p&gt;What does channel capacity have to do with manipulation? Think of a phone call over a bad connection: the bandwidth is too low (voice cuts out), and the SNR is too low (static drowns out words). You can barely communicate. Now consider Shannon’s AWGN channel capacity formula: \(C = B \log_2(1 + \text{SNR})\), where \(C\) is information capacity (bits/second), \(B\) is bandwidth (Hz), and \(\text{SNR}\) is signal-to-noise ratio. High capacity means more information per second. For a robot hand, high actuator information capacity means the ability to execute and sense complex, responsive behaviors: a clear conversation between hand and world.&lt;/p&gt;
-    &lt;p&gt;A high-ratio gearbox degrades both terms. Bandwidth collapses: reflected inertia scales as \(N^2\), limiting how fast the system can respond. SNR collapses: external force reflected to the motor is divided by \(N\), while friction noise stays constant. The signal-to-noise ratio degrades at least as fast as \(1/N\):&lt;/p&gt;
-    &lt;p&gt;\[\text{SNR} \;\approx\; \frac{\tau_{ext} / N}{\tau_{friction}} \;=\; \frac{\tau_{ext}}{N \cdot \tau_{friction}}\]&lt;/p&gt;
-    &lt;p&gt;By keeping reflected inertia low, we maximize bandwidth. By keeping friction, backlash, and chaos low, we maximize SNR. A low-ratio transmission preserves actuator information capacity in both directions: fast, precise actuation and high-fidelity force sensing. At \(N \approx 100\), the reflected force from a gentle touch is smaller than the friction noise floor. The channel is effectively closed: like trying to have a conversation through a wall.&lt;/p&gt;
-    &lt;p&gt;And stiction makes it worse. It doesn’t just add noise: it creates a hard dead zone. Below the stiction threshold, force information isn’t degraded. It’s erased. The controller receives nothing until the force is large enough to overcome the static friction of the entire gear train. For delicate manipulation; sensing millinewtons of contact; this is devastating.&lt;/p&gt;
-    &lt;p&gt;This is why most geared robot hands need external force/torque sensors at every fingertip: adding cost, fragility, and wiring complexity. A transparent actuator doesn’t need them. The motor is the sensor. Sangbae Kim, whose MIT Biomimetic Robotics Lab pioneered this approach for legs, calls it proprioceptive actuation: deliberately echoing the biological term. In biology, a surprising amount of force information comes not from the skin but from the muscles themselves, through low-friction tendons that preserve the signal. A low-ratio gearbox does the same thing for a robot.&lt;/p&gt;
-    &lt;head rend="h3"&gt;The Weakest Link&lt;/head&gt;
-    &lt;p&gt;There’s a third problem that doesn’t get enough attention in papers but matters enormously in practice: gearboxes break.&lt;/p&gt;
-    &lt;p&gt;Look at the size of those teeth. A high-ratio gearbox is the most mechanically complex component in a servo actuator, and it has to fit inside a finger. Gear teeth mesh under load, grease degrades, backlash increases over time; and because the teeth themselves are so small, they’re easy to break under impact. We’ve tested and taken apart a lot of hands. The gearbox is almost always the first thing to fail. And when it fails, the entire finger is dead.&lt;/p&gt;
-    &lt;p&gt;This isn’t just an engineering annoyance. It’s a scaling problem. If you want to deploy robot hands in the real world, reliability matters as much as performance. Every gear tooth is a potential failure point. Going from 288:1 to 15:1 doesn’t just improve the dynamics. It dramatically simplifies the mechanical system, reduces wear surfaces, and extends the operational lifetime of the hand.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Why Manipulation Needs Better&lt;/head&gt;
-    &lt;p&gt;Quasi-direct drive isn’t a new idea. The MIT Cheetah proved it for legs. UC Berkeley’s Blue robot proved it for arms. Low gear ratios made sim-to-real transfer work and gave these robots the compliance to survive real-world impacts. So the obvious question: why hasn’t anyone done this for hands?&lt;/p&gt;
-    &lt;p&gt;The short answer is the geometric curse; fingers are just too small for powerful motors. But there’s a deeper question worth asking first: does manipulation actually need transparent actuators? Could you get away with position control behind a high-ratio gearbox, as long as you solve the sim-to-real problem some other way?&lt;/p&gt;
-    &lt;p&gt;We don’t think so. And it comes down to how differently manipulation and locomotion relate to contact.&lt;/p&gt;
-    &lt;p&gt;A walking robot touches the ground in brief, periodic, predictable patterns. Foot strikes, pushes off, lifts. Contact is mostly a side effect of the trajectory. A position controller behind a stiff gearbox can handle this; QDD buys you better sim-to-real transfer and energy efficiency, but locomotion can work without it.&lt;/p&gt;
-    &lt;p&gt;Manipulation is different. Contact isn’t a side effect. It is the task. When a hand grasps a cup, threads a needle, or turns a screwdriver, every finger is in sustained, force-rich contact with the object. The quality of that contact; how much force, how compliant, how responsive; determines whether the task succeeds or fails. As Neville Hogan argued in his foundational work on impedance control, manipulation requires controlling the relationship between force and motion, not just one or the other.&lt;/p&gt;
-    &lt;p&gt;There’s a subtler point too. As Kim has observed, people assume you need tactile sensors to manipulate; but in biology, a large share of force information comes not from skin mechanoreceptors but from the muscles themselves, through proprioception. The low-friction tendon acts as a transparent channel. A low-ratio actuator does the same: it lets the motor feel what the finger feels. A high-ratio gearbox walls that channel off.&lt;/p&gt;
-    &lt;p&gt;Locomotion proved that QDD works. Manipulation is where we believe it matters most. The gearbox doesn’t just make simulation harder. It makes the task itself harder. It blinds the hand, stiffens the fingers, and destroys the force control that manipulation fundamentally requires.&lt;/p&gt;
-    &lt;head rend="h2"&gt;What We Built&lt;/head&gt;
-    &lt;head rend="h3"&gt;From 288 to 15&lt;/head&gt;
-    &lt;p&gt;So the question became: can we build a motor small enough for a finger but strong enough to barely need a gearbox? As far as we know, nobody had done it. The geometric curse made it seem impossible.&lt;/p&gt;
-    &lt;p&gt;The key insight was rethinking the motor topology itself. Conventional servo motors use a radial flux design; compact, well-understood, but the lever arm is limited by the rotor radius. We switched to an axial flux architecture. It’s flatter, which fits better inside a finger, and the magnets sit at a larger effective radius; longer lever arm, more torque per unit volume. Same physics that makes the geometric curse so punishing, now working in our favor.&lt;/p&gt;
-    &lt;p&gt;But a better topology alone isn’t enough. A motor that produces 1.6× more torque per volume still can’t sustain that torque if the windings melt. So we also optimized the power electronics and thermal management; making sure the steady-state temperature stays within safe limits even under continuous load. It’s the combination of both that lets us drop the gear ratio from 288:1 all the way down to 15:1 while maintaining roughly the same output torque. (Full technical details in our paper.)&lt;/p&gt;
-    &lt;p&gt;That single number; 288 to 15; and we started seeing the differences immediately.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Reflected inertia drops by a factor of \((288/15)^2 \approx 368\). Our motor has a somewhat larger rotor to achieve higher torque density, so the net improvement in absolute reflected inertia is less than 368x; but still well over two orders of magnitude. The finger stops being a sledgehammer.&lt;/item&gt;
-      &lt;item&gt;Friction drops significantly. Dead zones largely disappear.&lt;/item&gt;
-      &lt;item&gt;Backlash is reduced to near-zero by the single-stage low-ratio transmission.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;And the messy real-world equation starts converging back toward the ideal:&lt;/p&gt;
-    &lt;p&gt;\[\tau_{out} \approx \tau_{in}\]&lt;/p&gt;
-    &lt;p&gt;Better simulation and domain randomization will always help. But instead of only patching the simulator, we wanted to shrink the gap from the other direction; make the real robot closer to the idealized model, so there’s less to patch in the first place.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Does It Work?&lt;/head&gt;
-    &lt;p&gt;Here’s what we’ve seen so far.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Hardware Validation&lt;/head&gt;
-    &lt;p&gt;The hand is fully backdrivable. Push any finger and it yields naturally, like a human hand would. No gear wall, no dead zone, no sudden snap from stiction release. (Try this on a 288:1 geared hand; the finger won’t budge.) It can grasp fragile objects without crushing them, not because of a software force limiter, but because the low reflected inertia makes the fingers physically gentle. The hardware isn’t fighting the world.&lt;/p&gt;
-    &lt;p&gt;And because the transmission is far more transparent, we can read forces directly through the motor current; adduction, abduction, flexion, extension. No external force/torque sensor needed. At 15:1 there’s still some friction between motor and fingertip, so proprioceptive sensing isn’t as clean as true direct drive. It’s orders of magnitude better than at 288:1, where the friction floor drowns out gentle contact entirely. The forces the finger feels actually propagate back to the motor.&lt;/p&gt;
-    &lt;p&gt;These are early, qualitative indicators; not proof. We’re currently running quantitative sim-to-real benchmarks: zero-shot policy deployment, domain randomization ablations, torque tracking fidelity. We’ll share those results separately. But the signs are encouraging.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Robot Hand Landscape&lt;/head&gt;
-    &lt;p&gt;To help researchers choose the right hand for their project, here’s a comparison of dexterous robot hands currently available:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="7"&gt;
-        &lt;cell role="head"&gt;Hand&lt;/cell&gt;
-        &lt;cell role="head"&gt;DOF&lt;/cell&gt;
-        &lt;cell role="head"&gt;Gear Ratio&lt;/cell&gt;
-        &lt;cell role="head"&gt;Sim-to-Real Gap&lt;/cell&gt;
-        &lt;cell role="head"&gt;Force Transparency&lt;/cell&gt;
-        &lt;cell role="head"&gt;Reliability&lt;/cell&gt;
-        &lt;cell role="head"&gt;Link&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;Shadow Hand&lt;/cell&gt;
-        &lt;cell&gt;20&lt;/cell&gt;
-        &lt;cell&gt;Tendon&lt;/cell&gt;
-        &lt;cell&gt;High (friction, stretch)&lt;/cell&gt;
-        &lt;cell&gt;Low (needs external F/T)&lt;/cell&gt;
-        &lt;cell&gt;Low (cable wear)&lt;/cell&gt;
-        &lt;cell&gt;Shadow&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;Allegro Hand&lt;/cell&gt;
-        &lt;cell&gt;16&lt;/cell&gt;
-        &lt;cell&gt;369:1&lt;/cell&gt;
-        &lt;cell&gt;Medium (N²=136k)&lt;/cell&gt;
-        &lt;cell&gt;Low (blind)&lt;/cell&gt;
-        &lt;cell&gt;Medium (small teeth)&lt;/cell&gt;
-        &lt;cell&gt;Allegro&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;LEAP Hand&lt;/cell&gt;
-        &lt;cell&gt;16&lt;/cell&gt;
-        &lt;cell&gt;~288:1&lt;/cell&gt;
-        &lt;cell&gt;Medium (N²=83k)&lt;/cell&gt;
-        &lt;cell&gt;Low (blind)&lt;/cell&gt;
-        &lt;cell&gt;Low (servo breaks)&lt;/cell&gt;
-        &lt;cell&gt;LEAP&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;Inspire Hand&lt;/cell&gt;
-        &lt;cell&gt;6&lt;/cell&gt;
-        &lt;cell&gt;Linear&lt;/cell&gt;
-        &lt;cell&gt;Medium (linear friction)&lt;/cell&gt;
-        &lt;cell&gt;Medium (linear friction)&lt;/cell&gt;
-        &lt;cell&gt;Medium&lt;/cell&gt;
-        &lt;cell&gt;Inspire&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;XHand&lt;/cell&gt;
-        &lt;cell&gt;12&lt;/cell&gt;
-        &lt;cell&gt;QDD (underactuated)&lt;/cell&gt;
-        &lt;cell&gt;Low-Medium (coupling)&lt;/cell&gt;
-        &lt;cell&gt;Medium (QDD but coupling loss)&lt;/cell&gt;
-        &lt;cell&gt;Medium-High&lt;/cell&gt;
-        &lt;cell&gt;RobotEra&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;TESOLLO&lt;/cell&gt;
-        &lt;cell&gt;20&lt;/cell&gt;
-        &lt;cell&gt;~100:1&lt;/cell&gt;
-        &lt;cell&gt;Medium (N²=10k)&lt;/cell&gt;
-        &lt;cell&gt;Low-Medium (N²=10k)&lt;/cell&gt;
-        &lt;cell&gt;Medium (gearbox)&lt;/cell&gt;
-        &lt;cell&gt;TESOLLO&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;SharpaWave&lt;/cell&gt;
-        &lt;cell&gt;22&lt;/cell&gt;
-        &lt;cell&gt;~200:1&lt;/cell&gt;
-        &lt;cell&gt;Medium (N²=40k)&lt;/cell&gt;
-        &lt;cell&gt;Low (N²=40k blocks signal)&lt;/cell&gt;
-        &lt;cell&gt;Medium (gearbox)&lt;/cell&gt;
-        &lt;cell&gt;Sharpa&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;Wuji Hand&lt;/cell&gt;
-        &lt;cell&gt;20&lt;/cell&gt;
-        &lt;cell&gt;~100:1&lt;/cell&gt;
-        &lt;cell&gt;Medium (N²=10k)&lt;/cell&gt;
-        &lt;cell&gt;Low-Medium (N²=10k)&lt;/cell&gt;
-        &lt;cell&gt;Medium (tiny gears)&lt;/cell&gt;
-        &lt;cell&gt;Wuji&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;ALLEX Hand&lt;/cell&gt;
-        &lt;cell&gt;15&lt;/cell&gt;
-        &lt;cell&gt;Cable-driven&lt;/cell&gt;
-        &lt;cell&gt;Low-Medium (underactuated)&lt;/cell&gt;
-        &lt;cell&gt;High (force feedback)&lt;/cell&gt;
-        &lt;cell&gt;Low (cable maintenance)&lt;/cell&gt;
-        &lt;cell&gt;WIRobotics&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;Psyonic&lt;/cell&gt;
-        &lt;cell&gt;6&lt;/cell&gt;
-        &lt;cell&gt;~100:1&lt;/cell&gt;
-        &lt;cell&gt;Medium-High (linkages)&lt;/cell&gt;
-        &lt;cell&gt;Low-Medium (N²=10k)&lt;/cell&gt;
-        &lt;cell&gt;Medium (gearbox)&lt;/cell&gt;
-        &lt;cell&gt;Psyonic&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;Figure 03&lt;/cell&gt;
-        &lt;cell&gt;16&lt;/cell&gt;
-        &lt;cell&gt;High&lt;/cell&gt;
-        &lt;cell&gt;High&lt;/cell&gt;
-        &lt;cell&gt;Low (high ratio blocks signal)&lt;/cell&gt;
-        &lt;cell&gt;Medium&lt;/cell&gt;
-        &lt;cell&gt;Figure&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;Tesla Optimus&lt;/cell&gt;
-        &lt;cell&gt;22&lt;/cell&gt;
-        &lt;cell&gt;Tendon&lt;/cell&gt;
-        &lt;cell&gt;High (friction, stretch)&lt;/cell&gt;
-        &lt;cell&gt;Low (tendon friction)&lt;/cell&gt;
-        &lt;cell&gt;Low (cable wear)&lt;/cell&gt;
-        &lt;cell&gt;Tesla&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;Clone Hand&lt;/cell&gt;
-        &lt;cell&gt;27&lt;/cell&gt;
-        &lt;cell&gt;Hydraulic&lt;/cell&gt;
-        &lt;cell&gt;Extremely High (fluid)&lt;/cell&gt;
-        &lt;cell&gt;Unknown&lt;/cell&gt;
-        &lt;cell&gt;Medium (seals)&lt;/cell&gt;
-        &lt;cell&gt;Clone&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="7"&gt;
-        &lt;cell&gt;ORCA Hand&lt;/cell&gt;
-        &lt;cell&gt;17&lt;/cell&gt;
-        &lt;cell&gt;Tendon&lt;/cell&gt;
-        &lt;cell&gt;Medium (friction)&lt;/cell&gt;
-        &lt;cell&gt;Low-Medium (tendon friction)&lt;/cell&gt;
-        &lt;cell&gt;Low-Medium (cable)&lt;/cell&gt;
-        &lt;cell&gt;ORCA&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Origami Hand&lt;/cell&gt;
-        &lt;cell&gt;21&lt;/cell&gt;
-        &lt;cell&gt;15:1&lt;/cell&gt;
-        &lt;cell&gt;Low&lt;/cell&gt;
-        &lt;cell&gt;High (motor current)&lt;/cell&gt;
-        &lt;cell&gt;High (simple mech.)&lt;/cell&gt;
-        &lt;cell&gt;Origami&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Note: Analysis based on publicly available specifications and the problems discussed in this post. Sim-to-Real Gap correlates with gear ratio (higher N = larger N² reflected inertia and more friction/backlash). Force Transparency indicates whether external forces can be sensed through the actuator. Reliability reflects mechanical complexity (more stages = more failure points). Ratings are comparative, not absolute measurements.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The Take-Home&lt;/head&gt;
-    &lt;p&gt;Alan Kay once said: “People who are really serious about software should make their own hardware.”&lt;/p&gt;
-    &lt;p&gt;Yuke Zhu put it more directly:&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;“People who are really serious about robot learning should make their own robot hardware.”&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;We think the gearbox piece of the Dexterity Deadlock isn’t a software problem waiting for a software solution. It’s a hardware problem masquerading as one. Gearboxes create physics that simulators can’t model accurately, block the force information that manipulation requires, and are the first component to break.&lt;/p&gt;
-    &lt;p&gt;We’re not claiming we’ve solved dexterity. The deadlock has many pieces; occlusions, planning, contact; and this is just one of them. But we believe it’s a foundational one, and we’re attacking it from the hardware side.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Discussion&lt;/head&gt;
-    &lt;p&gt;Have thoughts, questions, or disagree with something? We’d love to hear from you.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47184744</guid><pubDate>Fri, 27 Feb 2026 19:51:33 +0000</pubDate></item><item><title>The Most-Seen UI on the Internet? Redesigning Turnstile and Challenge Pages</title><link>https://blog.cloudflare.com/the-most-seen-ui-on-the-internet-redesigning-turnstile-and-challenge-pages/</link><description>&lt;doc fingerprint="a38abb01ab346fbe"&gt;
-  &lt;main&gt;
-    &lt;div&gt;
-      &lt;p&gt;You've seen it. Maybe you didn't register it consciously, but you've seen it. That little widget asking you to verify you're human. That full-page security check before accessing a website. If you've spent any time on the Internet, you've encountered Cloudflare's Turnstile widget or Challenge Pages â likely more times than you can count.&lt;/p&gt;
-      &lt;p&gt;The Turnstile widget â a familiar sight across millions of websites&lt;/p&gt;
-      &lt;p&gt;When we say that a large portion of the Internet sits behind Cloudflare, we mean it. Our Turnstile widget and Challenge Pages are served 7.67 billion times every single day. That's not a typo. Billions. This might just be the most-seen user interface on the Internet.&lt;/p&gt;
-      &lt;p&gt;And that comes with enormous responsibility.&lt;/p&gt;
-      &lt;p&gt;Designing a product with billions of eyeballs on it isn't just challenging â it requires a fundamentally different approach. Every pixel, every word, every interaction has to work for someone's grandmother in rural Japan, a teenager in SÃ£o Paulo, a visually impaired developer in Berlin, and a busy executive in Lagos. All at the same time. In moments of frustration.&lt;/p&gt;
-      &lt;p&gt;Today weâre sharing the story of how we redesigned Turnstile and Challenge Pages. It's a story told in three parts, by three of us: the design process and research that shaped our decisions (Leo), the engineering challenge of deploying changes at unprecedented scale (Ana), and the measurable impact on billions of users (Marina).&lt;/p&gt;
-      &lt;p&gt;Let's start with how we approached the problem from a design perspective.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h2"&gt;Part 1: The design process&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;Let's be honest: nobody likes being asked to prove they're human. You know you're human. I know I'm human. The only one who doesn't seem convinced is that little widget standing between you and the website you're trying to access. At best, it's a minor inconvenience. At worst? You've probably wanted to throw your computer out the window in a fit of rage. We've all been there. And no one would blame you.&lt;/p&gt;
-      &lt;p&gt;Turnstile integrated into a login flow&lt;/p&gt;
-      &lt;p&gt;As the world warms up to what appears to be an inevitable AI revolution, the need for security verification is only increasing. At Cloudflare, we've seen a significant rise in bot attacks â and in response, organizations are investing more heavily in security measures. That means more challenges being issued to more end users, more often.&lt;/p&gt;
-      &lt;p&gt;The numbers tell the story:&lt;/p&gt;
-      &lt;p&gt;2023: 2.14B daily&lt;/p&gt;
-      &lt;p&gt;2024: 3B daily&lt;/p&gt;
-      &lt;p&gt;2025: 5.35B daily&lt;/p&gt;
-      &lt;p&gt;That's a 58.1% average increase in security checks, year over year. More security checks mean more opportunities for end user frustration. The more companies integrate these verification systems to protect themselves and their customers, the higher the chance that someone, somewhere, is going to have a bad experience.&lt;/p&gt;
-      &lt;p&gt;We knew it was time to take a hard look at our flagship products and ask ourselves: Are we doing right by the billions of people who encounter these experiences? Are we fulfilling our mission to build a better Internet â not just a more secure one, but a more human one?&lt;/p&gt;
-      &lt;p&gt;The answer, we discovered, was: we could do better.&lt;/p&gt;
-      &lt;p&gt;Before redesigning anything, we needed to understand what we were working with. We started by conducting a comprehensive audit of every state, every error message, and every interaction across both Turnstile and Challenge Pages.&lt;/p&gt;
-      &lt;p&gt;What we found wasn't the best.&lt;/p&gt;
-      &lt;p&gt;The state of inconsistency in the Turnstile widget. Multiple states with no unified approach&lt;/p&gt;
-      &lt;p&gt;The inconsistencies were glaring. We had no unified approach across the multitude of different error scenarios. Some messages were overly verbose and technical ("Your device clock is set to a wrong time or this challenge page was accidentally cached by an intermediary and is no longer available"). Others were too vague to be helpful ("Timed out"). The visual language varied wildly â different layouts, different hierarchies, different tones of voice.&lt;/p&gt;
-      &lt;p&gt;We also examined the feedback we'd received online. Social media, support tickets, community forums â we read it all. The frustration was palpable, and much of it was avoidable.&lt;/p&gt;
-      &lt;p&gt;Take our feedback mechanism, for example. We offered users feedback options like "The widget sometimes fails" versus "The widget fails all the time." But what's the difference, really? And how were they supposed to know how often it failed? We were asking users to interpret ambiguous options during their most frustrated moments. The more we left open to interpretation, the less useful the feedback became â and the more frustration we saw across social channels.&lt;/p&gt;
-      &lt;p&gt;The previous feedback screen: "The widget sometimes fails" vs "The widget fails all the time" â what's the difference?&lt;/p&gt;
-      &lt;p&gt;Our Challenge Pages â the full-page security blocks that appear when we detect suspicious activity or when site owners have heightened security settings â had similar issues. Some states were confusing. Others used too much technical jargon. Many failed to provide actionable guidance when users needed it most.&lt;/p&gt;
-      &lt;p&gt;The state of inconsistency on the Challenge pages. Multiple states with no unified approach&lt;/p&gt;
-      &lt;p&gt;The audit was humbling. But it gave us a clear picture of where we needed to focus.&lt;/p&gt;
-      &lt;p&gt;To design better experiences, we first needed to understand every possible path a user could take. What was the happy path? Was there even one? And what were the unhappy paths that led to escalating frustration?&lt;/p&gt;
-      &lt;p&gt;Mapping the complete user journey â from initial encounter through error scenarios, with sentiment tracking&lt;/p&gt;
-      &lt;p&gt;This was a true cross-functional effort. We worked closely with engineers like Ana who knew the technical ins and outs of every edge case, and with Marina on the product side who understood not just how the product worked, but how users felt about it â the love and the hate we'd see online.&lt;/p&gt;
-      &lt;p&gt;We have some of the smartest people working on bot protection at Cloudflare. But intelligence and clarity aren't the same thing. There's a delicate balance between technical complexity and user simplicity. Only when these two dance together successfully can we communicate information in a way that actually makes sense to people.&lt;/p&gt;
-      &lt;p&gt;And here's the thing: the messaging has to work for everyone. A person of any age. Any mental or physical capability. Any cultural background. Any level of technical sophistication. That's what designing at scale really means â you canât ignore edge cases, since, at such scale, they are no longer edge cases.&lt;/p&gt;
-      &lt;p&gt;One of the most influential books in UX design is Steve Krug's Don't Make Me Think. The core principle is simple: every moment a user spends trying to interpret, understand, or decode your interface is a moment of friction. And friction, especially in moments of frustration, leads to abandonment.&lt;/p&gt;
-      &lt;p&gt;Our audit revealed that we were asking users to think far too much. Different pieces of information occupied the same space in the UI across different states. There was no consistent visual hierarchy. Users encountering an error state in Turnstile would find information in a completely different place than they would on a Challenge Page.&lt;/p&gt;
-      &lt;p&gt;We made a fundamental decision: one information architecture to rule them all.&lt;/p&gt;
-      &lt;p&gt;Visual diagram displaying a unified information architecture with a consistent structure across Turnstile widget and Challenge pages&lt;/p&gt;
-      &lt;p&gt;Both Turnstile and Challenge Pages would now follow the same structural pattern. The same visual hierarchy. The same placement for actions, for explanatory text, for links to documentation.&lt;/p&gt;
-      &lt;p&gt;Did this constrain our design options? Absolutely. We had to say no to a lot of creative ideas that didn't fit the framework. But constraints aren't the enemy of good design â they're often its best friend. By limiting our options, we could go deeper on the details that actually mattered.&lt;/p&gt;
-      &lt;p&gt;For users, the benefit is profound: they don't need to re-learn what each piece of the UI means. Error states look consistent. Help links are always in the same place. Once you understand one state, you understand them all. That's cognitive load reduced to a minimum â exactly where it should be during a security verification.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h2"&gt;What user research taught us&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;How do you keep yourself accountable when redesigning something that billions of people see? You test. A lot.&lt;/p&gt;
-      &lt;p&gt;We recruited 8 participants across 8 different countries, deliberately seeking diversity in age, digital savviness, and cultural background. We weren't looking for tech-savvy early adopters â we wanted to understand how the redesign would work for everyone.&lt;/p&gt;
-      &lt;p&gt;Our approach was rigorous: participants saw both the current experience and proposed changes, without knowing which was "old" or "new." We counterbalanced positioning to eliminate bias. And we did not just test our new ideas, but also challenged our assumptions about what needed changing in the first place.&lt;/p&gt;
-      &lt;p&gt;Two different versions of a Turnstile being tested in an A/B test&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h3"&gt;Some things didnât need fixing&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;One hypothesis: should we align with competitors? Most CAPTCHA providers show "I am human" across all states. We use distinct content â "Verify you are human," then "Verifying...," then "Success!"&lt;/p&gt;
-      &lt;p&gt;Were we overcomplicating things? We tested it head-to-head.&lt;/p&gt;
-      &lt;p&gt;Our approach won decisively. For the interactivity state, "Verify you are human" scored 5 out of 8 points versus just 3 for "I am human." For the verifying state, it was even more dramatic â 7.5 versus 0.5. Users wanted to know what was happening, not just be told what they were.&lt;/p&gt;
-      &lt;p&gt;User testing results: users strongly favored our approach over the competitor-style design&lt;/p&gt;
-      &lt;p&gt;This experiment didn't ship as a feature, but it was invaluable. It gave us confidence we weren't just being different for the sake of it. Some things were already right.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h3"&gt;But these needed to change&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;The research surfaced four areas where we were failing users:&lt;/p&gt;
-      &lt;p&gt;Help, not bureaucracy. When users encountered errors, we offered "Send Feedback." In testing, they were baffled. "Who am I sending this to? The website? Cloudflare? My ISP?" More importantly, we discovered something fundamental: at the moment of maximum frustration, people don't want to file a report â they want to fix the problem. We replaced "Send Feedback" with "Troubleshoot" â a single word that promises action rather than bureaucracy.&lt;/p&gt;
-      &lt;p&gt;The problematic "Send Feedback" prompt: users didn't know who they were sending feedback to&lt;/p&gt;
-      &lt;p&gt;Attention, not alarm. We'd used red backgrounds liberally for errors. The reaction in testing was visceral â participants felt they had failed, felt powerless. Even for simple issues that would resolve with a retry, users assumed the worst and gave up. Red at full saturation wasn't communicating "Here's something to address." It was communicating "You have failed, and there's nothing you can do." The fix: red only for icons, never for text or backgrounds.&lt;/p&gt;
-      &lt;p&gt;The evolution: from the states with unclear error state description in red to much clearer and concise error communication in neutral-color text.&lt;/p&gt;
-      &lt;p&gt;Scannable, not verbose. We'd tried to be thorough, explaining errors in technical detail. It backfired. Non-technical users found it alienating. Technical users didn't need it. Everyone was trying to read it in the tiny real estate of a widget. The lesson: less is more, especially in constrained spaces during stressful moments.&lt;/p&gt;
-      &lt;p&gt;Accessible to everyone. Our audit revealed 10px fonts in some states. Grey text that technically met AA (at least 4.5:1 for normal text and 3:1 for large text) compliance but was difficult to read in practice. "Technically compliant" isn't good enough when you're serving the entire Internet.&lt;/p&gt;
-      &lt;p&gt;We set a clear goal: to meet the WCAG 2.2 AAA standardâ the highest and most stringent level of web accessibility compliance, designed to make content accessible to the broadest range of users, including those with severe disabilities. Throughout the redesign, when visual consistency conflicted with readability, readability won. Every time.&lt;/p&gt;
-      &lt;p&gt;This extended beyond vision. We designed for screen reader users, keyboard-only navigators, and people with color vision variations â going beyond what automated compliance tools can catch.&lt;/p&gt;
-      &lt;p&gt;And accessibility isn't just about impairments â it's about language. What fits in English, overflows in German. What's concise in Spanish is ambiguous in Japanese. Supporting over 40 languages forced us to radically simplify. The same "Unable to connect to website / Troubleshoot" pattern now works across English, Bulgarian, Danish, German, Greek, Japanese, Indonesian, Russian, Slovak, Slovenian, Serbian, Filipino, and many more.&lt;/p&gt;
-      &lt;p&gt;The redesigned error state across 12 languages â consistent layout despite varying text lengthsÂ &lt;/p&gt;
-      &lt;p&gt;So what did we actually ship?&lt;/p&gt;
-      &lt;p&gt;First, let's talk about what we didn't change. The happy path â "Verify you are human" â "Verifying..." â "Success!" â tested exceptionally well. Users understood what was happening at each stage. The distinct content for each state, which we'd worried might be overcomplicating things, was actually our competitive advantage.&lt;/p&gt;
-      &lt;p&gt; The happy path: Verify you are human â Verifying â Success! These states tested well and remained largely unchanged&lt;/p&gt;
-      &lt;p&gt;But for the states that needed work, we made significant changes guided by everything we learned.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h3"&gt;Simplified, scannable content&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;We radically reduced the amount of text in error states. Instead of verbose explanations like "Your device clock is set to a wrong time or this challenge page was accidentally cached by an intermediary and is no longer available," we now show:&lt;/p&gt;
-      &lt;list rend="ol"&gt;
-        &lt;item&gt;
-          &lt;p&gt;A clear, simple state name (e.g., "Incorrect device time")&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;A prominent "Troubleshoot" link&lt;/p&gt;
-        &lt;/item&gt;
-      &lt;/list&gt;
-      &lt;p&gt;That's it. The detailed guidance now lives in a dedicated modal screen that opens when users need it â giving them room to actually read and follow troubleshooting steps.&lt;/p&gt;
-      &lt;p&gt;The troubleshooting modal: detailed guidance when users need it, without cluttering the widget&lt;/p&gt;
-      &lt;p&gt;The troubleshooting modal provides context ("This error occurs when your device's clock or calendar is inaccurate. To complete this websiteâs security verification process, your device must be set to the correct date and time in your time zone."), numbered steps to try, links to documentation, and â only after the user has tried to resolve the issue â an option to submit feedback to Cloudflare. Help first, feedback second.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h3"&gt;AAA accessibility compliance&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;Every state now meets WCAG 2.2 AAA standards for contrast and readability. Font sizes have established minimums. Interactive elements are clearly focusable and properly announced by screen readers.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h3"&gt;Unified experience across Turnstile and Challenge pages&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;Whether users encounter the compact Turnstile widget or a full Challenge Page, the information architecture is now consistent. Same hierarchy. Same placement. Same mental model.&lt;/p&gt;
-      &lt;p&gt;Challenge Pages now follow a clean structure: the website name and favicon at the top, a clear status message (like "Verification successful" or "Your browser is out of date"), and actionable guidance below. No more walls of orange or red text. No more technical jargon without context.&lt;/p&gt;
-      &lt;p&gt;Re-designed Challenge page states with clear troubleshooting instructions.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h3"&gt;Validated across languages&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;Every piece of content was tested in over 40 supported languages. Our process involved three layers of validation:&lt;/p&gt;
-      &lt;list rend="ol"&gt;
-        &lt;item&gt;
-          &lt;p&gt;Initial design review by the design team&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;Professional translation by our qualified vendor&lt;/p&gt;
-        &lt;/item&gt;
-        &lt;item&gt;
-          &lt;p&gt;Final review by native-speaking Cloudflare employees&lt;/p&gt;
-        &lt;/item&gt;
-      &lt;/list&gt;
-      &lt;p&gt;This wasn't just about translation accuracy â it was about ensuring the visual design held up when content length varied dramatically between languages.&lt;/p&gt;
-      &lt;p&gt;The result is a security verification experience that's clearer, more accessible, less frustrating, and â crucially â just as secure. We didn't compromise on protection to improve the experience. We proved that good design and strong security aren't in conflict.&lt;/p&gt;
-      &lt;p&gt;Re-designed Turnstile widgets on the left and a re-designed Challenge page on the right&lt;/p&gt;
-      &lt;p&gt;But designing the experience was only half the battle. Shipping it to billions of users? That's where Ana comes in.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h2"&gt;Part 2: Shipping to billions&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;Some may say the hardest part of being a Frontend Engineer is centering a div. In reality, the real challenge often lies much deeper, especially when working close to the platform primitives. Building a critical piece of Internet infrastructure using native APIs forces you to think differently about UI development, tradeoffs, and long-term maintainability.&lt;/p&gt;
-      &lt;p&gt;In our case, we use Rust to handle the UI for both the Turnstile widget and the Challenge page. This decision brought clear benefits in terms of safety and consistency across platforms, but it also increased frontend complexity. Many of us are used to the ergonomics of modern frameworks like React, where common UI interactions come almost for free. Working with Rust meant reimplementing even simple interactions using lower level constructs like document.getElementById, createElement, and appendChild.&lt;/p&gt;
-      &lt;p&gt;On top of that, compile times and strict checks naturally slowed down rapid UI iteration compared to JavaScript based frameworks. Debugging was also more involved, as the tooling ecosystem is still evolving. These constraints pushed us to be more deliberate, more thoughtful, and ultimately more disciplined in how we approached UI development.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;Small visual changes, big global impact&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;What initially looked like small visual tweaks such as padding adjustments or alignment changes quickly revealed a much bigger challenge: internationalization.&lt;/p&gt;
-      &lt;p&gt;Once translations were available, we had to ensure that content remained readable and usable across 38 languages and 16 different UI states. Text length variability alone required careful design decisions. Some translations can be 30 to 300 percent longer than English. A short English string like âStuck?â becomes âTidak bisa melanjutkan?â in Indonesian or âEs geht nicht weiter?â in German, dramatically changing layout requirements.&lt;/p&gt;
-      &lt;p&gt;Right-to-left language support added another layer of complexity. Supporting Arabic, Persian or Farsi, and Hebrew meant more than flipping text direction. Entire layouts had to be mirrored, including alignment, navigation patterns, directional icons, and animation flows. Many of these elements are implicitly designed with left-to-right assumptions, so we had to revisit those decisions and make them truly bidirectional.&lt;/p&gt;
-      &lt;p&gt;Ordered lists also required special care. Not every culture uses the Western 1, 2, 3 numbering system, and hardcoding numeric sequences can make interfaces feel foreign or incorrect. We leaned on locale-aware numbering and fully translatable list formats to ensure ordering felt natural and culturally appropriate in every language.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;Building confidence through testing&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;As we started listing action points in feedback reports, correctness became even more critical. Every action needed to render properly, trigger the right flow, and behave consistently across states, languages, and edge cases.&lt;/p&gt;
-      &lt;p&gt;To get there, we invested heavily in testing. Unit tests helped us validate logic in isolation, while end-to-end tests ensured that new states and languages worked as expected in real scenarios. This testing foundation gave us confidence to iterate safely, prevented regressions, and ensured that feedback reports remained reliable and actionable for users.&lt;/p&gt;
-      &lt;p&gt;What began as a set of technical constraints turned into an opportunity to build a more robust, inclusive, and well-tested UI system. Working with fewer abstractions and closer to the browser primitives forced us to rethink assumptions, improve our internationalization strategy, and raise the overall quality bar.&lt;/p&gt;
-      &lt;p&gt;The result is not just a solution that works, but one we trust. And that trust is what allows us to keep improving, even when centering a div turns out to be the easy part.&lt;/p&gt;
-      &lt;p&gt;Designing for billions of people is a responsibility we take seriously. At this scale, it is essential to leverage measurable data to tell us the real impact of our design choices. As we prepare to roll out these changes, we are focusing on five key metrics that will tell us if weâve truly succeeded in making the Internetâs most-seen UI more human.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;1. Challenge Completion Rate&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;Our primary north star is the Challenge Solve Rate: the percentage of issued challenges that are successfully completed. By moving away from technical jargon like "intermediary caching" and toward simple, actionable labels like "Incorrect device time," we expect a significant uptick in CSR. A higher CSR doesn't mean we're being easier on bots; it means weâre removing the hurdles that were accidentally tripping up legitimate human users.&lt;/p&gt;
-      &lt;p&gt;Every second a user spends on a challenge page is a second they aren't getting the information that they need. Our research showed that users were often paralyzed by choice when seeing a wall of red text. With our new scannable, neutral-color design, we are tracking Time to Complete to ensure users can identify and resolve issues in seconds rather than minutes.&lt;/p&gt;
-      &lt;div&gt;
-        &lt;head rend="h4"&gt;3. Abandonment Rate Changes&lt;/head&gt;
-      &lt;/div&gt;
-      &lt;p&gt;In the past, our liberal use of "saturated red" caused a visceral reaction: users felt they had failed and simply gave up. By reserving red only for icons and using a unified architecture, we aim to reduce Abandonment Rates. We want users to feel empowered to click Troubleshoot rather than feeling powerless and clicking away.&lt;/p&gt;
-      &lt;p&gt;One of the bigger shifts from a product perspective is our new Troubleshooting Modal. By providing clear, numbered steps directly within the widget, we are building self-service support into the UI. We expect this to result in a measurable decrease in support ticket volume for both our customers and our own internal teams.&lt;/p&gt;
-      &lt;p&gt;We know that security challenges are rarely loved, but they shouldn't be hated because they are confusing. We are monitoring Social Sentiment across community forums, feedback reports, and social channels to see if the conversation shifts from "this widget is broken" to "I had an issue, but I fixed it".&lt;/p&gt;
-      &lt;p&gt;As a Product Manager, my goal is often invisible security â the best challenge is the one the user never sees. But when a challenge must be seen, it should be an assistant, not a bouncer. This redesign proves that AAA accessibility and high-security standards aren't in competition; they are two sides of the same coin. By unifying the architecture of Turnstile and Challenge Pages, weâve built a foundation that allows us to iterate faster and protect the Internet more humanely than ever before.&lt;/p&gt;
-      &lt;p&gt;This redesign is a foundation, not a finish line.&lt;/p&gt;
-      &lt;p&gt;We're continuing to monitor how users interact with the new experience, and we're committed to iterating based on what we learn. The feedback mechanisms we've built into the new design â the ones that actually help users troubleshoot, rather than just asking them to report problems â will give us richer insights than we've ever had before.&lt;/p&gt;
-      &lt;p&gt;We're also watching how the security landscape evolves. As bot attacks grow more sophisticated, and as AI continues to blur the line between human and automated behavior, the challenge of verification will only get harder. Our job is to stay ahead â to keep improving security without making the human experience worse.&lt;/p&gt;
-      &lt;p&gt;If you encounter the new Turnstile or Challenge Pages and have feedback, we want to hear it. Reach out through our community forums or use the feedback mechanisms built into the experience itself.&lt;/p&gt;
-    &lt;/div&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47186277</guid><pubDate>Fri, 27 Feb 2026 22:00:29 +0000</pubDate></item><item><title>Otters as Bioindicators of Estuarine Health</title><link>https://emt.pensoft.net/article/185117/</link><description>&lt;doc fingerprint="9d74309adf3b16a2"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47184480</guid><pubDate>Fri, 27 Feb 2026 19:26:38 +0000</pubDate></item><item><title>Otters as Bioindicators of Estuarine Health</title><link>https://emt.pensoft.net/article/185117/</link><description>&lt;doc fingerprint="9d74309adf3b16a2"&gt;
   &lt;main&gt;
     &lt;p&gt;Editorial&lt;/p&gt;
     &lt;p&gt;Other versions:&lt;/p&gt;
@@ -1940,7 +987,7 @@ sized.&lt;/p&gt;
     &lt;p&gt;Subscribe to email alerts for current Article's categories&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47186444</guid><pubDate>Fri, 27 Feb 2026 22:13:54 +0000</pubDate></item><item><title>I am directing the Department of War to designate Anthropic a Supply-Chain Risk</title><link>https://twitter.com/secwar/status/2027507717469049070</link><description>&lt;doc fingerprint="d635e49f34142863"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47186444</guid><pubDate>Fri, 27 Feb 2026 22:13:54 +0000</pubDate></item><item><title>I am directing the Department of War to designate Anthropic a supply-chain risk</title><link>https://twitter.com/secwar/status/2027507717469049070</link><description>&lt;doc fingerprint="d635e49f34142863"&gt;
   &lt;main&gt;
     &lt;p&gt;We’ve detected that JavaScript is disabled in this browser. Please enable JavaScript or switch to a supported browser to continue using x.com. You can see a list of supported browsers in our Help Center.&lt;/p&gt;
     &lt;p&gt;Help Center&lt;/p&gt;
@@ -2159,4 +1206,34 @@ emuko restore &amp;lt;snapshot&amp;gt;   # restore a snapshot
     &lt;p&gt;Apache 2.0. See LICENSE.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47187121</guid><pubDate>Fri, 27 Feb 2026 23:01:49 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47187121</guid><pubDate>Fri, 27 Feb 2026 23:01:49 +0000</pubDate></item><item><title>Zugunruhe, and what makes things worth doing</title><link>https://www.nathanzhao.cc/zugunruhe</link><description>&lt;doc fingerprint="27f1d1158fe789d8"&gt;
+  &lt;main&gt;
+    &lt;head rend="h2"&gt;Nathan's Notes&lt;/head&gt;
+    &lt;head rend="h1"&gt;Zugunruhe&lt;/head&gt;
+    &lt;p&gt;Ideology, beyond robustness and agency&lt;/p&gt;
+    &lt;p&gt;Feb 27, 2026&lt;/p&gt;
+    &lt;quote&gt;&lt;p&gt;“Beauty is truth, truth beauty, — that is all&lt;/p&gt;&lt;lb/&gt;Ye know on earth, and all ye need to know.”&lt;lb/&gt;– Keats&lt;/quote&gt;
+    &lt;p&gt;Patrick Kidger wrote a post I read as I was getting into JAX, and even though the post was largely unrelated to what I was looking for, the writing itself is something I sometimes recall. The argument he makes is not complicated. He says the best researchers just “know stuff,” across a wide breadth of domains such as ML, scientific computing, software engineering, mathematics, statistics. Possessing a technical depth of knowledge is how new ideas get generated and bad ones get recognized. Not awareness of adjacent fields but real facility with them, enough that connections form without forcing. The people who do the best work know numerous random facts, not as trivia but as something load-bearing in how they think.&lt;/p&gt;
+    &lt;p&gt;Specialization, in this framing, only works as a last mile on top of something wider. Old ideas resurface constantly with new packaging. Without that base, everything looks like it should be the next SWE-killer, some revolution. People begin to trust things at first sight just because of pedigree and proxies rather than accuracy.&lt;/p&gt;
+    &lt;p&gt;I don’t believe building this base must be constrained simply to the goal of an ML PhD, or even anything in computer science. Across all of our personal aesthetics, each of our experiences drives an inherent intuition. Dirac believed a truly fundamental theory must be mathematically beautiful, and that this wasn’t aesthetic preference but a truly working heuristic. Even when experiments seemed to contradict general relativity, he argued the theory should be trusted: “Anyone who appreciates the fundamental harmony connecting the way nature runs and general mathematical principles must feel that a theory with the beauty and elegance of Einstein’s theory has to be substantially correct.”&lt;/p&gt;
+    &lt;head rend="h2"&gt;Coat Racking&lt;/head&gt;
+    &lt;p&gt;People are mostly consumptive now rather than productive. Shortform media compressed attention into something that rewards recognition over understanding. People end up as a kind of philosopher’s coat rack, collecting frameworks and mental models and recycled takes but never wearing any of them. There is no progressive expansion of ideas brought on by real world perturbations, forcing nuance.&lt;/p&gt;
+    &lt;p&gt;AI, when used without any real intention, exaggerates this particular human failure mode. To some extent, every token corresponds to a decision. When a model writes on someone’s behalf, it collapses thousands of those micro-decisions into a single generation. Rhetoric directly corresponds to how various audiences receive a concept, even if the underlying meaning is the same. Syntactic structure and use of analogies can reinforce or confound a message. Paragraph structure, argument ordering, what to cut (even if the thought itself is meaningful) are each a real writer’s judgment call, and judgment atrophies without use. The people who use these tools best are the ones who have read and written thoughtfully for long enough to steer them, who can describe the rhetoric they want rather than recognize it after the fact.&lt;/p&gt;
+    &lt;p&gt;There’s a tension between robustness and evolvability in the theory of human adaptation that feels relevant. Chimpanzee groups separated by a river are more genetically distinct than humans from different continents — in part because culture itself (theoretically) suppresses genetic diversity, buffering us from the selection pressures that would otherwise demand it. Clothing instead of cold tolerance, medicine instead of immune systems. Robustness consumes biological evolvability. Now the same tradeoff shows up in how people think. Confirmation bias and prestige bias are cognitive robustness strategies — deferring to what’s already worked or already credentialed. In a stable landscape, this makes sense. In a fast-moving field, the interesting bets get made before social proof exists, by people whose model is good enough to evaluate the world directly. These are early adopters. You can’t get there by being robust harder, carrying more coats. You have to make your own.&lt;/p&gt;
+    &lt;p&gt;Genuine intrigue matters much more than extrinsic motivation for building a strong world model. A higher percentage of the musicians I know think this way than founders (alas, being a founder is a stylish thing now). They’ve built a working understanding of the creator economy from the inside, deconstructing how Spotify’s algorithm weights save-to-listen ratios, how YouTube surfaces new channels, which subcultures drive real engagement versus which ones just look active, how to build a visual identity that reads coherently across a 1-inch profile picture and a festival poster. They think about branding and demographics not because someone told them to but because their craft demanded it. Nobody taught them a framework for any of it. They cared enough to figure it out, and the figuring-out required pulling from places that had nothing to do with music. Their understanding feels much richer compared to anything a GSB student can tell you, with all the resources in the world. The difference isn’t information. One group built understanding against a problem they were genuinely trying to solve. The other collected it reflexively, with no pressure to cohere.&lt;/p&gt;
+    &lt;p&gt;What matters is the quality of the internal model. A single way of seeing the world makes thinking brittle in ways that aren’t obvious from the inside. You can execute within a known framework but the moment it stops applying there’s nothing to fall back on.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Pathfinding&lt;/head&gt;
+    &lt;p&gt;The Renaissance ideal was that a single person could understand most of what was knowable. Leon Battista Alberti wrote the first scientific study of perspective in painting, designed church facades, invented the first polyalphabetic cipher, wrote a Latin comedy so convincing it was still being published as genuine Roman text 150 years after his death. “A man can do all things if he will.” That’s not the case anymore. Danny Hillis calls it “The Entanglement” — past the Enlightenment into an era where each expert knows a piece but the whole system has become causally opaque even to the sum of its specialists. In a slower yet complex world, one might say that specializing harder would be the right response. But progress is diffuse now, spread across industries that increasingly borrow from each other. The person who can follow multiple tailwinds and cross-pollinate between them will outpace the person who can only think within one.&lt;/p&gt;
+    &lt;p&gt;Brian Eno called himself a “non-musician” when he joined Roxy Music — preferring “systems manipulator.” He studied under Roy Ascott’s Groundcourse, where the reading list was more cybernetics than art history. Stafford Beer’s The Brain of the Firm taught him how systems could have integrity and personality using only rules, without specifying anything algorithmically. That idea became generative music — compositions that grow themselves from initial constraints. It also became Oblique Strategies with Peter Schmidt, a deck of cards for disrupting creative process. It became his production style on Bowie’s Berlin trilogy and Talking Heads, treating the studio as an instrument rather than a capture device. And it became the Long Now Foundation, which he co-founded and named, where he designed the chime generator for a clock meant to run ten thousand years. One deep curiosity about emergent structure, operating across music, visual art, systems thinking, and technology for fifty years. The breadth is a byproduct of the curiosity, not the other way around.&lt;/p&gt;
+    &lt;p&gt;One can’t fake nor cram the base. It has to come from having genuinely cared about a lot of things over a long time. Some of the best pretraining is just experiencing things without overthinking them, being shaped by something before deciding what it’s for.&lt;/p&gt;
+    &lt;p&gt;What I’ve been calling “base” is probably better described as longform ideology — the slow accretion of enough real understanding, across enough domains, that it coheres into something you’d defend. A worldview that itself is load-bearing. People like to use the word “taste” to describe what their intuition produces, but taste (both in its usage and what it describes) is a hedge. It feels like UI/UX polishing, not something someone would stake their life’s work on. It gets adopted by people who want to sound discerning without committing to anything, preference dressed up as conviction. Nobody’s taste ever got them arrested. Ideology does.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Ideology, Not Agency&lt;/head&gt;
+    &lt;p&gt;Agency is underspecified. Strong habits can look productive without being agentic, where the actor may simply act under inertia. Meanwhile, a high-information diet paired with an action bias can produce someone extremely agentic who directs all of it toward a hopeless market. Another social media app without a novel perspective, another weekend project without retention dressed up as ARR. Capital without thesis, deployment without differentiation. The ability to gamble everything on Kalshi, quit a job, move across the country — but toward what?&lt;/p&gt;
+    &lt;p&gt;In 1926, Mussolini’s government arrested an Italian political theorist whose writings they considered dangerous enough that the prosecutor reportedly said at trial they had to stop this brain from functioning for twenty years. Instead, Antonio Gramsci spent his last decade in a fascist prison and filled thirty-three notebooks — over three thousand pages of political theory, philosophy, cultural criticism. Sick for most of it, barely able to write. The Prison Notebooks went on to shape how people think about culture, power, and class for decades.&lt;/p&gt;
+    &lt;p&gt;One of his ideas, the philosophy of praxis argued that thought without action is sterile but action without a coherent worldview is just flailing. The people who actually change things aren’t the ones with the most freedom to act but the ones whose understanding runs deep enough to know what to do with whatever freedom they have. The organic intellectual isn’t defined by credentials but by thinking that emerges from genuine engagement with the world, the ability to name what others only feel. A worldview that didn’t need freedom to propagate. Just contact with reality, which he maintained through prison walls.&lt;/p&gt;
+    &lt;p&gt;Compared to the “agentic,” I’d rather bet on someone who feels trapped but desperate to do differentiated and novel things, or someone whose habits run so deep that intuition drives how they act without deliberation. Both are technically less agentic than the person who makes deliberate choices every day, optimizes every hour, ships every weekend. When you don’t have much room, you get precise about what matters quickly. And when intuition runs deep enough, perturbation from externalities is meaningful enough that finding the optimal path to an end state comes easy. Either way there is real potential.&lt;/p&gt;
+    &lt;p&gt;I have a friend from high school, now at an Ivy League, who put down all his internship money to sportsbet on Kalshi. He doesn’t know anything about sports. He is already going to be in extreme debt from student loans, and doesn’t think he will be satisfied working IB or consulting (honestly, understandably). So, thinking from his shoes in this very simplified description of his life, why wouldn’t he bet it all? He and many young Americans across the world don’t believe that they have a meaningful future. If they don’t feel they have a reliable control on their life path, wouldn’t their most sensical path be to take the 1% chance to potentially be satisfied? Now, say he is not restless because his currently bad state, but rather because he finds his life so meaningless where even the standard human goals of making money, having a family, or achieving some high level of status is not enough. He truly wants to change the world, out of delusion, and has many reasons to do so — spite, a grand vision, maybe a machiavellian philanthropy. I say this person exists. I say he should take the leap, and his restlessness will find purchase.&lt;/p&gt;
+    &lt;p&gt;(Before migration, birds undergo a state ornithologists call Zugunruhe — migratory restlessness. Corticosterone floods the body, organs reshape, flight muscles hypertrophy. Lorine Niedecker, paraphrasing the naturalist W.H. Hudson, states: birds feel something akin to pain just before migration, and nothing alleviates it except flight. What else would be so inevitable without their existence?)&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47187235</guid><pubDate>Fri, 27 Feb 2026 23:09:32 +0000</pubDate></item><item><title>Qt45: A small polymerase ribozyme that can synthesize itself</title><link>https://www.science.org/doi/10.1126/science.adt2760</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47187649</guid><pubDate>Fri, 27 Feb 2026 23:42:14 +0000</pubDate></item></channel></rss>
