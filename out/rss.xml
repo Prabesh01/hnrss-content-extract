@@ -1,302 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Tue, 10 Mar 2026 13:53:52 +0000</lastBuildDate><item><title>Optimizing Top K in Postgres</title><link>https://www.paradedb.com/blog/optimizing-top-k</link><description>&lt;doc fingerprint="fb4c88706ee95816"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;How We Optimized Top K in Postgres&lt;/head&gt;
-    &lt;p&gt;In databases, Top K means “give me the K best rows, ordered by some column or value.” Commonly that means “the most recent rows,” “the highest scores,” or “the largest values.”&lt;/p&gt;
-    &lt;p&gt;It feels like a basic problem that Postgres should solve. After all, can’t we just create an index? Yet in many production Postgres deployments, Top K is deceptively hard. This post examines where Postgres’ Top K optimizations shine, where they falter, and why search libraries like Lucene/Tantivy or databases like ParadeDB that specialize in Top K take a fundamentally different approach.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Postgres' Solution: A Sorted B-Tree&lt;/head&gt;
-    &lt;p&gt;Let’s begin with a single table containing 100M rows.&lt;/p&gt;
-    &lt;code&gt;CREATE TABLE benchmark_logs (
-    id SERIAL PRIMARY KEY,
-    message TEXT,
-    country VARCHAR(255),
-    severity INTEGER,
-    timestamp TIMESTAMP,
-    metadata JSONB
-);
-&lt;/code&gt;
-    &lt;p&gt;We want to return the top 10 most recent rows by &lt;code&gt;timestamp&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;SELECT *
-FROM benchmark_logs
-ORDER BY timestamp DESC
-LIMIT 10;
-&lt;/code&gt;
-    &lt;p&gt;Without an index, this query takes 15 seconds. To accelerate it, we can create a B-Tree index on &lt;code&gt;timestamp&lt;/code&gt;.&lt;/p&gt;
-    &lt;code&gt;CREATE INDEX ON benchmark_logs (timestamp);
-&lt;/code&gt;
-    &lt;p&gt;B-Trees are ideal for Top K queries because they are sorted structures, so the retrieval of Top K results is trivially O(K). Easy and done, right? Our query drops to an impressive 5ms.&lt;/p&gt;
-    &lt;p&gt;Under the hood, a B-tree is a hierarchy of Postgres pages (think of pages as nodes). Upper pages guide navigation, while the actual indexed values live in the leaf pages at the bottom in sorted order. To answer “give me the top K largest rows,” Postgres jumps from the root down to the leaf with the largest value and then walks backward through the linked leaves, reading entries until it has collected K rows. Because a B-tree is a balanced tree, the path from the root to any leaf is short and predictable.&lt;/p&gt;
-    &lt;head rend="h2"&gt;But Wait, We Need Filters Too&lt;/head&gt;
-    &lt;p&gt;There’s a constraint hiding in the example above: it only works when the index fully matches the query shape. The moment you add filters that aren’t part of the index, things get complicated.&lt;/p&gt;
-    &lt;p&gt;Consider a more realistic query with the filter &lt;code&gt;WHERE severity &amp;lt; 3&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;SELECT *
-FROM benchmark_logs
-WHERE severity &amp;lt; 3
-ORDER BY timestamp DESC
-LIMIT 10;
-&lt;/code&gt;
-    &lt;p&gt;Now Postgres faces a dilemma. It can use the B-tree index on &lt;code&gt;timestamp&lt;/code&gt; to get rows in the right &lt;code&gt;timestamp&lt;/code&gt; order, but it has no way to skip directly to “US” rows. It must walk the index one entry at a time, checking the country for each row and discarding most of them. In the worst case, this means walking the entire index. Or it can scan rows that match &lt;code&gt;severity &amp;lt; 3&lt;/code&gt; first, but then it loses the ordering and must sort the results afterward.&lt;/p&gt;
-    &lt;p&gt;Either way, Postgres ends up scanning far more rows than K, doing extra work to filter or sort, and suddenly we’re back to queries taking up to 15 seconds in the worst case.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Sorting and Filtering = Combinatorial Explosion&lt;/head&gt;
-    &lt;p&gt;A natural response is to add a composite B-tree index on both &lt;code&gt;severity&lt;/code&gt; and &lt;code&gt;timestamp&lt;/code&gt;.&lt;/p&gt;
-    &lt;code&gt;CREATE INDEX ON benchmark_logs (severity, timestamp);
-&lt;/code&gt;
-    &lt;p&gt;A composite B-tree is still a sorted tree, but now entries are ordered first by &lt;code&gt;severity&lt;/code&gt;, and then by &lt;code&gt;timestamp&lt;/code&gt; within each &lt;code&gt;severity&lt;/code&gt; value. This works great for this query shape: Postgres can jump directly to the portion of the tree matching &lt;code&gt;severity &amp;lt; 3&lt;/code&gt; and then walk the timestamps in descending order to get the top K rows.&lt;/p&gt;
-    &lt;p&gt;The problem is that this solution doesn’t generalize. For instance, imagine we now also want to filter by &lt;code&gt;country&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;SELECT *
-FROM benchmark_logs
-WHERE country = 'United States'
-AND severity &amp;lt; 3
-ORDER BY timestamp DESC
-LIMIT 10;
-&lt;/code&gt;
-    &lt;p&gt;Or, if we change the sort columns:&lt;/p&gt;
-    &lt;code&gt;SELECT *
-FROM benchmark_logs
-WHERE country = 'United States'
-ORDER BY severity ASC, timestamp DESC
-LIMIT 10;
-&lt;/code&gt;
-    &lt;p&gt;Supporting every realistic combination of filters and sort orders requires a growing set of indexes. These indexes cause storage bloat, slower writes, and query plans that are hard to reason about.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Postgres’ Top K Falls Apart with Search&lt;/head&gt;
-    &lt;p&gt;Everything so far assumed that filters are simple predicates that can be expressed as equality or range conditions inside a B-tree. Full text search breaks that assumption.&lt;/p&gt;
-    &lt;p&gt;Consider a query that combines Postgres’ native text search (which performs token matching instead of full string matching) with a range filter, and then returns results sorted by relevance (i.e. a TF-IDF-like score):&lt;/p&gt;
-    &lt;code&gt;SELECT *,
-       ts_rank(to_tsvector('english', message), q) AS rank
-FROM benchmark_logs,
-     plainto_tsquery('english', 'research team') AS q
-WHERE to_tsvector('english', message) @@ q
-  AND severity &amp;lt; 3
-ORDER BY rank DESC
-LIMIT 10;
-&lt;/code&gt;
-    &lt;p&gt;This query may look similar to the earlier examples: filter rows, then return the top 10 by score. But internally, Postgres has no single structure that can satisfy all of these constraints at once.&lt;/p&gt;
-    &lt;p&gt;Postgres can use a GIN (generalized inverted) index for the &lt;code&gt;tsvector&lt;/code&gt; text search predicate and a B-tree for ordering or numeric filters. But because GIN does not preserve ordering and Postgres cannot combine ordering guarantees across different indexes, the planner must decompose the query into phases:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Use the GIN index to produce a (potentially large) set of matching row IDs&lt;/item&gt;
-      &lt;item&gt;Fetch those rows from the “heap” (i.e. the underlying table storage)&lt;/item&gt;
-      &lt;item&gt;Apply additional filters like &lt;code&gt;severity &amp;lt; 3&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Sort the surviving rows&lt;/item&gt;
-      &lt;item&gt;Return the top 10 results&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;If the result set produced by GIN is large, the repeated heap fetches in Step 2 become very expensive. To demonstrate, let's see how well this query can perform if we optimize it as much as possible. First, we'll precompute the &lt;code&gt;to_tsvector&lt;/code&gt; expression, which avoids some query-time overhead and helps the Postgres planner collect better statistics:&lt;/p&gt;
-    &lt;code&gt;ALTER TABLE benchmark_logs
-ADD COLUMN message_fts tsvector
-GENERATED ALWAYS AS (to_tsvector('english', coalesce(message,''))) STORED;
-&lt;/code&gt;
-    &lt;p&gt;Next, we'll create a GIN index on the generated column:&lt;/p&gt;
-    &lt;code&gt;CREATE INDEX ON benchmark_logs USING gin (message_fts);
-&lt;/code&gt;
-    &lt;p&gt;Finally, we'll replace the &lt;code&gt;to_tsvector&lt;/code&gt; expressions in our query with the generated column:&lt;/p&gt;
-    &lt;code&gt;SELECT *,
-       ts_rank(message_fts, q) AS rank
-FROM benchmark_logs,
-     plainto_tsquery('english', 'research team') AS q
-WHERE message_fts @@ q
-  AND severity &amp;lt; 3
-ORDER BY rank DESC
-LIMIT 10;
-&lt;/code&gt;
-    &lt;p&gt;With our GIN index in place, this query still takes 37 seconds to execute, largely because the query &lt;code&gt;research team&lt;/code&gt;
-returns millions of matches that must be checked against the filter and sorted.&lt;/p&gt;
-    &lt;p&gt;As an additional optimization, we can create a partial GIN index on the predicate &lt;code&gt;severity &amp;lt; 3&lt;/code&gt;.&lt;/p&gt;
-    &lt;code&gt;CREATE INDEX ON benchmark_logs USING gin (message_fts) WHERE severity &amp;lt; 3;
-&lt;/code&gt;
-    &lt;p&gt;Unfortunately, the query still takes roughly the same amount of time (33 seconds) because a large candidate set is still being returned even with the &lt;code&gt;severity &amp;lt; 3&lt;/code&gt; predicate1. Achieving further improvements would require altering the query itself to make it more selective
-— which may or may not be feasible in real-world scenarios.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Search Databases Think About Top K Differently&lt;/head&gt;
-    &lt;p&gt;These examples highlight two problems with Top K in Postgres:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;B-trees force you to pre-commit to a query shape, which is at odds with the idea of ad-hoc Top K queries.&lt;/item&gt;
-      &lt;item&gt;B-trees don't play well with text search queries/GIN indexes, especially when the Top K candidate sets are large.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Search databases like ParadeDB take a fundamentally different approach. Rather than requiring many tailored indexes, we use a single compound index that contains all fields required for Top K filtering and sorting. Unlike a B-tree, this index is not necessarily sorted. This means that the goal isn't to beat a B-tree optimized for one specific query — it's to make all shapes of Top K queries, including those with text search and scoring, reasonably fast with low variance across different shapes2.&lt;/p&gt;
-    &lt;p&gt;Additionally, because the sort keys are not known up front, we must accept that large candidate sets are inevitable. The optimization target becomes making the actual work of scanning and filtering extremely cheap, and to prune aggressively when selecting the Top K to avoid extra work.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The Basic Data Structures: Inverted Index and Columnar Arrays&lt;/head&gt;
-    &lt;p&gt;ParadeDB's index, like most search indexes, is built on two core structures. The first is an inverted index, which maps each term (i.e. “research”) to a “posting list” — a sorted list of document IDs that contain that term.&lt;/p&gt;
-    &lt;code&gt;Documents                     Inverted Index
-[1]: "us research"            research → [1, 2]
-[2]: "ca research"            us       → [1, 3]
-[3]: "us database"            ca       → [2]
-                              database → [3]
-&lt;/code&gt;
-    &lt;p&gt;The second is a columnar layout, which stores a single field in a contiguous, compact array. Columnar arrays are well known for accelerating analytical queries, but they are also a natural fit for Top K queries because they allow for cheap, cache-friendly lookups.&lt;/p&gt;
-    &lt;code&gt;Row Store
-+------------------------------+
-|  id | country | severity     |
-| [1] | [US]    | [2]          |
-| [2] | [CA]    | [9]          |
-| [3] | [US]    | [1]          |
-+------------------------------+
-
-Column Store
-+------------------------------+
-| id:       [1][2][3]          |
-| country:  [US][CA][US]       |
-| severity: [2][9][1]          |
-+------------------------------+
-&lt;/code&gt;
-    &lt;p&gt;In ParadeDB, these structures are provided by Tantivy, the Rust-based search library inspired by Lucene.&lt;/p&gt;
-    &lt;head rend="h2"&gt;A Compound Index Eliminates Expensive Row Lookups&lt;/head&gt;
-    &lt;p&gt;In Postgres, every indexed row contains a pointer to where the row lives in the table. If a Top K filter cannot be fully answered by the index, Postgres must follow that pointer and materialize the entire row from the underlying table storage. This operation is expensive and prone to cache misses when performed for millions of candidates.&lt;/p&gt;
-    &lt;p&gt;ParadeDB solves this by storing all searchable, filterable, and sortable fields inside a single index. Every indexed row is assigned a compact internal &lt;code&gt;u32&lt;/code&gt; identifier called a document ID, and every data structure in the index refers to that same ID.&lt;/p&gt;
-    &lt;p&gt;This document ID design is very efficient for boolean queries (i.e. multiple &lt;code&gt;WHERE&lt;/code&gt; clauses). For example, consider the boolean &lt;code&gt;WHERE country = 'United States' AND severity &amp;lt; 3&lt;/code&gt;. The text condition produces a stream of document IDs from the inverted index, while the range filter becomes a direct lookup into a columnar array at that same ID. Evaluating the &lt;code&gt;AND&lt;/code&gt; condition reduces to intersecting &lt;code&gt;u32&lt;/code&gt; streams without materializing any intermediate rows.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Columnar Arrays Make Filters Cheap&lt;/head&gt;
-    &lt;p&gt;Because candidates produced by the text search index may not be in contiguous order, columnar arrays must have true O(1) random access. In Tantivy’s columnar format, this is achieved by setting the row ID of a columnar value to its ordinal (i.e. its position in the array). So accessing a value from a column to evaluate a filter is simply:&lt;/p&gt;
-    &lt;code&gt;value = column[row_id]
-&lt;/code&gt;
-    &lt;p&gt;Additionally, columns are annotated with minimum and maximum value metadata. This allows range filters like &lt;code&gt;severity &amp;lt; 3&lt;/code&gt; to skip entire columns that cannot satisfy the filter. For columns that do overlap the range, values are processed in batches instead of individually. By applying comparisons to vectors of values instead of scalars, the engine can use SIMD instructions to evaluate many values in a single CPU operation.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Block WAND Enables Early Pruning&lt;/head&gt;
-    &lt;code&gt;Current score threshold: 8.5
-
-+-------------------+   max_score=12 → Evaluate
-| Block A           |
-| docs: [1 2 3 4]   |
-+-------------------+
-
-+-------------------+   max_score=7 → Skip
-| Block B           |
-| docs: [5 6 7 8]   |
-+-------------------+
-&lt;/code&gt;
-    &lt;p&gt;For queries that are ordered by a relevance score (i.e. a BM25 score), Tantivy goes one step further with an optimization called Block WAND. Conceptually, this means skipping the evaluation of entire chunks of documents unless they have a mathematical possibility of entering the Top K.&lt;/p&gt;
-    &lt;p&gt;Block WAND works by maintaining an upper bound on how much score any document within a block of document IDs could possibly achieve. As the engine fills its Top K heap, it establishes a threshold: the lowest score currently in the heap. Before evaluating a block, the engine checks the block’s maximum score. If that maximum is below the threshold, the entire block is skipped without scoring individual documents.&lt;/p&gt;
-    &lt;p&gt;In ParadeDB, the analogous query to the relevance-sorted query above would be:&lt;/p&gt;
-    &lt;code&gt;SELECT *, pdb.score(id) FROM benchmark_logs
-WHERE severity &amp;lt; 3 AND message ||| 'research team'
-ORDER BY pdb.score(id) DESC
-LIMIT 10;
-&lt;/code&gt;
-    &lt;p&gt;&lt;code&gt;|||&lt;/code&gt; is ParadeDB's match
-disjunction
-operator.&lt;/p&gt;
-    &lt;p&gt;This query now drops to a very reasonable 300ms4.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Top K Text Search Query Time: ParadeDB vs Postgres GIN&lt;/head&gt;
-    &lt;head rend="h2"&gt;A Recent Improvement to ParadeDB's Top K Performance&lt;/head&gt;
-    &lt;p&gt;In &lt;code&gt;0.21.0&lt;/code&gt; Top K performance improved by up to 30% for certain benchmarked Top K queries. For instance, the following Top K query dropped from 90ms to 70ms over a 100M row dataset:&lt;/p&gt;
-    &lt;code&gt;SELECT * FROM benchmark_logs
-WHERE message === 'research' AND country === 'Canada'
-ORDER BY severity, timestamp LIMIT 10;
-&lt;/code&gt;
-    &lt;p&gt;&lt;code&gt;===&lt;/code&gt; is ParadeDB's term
-search operator.&lt;/p&gt;
-    &lt;p&gt;This improvement was thanks to an upstream change in Tantivy, which changes how doc ID iterators are advanced when executing a boolean query.&lt;/p&gt;
-    &lt;p&gt;Previously, in order to determine if a doc ID was present in all clauses of a boolean &lt;code&gt;AND&lt;/code&gt;, Tantivy had to advance all iterators to the next matching document using &lt;code&gt;seek&lt;/code&gt; . For instance, consider two doc ID iterators:&lt;/p&gt;
-    &lt;code&gt;Iterator A (country = 'United States'): [100, 101, 102, 103, ...]
-Iterator B (country = 'Canada'): [50, 10000, ...]
-&lt;/code&gt;
-    &lt;p&gt;Let’s assume iterator &lt;code&gt;B&lt;/code&gt; is currently positioned on &lt;code&gt;50&lt;/code&gt;, and iterator &lt;code&gt;A&lt;/code&gt; is positioned on &lt;code&gt;100&lt;/code&gt;. In order to determine if &lt;code&gt;100&lt;/code&gt; is in &lt;code&gt;B&lt;/code&gt;, we have to advance &lt;code&gt;B&lt;/code&gt; to &lt;code&gt;10000&lt;/code&gt; . This can be an expensive operation because advancing to the next match may require scanning several blocks containing values between &lt;code&gt;50&lt;/code&gt; and &lt;code&gt;10000&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;With this change, Tantivy can instead perform a cheaper membership check for a specific doc ID without actually advancing the iterator.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Wrapping Up&lt;/head&gt;
-    &lt;p&gt;Postgres' Top K approach is a bit like all or nothing — the happy path is nearly instant, but the worst case can take seconds or even minutes. ParadeDB, on the other hand, is designed to make any Top K query reasonably fast as long as all filters and sort keys are present in the index.&lt;/p&gt;
-    &lt;p&gt;Moving forward, we still see meaningful headroom to optimize our Top K performance by pruning work earlier in the execution pipeline. One direction is index partitioning and segment-level ordering, where data is physically grouped or sorted by commonly queried dimensions (such as time ranges or coarse score buckets). With this layout, entire segments whose maximum possible score or ordering value cannot beat the current Top K threshold can be skipped.&lt;/p&gt;
-    &lt;p&gt;We're also currently working on optimizing Top K joins — i.e. "search and filter over multiple tables, join the results, and return the Top K." If this kind of work excites you, we’re hiring for engineers who enjoy solving these kinds of database internals problems.&lt;/p&gt;
-    &lt;p&gt;And please don’t hesitate to give our open-source project a star!&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;The &lt;code&gt;EXPLAIN ANALYZE&lt;/code&gt;output of the Top K text search query with GIN:&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;code&gt;                                                                               QUERY PLAN
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Limit  (cost=22944.38..22944.41 rows=10 width=289) (actual time=33747.662..33747.667 rows=10.00 loops=1)
-   Buffers: shared hit=11851 read=5890349
-   -&amp;gt;  Sort  (cost=22944.38..22946.87 rows=995 width=289) (actual time=33747.660..33747.664 rows=10.00 loops=1)
-         Sort Key: (ts_rank(benchmark_logs.message_fts, '''research'' &amp;amp; ''team'''::tsquery)) DESC
-         Sort Method: top-N heapsort  Memory: 35kB
-         Buffers: shared hit=11851 read=5890349
-         -&amp;gt;  Bitmap Heap Scan on benchmark_logs  (cost=18964.29..22922.88 rows=995 width=289) (actual time=4791.339..25655.017 rows=10000000.00 loops=1)
-               Recheck Cond: ((message_fts @@ '''research'' &amp;amp; ''team'''::tsquery) AND (severity &amp;lt; 3))
-               Heap Blocks: exact=5882353
-               Buffers: shared hit=11851 read=5890349
-               -&amp;gt;  Bitmap Index Scan on benchmark_logs_message_fts_idx  (cost=0.00..18964.04 rows=995 width=0) (actual time=3669.878..3669.881 rows=10000000.00 loops=1)
-                     Index Cond: (message_fts @@ '''research'' &amp;amp; ''team'''::tsquery)
-                     Index Searches: 1
-                     Buffers: shared hit=11851 read=7996
- Planning:
-   Buffers: shared read=2
- Planning Time: 1.342 ms
- Execution Time: 33813.810 ms
-(18 rows)
-&lt;/code&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;See our benchmarks of 100M rows, published on our public benchmarks. See the &lt;code&gt;logs (100M rows)&lt;/code&gt;results.&lt;/item&gt;
-      &lt;item&gt;ParadeDB uses BM25 instead of TF-IDF for relevance scoring. BM25 is generally considered to be a more accurate relevance score.&lt;/item&gt;
-      &lt;item&gt;The &lt;code&gt;EXPLAIN ANALYZE&lt;/code&gt;output of the Top K text search query with ParadeDB:&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;code&gt;    QUERY PLAN
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Limit  (cost=1010.12..1011.35 rows=10 width=257) (actual time=297.430..298.912 rows=10.00 loops=1)
-   Buffers: shared hit=20920 read=13732
-   -&amp;gt;  Gather Merge  (cost=1010.12..4877326.97 rows=39806668 width=257) (actual time=297.428..298.910 rows=10.00 loops=1)
-         Workers Planned: 7
-         Workers Launched: 7
-         Buffers: shared hit=20920 read=13732
-         -&amp;gt;  Parallel Custom Scan (ParadeDB Scan) on benchmark_logs  (cost=10.00..10.02 rows=1 width=257) (actual time=249.554..249.605 rows=10.00 loops=8)
-               Table: benchmark_logs
-               Index: benchmark_logs_idx
-               Segment Count: 8
-               Heap Fetches: 10
-               Exec Method: TopNScanExecState
-               Scores: true
-                  TopN Order By: pdb.score() desc
-                  TopN Limit: 10
-                  Queries: 8
-               Tantivy Query: {"boolean":{"must":[{"range":{"field":"severity","lower_bound":null,"upper_bound":{"excluded":3},"is_datetime":false}},{"with_index":{"query":{"match":{"field":"message","value":"research team","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}]}}
-               Buffers: shared hit=20856 read=13732
- Planning:
-   Buffers: shared hit=576 read=7
- Planning Time: 5.927 ms
- Execution Time: 299.393 ms
-(22 rows)
-&lt;/code&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47302493</guid><pubDate>Sun, 08 Mar 2026 22:54:17 +0000</pubDate></item><item><title>Is legal the same as legitimate: AI reimplementation and the erosion of copyleft</title><link>https://writings.hongminhee.org/2026/03/legal-vs-legitimate/</link><description>&lt;doc fingerprint="3f92e3119b21c392"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Is legal the same as legitimate: AI reimplementation and the erosion of copyleft&lt;/head&gt;
-    &lt;p&gt;Last week, Dan Blanchard, the maintainer of chardet—a Python library for detecting text encodings used by roughly 130 million projects a month—released a new version. Version 7.0 is 48 times faster than its predecessor, supports multiple cores, and was redesigned from the ground up. Anthropic's Claude is listed as a contributor. The license changed from LGPL to MIT.&lt;/p&gt;
-    &lt;p&gt;Blanchard's account is that he never looked at the existing source code directly. He fed only the API and the test suite to Claude and asked it to reimplement the library from scratch. The resulting code shares less than 1.3% similarity with any prior version, as measured by JPlag. His conclusion: this is an independent new work, and he is under no obligation to carry forward the LGPL. Mark Pilgrim, the library's original author, opened a GitHub issue to object. The LGPL requires that modifications be distributed under the same license, and a reimplementation produced with ample exposure to the original codebase cannot, in Pilgrim's view, pass as a clean-room effort.&lt;/p&gt;
-    &lt;p&gt;The dispute drew responses from two prominent figures in the open source world. Armin Ronacher, the creator of Flask, welcomed the relicensing. Salvatore Sanfilippo (antirez), the creator of Redis, published a broader defense of AI reimplementation, grounding it in copyright law and the history of the GNU project. Both conclude, by different routes, that what Blanchard did is legitimate. I respect both writers, and I think both are wrong—or more precisely, both are evading the question that actually matters.&lt;/p&gt;
-    &lt;p&gt;That question is this: does legal mean legitimate? Neither piece answers it. Both move from “this is legally permissible” to “this is therefore fine,” without pausing at the gap between those two claims. Law sets a floor; clearing it does not mean the conduct is right. That gap is where this essay begins.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The analogy points the wrong way&lt;/head&gt;
-    &lt;p&gt;Antirez builds his case on history. When the GNU project reimplemented the UNIX userspace, it was lawful. So was Linux. Copyright law prohibits copying “protected expressions”—the actual code, its structure, its specific mechanisms—but it does not protect ideas or behavior. AI-assisted reimplementation occupies the same legal ground. Therefore, it is lawful.&lt;/p&gt;
-    &lt;p&gt;The legal analysis is largely correct, and I am not disputing it. The problem lies in what antirez does next: he presents the legal conclusion as if it were also a social one, and uses a historical analogy that, examined more carefully, argues against his own position.&lt;/p&gt;
-    &lt;p&gt;When GNU reimplemented the UNIX userspace, the vector ran from proprietary to free. Stallman was using the limits of copyright law to turn proprietary software into free software. The ethical force of that project did not come from its legal permissibility—it came from the direction it was moving, from the fact that it was expanding the commons. That is why people cheered.&lt;/p&gt;
-    &lt;p&gt;The vector in the chardet case runs the other way. Software protected by a copyleft license—one that guarantees users the right to study, modify, and redistribute derivative works under the same terms—has been reimplemented under a permissive license that carries no such guarantee. This is not a reimplementation that expands the commons. It is one that removes the fencing that protected the commons. Derivative works built on chardet 7.0 are under no obligation to share their source code. That obligation, which applied to a library downloaded 130 million times a month, is now gone.&lt;/p&gt;
-    &lt;p&gt;Antirez does not address this directional difference. He invokes the GNU precedent, but that precedent is a counterexample to his conclusion, not a supporting one.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Does the GPL work against sharing?&lt;/head&gt;
-    &lt;p&gt;Ronacher's argument is different. He discloses upfront that he has a stake in the outcome: “I personally have a horse in the race here because I too wanted chardet to be under a non-GPL license for many years. So consider me a very biased person in that regard.” He goes on to write that he considers “the GPL to run against that spirit by restricting what can be done with it”—the spirit being that society is better off when we share.&lt;/p&gt;
-    &lt;p&gt;This claim rests on a fundamental misreading of what the GPL does.&lt;/p&gt;
-    &lt;p&gt;Start with what the GPL actually prohibits. It does not prohibit keeping source code private. It imposes no constraint on privately modifying GPL software and using it yourself. The GPL's conditions are triggered only by distribution. If you distribute modified code, or offer it as a networked service, you must make the source available under the same terms. This is not a restriction on sharing. It is a condition placed on sharing: if you share, you must share in kind.&lt;/p&gt;
-    &lt;p&gt;The requirement that improvements be returned to the commons is not a mechanism that suppresses sharing. It is a mechanism that makes sharing recursive and self-reinforcing. The claim that imposing contribution obligations on users of a commons undermines sharing culture does not hold together logically.&lt;/p&gt;
-    &lt;p&gt;The contrast with the MIT license clarifies the point. Under MIT, anyone may take code, improve it, and close it off into a proprietary product. You can receive from the commons without giving back. If Ronacher calls this structure “more share-friendly,” he is using a concept of sharing with a specific directionality built in: sharing flows toward whoever has more capital and more engineers to take advantage of it.&lt;/p&gt;
-    &lt;p&gt;The historical record bears this out. In the 1990s, companies routinely absorbed GPL code into proprietary products—not because they had chosen permissive licenses, but because copyleft enforcement was slack. The strengthening of copyleft mechanisms closed that gap. For individual developers and small projects without the resources to compete on anything but reciprocity, copyleft was what made the exchange approximately fair.&lt;/p&gt;
-    &lt;p&gt;The creator of Flask knows this distinction. If he elides it anyway, the argument is not naïve—it is convenient.&lt;/p&gt;
-    &lt;head rend="h2"&gt;A self-refuting example&lt;/head&gt;
-    &lt;p&gt;The most interesting moment in Ronacher's piece is not the argument but a detail he mentions in passing: Vercel reimplemented GNU Bash using AI and published it, then got visibly upset when Cloudflare reimplemented Next.js the same way.&lt;/p&gt;
-    &lt;p&gt;Ronacher notes this as an irony and moves on. But the irony cuts deeper than he lets on. Next.js is MIT licensed. Cloudflare's vinext did not violate any license—it did exactly what Ronacher calls a contribution to the culture of openness, applied to a permissively licensed codebase. Vercel's reaction had nothing to do with license infringement; it was purely competitive and territorial. The implicit position is: reimplementing GPL software as MIT is a victory for sharing, but having our own MIT software reimplemented by a competitor is cause for outrage. This is what the claim that permissive licensing is “more share-friendly” than copyleft looks like in practice. The spirit of sharing, it turns out, runs in one direction only: outward from oneself.&lt;/p&gt;
-    &lt;p&gt;Ronacher registers the contradiction and does not stop. “This development plays into my worldview,” he writes. When you present evidence that cuts against your own position, acknowledge it, and then proceed to your original conclusion unchanged, that is a signal that the conclusion preceded the argument.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Legality and social legitimacy are different registers&lt;/head&gt;
-    &lt;p&gt;Back to the question posed at the start. Is legal the same as legitimate?&lt;/p&gt;
-    &lt;p&gt;Antirez closes his careful legal analysis as though it settles the matter. Ronacher acknowledges that “there is an obvious moral question here, but that isn't necessarily what I'm interested in.” Both pieces treat legal permissibility as a proxy for social legitimacy. But law only says what conduct it will not prevent—it does not certify that conduct as right. Aggressive tax minimization that never crosses into illegality may still be widely regarded as antisocial. A pharmaceutical company that legally acquires a patent on a long-generic drug and raises the price a hundredfold has not done something legal and therefore fine. Legality is a necessary condition; it is not a sufficient one.&lt;/p&gt;
-    &lt;p&gt;In the chardet case, the distinction is sharper still. What the LGPL protected was not Blanchard's labor alone. It was a social compact agreed to by everyone who contributed to the library over twelve years. The terms of that compact were: if you take this and build on it, you share back under the same terms. This compact operated as a legal instrument, yes, but it was also the foundation of trust that made contribution rational. The fact that a reimplementation may qualify legally as a new work, and the fact that it breaks faith with the original contributors, are separate questions. If a court eventually rules in Blanchard's favor, that ruling will tell us what the law permits. It will not tell us that the act was right.&lt;/p&gt;
-    &lt;p&gt;Zoë Kooyman, executive director of the FSF, put it plainly: “Refusing to grant others the rights you yourself received as a user is highly antisocial, no matter what method you use.”&lt;/p&gt;
-    &lt;head rend="h2"&gt;Whose perspective is the default?&lt;/head&gt;
-    &lt;p&gt;Reading this debate, I keep returning to a question about position. From where are these two writers looking at the situation?&lt;/p&gt;
-    &lt;p&gt;Antirez created Redis. Ronacher created Flask. Both are figures at the center of the open source ecosystem, with large audiences and well-established reputations. For them, falling costs of AI reimplementation means something specific: it is easier to reimplement things they want in a different form. Ronacher says explicitly that he had begun reimplementing GNU Readline precisely because of its copyleft terms.&lt;/p&gt;
-    &lt;p&gt;For the people who have spent years contributing to a library like chardet, the same shift in costs means something else entirely: the copyleft protection around their contributions can be removed. The two writers are speaking from the former position to people in the latter, telling them that this was always lawful, that historical precedent supports it, and that the appropriate response is adaptation.&lt;/p&gt;
-    &lt;p&gt;When positional asymmetry of this kind is ignored, and the argument is presented as universal analysis, what you get is not analysis but rationalization. Both writers arrive at conclusions that align precisely with their own interests. Readers should hold that fact in mind.&lt;/p&gt;
-    &lt;head rend="h2"&gt;What this fight points toward&lt;/head&gt;
-    &lt;p&gt;Bruce Perens, who wrote the original Open Source Definition, told The Register: “The entire economics of software development are dead, gone, over, kaput!” He meant it as an alarm. Antirez, from a similar assessment of the situation, draws the conclusion: adapt. Ronacher says he finds the direction exciting.&lt;/p&gt;
-    &lt;p&gt;None of the three responses addresses the central question. When copyleft becomes technically easier to circumvent, does that make it less necessary, or more?&lt;/p&gt;
-    &lt;p&gt;I think more. What the GPL protected was not the scarcity of code but the freedom of users. The fact that producing code has become cheaper does not make it acceptable to use that code as a vehicle for eroding freedom. If anything, as the friction of reimplementation disappears, so does the friction of stripping copyleft from anything left exposed. The erosion of enforcement capacity is a legal problem. It does not touch the underlying normative judgment.&lt;/p&gt;
-    &lt;p&gt;That judgment is this: those who take from the commons owe something back to the commons. The principle does not change depending on whether a reimplementation takes five years or five days. No court ruling on AI-generated code will alter its social weight.&lt;/p&gt;
-    &lt;p&gt;This is where law and community norms diverge. Law is made slowly, after the fact, reflecting existing power arrangements. The norms that open source communities built over decades did not wait for court approval. People chose the GPL when the law offered them no guarantee of its enforcement, because it expressed the values of the communities they wanted to belong to. Those values do not expire when the law changes.&lt;/p&gt;
-    &lt;p&gt;In previous writing, I argued for a training copyleft (TGPL) as the next step in this line of development. The chardet situation suggests the argument has to go further: to a specification copyleft covering the layer below source code. If source code can now be generated from a specification, the specification is where the essential intellectual content of a GPL project resides. Blanchard's own claim—that he worked only from the test suite and API without reading the source—is, paradoxically, an argument for protecting that test suite and API specification under copyleft terms.&lt;/p&gt;
-    &lt;p&gt;The history of the GPL is the history of licensing tools evolving in response to new forms of exploitation: GPLv2 to GPLv3, then AGPL. What drove each evolution was not a court ruling but a community reaching a value judgment first and then seeking legal instruments to express it. The same sequence is available now. Whatever courts eventually decide about AI reimplementation, the question we need to answer first is not a legal one. It is a social one. Do those who take from the commons owe something back? I think they do. That judgment does not require a verdict.&lt;/p&gt;
-    &lt;p&gt;What makes the pieces by antirez and Ronacher worth reading is not that they are right. It is that they make visible, with unusual clarity, what they are choosing not to see. When legality is used as a substitute for a value judgment, the question that actually matters gets buried in the footnotes of a law it has already outgrown.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47310160</guid><pubDate>Mon, 09 Mar 2026 15:12:53 +0000</pubDate></item><item><title>JSLinux Now Supports x86_64</title><link>https://bellard.org/jslinux/</link><description>&lt;doc fingerprint="1cef280bd983e7ac"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Tue, 10 Mar 2026 14:38:41 +0000</lastBuildDate><item><title>JSLinux Now Supports x86_64</title><link>https://bellard.org/jslinux/</link><description>&lt;doc fingerprint="1cef280bd983e7ac"&gt;
   &lt;main&gt;
     &lt;p&gt;The following emulated systems are available:&lt;/p&gt;
     &lt;table&gt;
@@ -866,90 +569,7 @@ itself.&lt;/p&gt;
     &lt;p&gt;To everyone who I probably forgot to mention, who has opened issues, suggested features, or just tried Emacs Solo and told me about it: thank you. Open source is a conversation, and every bit of feedback makes the project better.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47317616</guid><pubDate>Tue, 10 Mar 2026 00:16:44 +0000</pubDate></item><item><title>The “JVG algorithm” only wins on tiny numbers</title><link>https://scottaaronson.blog/?p=9615</link><description>&lt;doc fingerprint="d8d8b15ba1a00ceb"&gt;
-  &lt;main&gt;
-    &lt;head rend="h2"&gt;The ”JVG algorithm” is crap&lt;/head&gt;
-    &lt;p&gt;Sorry to interrupt your regular programming about the AI apocalypse, etc., and return to the traditional beat of this blog’s very earliest years … but I’ve now gotten multiple messages asking me to comment on something called the “JVG (Jesse–Victor–Gharabaghi) algorithm” (yes, the authors named it after themselves). This is presented as a massive improvement over Shor’s factoring algorithm, which could (according to popular articles) allow RSA-2048 to be broken using only 5,000 physical qubits.&lt;/p&gt;
-    &lt;p&gt;On inspection, the paper’s big new idea is that, in the key step of Shor’s algorithm where you compute xr mod N in a superposition over all r’s, you instead precompute the xr mod N’s on a classical computer and then load them all into the quantum state.&lt;/p&gt;
-    &lt;p&gt;Alright kids, why does this not work? Shall we call on someone in the back of the class—like, any undergrad quantum computing class in the world? Yes class, that’s right! There are exponentially many r’s. Computing them all takes exponential time, and loading them into the quantum computer also takes exponential time. We’re out of the n2-time frying pan but into the 2n-time fire. This can only look like it wins on tiny numbers; on large numbers it’s hopeless.&lt;/p&gt;
-    &lt;p&gt;If you want to see people explaining the same point more politely and at greater length, try this from Hacker News or this from Postquantum.com.&lt;/p&gt;
-    &lt;p&gt;Even for those who know nothing about quantum algorithms, is there anything that could’ve raised suspicion here?&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;The paper didn’t appear on the arXiv, but someplace called “Preprints.org.” Come to think of it, I should add this to my famous Ten Signs a Claimed Mathematical Breakthrough is Wrong! It’s not that there isn’t tons of crap on the arXiv as well, but so far I’ve seen pretty much only crap on preprint repositories other than arXiv, ECCC, and IACR.&lt;/item&gt;
-      &lt;item&gt;Judging from a Google search, the claim seems to have gotten endlessly amplified on clickbait link-farming news sites, but ignored by reputable science news outlets—yes, even the usual quantum hypesters weren’t touching this one!&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Often, when something is this bad, the merciful answer is to let it die in obscurity. In this case, I feel like there was a sufficient level of intellectual hooliganism, just total lack of concern for what’s true, that those involved deserve to have this Shtetl-Optimized post as a tiny bit of egg on their faces forever.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47317739</guid><pubDate>Tue, 10 Mar 2026 00:35:19 +0000</pubDate></item><item><title>Learnings from paying artists royalties for AI-generated art</title><link>https://www.kapwing.com/blog/learnings-from-paying-artists-royalties-for-ai-generated-art/</link><description>&lt;doc fingerprint="3af313319956c5ed"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Learnings from Paying Artists Royalties for AI-Generated Art&lt;/head&gt;
-    &lt;p&gt;A retrospective on Tess.Design, our attempt to make an ethical, artist-friendly AI marketplace. We launched Tess in May 2024 and shut it down in January 2026.&lt;/p&gt;
-    &lt;p&gt;In 2024, we launched Tess.Design, a marketplace of fine-tuned AI image models where artists got paid a 50% royalty every time someone used their style. Less than two years later, we shut it down. This post is a candid account of what we built, what the data showed, and what any entrepreneur should know before trying to build an AI licensing business on top of creative talent.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The Problem We Were Solving&lt;/head&gt;
-    &lt;p&gt;By 2023, AI image generation had become mainstream and deeply controversial. Image generation models like DALL-E and Midjourney trained on billions of scraped images, often without artist consent or compensation. Surveys consistently showed that consumers believed artists deserved payment when AI generated content in their style. Yet no business model existed to make that happen.&lt;/p&gt;
-    &lt;p&gt;Media companies were in a stalemate. Outlets like Rolling Stones and Fortune wanted AI-generated imagery for blogs, thumbnails, websites, and graphics. But their legal teams were nervous about copyright exposure, given the numerous ongoing lawsuits. So the publishers either banned AI tools entirely or turned a blind eye to their use, hoping for the best.&lt;/p&gt;
-    &lt;p&gt;Tess was our answer to this problem: an AI image generation platform where every image was traceable to a single consenting artist, who earned a royalty in its production. In this way, we argued that Tess was the first “properly-licensed” image generator that produced the same quality images as Midjourney and other leading models.&lt;/p&gt;
-    &lt;head rend="h2"&gt;How the Business Model Worked&lt;/head&gt;
-    &lt;p&gt;Tess Artists submitted a set of their work to fine-tune a Stable Diffusion base model. The resulting model, linked to that artist's aesthetic, was listed on a public marketplace at tess.design/models. Subscribers paid for access; the artist earned 50% of the revenue when subscribers used their model.&lt;/p&gt;
-    &lt;p&gt;The legal architecture mattered as much as the product. Working with Fenwick, we constructed a contributor agreement and Enterprise Service Agreement built on a novel copyright argument. We posited that because all outputs were stylistically transformed into the contributing artist's aesthetic, the artist held copyright over the derivative works and could license them downstream to customers. This created a clean chain of copyright ownership, something no other AI image generator at the time offered.&lt;/p&gt;
-    &lt;p&gt;To seed the marketplace, we offered 25 founding artists an advance royalty of $300–$4,000 based on their portfolio quality and audience reach. In addition to income, we pitched artists on these value propositions:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Passive income from royalties on every generation&lt;/item&gt;
-      &lt;item&gt;A dashboard showing exactly how their model was being used&lt;/item&gt;
-      &lt;item&gt;A free Tess subscription to use their own model for brainstorming and scaling repetitive work (roughly 1 in 4 artists took advantage of this)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h2"&gt;What 325 Cold Emails to Artists Taught Us&lt;/head&gt;
-    &lt;p&gt;In building Tess, we learned a lot from the growth path of Spotify, which took two years to develop its partnerships with record labels. Unlike the music industry, however, illustration and digital art is fragmented. We reached out to 11 illustration agencies about getting their artists on Tess. 0 said yes. So we went artist by artist—sourcing contacts from Instagram, LinkedIn, agency websites, and the bylines of editorial publications we admired.&lt;/p&gt;
-    &lt;p&gt;We reached out to 325 artists over about 6 weeks. The leads were high-end editorial artists who make illustrations for magazines like the New Yorker, take custom commissions, and maintain distinctive styles for studio work.&lt;/p&gt;
-    &lt;p&gt;The response rate was striking:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Almost 50% of the artists we reached out to responded to our cold emails.&lt;/item&gt;
-      &lt;item&gt;6.5% of artists that we reached out to agreed to join Tess and had models trained on their work&lt;/item&gt;
-      &lt;item&gt;22.4% of artists were hard nos.&lt;/item&gt;
-      &lt;item&gt;20.8% of the artists were maybes - took calls, asked questions, but never committed&lt;/item&gt;
-      &lt;item&gt;50.2% of artists did not respond to us&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;For artists who said no, their objections fell into four categories:&lt;/p&gt;
-    &lt;p&gt;1) Ideological opposition to AI: Many artists saw AI as categorically exploitative, regardless of the revenue model.&lt;/p&gt;
-    &lt;quote&gt;“There is no such thing as ethical AI, full stop.”&lt;/quote&gt;
-    &lt;p&gt;2) Brand dilution. High-end artists worried that enabling anyone to generate in their style would cheapen it.&lt;/p&gt;
-    &lt;quote&gt;“ I don’t want it used by a cigarette brand”&lt;/quote&gt;
-    &lt;p&gt;3) On principle: Some believed art should be made by hand, regardless of the compensation structure.&lt;/p&gt;
-    &lt;quote&gt;“As an artist, I hold certain values regarding the creative process, and I personally feel that AI-generated art goes against those principles. While I acknowledge the technological advancements in this field, I prefer to maintain a hands-on approach to my work”&lt;/quote&gt;
-    &lt;p&gt;4) Reputation risk of being associated with generative AI, which the industry generally sees as terrible.The artist community was hostile to AI in 2024. Joining Tess meant risking cancellation. One artist put it plainly: "I've seen how other artists get fried when they say they're interested in AI." Social punishment was a real deterrent.&lt;/p&gt;
-    &lt;p&gt;The artists who said yes were motivated by passive income, curiosity about AI, and a pragmatic desire to offload repetitive commission work—wedding placards, gift tags, wine labels—so they could focus on more meaningful projects.&lt;/p&gt;
-    &lt;p&gt;“I’ve always been passionate about staying at the forefront of technology and embracing the innovations it offers,” one participating artist wrote. “I see AI as increasingly essential in every aspect of our lives, and joining Tess seemed like the ideal way to integrate AI into my profession.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The Numbers&lt;/head&gt;
-    &lt;p&gt;Tess ran for 20 months and generated $12,172.33 in gross revenue. We paid out $18,000 in advanced royalties to artists and spent roughly $100/month on infrastructure (subsidized initially by Azure credits). So, Tess was a net loss: approximately $7,000 in direct costs—not counting the engineering, design, marketing, and product time invested.&lt;/p&gt;
-    &lt;p&gt;No artists earned enough from usage to receive additional royalties beyond their advance. The pre-generation economics never reached a meaningful scale.&lt;/p&gt;
-    &lt;p&gt;We came close to an Enterprise contract. A major US media outlet evaluated Tess as a compliant alternative to banning AI generation outright. Ultimately, however, their legal team blocked the CTO from moving forward with Tess as the unresolved court cases around AI copyright made any AI licensing product too risky to touch.&lt;/p&gt;
-    &lt;p&gt;Finally, we lost some trust from our team as well, which always happens when you invest in a product that doesn't work out. One engineer who left Kapwing in fall of 2025 said that the short-lived Tess investment contributed to burnout.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Why we shut it down&lt;/head&gt;
-    &lt;p&gt;Three factors converged, leading us to shut down Tess:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;The legal argument was not proven out. Despite our legal argument about copyright protection, the ongoing litigation kept the question open. Organizations like Forbes and the SF Standard who had shown interest in our model couldn’t afford to bet on an unresolved legal argument. Without regulation clarity, Tess couldn’t compete with models like NanoBanana, DALLE, and Midjourney.&lt;/item&gt;
-      &lt;item&gt;The timing wasn’t right. We depended on artists helping us to promote the platform, and they didn’t. When we launched, Creative Bloq covered the story, but the Twitter reaction was largely negative. The cultural moment in 2024 was one of deep distrust toward AI among the creative community.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;We needed to focus on Kapwing. Unfortunately, given our current resources, we can no longer run Tess sustainably, especially as our startup credits have now run out. We moved the most useful Tess functionality into Kapwing’s AI Assistant, which enables artists to set up private Custom Kais to emulate their own style with reference images. With focused resources, Tess might have grown. But with split attention, it could not.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h2"&gt;What This Means for Entrepreneurs Building AI Licensing Models&lt;/head&gt;
-    &lt;p&gt;The underlying model—paying human creators a royalty to license their style, voice, likeness, or training data to fine-tune AI—is not dead. It's early. Here's what I'd tell founders exploring this space:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Creator adoption is a two-sided marketplace problem, and supply is harder than it looks. Unlike music or stock photography, illustration has no dominant intermediaries. You have to recruit one artist at a time. Factor in that a meaningful fraction of your target creators will refuse on principle, regardless of the compensation.&lt;/item&gt;
-      &lt;item&gt;Brand dilution is a real product problem. Creators with valuable styles need meaningful controls over how those styles are deployed and appreciate visibility. Build custom moderation guardrails into your product to differentiate.&lt;/item&gt;
-      &lt;item&gt;Timing matters. We launched Tess into a cultural moment of maximum hostility toward AI among artists. That's changing. As the legal framework solidifies and creator attitudes shift, the same business model will face less friction.&lt;/item&gt;
-      &lt;item&gt;Focus on one thing at a time to move faster. We chose to explore a pivot, not realizing the investment that it required. And the result was that we slowed down on Kapwing. Although we’ve recovered with the launch of Kapwing AI, I regret that we did not put all of our eggs in one basket.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h2"&gt;Closing Thoughts&lt;/head&gt;
-    &lt;p&gt;I’m proud of Tess and what we built. We genuinely attempted to move the industry toward a more equitable AI licensing model where human creators get a cut of the value that they generate, and where brand/publishers have an easier time defining the output they want. If Tess had succeeded, it would have created a more beautiful world with more accessible art for all.&lt;/p&gt;
-    &lt;p&gt;When I got married in 2025, I used Tess to generate all of the artwork: the invitation, the table placards, and the textures for the table chart. We also put up art made by our artist friends like Baffour Kyerematen, Gloria Ford, and Abby Cali. Tess will always remind me of my wedding day and the beautiful coexistence of AI art and human-made art.&lt;/p&gt;
-    &lt;p&gt;Thank you to each of the 142 customers who took a bet on Tess and to the artists who trusted us with their work. We’re sorry we couldn't build the thing large enough to sustain it. I hope that an entrepreneur takes another shot at this in the future.&lt;/p&gt;
-    &lt;p&gt;If you’re building in this space, reach out. I’m happy to share more of what we learned. We'd also be open to selling the Tess.Design domain and concept so that the idea can live on.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47318421</guid><pubDate>Tue, 10 Mar 2026 02:24:52 +0000</pubDate></item><item><title>Show HN: I Was Here – Draw on street view, others can find your drawings</title><link>https://washere.live</link><guid isPermaLink="false">https://news.ycombinator.com/item?id=47319255</guid><pubDate>Tue, 10 Mar 2026 05:04:23 +0000</pubDate></item><item><title>LoGeR – 3D reconstruction from extremely long videos (DeepMind, UC Berkeley)</title><link>https://loger-project.github.io</link><description>&lt;doc fingerprint="fe4fa61ff92ac836"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47317616</guid><pubDate>Tue, 10 Mar 2026 00:16:44 +0000</pubDate></item><item><title>LoGeR – 3D reconstruction from extremely long videos (DeepMind, UC Berkeley)</title><link>https://loger-project.github.io</link><description>&lt;doc fingerprint="fe4fa61ff92ac836"&gt;
   &lt;main&gt;
     &lt;p&gt;LoGeR scales feedforward dense 3D reconstruction to extremely long videos. By processing video streams in chunks and bridging them with a novel hybrid memory module, LoGeR alleviates quadratic complexity bottlenecks. It combines Sliding Window Attention (SWA) for precise local alignment with Test-Time Training (TTT) for long-range global consistency, reducing drift over massive sequences up to 19,000 frames without any post-hoc optimization.&lt;/p&gt;
     &lt;p&gt;Scaling to unprecedented horizons. Even without backend optimization, LoGeR maintains strong geometric coherence and reduces scale drift over kilometer-scale trajectories.&lt;/p&gt;
@@ -1948,42 +1568,389 @@ images.&lt;/p&gt;
     &lt;p&gt;Last modified on: March 10, 2026 by Colin Percival&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47321499</guid><pubDate>Tue, 10 Mar 2026 10:45:09 +0000</pubDate></item><item><title>Yann LeCun's AI startup raises $1B in Europe's largest ever seed round</title><link>https://www.ft.com/content/e5245ec3-1a58-4eff-ab58-480b6259aaf1</link><description>&lt;doc fingerprint="9c7b18515eca9be9"&gt;
-  &lt;main&gt;&lt;head rend="h1"&gt;&lt;quote&gt;Yann LeCun’s AI start-up raises more than $1bn in Europe’s largest seed round&lt;/quote&gt;&lt;/head&gt;&lt;head rend="h2"&gt;Try unlimited access&lt;/head&gt;Only $1 for 4 weeks&lt;p&gt;Then $75 per month. Complete digital access to quality FT journalism on any device. Cancel anytime during your trial.&lt;/p&gt;&lt;head rend="h2"&gt;Explore more offers.&lt;/head&gt;&lt;head rend="h3"&gt;FT Edit&lt;/head&gt;&lt;p&gt;Access to eight surprising articles a day, hand-picked by FT editors. For seamless reading, access content via the FT Edit page on FT.com and receive the FT Edit newsletter.&lt;/p&gt;&lt;head rend="h3"&gt;Standard Digital&lt;/head&gt;&lt;p&gt;Essential digital access to quality FT journalism on any device. Pay a year upfront and save 20%.&lt;/p&gt;&lt;head rend="h3"&gt;Premium Digital&lt;/head&gt;&lt;p&gt;Complete digital access to quality FT journalism with expert analysis from industry leaders. Pay a year upfront and save 20%.&lt;/p&gt;&lt;p&gt;Check whether you already have access via your university or organisation.&lt;/p&gt;&lt;p&gt;Terms &amp;amp; Conditions apply&lt;/p&gt;&lt;head rend="h2"&gt;Explore our full range of subscriptions.&lt;/head&gt;&lt;head rend="h3"&gt;For individuals&lt;/head&gt;&lt;p&gt;Discover all the plans currently available in your country&lt;/p&gt;&lt;head rend="h3"&gt;For multiple readers&lt;/head&gt;&lt;p&gt;Digital access for organisations. Includes exclusive features and content.&lt;/p&gt;&lt;head rend="h2"&gt;Why the FT?&lt;/head&gt;&lt;p&gt;See why over a million readers pay to read the Financial Times.&lt;/p&gt;&lt;/main&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47321499</guid><pubDate>Tue, 10 Mar 2026 10:45:09 +0000</pubDate></item><item><title>Yann LeCun's AI startup raises $1B in Europe's largest ever seed round</title><link>https://www.ft.com/content/e5245ec3-1a58-4eff-ab58-480b6259aaf1</link><description>&lt;doc fingerprint="9c7b1b545e8a99e9"&gt;
+  &lt;main&gt;&lt;head rend="h1"&gt;&lt;quote&gt;Yann LeCun’s AI start-up raises more than $1bn in Europe’s largest seed round&lt;/quote&gt;&lt;/head&gt;&lt;head rend="h2"&gt;Join FT Edit&lt;/head&gt;Only $49 a year&lt;p&gt;Get 2 months free with an annual subscription at was $59.88 now $49. Access to eight surprising articles a day, hand-picked by FT editors. For seamless reading, access content via the FT Edit page on FT.com and receive the FT Edit newsletter.&lt;/p&gt;&lt;head rend="h2"&gt;Explore more offers.&lt;/head&gt;&lt;head rend="h3"&gt;Trial&lt;/head&gt;&lt;p&gt;Then $75 per month. Complete digital access to quality FT journalism on any device. Cancel or change your plan anytime during your trial.&lt;/p&gt;&lt;head rend="h3"&gt;Standard Digital&lt;/head&gt;&lt;p&gt;Essential digital access to quality FT journalism on any device. Pay a year upfront and save 20%.&lt;/p&gt;&lt;head rend="h3"&gt;Premium Digital&lt;/head&gt;&lt;p&gt;Complete digital access to quality FT journalism with expert analysis from industry leaders. Pay a year upfront and save 20%.&lt;/p&gt;&lt;p&gt;Check whether you already have access via your university or organisation.&lt;/p&gt;&lt;p&gt;Terms &amp;amp; Conditions apply&lt;/p&gt;&lt;head rend="h2"&gt;Explore our full range of subscriptions.&lt;/head&gt;&lt;head rend="h3"&gt;For individuals&lt;/head&gt;&lt;p&gt;Discover all the plans currently available in your country&lt;/p&gt;&lt;head rend="h3"&gt;For multiple readers&lt;/head&gt;&lt;p&gt;Digital access for organisations. Includes exclusive features and content.&lt;/p&gt;&lt;head rend="h2"&gt;Why the FT?&lt;/head&gt;&lt;p&gt;See why over a million readers pay to read the Financial Times.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47321533</guid><pubDate>Tue, 10 Mar 2026 10:50:30 +0000</pubDate></item><item><title>Ask HN: Remember Fidonet?</title><link>https://news.ycombinator.com/item?id=47321760</link><description>&lt;doc fingerprint="ae0d935f99ac2fef"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47321533</guid><pubDate>Tue, 10 Mar 2026 10:50:30 +0000</pubDate></item><item><title>PgAdmin 4 9.13 with AI Assistant Panel</title><link>https://www.pgadmin.org/docs/pgadmin4/9.13/query_tool.html#ai-assistant-panel</link><description>&lt;doc fingerprint="ea1eb85b6890c986"&gt;
   &lt;main&gt;
-    &lt;p&gt;FidoNet was a simply wonderful innovation, and it was a reflection of the creativity of its author - Tom Jennings - and his views of community and identity. https://grokipedia.com/page/tom_jennings&lt;/p&gt;
-    &lt;p&gt;Tom was working on FidoNet in 1984, the same time my Iris co-founders and I had begun work on what became Lotus Notes. Architecturally, those of us who were working on collaborative systems in that era were shaped by the decentralized architecture of USEnet - inspired and motivated by the observation that a community could be brought together by something technologically as simple as uucp.&lt;/p&gt;
-    &lt;p&gt;Both dial-up focused, Tom took this in the direction of a decentralized BBS, while I took it in the direction of masterless replicated nosql databases we called 'notefiles'. Identity being at the core, Tom was focused more on public community while we focused on private collaboration.&lt;/p&gt;
-    &lt;p&gt;It was such an exciting time for emergent decentralization, shaped by a strong dose of 60's idealism.&lt;/p&gt;
-    &lt;p&gt;Their account that has been posting for over 15 years and has made numerous comments with real insight into the times under discussion? I know it's necessary to have a healthy bit of skepticism when being on the Internet but I think we could agree this is one of the weirdest, longest, dumbest cons in the history of confidence games if this is not Ray Ozzie.&lt;/p&gt;
-    &lt;p&gt;HN has a fairly wide group of "famous" contributors like Woz, etc.&lt;/p&gt;
-    &lt;p&gt;And the Zone 1 Hub, Dark Realms (a Renegade BBS since 1994) is here: https://www.darkrealms.ca/ It has node lists available if you're looking for systems to connect from.&lt;/p&gt;
-    &lt;p&gt;FidoNet was great fun. Despite finding it difficult to remember any useful numbers in my life (credit card, NI etc) I can still remember my FidoNet addresses from when I was a youngster.&lt;/p&gt;
-    &lt;p&gt;I'm not sure how I'd feel about an archive though, I'm sure I wrote a lot of childish nonsense on it! like a lot of things, perhaps best left as a happy memory...&lt;/p&gt;
-    &lt;p&gt;I remember when a lot of online communities still felt small and human like that. People actually recognised usernames and conversations carried on over days rather than minutes.&lt;/p&gt;
-    &lt;p&gt;Feels like most modern platforms traded that for scale.&lt;/p&gt;
-    &lt;p&gt;There was also a locality to BBSs (less so the distributed relay systems like Fidonet) because of the cost of non-local telephone calls. I was a subscriber to a BBS is a relatively nearby city (though telephone costs were still high--used offline readers). A number of us would get together in-real-life semi-regularly.&lt;/p&gt;
-    &lt;p&gt;One thing I miss about HN type forums is the "here is what you haven't read yet". When an article has 100 comments and I've already read 75 it is rarely worth my time wading through to see the new ones. Even though I know from experience that writing a good insightful comment takes a lot of time. Most of what I'm missing will not be very insightful, but I'm sure I'm missing some of the most insightful comments. It also discourages me (and I assume others) from writing a long insightful response at times because I most of the people who would be interested will see it.&lt;/p&gt;
-    &lt;p&gt;As with so many old things, it's still alive, but it's down to the die-hards. I still miss it, though - I participated in Net 232 (Champaign-Urbana) for a while, then Net 115 in Chicago. We had some great gatherings back in those days, but in the Chicago area, the scene blew away pretty quickly when the internet opened up.&lt;/p&gt;
-    &lt;p&gt;There was a time we were encouraged to be friendly with Russia, and many Russian devs were on Fidonet. This was actually how some I knew were recruited to work for western companies.&lt;/p&gt;
-    &lt;p&gt;Greetings from a Russian, still friendly despite all the political shitshow :)&lt;/p&gt;
-    &lt;p&gt;We've spent so many nights with my friend (15 yo in 1996, the peak FidoNet) connecting to BBSes over phone modem, soaking up all the Fido lore, humour and lingo, dreaming of obtaining us a .point for ourselves somehow. To that end, we visited a number of local "sysopkas" and "pointovkas" (sysop/point parties), making friends with actual point owners who gathered in a local park to booze some and have fun.&lt;/p&gt;
-    &lt;p&gt;What a blessed time it was! The future seemed spotless and bright...&lt;/p&gt;
-    &lt;p&gt;yes! don't remember my number, Zone 4 for sure (Argentina).&lt;/p&gt;
-    &lt;p&gt;Exchanging messages with people on the other side of the world felt like magic at the time (even though it took many hours/days for a msg to round-trip)&lt;/p&gt;
-    &lt;p&gt;I also run "Sudaka's BBS" based on Maximus/2, with many interactive "apps" I'd developed using Maximus' proprietary C-like language. Great high-school times.&lt;/p&gt;
-    &lt;p&gt;I can still hear my parents complaining about my monopolizing the phone line every night :-)&lt;/p&gt;
-    &lt;p&gt;I also remember the MausNet. This was a German speaking counterpart so to speak. Interestingly, I remember it from my Atari days, even though it was initially a Apple network (Münster Apple User Service).&lt;/p&gt;
-    &lt;p&gt;Greetings from the past! Was on KA2 back then, Minnie was such a nice user experience. Will always remember the groups Pascal, Oberlehrer and Allohol =;-D&lt;/p&gt;
-    &lt;p&gt;I remember, and ran a node for a while. I think it is alive today in spirit through forums like this. The original needs and limitations that drove the creation of Fidonet have been dead for decades though.&lt;/p&gt;
-    &lt;p&gt;I was born too late and missed most of the fun, but still managed to catch the trailing end of fidonet in the late 2000s. Pretty much everything was over IP already, there wasn't a single proper dial-up node in my local network (which was pretty small already, around 20 nodes in its heyday), but for me this IP connection happened to be a pay-by-the-minute dialup ISP, so the offline nature of fidonet helped me stay glued to the computer and actively participate in dozens of communities with just a few expensive online minutes per day. Later (in highschool) I ran my own dialup node just for fun on an old PII with NT4 in a cardboard box under my bed. It survived multiple hardware and geographical moves and was running over IP up to about 2012-ish, and was finally nuked from the nodelist in 2018. I still have all the configs in the backups somewhere and the active NCs contact, so technically could get it back up if really wanted to. Too bad there's nobody there to speak to.&lt;/p&gt;
-    &lt;p&gt;I do remember. :) Posted the same question ten years ago: https://news.ycombinator.com/item?id=12216932 The archives are almost completely gone and only a small fraction is available on internet. Perhaps some still exist on old harddrives - but I wouldn't count on it. Disk space wasn't cheap back then.&lt;/p&gt;
-    &lt;p&gt;Well, and hard drives fail and there weren't really great economical backup options at the time. In spite of being active on one BBS in particular, I basically have nothing digital saved from that time.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Contents&lt;/head&gt;
+    &lt;head rend="h1"&gt;Query Tool¶&lt;/head&gt;
+    &lt;p&gt;The Query Tool is a powerful, feature-rich environment that allows you to execute arbitrary SQL commands and review the result set. You can access the Query Tool via the Query Tool menu option on the Tools menu, or through the context menu of select nodes of the Object explorer control. The Query Tool allows you to:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Issue ad-hoc SQL queries.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Execute arbitrary SQL commands.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Edit the result set of a SELECT query if it is updatable.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Displays current connection and transaction status as configured by the user.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Save the data displayed in the output panel to a CSV file.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Review the execution plan of a SQL statement in either a text, a graphical format or a table format (similar to https://explain.depesz.com).&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;View analytical information about a SQL statement.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;You can open multiple copies of the Query tool in individual tabs simultaneously. To close a copy of the Query tool, click the X of the tab.&lt;/p&gt;
+    &lt;p&gt;The Query Tool features two panels:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;The upper panel displays the SQL Editor. You can use the panel to enter, edit, or execute a query or a script. It also shows the History tab which can be used to view the queries that have been executed in the session, a Scratch Pad which can be used to hold text snippets during editing, and an AI Assistant tab for generating SQL from natural language (when AI is configured). If the Scratch Pad is closed, it can be re-opened (or additional ones opened) by right-clicking in the SQL Editor and other panels and adding a new panel.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The lower panel displays the Data Output panel. The tabbed panel displays the result set returned by a query, information about a query’s execution plan, server messages related to the query’s execution and any asynchronous notifications received from the server.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;Query Tool in Workspace Layout¶&lt;/head&gt;
+    &lt;p&gt;The workspace layout offers a distraction-free, dedicated area for the Query Tool. When the Query Tool workspace is accessed, the Welcome page opens by default.&lt;/p&gt;
+    &lt;p&gt;Note: In the Workspace layout, all Query Tool and View/Edit Data tabs open within the Query Tool workspace.&lt;/p&gt;
+    &lt;p&gt;In the classic UI, users must connect to a database server and navigate to the database node before using the Query Tool. However, with the introduction of the Workspace layout and Welcome page, users can seamlessly connect to any ad-hoc server, even if it is not registered in the Object Explorer.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Select Existing Server from the dropdown to connect to a server already listed in the Object Explorer. It is optional.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Provide the Server Name for ad-hoc servers.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Specify the IP address of the server host, or the fully qualified domain name in the Host name/address field.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Enter the listener port number of the server host in the Port field.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Use the Database field to specify the name of the database to which the client will connect.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Use the User field to specify the name of a user that will be used when authenticating with the server.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Use the Password field to provide a password that will be supplied when authenticating with the server.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Use the Role field to specify the name of a role that has privileges that will be conveyed to the client after authentication with the server.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Use the Service field to specify the service name. For more information, see Section 33.16 of the Postgres documentation.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Use the fields in the Connection Parameters to configure the connection parameters.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;After filling in all the required fields, click the Connect &amp;amp; Open Query Tool button to launch the Query Tool with the provided server details. If the password is not supplied, you will be prompted to enter it.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Toolbar¶&lt;/head&gt;
+    &lt;p&gt;The toolbar is described in the following subsections.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The SQL Editor Panel¶&lt;/head&gt;
+    &lt;p&gt;The SQL editor panel is a workspace where you can manually provide a query, copy a query from another source, or read a query from a file. The SQL editor features syntax coloring and autocompletion.&lt;/p&gt;
+    &lt;p&gt;To use autocomplete, begin typing your query; when you would like the Query editor to suggest object names or commands that might be next in your query, press the Control+Space key combination. For example, type “SELECT * FROM” (without quotes, but with a trailing space), and then press the Control+Space key combination to select from a popup menu of autocomplete options.&lt;/p&gt;
+    &lt;p&gt;After entering a query, select the Execute script icon from the toolbar. The complete contents of the SQL editor panel will be sent to the database server for execution. To execute only a section of the code that is displayed in the SQL editor, highlight the text that you want the server to execute, and click the Execute script icon.&lt;/p&gt;
+    &lt;p&gt;You can also execute a query based on cursor position. Query tool will detect a query and underline it when cursor position changes. Now, to execute the current underlined query, hit the Execute query button on the toolbar. If a section is highlighted then it will behave like normal execute.&lt;/p&gt;
+    &lt;p&gt;The warning will appear only if Underline query at cursor? is set to False and the Underlined query execute warning? switch is set to True Preferences Query tool’s Options.&lt;/p&gt;
+    &lt;p&gt;The message returned by the server when a command executes is displayed on the Messages tab. If the command is successful, the Messages tab displays execution details.&lt;/p&gt;
+    &lt;p&gt;Options on the Edit menu offer functionality that helps with code formatting and commenting:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;The auto-indent feature will automatically indent text to the same depth as the previous line when you press the Return key.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Block indent text by selecting two or more lines and pressing the Tab key.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Implement or remove SQL style or toggle C style comment notation within your code.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;You can also drag and drop certain objects from the treeview which can save time in typing long object names. Text containing the object name will be fully qualified with schema. Double quotes will be added if required. For functions and procedures, the function name along with parameter names will be pasted in the Query Tool.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Query History Panel¶&lt;/head&gt;
+    &lt;p&gt;Use the Query History tab to review activity for the current session:&lt;/p&gt;
+    &lt;p&gt;The Query History tab displays information about recent commands:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;The date and time that a query was invoked.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The text of the query.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The number of rows returned by the query.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The amount of time it took the server to process the query and return a result set.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Messages returned by the server (not noted on the Messages tab).&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The source of the query (indicated by icons corresponding to the toolbar).&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;You can show or hide the queries generated internally by pgAdmin (during ‘View/Edit Data’ or ‘Save Data’ operations).&lt;/p&gt;
+    &lt;p&gt;You can remove a single query by selecting it and clicking on the Remove button. If you would like to remove all of the histories from the Query History tab, then click on the Remove All button.&lt;/p&gt;
+    &lt;p&gt;By using the Copy button, you can copy a particular query to the clipboard, and with the Copy to Query Editor button, you can copy a specific query to the Query Editor tab. During this operation, all existing content in the Query Editor is erased.&lt;/p&gt;
+    &lt;p&gt;Query History is maintained across sessions for each database on a per-user basis when running in Query Tool mode. In View/Edit Data mode, history is not retained. By default, the last 20 queries are stored for each database. This can be adjusted in &lt;code&gt;config_local.py&lt;/code&gt; or &lt;code&gt;config_system.py&lt;/code&gt; (see the
+config.py documentation) by overriding the
+MAX_QUERY_HIST_STORED value. See the Deployment section
+for more information.&lt;/p&gt;
+    &lt;head rend="h2"&gt;AI Assistant Panel¶&lt;/head&gt;
+    &lt;p&gt;The AI Assistant tab provides a chat-style interface for generating SQL queries from natural language descriptions. This feature requires an AI provider to be configured in Preferences &amp;gt; AI. For configuration details, see the Preferences documentation.&lt;/p&gt;
+    &lt;p&gt;To use the AI Assistant:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Click on the AI Assistant tab in the upper panel, or use the AI Assistant toolbar button.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Type a description of the SQL query you need in natural language.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Press Enter or click the send button to submit your request.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The AI will analyze your database schema and generate appropriate SQL.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The AI Assistant displays conversations with your messages and AI responses. When the AI generates SQL, it appears in a syntax-highlighted code block with action buttons:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Insert - Insert the SQL at the current cursor position in the SQL Editor.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Replace - Replace all content in the SQL Editor with the generated SQL.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Copy - Copy the SQL to the clipboard.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The AI Assistant maintains conversation context, allowing you to refine queries iteratively. For example, you can ask for a query and then follow up with “also add a filter for active users” to modify the previous result.&lt;/p&gt;
+    &lt;p&gt;Tips for effective use:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Be specific about table and column names if you know them.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Describe the desired output format (e.g., “show count by category”).&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;For complex queries, break down requirements step by step.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Use the Clear button to start a fresh conversation.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Note: The AI Assistant uses database schema inspection tools to understand your database structure. It supports SELECT, INSERT, UPDATE, DELETE, and DDL statements. All generated queries should be reviewed before execution.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Data Output Panel¶&lt;/head&gt;
+    &lt;p&gt;The Data Output panel displays data and statistics generated by the most recently executed query.&lt;/p&gt;
+    &lt;p&gt;The Data Output tab displays the result set of the query in a table format. You can:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Select and copy from the displayed result set.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Use the Save results to file icon to save the content of the Data Output tab as a comma-delimited file.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Edit the data in the result set of a SELECT query if it is updatable.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Move between pages of data result.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;A result set is updatable if:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;All columns are either selected directly from a single table, or are not table columns at all (e.g. concatenation of 2 columns). Only columns that are selected directly from the table are editable, other columns are read-only.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;All the primary key columns or OIDs of the table are selected in the result set.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Any columns that are renamed or selected more than once are also read-only.&lt;/p&gt;
+    &lt;p&gt;Editable and read-only columns are identified using pencil and lock icons (respectively) in the column headers.&lt;/p&gt;
+    &lt;p&gt;The psycopg2 driver version should be equal to or above 2.8 for updatable query result sets to work.&lt;/p&gt;
+    &lt;p&gt;An updatable result set is identical to the Data Grid in View/Edit Data mode, and can be modified in the same way.&lt;/p&gt;
+    &lt;p&gt;If Auto-commit is off, the data changes are made as part of the ongoing transaction, if no transaction is ongoing a new one is initiated. The data changes are not committed to the database unless the transaction is committed.&lt;/p&gt;
+    &lt;p&gt;If any errors occur during saving (for example, trying to save NULL into a column with NOT NULL constraint) the data changes are rolled back to an automatically created SAVEPOINT to ensure any previously executed queries in the ongoing transaction are not rolled back.&lt;/p&gt;
+    &lt;p&gt;All rowsets from previous queries or commands that are displayed in the Data Output panel will be discarded when you invoke another query; open another Query Tool tab to keep your previous results available.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Explain Panel¶&lt;/head&gt;
+    &lt;p&gt;To generate the Explain or Explain Analyze plan of a query, click on Explain or Explain Analyze button in the toolbar.&lt;/p&gt;
+    &lt;p&gt;More options related to Explain and Explain Analyze can be selected from the drop down on the right side of Explain Analyze button in the toolbar.&lt;/p&gt;
+    &lt;p&gt;Please note that pgAdmin generates the Explain [Analyze] plan in JSON format.&lt;/p&gt;
+    &lt;p&gt;Note: If multiple queries are present and none is selected, Explain [Analyze] runs the query located at the cursor position.&lt;/p&gt;
+    &lt;p&gt;On successful generation of Explain plan, it will create three tabs/panels under the Explain panel.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Graphical&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Please note that EXPLAIN VERBOSE cannot be displayed graphically. Click on a node icon on the Graphical tab to review information about that item; a popup window will display on the right side with the information about the selected object. For information on JIT statistics, triggers and a summary, click on the button on top-right corner; a similar popup window will be displayed when appropriate.&lt;/p&gt;
+    &lt;p&gt;Use the download button on top left corner of the Explain canvas to download the plan as an SVG file.&lt;/p&gt;
+    &lt;p&gt;Note: Download as SVG is not supported on Internet Explorer.&lt;/p&gt;
+    &lt;p&gt;Note that the query plan that accompanies the Explain analyze is available on the Data Output tab.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Table&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Table tab shows the plan details in table format, it generates table format similar to explain.depesz.com. Each row of the table represent the data for a Explain Plan Node. It may contain the node information, exclusive timing, inclusive timing, actual vs planned rows differences, actual rows, planned rows, loops.&lt;/p&gt;
+    &lt;p&gt;background color of the exclusive, inclusive, and Rows X columns may vary based on the difference between actual vs planned.&lt;/p&gt;
+    &lt;p&gt;If percentage of the exclusive/inclusive timings of the total query time is: &amp;gt; 90 - Red color &amp;gt; 50 - Orange (between red and yellow) color &amp;gt; 10 - Yellow color&lt;/p&gt;
+    &lt;p&gt;If planner mis-estimated number of rows (actual vs planned) by 10 times - Yellow color 100 times - Orange (between Red and Yellow) color 1000 times - Red color&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Statistics&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Statistics tab shows two tables: 1. Statistics per Plan Node Type 2. Statistics per Table&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;AI Insights&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The AI Insights tab provides AI-powered analysis of query execution plans, identifying performance bottlenecks and suggesting optimizations. This tab is only available when an AI provider is configured in Preferences &amp;gt; AI.&lt;/p&gt;
+    &lt;p&gt;When you switch to the AI Insights tab, the AI analyzes the execution plan and provides:&lt;/p&gt;
+    &lt;p&gt;Performance Bottlenecks - Issues identified in the query plan, such as:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Sequential scans on large tables that could benefit from indexes&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Significant differences between estimated and actual row counts&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Expensive sort or hash operations&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Nested loops with high iteration counts&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Recommendations - Concrete suggestions to improve query performance:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Index creation statements with appropriate columns&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;ANALYZE commands to update table statistics&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Configuration parameter adjustments&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Query restructuring suggestions&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Each recommendation that includes SQL (such as CREATE INDEX statements) has action buttons to Copy the SQL to the clipboard or Insert it into the Query Editor.&lt;/p&gt;
+    &lt;p&gt;Click the Regenerate button to request a fresh analysis of the current plan.&lt;/p&gt;
+    &lt;p&gt;Note: AI analysis is generated on-demand when you first click the AI Insights tab or when a new explain plan is generated while the tab is active. The analysis provides guidance but all suggested changes should be carefully evaluated before applying to production databases.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Messages Panel¶&lt;/head&gt;
+    &lt;p&gt;Use the Messages tab to view information about the most recently executed query:&lt;/p&gt;
+    &lt;p&gt;If the server returns an error, the error message will be displayed on the Messages tab, and the syntax that caused the error will be underlined in the SQL editor. If a query succeeds, the Messages tab displays how long the query took to complete and how many rows were retrieved:&lt;/p&gt;
+    &lt;head rend="h2"&gt;Notifications Panel¶&lt;/head&gt;
+    &lt;p&gt;Use the Notifications tab to view the notifications using PostgreSQL Listen/ Notify feature. For more details see PostgreSQL documentation.&lt;/p&gt;
+    &lt;p&gt;Example:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Execute LISTEN “foo” in first Query Tool session&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;2. In the another Query Tool session, execute Notify command or pg_notify function to send the notification of the event together with the payload.&lt;/p&gt;
+    &lt;p&gt;3. You can observe the Notification tab in the first Query Tool session where it shows the Recorded time, Event, Process ID, and the Payload of the particular channel.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Graph Visualiser Panel¶&lt;/head&gt;
+    &lt;p&gt;Click the Graph Visualiser button in the toolbar to generate the Graphs of the query results. The graph visualiser supports Line Charts, Stacked Line Charts, Bar Charts, Stacked Bar Charts, and Pie Charts.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Graph Type&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Choose the type of the graph that you would like to generate.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;X Axis&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Choose the column whose value you wish to display on X-axis from the X Axis dropdown. Select the &amp;lt;Row Number&amp;gt; option to use the number of rows as labels on the X-axis.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Y Axis&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Choose the columns whose value you wish to display on Y-axis from the Y Axis dropdown. Users can choose multiple columns. Choose the &amp;lt;Select All&amp;gt; option from the drop-down menu to select all the columns.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Download and Zoom button&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Zooming is performed by clicking and selecting an area over the chart with the mouse. The Zoom to original button will bring you back to the original zoom level.&lt;/p&gt;
+    &lt;p&gt;Click the Download button on the button bar to download the chart.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Line Chart¶&lt;/head&gt;
+    &lt;p&gt;The Line Chart can be generated by selecting the ‘Line Chart’ from the Graph Type drop-down, selecting the X-axis and the Y-axis, and clicking on the ‘Generate’ button. Below is an example of a chart of employee names and their salaries.&lt;/p&gt;
+    &lt;p&gt;Set Use different data point styles? option to true in the Preferences, to show data points in a different style on each graph lines.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Stacked Line Chart¶&lt;/head&gt;
+    &lt;p&gt;The Stacked Line Chart can be generated by selecting the ‘Stacked Line Chart’ from the Graph Type drop-down, selecting the X-axis and the Y-axis, and clicking on the ‘Generate’ button.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Bar Chart¶&lt;/head&gt;
+    &lt;p&gt;The Bar Chart can be generated by selecting the ‘Bar Chart’ from the Graph Type drop-down, selecting the X-axis and the Y-axis, and clicking on the ‘Generate’ button.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Stacked Bar Chart¶&lt;/head&gt;
+    &lt;p&gt;The Stacked Bar Chart can be generated by selecting the ‘Stacked Bar Chart’ from the Graph Type drop-down, selecting the X-axis and the Y-axis, and clicking on the ‘Generate’ button.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Pie Chart¶&lt;/head&gt;
+    &lt;p&gt;The Pie Chart can be generated by selecting the ‘Pie Chart’ from the Graph Type drop-down, selecting the Label and Value, and clicking on the ‘Generate’ button.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Connection Status¶&lt;/head&gt;
+    &lt;p&gt;Use the Connection status feature to view the current connection and transaction status by clicking on the status icon in the Query Tool:&lt;/p&gt;
+    &lt;head rend="h2"&gt;Change connection¶&lt;/head&gt;
+    &lt;p&gt;User can connect to another server or database from existing open session of query tool.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Click on the connection link next to connection status.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Now click on the &amp;lt;New Connection&amp;gt; option from the dropdown.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Now select server, database, user, and role to connect and click on the ‘Save’ button.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;A newly created connection will now get listed in the options.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;To connect, select the newly created connection from the dropdown list.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;Macros¶&lt;/head&gt;
+    &lt;p&gt;Query Tool Macros enable you to execute pre-defined SQL queries with a single key press. Pre-defined queries can contain the placeholder $SELECTION$. Upon macro execution, the placeholder will be replaced with the currently selected text in the Query Editor pane of the Query Tool.&lt;/p&gt;
+    &lt;p&gt;To create a macro, select the Manage Macros option from the Macros menu on the Query Tool. Select the key you wish to use, enter the name of the macro, and the query, optionally including the selection placeholder, and then click the Save button to store the macro.&lt;/p&gt;
+    &lt;p&gt;To add a query to macros, write and select your query, then go to the Macros menu in the Query Tool and click Add to macros. Your query will be automatically saved to macros.&lt;/p&gt;
+    &lt;p&gt;To delete a macro, select the macro on the Manage Macros dialogue, and then click the Delete button. The server will prompt you for confirmation to delete the macro.&lt;/p&gt;
+    &lt;p&gt;To execute a macro, simply select the appropriate shortcut keys, or select it from the Macros menu.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Server Side Cursor¶&lt;/head&gt;
+    &lt;p&gt;Server-side cursors allow partial retrieval of large datasets, making them particularly useful when working with very large result sets. However, they may offer lower performance in typical, everyday usage scenarios.&lt;/p&gt;
+    &lt;p&gt;To enable server-side cursors:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Go to Preferences &amp;gt; Query Tool &amp;gt; Options and set “Use server cursor?” to True.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Alternatively, you can enable it on a per-session basis via the Query Tool’s Execute menu.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Limitations:&lt;/p&gt;
+    &lt;p&gt;1. Transaction Requirement: Server-side cursors work only in transaction mode. If enabled pgAdmin will automatically ensure queries run within a transaction.&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Limited Use Case: Use server-side cursors only when fetching large datasets.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;3. Pagination Limitation: In the Result Grid, the First and Last page buttons will be disabled, as server-side cursors do not return a total row count. Consequently, the total number of rows will not be displayed after execution.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47321760</guid><pubDate>Tue, 10 Mar 2026 11:24:00 +0000</pubDate></item><item><title>Online age-verification tools for child safety are surveilling adults</title><link>https://www.cnbc.com/2026/03/08/social-media-child-safety-internet-ai-surveillance.html</link><description>&lt;doc fingerprint="368408565ad7f5f4"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47322033</guid><pubDate>Tue, 10 Mar 2026 11:58:36 +0000</pubDate></item><item><title>Traffic from Russia to Cloudflare is 60% down from last year</title><link>https://radar.cloudflare.com/traffic/ru?dateRange=52w</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47322629</guid><pubDate>Tue, 10 Mar 2026 12:55:14 +0000</pubDate></item><item><title>Online age-verification tools for child safety are surveilling adults</title><link>https://www.cnbc.com/2026/03/08/social-media-child-safety-internet-ai-surveillance.html</link><description>&lt;doc fingerprint="368408565ad7f5f4"&gt;
   &lt;main&gt;
     &lt;p&gt;New U.S laws designed to protect minors are pulling millions of adult Americans into mandatory age-verification gates to access online content, leading to backlash from users and criticism from privacy advocates that a free and open internet is at stake. Roughly half of U.S. states have enacted or are advancing laws requiring platforms — including adult content sites, online gaming services, and social media apps — to block underage users, forcing companies to screen everyone who approaches these digital gates.&lt;/p&gt;
     &lt;p&gt;"There's a big spectrum," said Joe Kaufmann, global head of privacy at Jumio, one of the largest digital identity-verification and authentication platforms. He explained that the patchwork of state laws vary in technical demands and compliance expectations. "The regulations are moving in many different directions at once," he said.&lt;/p&gt;
@@ -2022,25 +1989,292 @@ images.&lt;/p&gt;
 &lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47322635</guid><pubDate>Tue, 10 Mar 2026 12:55:42 +0000</pubDate></item><item><title>SHOW HN: A usage circuit breaker for Cloudflare Workers</title><link>https://news.ycombinator.com/item?id=47322794</link><description>&lt;doc fingerprint="c2124b24652b5fa4"&gt;
   &lt;main&gt;
     &lt;div&gt;
-      &lt;p&gt;I run 3mins.news (https://3mins.news), an AI news aggregator built entirely on Cloudflare Workers. The backend has 10+ cron triggers running every few minutes — RSS fetching, article clustering, LLM calls, email delivery.&lt;/p&gt;
-      &lt;p&gt;The problem: Workers Paid Plan has hard monthly limits (10M requests, 1M KV writes, 1M queue ops, etc.). There's no built-in "pause when you hit the limit" — CF just starts billing overages. KV writes cost $5/M over the cap, so a retry loop bug can get expensive fast.&lt;/p&gt;
-      &lt;p&gt;AWS has Budget Alerts, but those are passive notifications — by the time you read the email, the damage is done. I wanted active, application-level self-protection.&lt;/p&gt;
-      &lt;p&gt;So I built a circuit breaker that faces inward — instead of protecting against downstream failures (the Hystrix pattern), it monitors my own resource consumption and gracefully degrades before hitting the ceiling.&lt;/p&gt;
+      &lt;p&gt;I run 3mins.news (https://3mins.news), an AI news aggregator built entirely on Cloudflare Workers. The backend has 10+ cron triggers running every few minutes: RSS fetching, article clustering, LLM calls, email delivery.&lt;/p&gt;
+      &lt;p&gt;The problem: Workers Paid Plan has hard monthly limits (10M requests, 1M KV writes, 1M queue ops, etc.). There's no built-in "pause when you hit the limit", CF just starts billing overages. KV writes cost $5/M over the cap, so a retry loop bug can get expensive fast.&lt;/p&gt;
+      &lt;p&gt;AWS has Budget Alerts, but those are passive notifications, by the time you read the email, the damage is done. I wanted active, application-level self-protection.&lt;/p&gt;
+      &lt;p&gt;So I built a circuit breaker that faces inward, instead of protecting against downstream failures (the Hystrix pattern), it monitors my own resource consumption and gracefully degrades before hitting the ceiling.&lt;/p&gt;
       &lt;p&gt;Key design decisions:&lt;/p&gt;
       &lt;p&gt;- Per-resource thresholds: Workers Requests ($0.30/M overage) only warns at 80%. KV Writes ($5/M overage) can trip the breaker at 90%. Not all resources are equally dangerous, so some are configured as warn-only (trip=null).&lt;/p&gt;
-      &lt;p&gt;- Hysteresis: Trips at 90%, recovers at 85%. The 5% gap prevents oscillation — without it the system flaps between tripped and recovered every check cycle.&lt;/p&gt;
+      &lt;p&gt;- Hysteresis: Trips at 90%, recovers at 85%. The 5% gap prevents oscillation, without it the system flaps between tripped and recovered every check cycle.&lt;/p&gt;
       &lt;p&gt;- Fail-safe on monitoring failure: If the CF usage API is down, maintain last known state rather than assuming "everything is fine." A monitoring outage shouldn't mask a usage spike.&lt;/p&gt;
       &lt;p&gt;- Alert dedup: Per-resource, per-month. Without it you'd get ~8,600 identical emails for the rest of the month once a resource hits 80%.&lt;/p&gt;
       &lt;p&gt;Implementation: every 5 minutes, queries CF's GraphQL API (requests, CPU, KV, queues) + Observability Telemetry API (logs/traces) in parallel, evaluates 8 resource dimensions, caches state to KV. Between checks it's a single KV read — essentially free.&lt;/p&gt;
       &lt;p&gt;When tripped, all scheduled tasks are skipped. The cron trigger still fires (you can't stop that), but the first thing it does is check the breaker and bail out if tripped.&lt;/p&gt;
-      &lt;p&gt;It's been running in production for two weeks. Caught a KV reads spike at 82% early in the month — got one warning email, investigated, fixed the root cause, never hit the trip threshold.&lt;/p&gt;
+      &lt;p&gt;It's been running in production for two weeks. Caught a KV reads spike at 82% early in the month, got one warning email, investigated, fixed the root cause, never hit the trip threshold.&lt;/p&gt;
       &lt;p&gt;The pattern should apply to any metered serverless platform (Lambda, Vercel, Supabase) or any API with budget ceilings (OpenAI, Twilio). The core idea: treat your own resource budget as a health signal, just like you'd treat a downstream service's error rate.&lt;/p&gt;
       &lt;p&gt;Happy to share code details if there's interest.&lt;/p&gt;
       &lt;p&gt;Full writeup with implementation code and tests: https://yingjiezhao.com/en/articles/Usage-Circuit-Breaker-for-Cloudflare-Workers&lt;/p&gt;
     &lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47322794</guid><pubDate>Tue, 10 Mar 2026 13:09:00 +0000</pubDate></item><item><title>Hisense TVs add unskippable startup ads before live TV</title><link>https://www.guru3d.com/story/hisense-vidaa-tvs-reportedly-add-unskippable-startup-ads-before-live-tv/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47322966</guid><pubDate>Tue, 10 Mar 2026 13:26:47 +0000</pubDate></item><item><title>Germany's Solar Boom Eases Power Costs as Gas Price Jumps</title><link>https://www.bloomberg.com/news/articles/2026-03-06/germany-s-solar-boom-eases-power-costs-as-gas-price-jumps</link><description>&lt;doc fingerprint="2b55257bc3b4405b"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47322794</guid><pubDate>Tue, 10 Mar 2026 13:09:00 +0000</pubDate></item><item><title>Intel Demos Chip to Compute with Encrypted Data</title><link>https://spectrum.ieee.org/fhe-intel</link><description>&lt;doc fingerprint="ffdf7769692cd8f7"&gt;
+  &lt;main&gt;
+    &lt;head rend="h2"&gt;Summary&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Fully homomorphic encryption (FHE) allows computing on encrypted data without decryption, but it’s currently slow on standard CPUs and GPUs.&lt;/item&gt;
+      &lt;item&gt;Intel’s Heracles chip accelerates FHE tasks up to 5,000 times faster than top Intel server CPUs.&lt;/item&gt;
+      &lt;item&gt;Heracles uses a 3-nanometer FinFET technology and high-bandwidth memory, enabling efficient encrypted computing at scale.&lt;/item&gt;
+      &lt;item&gt;Startups and Intel are racing to commercialize FHE accelerators, with potential applications in AI and secure data processing.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Worried that your latest ask to a cloud-based AI reveals a bit too much about you? Want to know your genetic risk of disease without revealing it to the services that compute the answer?&lt;/p&gt;
+    &lt;p&gt;There is a way to do computing on encrypted data without ever having it decrypted. It’s called fully homomorphic encryption, or FHE. But there’s a rather large catch. It can take thousands—even tens of thousands—of times longer to compute on today’s CPUs and GPUs than simply working with the decrypted data.&lt;/p&gt;
+    &lt;p&gt;So universities, startups, and at least one processor giant have been working on specialized chips that could close that gap. Last month at the IEEE International Solid-State Circuits Conference (ISSCC) in San Francisco, Intel demonstrated its answer, Heracles, which sped up FHE computing tasks as much as 5,000-fold compared to a top-of the-line Intel server CPU.&lt;/p&gt;
+    &lt;p&gt;Startups are racing to beat Intel and each other to commercialization. But Sanu Mathew, who leads security circuits research at Intel, believes the CPU giant has a big lead, because its chip can do more computing than any other FHE accelerator yet built. “Heracles is the first hardware that works at scale,” he says.&lt;/p&gt;
+    &lt;p&gt;The scale is measurable both physically and in compute performance. While other FHE research chips have been in the range of 10 square millimeters or less, Heracles is about 20 times that size and is built using Intel’s most advanced, 3-nanometer FinFET technology. And it’s flanked inside a liquid-cooled package by two 24-gigabyte high-bandwidth memory chips—a configuration usually seen only in GPUs for training AI.&lt;/p&gt;
+    &lt;p&gt;RELATED: How to Compute with Data You Can’t See&lt;/p&gt;
+    &lt;p&gt;In terms of scaling compute performance, Heracles showed muscle in live demonstrations at ISSCC. At its heart the demo was a simple private query to a secure server. It simulated a request by a voter to make sure that her ballot had been registered correctly. The state, in this case, has an encrypted database of voters and their votes. To maintain her privacy, the voter would not want to have her ballot information decrypted at any point; so using FHE, she encrypts her ID and vote and sends it to the government database. There, without decrypting it, the system determines if it is a match and returns an encrypted answer, which she then decrypts on her side.&lt;/p&gt;
+    &lt;p&gt;On an Intel Xeon server CPU, the process took 15 milliseconds. Heracles did it in 14 microseconds. While that difference isn’t something a single human would notice, verifying 100 million voter ballots adds up to more than 17 days of CPU work versus a mere 23 minutes on Heracles.&lt;/p&gt;
+    &lt;p&gt;Looking back on the five-year journey to bring the Heracles chip to life, Ro Cammarota, who led the project at Intel until last December and is now at University of California Irvine, says “we have proven and delivered everything that we promised.”&lt;/p&gt;
+    &lt;head rend="h2"&gt;FHE Data Expansion&lt;/head&gt;
+    &lt;p&gt;FHE is fundamentally a mathematical transformation, sort of like the Fourier transform. It encrypts data using a quantum-computer-proof algorithm, but, crucially, uses corollaries to the mathematical operations usually used on unencrypted data. These corollaries achieve the same ends on the encrypted data.&lt;/p&gt;
+    &lt;p&gt;One of the main things holding such secure computing back is the explosion in the size of the data once it’s encrypted for FHE, Anupam Golder, a research scientist at Intel’s circuits research lab, told engineers at ISSCC. “Usually, the size of cipher text is the same as the size of plain text, but for FHE it’s orders of magnitude larger,” he said.&lt;/p&gt;
+    &lt;p&gt;While the sheer volume is a big problem, the kinds of computing you need to do with that data is also an issue. FHE is all about very large numbers that must be computed with precision. While a CPU can do that, it’s very slow going—integer addition and multiplication take about 10,000 more clock cycles in FHE. Worse still, CPUs aren’t built to do such computing in parallel. Although GPUs excel at parallel operations, precision is not their strong suit. (In fact, from generation to generation, GPU designers have devoted more and more of the chip’s resources to computing less and less-precise numbers.)&lt;/p&gt;
+    &lt;p&gt;FHE also requires some oddball operations with names like “twiddling” and “automorphism,” and it relies on a compute-intensive noise-cancelling process called bootstrapping. None of these things are efficient on a general-purpose processor. So, while clever algorithms and libraries of software cheats have been developed over the years, the need for a hardware accelerator remains if FHE is going to tackle large-scale problems, says Cammarota.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Labors of Heracles&lt;/head&gt;
+    &lt;p&gt;Heracles was initiated under a DARPA program five years ago to accelerate FHE using purpose-built hardware. It was developed as “a whole system-level effort that went all the way from theory and algorithms down to the circuit design,” says Cammarota.&lt;/p&gt;
+    &lt;p&gt;Among the first problems was how to compute with numbers that were larger than even the 64-bit words that are today a CPU’s most precise. There are ways to break up these gigantic numbers into chunks of bits that can be calculated independently of each other, providing a degree of parallelism. Early on, the Intel team made a big bet that they would be able to make this work in smaller, 32-bit chunks, yet still maintain the needed precision. This decision gave the Heracles architecture some speed and parallelism, because the 32-bit arithmetic circuits are considerably smaller than 64-bit ones, explains Cammarota.&lt;/p&gt;
+    &lt;p&gt;At Heracles’ heart are 64 compute cores—called tile-pairs—arranged in an eight-by-eight grid. These are what are called single instruction multiple data (SIMD) compute engines designed to do the polynomial math, twiddling, and other things that make up computing in FHE and to do them in parallel. An on-chip 2D mesh network connects the tiles to each other with wide, 512 byte, buses.&lt;/p&gt;
+    &lt;p&gt;RELATED: Tech Keeps Chatbots From Leaking Your Data&lt;/p&gt;
+    &lt;p&gt;Important to making encrypted computing efficient is feeding those huge numbers to the compute cores quickly. The sheer amount of data involved meant linking 48-GB-worth of expensive high-bandwidth memory to the processor with 819 GB per second connections. Once on the chip, data musters in 64 megabytes of cache memory—somewhat more than an Nvidia Hopper-generation GPU. From there it can flow through the array at 9.6 terabytes per second by hopping from tile-pair to tile-pair.&lt;/p&gt;
+    &lt;p&gt;To ensure that computing and moving data don’t get in each other’s way, Heracles runs three synchronized streams of instructions simultaneously, one for moving data onto and off of the processor, one for moving data within it, and a third for doing the math, Golder explained.&lt;/p&gt;
+    &lt;p&gt;It all adds up to some massive speed ups, according to Intel. Heracles—operating at 1.2 gigahertz—takes just 39 microseconds to do FHE’s critical math transformation, a 2,355-fold improvement over an Intel Xeon CPU running at 3.5 GHz. Across seven key operations, Heracles was 1,074 to 5,547 times as fast.&lt;/p&gt;
+    &lt;p&gt;The differing ranges have to do with how much data movement is involved in the operations, explains Mathew. “It’s all about balancing the movement of data with the crunching of numbers,” he says.&lt;/p&gt;
+    &lt;head rend="h2"&gt;FHE Competition&lt;/head&gt;
+    &lt;p&gt;“It’s very good work,” Kurt Rohloff, chief technology officer at FHE software firm Duality Technology, says of the Heracles results. Duality was part of a team that developed a competing accelerator design under the same DARPA program that Intel conceived Heracles under. “When Intel starts talking about scale, that usually carries quite a bit of weight.”&lt;/p&gt;
+    &lt;p&gt;Duality’s focus is less on new hardware than on software products that do the kind of encrypted queries that Intel demonstrated at ISSCC. At the scale in use today “there’s less of a need for [specialized] hardware,” says Rohloff. “Where you start to need hardware is emerging applications around deeper machine-learning oriented operations like neural net, LLMs, or semantic search.”&lt;/p&gt;
+    &lt;p&gt;Last year, Duality demonstrated an FHE-encrypted language model called BERT. Like more famous LLMs such as ChatGPT, BERT is a transformer model. However it’s only one tenth the size of even the most compact LLMs.&lt;/p&gt;
+    &lt;p&gt;John Barrus, vice president of product at Dayton, Ohio-based Niobium Microsystems, an FHE chip startup spun out of another DARPA competitor, agrees that encrypted AI is a key target of FHE chips. “There are a lot of smaller models that, even with FHE’s data expansion, will run just fine on accelerated hardware,” he says.&lt;/p&gt;
+    &lt;p&gt;With no stated commercial plans from Intel, Niobium expects its chip to be “the world’s first commercially viable FHE accelerator, designed to enable encrypted computations at speeds practical for real-world cloud and AI infrastructure.” Although it hasn’t announced when a commercial chip will be available, last month the startup revealed that it had inked a deal worth 10 billion South Korean won (US $6.9 million) with Seoul-based chip design firm Semifive to develop the FHE accelerator for fabrication using Samsung Foundry’s 8-nanometer process technology.&lt;/p&gt;
+    &lt;p&gt;Other startups including Fabric Cryptography, Cornami, and Optalysys have been working on chips to accelerate FHE. Optalysys CEO Nick New says Heracles hits about the level of speedup you could hope for using an all-digital system. “We’re looking at pushing way past that digital limit,” he says. His company’s approach is to use the physics of a photonic chip to do FHE’s compute-intensive transform steps. That photonics chip is on its seventh generation, he says, and among the next steps is to 3D integrate it with custom silicon to do the non-transform steps and coordinate the whole process. A full 3D-stacked commercial chip could be ready in two or three years, says New.&lt;/p&gt;
+    &lt;p&gt;While competitors develop their chips, so will Intel, says Mathew. It will be improving on how much the chip can accelerate computations by fine tuning the software. It will also be trying out more massive FHE problems, and exploring hardware improvements for a potential next generation. “This is like the first microprocessor… the start of a whole journey,” says Mathew.&lt;/p&gt;
+    &lt;p&gt;Samuel K. Moore is the senior editor at IEEE Spectrum in charge of semiconductors coverage. An IEEE member, he has a bachelor's degree in biomedical engineering from Brown University and a master's degree in journalism from New York University.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47322815</guid><pubDate>Tue, 10 Mar 2026 13:10:48 +0000</pubDate></item><item><title>Show HN: DD Photos – open-source photo album site generator (Go and SvelteKit)</title><link>https://github.com/dougdonohoe/ddphotos</link><description>&lt;doc fingerprint="57973850cda7ffa1"&gt;
+  &lt;main&gt;
+    &lt;p&gt;I was dissatisfied with photo sharing sites, especially Apple's iCloud shared albums, which typically take 20+ seconds to load. Other sites for sharing have their own irritations like cumbersome UIs, advertising, hawking of photo paraphernalia and social media distractions.&lt;/p&gt;
+    &lt;p&gt;I just want to share my photos with friends and family. I want it fast, easy, mobile friendly, and distraction free. Focus on the photos. So I built this, with help from Claude Code, and it is what is behind photos.donohoe.info. It's pretty good and meets my needs. Maybe it will meet yours too, which is why I've open-sourced it.&lt;/p&gt;
+    &lt;p&gt;The site has a home page, with all of your albums and their description. You can easily switch between dark and light themes. Click/touch an album and you see a grid of all photos. Click/touch a photo to see the full size version and a caption, if it has one. You can easily swipe between photos (or use arrow keys on a laptop). It works great on mobile, tablet, and desktop.&lt;/p&gt;
+    &lt;p&gt;Here's what it looks like on a big display (see SCREENSHOTS.md for larger versions):&lt;/p&gt;
+    &lt;p&gt;The idea is that you already use something else to curate and filter your photos. Maybe it is Adobe Lightroom Classic (my tool). Or maybe it is Apple Photos or Google Photos. It doesn't matter, but once you get a selection of photos that comprise an album, you export the photos into a folder. All the photos in a folder make up an album. It's that simple.&lt;/p&gt;
+    &lt;p&gt;You can create an optional &lt;code&gt;photogen.txt&lt;/code&gt; file in each album folder to
+define captions for each photo.  This file can also be used to define the
+album's sort order, if order-by-date isn't sufficient.&lt;/p&gt;
+    &lt;p&gt;With DD Photos, you define where your albums live in an &lt;code&gt;albums.yaml&lt;/code&gt; file.
+In a separate &lt;code&gt;descriptions.txt&lt;/code&gt; you provide a short description of each album.&lt;/p&gt;
+    &lt;p&gt;Once you have defined where your photos live, you run the &lt;code&gt;photogen&lt;/code&gt; tool,
+which resizes the photos for web viewing and generates index files that
+the web app uses.&lt;/p&gt;
+    &lt;p&gt;That's it. Now, you can easily view your photo albums on your machine using the dev server.&lt;/p&gt;
+    &lt;p&gt;Finally, there is a build step which creates a static site that can easily be deployed to a machine that has a web server (like Apache) or theoretically something like AWS S3. No code runs on a server. No database is needed. It's just HTML, CSS, JavaScript and your (resized) photos.&lt;/p&gt;
+    &lt;p&gt;Website features:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Concise album cards with description, number of photos, date range and your choice of cover photo.&lt;/item&gt;
+      &lt;item&gt;Album page has a nicely justified photo grid layout with PhotoSwipe lightbox that adjusts well to any screen size.&lt;/item&gt;
+      &lt;item&gt;Keyboard support: arrow keys navigate in lightbox, ESC key exits lightbox and returns to home page from album page.&lt;/item&gt;
+      &lt;item&gt;Optional per-photo descriptions via &lt;code&gt;photogen.txt&lt;/code&gt;: used as image "alt" text, grid mouse-hover caption (desktop), always-visible caption (mobile), and lightbox caption.&lt;/item&gt;
+      &lt;item&gt;Each photo has a shareable permalink (e.g., &lt;code&gt;/albums/patagonia/5&lt;/code&gt;) accessible via a copy-to-clipboard button.&lt;/item&gt;
+      &lt;item&gt;Dark/light theme toggle.&lt;/item&gt;
+      &lt;item&gt;OpenGraph tags for rich link previews when sharing album or photo URLs on social media or messaging apps, using a JPEG version of the album cover photo as the preview image.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Backend features:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Two efficient WebP image sizes created: &lt;code&gt;grid&lt;/code&gt;(600px) and&lt;code&gt;full&lt;/code&gt;(1600px).&lt;/item&gt;
+      &lt;item&gt;EXIF metadata extraction (dimensions, date) stored in JSON.&lt;/item&gt;
+      &lt;item&gt;All image metadata stripped from WebP output (smaller files, no GPS leak).&lt;/item&gt;
+      &lt;item&gt;Concurrent image resizing via goroutines (buffered channel, WaitGroup).&lt;/item&gt;
+      &lt;item&gt;Dry-run mode by default (use &lt;code&gt;-doit&lt;/code&gt;to write files).&lt;/item&gt;
+      &lt;item&gt;Optionally use &lt;code&gt;photogen.txt&lt;/code&gt;to override sort order (default is by capture date).&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The &lt;code&gt;photogen&lt;/code&gt; Go program (&lt;code&gt;cmd/photogen/photogen.go&lt;/code&gt;) resizes your photos to WebP
+format and generates the JSON index files (&lt;code&gt;albums.json&lt;/code&gt;, per-album &lt;code&gt;index.json&lt;/code&gt;)
+that are consumed by the frontend.  It also generates a &lt;code&gt;sitemap.xml&lt;/code&gt; file that
+identifies each album.&lt;/p&gt;
+    &lt;p&gt;The site (in &lt;code&gt;web&lt;/code&gt;, a Node.js app) is built with SvelteKit and statically generated.
+The HTML shell and assets are pre-built files served directly by a web server, with photo data
+fetched client-side from the static JSON indexes generated by &lt;code&gt;photogen&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;There are many ways to deploy a static site like this. It is somewhat outside the scope of this project to tackle all the various deployment strategies, but I may add more options in the future if there is interest.&lt;/p&gt;
+    &lt;p&gt;That said, I happen to already run an Apache server on an AWS EC2 instance that is fronted by CloudFront. Deployment for me is an &lt;code&gt;rsync&lt;/code&gt; to this server, and I've included the
+script which does this.  My actual AWS setup is maintained in Terraform files in a
+private repo, but I provide some details in the README-DEV
+for those that are curious.  Part of what makes my photos site fast is the use of the CDN
+and the fact that the site is entirely static.&lt;/p&gt;
+    &lt;p&gt;The following setup instructions are Mac-centric (via Homebrew). Linux should work with equivalent package manager commands (&lt;code&gt;apt&lt;/code&gt;, &lt;code&gt;yum&lt;/code&gt;). Windows users should use WSL2.&lt;/p&gt;
+    &lt;code&gt;# Install Go, vips library and pkg-config dependency (for photogen)
+brew install go vips pkg-config
+
+# In root of this repo, fetch Go libraries
+go mod download&lt;/code&gt;
+    &lt;p&gt;The website is a Node.js app. Install nvm first if you don't already have it.&lt;/p&gt;
+    &lt;code&gt;# Install Node and dependencies (for the web app):
+make web-nvm-install  # installs the Node version specified in web/.nvmrc
+make web-npm-install  # install npm dependencies
+
+# Optional: Install playwright dependencies if running e2e tests
+make web-playwright-install  # installs Playwright + Chromium for e2e tests&lt;/code&gt;
+    &lt;p&gt;You may also want to install Docker if you don't have it, as it is required for testing site behavior using Apache.&lt;/p&gt;
+    &lt;p&gt;Once you have the required software installed, you should be able to build and view the sample site provided within this repo (in the &lt;code&gt;sample&lt;/code&gt; dir).&lt;/p&gt;
+    &lt;code&gt;# Resize photos and generate .json files
+make sample-photogen
+
+# Run dev server
+make sample-npm-run-dev&lt;/code&gt;
+    &lt;p&gt;You should see a &lt;code&gt;VITE&lt;/code&gt; message and a browser window should
+open at localhost:5173.&lt;/p&gt;
+    &lt;p&gt;You can also build the static site and test it in Apache (requires Docker and assumes &lt;code&gt;photogen&lt;/code&gt; has been run).&lt;/p&gt;
+    &lt;code&gt;# Build docker image (one time)
+make web-docker-build
+
+# Build sample site
+make sample-build
+
+# Run it in Docker/Apache
+make web-docker-run &lt;/code&gt;
+    &lt;p&gt;You should be able to see the site at localhost:8080.&lt;/p&gt;
+    &lt;p&gt;Congratulations! Now that you've got the sample site working, you can work on your own albums. You can start first by adding to the sample config in &lt;code&gt;sample/config/albums.yaml&lt;/code&gt;.  Or you can start building your own using the
+examples in &lt;code&gt;config&lt;/code&gt;.  The sections below provide details about how everything
+works.&lt;/p&gt;
+    &lt;p&gt;There are three configuration files one needs to build a site:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;&lt;code&gt;albums.yaml&lt;/code&gt;- Defines your list of albums, an id for the site (useful if you have multiple sites), and the locations of your photos.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;descriptions.txt&lt;/code&gt;- The description of the album that you see. This is in a separate file to allow sharing of albums across sites (useful in development), and also enables localization in the future.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;site.env&lt;/code&gt;- Global values like site name, description and copyright info.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The &lt;code&gt;config&lt;/code&gt; directory contains examples of each, and serves as detailed
+documentation of each parameter.  The &lt;code&gt;sample/config&lt;/code&gt; files are a working
+example that drives our "Sample Photo Album".&lt;/p&gt;
+    &lt;p&gt;The &lt;code&gt;config&lt;/code&gt; directory is the default, so feel free to put your config
+files there (just copy the examples and edit them).  Or edit the sample
+app.  Or create your own config directory and use the &lt;code&gt;--config-dir&lt;/code&gt;
+option.&lt;/p&gt;
+    &lt;code&gt;cp config/albums.example.yaml config/albums.yaml
+cp config/descriptions.example.txt config/descriptions.txt
+cp config/site.example.env config/site.env&lt;/code&gt;
+    &lt;p&gt;TIP: If you use &lt;code&gt;prod&lt;/code&gt; as your &lt;code&gt;settings.id&lt;/code&gt; value in &lt;code&gt;albums.yaml&lt;/code&gt;,
+you can use some provided make targets, like &lt;code&gt;use-prod&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;The &lt;code&gt;Makefile&lt;/code&gt; is a good reference for the commands (you used them to run the sample site).
+Assuming you put your config files in &lt;code&gt;config&lt;/code&gt;, these commands are useful:&lt;/p&gt;
+    &lt;code&gt;# Dry run of indexing and resizing
+go run cmd/photogen/photogen.go -resize -index
+
+# Do it for real
+go run cmd/photogen/photogen.go -resize -index -doit&lt;/code&gt;
+    &lt;p&gt;NOTE: output goes to &lt;code&gt;web/albums/[ID]&lt;/code&gt; by default.  For example,
+the sample site is in &lt;code&gt;web/albums/sample&lt;/code&gt;.  A symlink from
+&lt;code&gt;web/static/albums&lt;/code&gt; points to the current site data you are working
+with.  See the &lt;code&gt;use-prod&lt;/code&gt; Makefile target for an example of
+how this symlink is created.&lt;/p&gt;
+    &lt;p&gt;Once &lt;code&gt;photogen&lt;/code&gt; has been successfully run, you can run the
+dev server.&lt;/p&gt;
+    &lt;code&gt;# Make sure symlink is correct
+ln -sfn ../albums/my-site web/static/albums # if id is not 'prod'
+make use-prod # if id is 'prod'
+
+# Run dev server
+make web-npm-run-dev&lt;/code&gt;
+    &lt;p&gt;To test the build process:&lt;/p&gt;
+    &lt;code&gt;make web-npm-build&lt;/code&gt;
+    &lt;p&gt;This deletes and recreates the &lt;code&gt;web/build&lt;/code&gt; directory, which will have all
+the files needed to run the site, including copies of your resized photos.&lt;/p&gt;
+    &lt;p&gt;To run it using the Docker/Apache image:&lt;/p&gt;
+    &lt;code&gt;make web-docker-run&lt;/code&gt;
+    &lt;p&gt;You should be able to see the site at localhost:8080.&lt;/p&gt;
+    &lt;p&gt;Assuming the dev server is running, you can run the playwright tests:&lt;/p&gt;
+    &lt;code&gt;make web-playwright-test-dev&lt;/code&gt;
+    &lt;p&gt;These should pass against &lt;code&gt;sample&lt;/code&gt;, but some will fail against your site,
+because values are hardcoded at the moment (i.e., the smoke/caption tests
+reference specific album names - &lt;code&gt;antarctica&lt;/code&gt; and &lt;code&gt;uganda&lt;/code&gt;).&lt;/p&gt;
+    &lt;p&gt;You can also run some smoke tests as defined in &lt;code&gt;bin/test-photos-apache.sh&lt;/code&gt;.
+Assuming Docker/Apache is running:&lt;/p&gt;
+    &lt;code&gt;make web-docker-test&lt;/code&gt;
+    &lt;p&gt;If Docker/Apache isn't running, you can auto-start and stop it to run these tests against sample site:&lt;/p&gt;
+    &lt;code&gt;make sample-test-apache&lt;/code&gt;
+    &lt;p&gt;See README-DEV for more details about &lt;code&gt;photogen&lt;/code&gt;, the
+SvelteKit site, deployment and other technical details.&lt;/p&gt;
+    &lt;p&gt;Much of this project was built with Claude Code. See HISTORY.md for a detailed session log covering WebP conversion, concurrent image resizing, static site setup, Apache URL routing and Docker test environment, photo descriptions and captions, photo permalinks, Open Graph and social sharing tags, SvelteKit client-side navigation, Playwright E2E tests, YAML-based album configuration, deploy scripts, open-source prep, and more.&lt;/p&gt;
+    &lt;p&gt;This project is licensed under the GNU Affero General Public License v3.0 (AGPL v3).&lt;/p&gt;
+    &lt;p&gt;If you'd like to use this project under different terms, contact doug [at] donohoe [dot] info.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47322838</guid><pubDate>Tue, 10 Mar 2026 13:13:48 +0000</pubDate></item><item><title>Hisense TVs add unskippable startup ads before live TV</title><link>https://www.guru3d.com/story/hisense-vidaa-tvs-reportedly-add-unskippable-startup-ads-before-live-tv/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47322966</guid><pubDate>Tue, 10 Mar 2026 13:26:47 +0000</pubDate></item><item><title>Sending Jabber/XMPP Messages via HTTP</title><link>https://gultsch.de/posts/xmpp-via-http/</link><description>&lt;doc fingerprint="f4107758d8f8be96"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Sending Jabber/XMPP Messages via HTTP&lt;/head&gt;
+    &lt;p&gt;Table of Contents:&lt;/p&gt;
+    &lt;p&gt;The goal of this tutorial is to set up a simple REST API that allows you to send XMPP messages to an existing XMPP account. This can be easily integrated into monitoring solutions or other scripts that send out status information.&lt;/p&gt;
+    &lt;p&gt;While there are command-line tools like go-sendxmpp that send messages by connecting to an XMPP server directly, this guide is specifically about providing an HTTP interface.&lt;/p&gt;
+    &lt;code&gt;curl "https://ntfy.stdmsg.tech:5281/msg/user@example.com" \
+  -u coffee@ntfy.stdmsg.tech:secret \
+  -H "Content-Type: text/plain" \
+  -d "Your flat white is done"
+&lt;/code&gt;
+    &lt;p&gt;Hint: If you donât have an XMPP account to receive these messages, you can create one on a public server from within Conversations (F-Droid, Google Play) or another XMPP client of your choosing.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Requirements&lt;/head&gt;
+    &lt;p&gt;This guide assumes you have a relatively clean install of Debian 13. However, using other Linux distributions or integrating this into an install with existing services will probably work as well. The only other requirement is that you have a domain. Any subdomain over which you control the A record will do. In this tutorial, we will use the domain &lt;code&gt;ntfy.stdmsg.tech&lt;/code&gt; (be sure to replace it with your own).&lt;/p&gt;
+    &lt;head rend="h2"&gt;Setup&lt;/head&gt;
+    &lt;head rend="h3"&gt;Installation&lt;/head&gt;
+    &lt;p&gt;We are installing Prosody IM, the community modules and certbot (to get certificates).&lt;/p&gt;
+    &lt;code&gt;apt install prosody prosody-modules lua-unbound liblua5.4-dev certbot
+&lt;/code&gt;
+    &lt;p&gt;The Prosody community module we need doesnât come with the prosody-modules Debian package. We are going to use the Prosody plugin installer instead.&lt;/p&gt;
+    &lt;code&gt;prosodyctl install --server=https://modules.prosody.im/rocks/ mod_post_msg
+&lt;/code&gt;
+    &lt;head rend="h3"&gt;Configuration&lt;/head&gt;
+    &lt;p&gt;We will be creating a mininal configuration file for Prosody, usually a regular XMPP server, that has everything disabled, except for the stuff that is required to provide the REST API.&lt;/p&gt;
+    &lt;p&gt;Replace &lt;code&gt;/etc/prosody/prosody.cfg.lua&lt;/code&gt; with this configuration:&lt;/p&gt;
+    &lt;code&gt;pidfile = "/var/run/prosody/prosody.pid"
+
+modules_enabled = {
+	"tls";
+	"dialback";
+	"http";
+	"admin_shell";
+	"post_msg";
+}
+modules_disabled = {
+	"c2s";
+	"offline";
+}
+
+log = {
+	info = "prosody.log";
+	error = "prosody.err";
+}
+
+certificates = "certs"
+
+VirtualHost "ntfy.stdmsg.tech"
+&lt;/code&gt;
+    &lt;head rend="h3"&gt;Getting certificates&lt;/head&gt;
+    &lt;p&gt;We are using certbot to retrieve Letâs Encrypt certificates. If you already have a certbot setup make sure to change the &lt;code&gt;--standalone&lt;/code&gt; parameter to something more suitable.&lt;/p&gt;
+    &lt;code&gt;certbot certonly --standalone  -d ntfy.stdmsg.tech
+prosodyctl --root cert import /etc/letsencrypt/live/
+&lt;/code&gt;
+    &lt;p&gt;This assumes you have the A record of your domain pointed to your server.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Check and first start&lt;/head&gt;
+    &lt;p&gt;You can use &lt;code&gt;prosodyctl check&lt;/code&gt; to check over the configuration file. Afterwards restart Prosody with the new configuration file.&lt;/p&gt;
+    &lt;code&gt;systemctl restart prosody
+&lt;/code&gt;
+    &lt;p&gt;You can use &lt;code&gt;ss -ltnp&lt;/code&gt; to check if Prosody is running on port 5269 (XMPP S2S) and port 5281 (The HTTPS port used for the REST API).&lt;/p&gt;
+    &lt;head rend="h2"&gt;Send your first message&lt;/head&gt;
+    &lt;head rend="h3"&gt;Creating a user&lt;/head&gt;
+    &lt;code&gt;prosodyctl adduser coffee@ntfy.stdmsg.tech
+&lt;/code&gt;
+    &lt;p&gt;Enter a password of your choice when prompted. We pick “secret” in this example.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Using the REST API&lt;/head&gt;
+    &lt;code&gt;curl "https://ntfy.stdmsg.tech:5281/msg/user@example.com" \
+  -u coffee@ntfy.stdmsg.tech:secret \
+  -H "Content-Type: text/plain" \
+  -d "Your flat white is done"
+&lt;/code&gt;
+    &lt;p&gt;The &lt;code&gt;user@example.com&lt;/code&gt; (part of the path) is the recipient. The -u part is the user youâve just created and its password. Itâs the sender of the XMPP message.&lt;/p&gt;
+    &lt;p&gt;You can create multiple users depending on how much seperation of concern you want.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Additional reading&lt;/head&gt;
+    &lt;p&gt;The module we are using is called &lt;code&gt;mod_post_msg&lt;/code&gt;. Its documentation describes how it can take JSON payloads, if this is more appropriate for your use case.&lt;/p&gt;
+    &lt;p&gt;You can also configure the built-in HTTP server and/or put it behind a reverse proxy.&lt;/p&gt;
+    &lt;p&gt;For a more permanent setup, you might want to look into setting up a certbot hook that reimports fresh certificates into Prosody.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47322998</guid><pubDate>Tue, 10 Mar 2026 13:29:21 +0000</pubDate></item><item><title>Germany's Solar Boom Eases Power Costs as Gas Price Jumps</title><link>https://www.bloomberg.com/news/articles/2026-03-06/germany-s-solar-boom-eases-power-costs-as-gas-price-jumps</link><description>&lt;doc fingerprint="2b55257bc3b4405b"&gt;
   &lt;main&gt;
     &lt;p&gt;New Energy&lt;/p&gt;
     &lt;head rend="h1"&gt;Germany’s Solar Boom Eases Power Costs as Gas Price Jumps&lt;/head&gt;
@@ -2048,4 +2282,89 @@ images.&lt;/p&gt;
     &lt;p&gt;The country’s solar installations will feed more than 40 gigawatts of electricity into the public grid at noon on Friday for the fifth day in a row, according to data from the Fraunhofer Institute. Last year, there were only four days with this level of solar generation in the entire month of March.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47323028</guid><pubDate>Tue, 10 Mar 2026 13:32:05 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47323028</guid><pubDate>Tue, 10 Mar 2026 13:32:05 +0000</pubDate></item><item><title>Rebasing in Magit</title><link>https://entropicthoughts.com/rebasing-in-magit</link><description>&lt;doc fingerprint="a6ac9d522d7c17b5"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Rebasing in Magit&lt;/head&gt;
+    &lt;p&gt;I read Ian Whitlock’s article on why he can’t quit Magit and it inspired me to share more about Magit from my perspective. This article will focus on rebasing.&lt;/p&gt;
+    &lt;head rend="h1"&gt;Your command centre: the git log&lt;/head&gt;
+    &lt;p&gt; Here I have opened the git log1 I’m sorry about the mouse cursor – it’s an artifact of selecting the area to screenshot., by first opening Magit (which I have bound to the &lt;code&gt;F3&lt;/code&gt; key), and then pressing &lt;code&gt;lL&lt;/code&gt;. The first &lt;code&gt;l&lt;/code&gt; is the prefix
+key for dealing with the git log, and the second &lt;code&gt;L&lt;/code&gt; is to to view the log for
+all local branches (and the remote branches they track.)
+&lt;/p&gt;
+    &lt;p&gt; Hypothetically, if we wanted to run a more complicated log command, it is very easy to do that in Magit. When we press the first &lt;code&gt;l&lt;/code&gt; and pause for a moment,
+Magit shows us unintrusive hints for all options that are available:
+&lt;/p&gt;
+    &lt;p&gt;This means we don’t have to remember exactly which options there are because if we need them, Magit will remind us. Some examples:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;To limit to a particular author, we type &lt;code&gt;-A&lt;/code&gt;and then Magit gives us a fuzzy-matching list of all repository authors. We can either browse that list, or type the name of the author we are interested in and press return to confirm.&lt;/item&gt;
+      &lt;item&gt;To limit the date range of the log, we type &lt;code&gt;=u&lt;/code&gt;and then Magit gives us a calendar view in which we can select a date, or type one manually.&lt;/item&gt;
+      &lt;item&gt;Then we want a graph view with colour and decorations and no merge commits. This is already enabled by default in this configuration. (Indicated by bold and highlighted flag names.)&lt;/item&gt;
+      &lt;item&gt;We want to see file diffstats, so we type &lt;code&gt;-s&lt;/code&gt;.&lt;/item&gt;
+      &lt;item&gt;Oh, and we only care about files in the &lt;code&gt;tests&lt;/code&gt;subdirectory, so we type&lt;code&gt;--&lt;/code&gt;to limit to files and then type&lt;code&gt;tests&lt;/code&gt;and confirm with return.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt; With this configuration, we want to look at all branches, including remote ones. We get that view by finally pressing &lt;code&gt;b&lt;/code&gt;.
+&lt;/p&gt;
+    &lt;p&gt;This is a high level of discoverability for git! I have always been that guy listed in git.txt, but Magit’s discoverability still teaches me a lot of new ways to use git. But it’s not only discoverable, it’s also quick. Here’s the full sequence of keypresses, with ␍ standing for confirming with return:&lt;/p&gt;
+    &lt;quote&gt;l-Akqr␍=u2025-06-01␍-s--tests␍b&lt;/quote&gt;
+    &lt;p&gt;That looks complicated, but remember how we built it: we looked at the hints and selected one option at a time. Now, if this is a log type we’ll use often, we are going to start to be able to write out that incantation without even looking at the hints. It’s both discoverable and efficient.&lt;/p&gt;
+    &lt;p&gt;The corresponding git command in the shell would have been&lt;/p&gt;
+    &lt;code&gt;$ git log --branches --remote --author=kqr --until=2025-06-01 \
+   --graph --color --decorate --no-merges --stat -- tests
+&lt;/code&gt;
+    &lt;p&gt;How do I know? Because it’s right there in the Magit log hints! If Magit hadn’t told me, I would have to spend a lot of time going back and forth between the man page and the command line.&lt;/p&gt;
+    &lt;p&gt;People worry that if you use more interactive interfaces to git, you’ll get worse at managing the git command line. Not so with Magit. Magit is completely transparent and encourages you to understand which git commands it is executing under the hood.&lt;/p&gt;
+    &lt;p&gt;This might seem like an excessive rant about the git log in an article ostensibly about rebasing, but there’s a reason for that: the git log is how we’ll understand the structure of our repo. And because in Magit, the git log is interactive.&lt;/p&gt;
+    &lt;head rend="h1"&gt;Rebasing from the log&lt;/head&gt;
+    &lt;p&gt;As a reminder, this was what we were working with.&lt;/p&gt;
+    &lt;p&gt; We want to rebase the &lt;code&gt;profiling-of-test-suite&lt;/code&gt; branch on top of
+&lt;code&gt;optimise-company-name-generation&lt;/code&gt;. We can tell that the current branch is
+&lt;code&gt;optimise&lt;/code&gt;, because it’s surrounded by a blue box.
+&lt;/p&gt;
+    &lt;p&gt; We have placed the text cursor over the &lt;code&gt;profiling&lt;/code&gt; branch (it is highlighted in
+grey), so we can switch to that branch by pressing &lt;code&gt;bb␍&lt;/code&gt;. The first &lt;code&gt;b&lt;/code&gt; is for
+checking out, the second &lt;code&gt;b&lt;/code&gt; is for branch, and the fuzzy-matching list will
+default to the branch under the cursor in the log view. When we have done so,
+the box will jump over to the &lt;code&gt;profiling&lt;/code&gt; branch, indicating we have switched to
+it.
+&lt;/p&gt;
+    &lt;p&gt; Then we move the cursor up to the &lt;code&gt;optimise&lt;/code&gt; branch, and press &lt;code&gt;re␍&lt;/code&gt;. The &lt;code&gt;r&lt;/code&gt; is
+for rebase, the &lt;code&gt;e&lt;/code&gt; is for “elsewhere” (i.e. not on top of the upstream), and
+the fuzzy-matching list again defaults to the commit under the cursor in the log
+view, so we can confirm with return.2 As a reminder, if we’re ever unsure, we
+can type only the first letter and Magit will show us hints. (For example,
+adding &lt;code&gt;-i&lt;/code&gt; will make the rebase interactive.)
+&lt;/p&gt;
+    &lt;p&gt; That’s it! The log updates to show the &lt;code&gt;profiling&lt;/code&gt; branch on top of &lt;code&gt;optimise&lt;/code&gt;.
+&lt;/p&gt;
+    &lt;p&gt; If we have a more complicated, interactive rebase, we get an editable list of commits with convenient hotkeys for performing rebase operations, like &lt;code&gt;k&lt;/code&gt; to
+discard, &lt;code&gt;f&lt;/code&gt; to fixup, &lt;code&gt;w&lt;/code&gt; to reword, &lt;code&gt;s&lt;/code&gt; to squash, etc. There’s also a list of
+supported operations under the commit list, if we forget what operations are
+available.3 For example, I almost never create new commits when I rebase, nor
+do I create merge commits. But you can do it.
+&lt;/p&gt;
+    &lt;head rend="h1"&gt;What did it just do?&lt;/head&gt;
+    &lt;p&gt; If we want to know which command Magit executed, we can press &lt;code&gt;$&lt;/code&gt; and we get the
+Magit command log, where Magit lists every git command it executes. In this
+case, it will show
+&lt;/p&gt;
+    &lt;quote&gt;git checkout profiling-of-test-suite git rebase --autostash optimise-company-name-generation&lt;/quote&gt;
+    &lt;p&gt; … huh, what is &lt;code&gt;--autostash&lt;/code&gt; and why does Magit default to it? Let’s look it up
+in &lt;code&gt;man git-rebase&lt;/code&gt;:
+&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;--autostash&lt;/p&gt;
+      &lt;p&gt;Automatically create a temporary stash entry before the operation begins, and apply it after the operation ends. This means that you can run rebase on a dirty worktree. However, use with care: the final stash application after a successful rebase might result in conflicts.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Okay, yeah, that does make sense as a default. I frequently rebase with a dirty worktree and it’s nice to not have to stash manually.&lt;/p&gt;
+    &lt;p&gt; This is another way in which Magit can teach us to be better at git. I would not have known about &lt;code&gt;--autostash&lt;/code&gt; if Magit hadn’t defaulted to it. This is also how
+I learned that &lt;code&gt;--force-with-lease&lt;/code&gt; is strictly better than &lt;code&gt;--force&lt;/code&gt;, but few
+people know about it.
+&lt;/p&gt;
+    &lt;head rend="h1"&gt;Other git interfaces&lt;/head&gt;
+    &lt;p&gt;This was not a complicated operation. We could have done this through the git command line. It would have been trivial, in fact – we just saw the two commands Magit executed under the hood. But by doing it through the interactive Magit log view, we gain a much better intuition and understanding for what effect the commands have. When we get comfortable with Magit, we will start to execute more complicated commands, which we might not have the confidence to do without the clear presentation of the interactive Magit log.&lt;/p&gt;
+    &lt;p&gt;Of course, there are other graphical git interfaces, and we could have done this rebase through any of them. But then we wouldn’t have learned as much about git as we did.&lt;/p&gt;
+    &lt;p&gt;Magit sits at a perfect point in the solution space where it is basically just a thin wrapper around the git command line, and is not ashamed of that. Yet it augments the git command line with interactivity, discoverability, and efficiency that is difficult to find elsewhere.&lt;/p&gt;
+    &lt;p&gt;We have seen only a glimpse of it here – wait ’till you hear about how easily Magit lets us stage, unstage, revert, reset files, hunks, or even parts of hunks interactively.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=47323105</guid><pubDate>Tue, 10 Mar 2026 13:38:39 +0000</pubDate></item></channel></rss>
