@@ -1,63 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-05-01T07:58:53.409729+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=47958081</id><title>Lessons from Building an OTel Normalizer for GenAI</title><updated>2026-05-01T07:58:59.355200+00:00</updated><content>&lt;doc fingerprint="7a03c85204a2be58"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Everyone says they support OpenTelemetry. However, nobody actually emits the same attributes.This blog post covers what engineers at groundcover learned as we build an GenAI SDK, Framework, and Provider agnostic AI Observability solution.&lt;/p&gt;
-    &lt;p&gt;One of groundcover’s main values is that o11y data collection should be straightforward and unbounded. We believe that SRE’s should focus on addressing incidents and root cause analysis instead of instrumentation, data processing, data gaps, dashboarding, and materialized views. We aim to make AI Observability with OTel as simple as it currently is to collect Infra, APM, and RUM data with our eBPF sensor. Through this process we discovered that there are many hurdles associated with traditional instrumentation. We hope these findings highlight our commitment to building tools that just work and put the power back into the developer’s hands.&lt;/p&gt;
-    &lt;head rend="h2"&gt;How standard is OTel in GenAI?&lt;/head&gt;
-    &lt;p&gt;There's a comforting narrative in the AI observability space, “OpenTelemetry has GenAI semantic conventions, SDKs are adopting them, and soon every LLM call will emit the same standard telemetry. Plug in any backend, get unified visibility”.&lt;/p&gt;
-    &lt;p&gt;We believed this narrative too. Then we tried to actually build it for our AI Observability feature and our Agent Mode, our agentic observability coworker that assists you in addressing incidents by performing root cause analysis within your own cloud.&lt;/p&gt;
-    &lt;p&gt;We spent weeks building a normalizer that ingests GenAI spans from every major instrumentation SDK and produces a single canonical view for any Gen AI data — model, tokens, cost, messages, tool calls — regardless of which SDK emitted the span or which LLM provider was called.&lt;/p&gt;
-    &lt;head rend="h4"&gt;What we found is that the "standard" is more like a suggestion, and the real world is a maze of naming conflicts, structural mismatches, and provider-specific quirks that no amount of spec reading prepares you for.&lt;/head&gt;
-    &lt;p&gt;This post is the field report.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The Setup: What We Expected vs. What We Got&lt;/head&gt;
-    &lt;p&gt;Before we dive into the details of the normalizer let’s take a moment to understand what groundcover offers for AI Observability. We support two paths for capturing GenAI telemetry:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;SDK instrumentation — the customer instruments their app with an OTel-compatible GenAI SDK (Traceloop, LangSmith, the official OTel instrumentations, or manual attributes), and the spans arrive via OTLP.&lt;/item&gt;
-      &lt;item&gt;eBPF — our kernel-level sensor intercepts HTTP calls to LLM providers (OpenAI, Anthropic, Bedrock) and reconstructs the GenAI semantics from the raw API request/response.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h4"&gt;Both paths need to produce the same canonical output. A "chat completion" is a chat completion whether it was captured by Traceloop, LangSmith, or extracted from raw bytes on the wire.&lt;/head&gt;
-    &lt;head rend="h2"&gt;Three Axes, One Canonical Model&lt;/head&gt;
-    &lt;p&gt;The complexity isn't one-dimensional. There are three independent vectors that combine to produce the telemetry we need to normalize:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Instrumentation SDKs— how the telemetry is emitted. Traceloop, LangSmith, the official OTel instrumentations, or manual `gen_ai.*` attributes. Each SDK emits different attribute names, different message formats, and different token field naming. This is what determines the wire format.&lt;/item&gt;
-      &lt;item&gt;Orchestration frameworks — how the agent workflow is structured. LangGraph, CrewAI, Pydantic AI, AutoGen, Semantic Kernel, or raw SDK calls with no framework at all. The framework determines the span tree shape (flat LLM calls vs. deeply nested agent → task → tool hierarchies), which metadata appears (conversation IDs, agent names, tool definitions), and how message content is serialized.&lt;lb/&gt;For example, LangGraph wraps output in `{"output": [{"update": {"messages": [...]}}]}` state objects. While CrewAI emits its own crew → task → tool span hierarchy and Pydantic AI has a different nesting pattern entirely.&lt;lb/&gt;The same provider, instrumented by the same SDK, produces different telemetry depending on the framework.&lt;/item&gt;
-      &lt;item&gt;LLM providers — who is being called. OpenAI, Anthropic, Bedrock, Gemini, Groq, Mistral. Each provider has its own API format, its own token semantics (does "input tokens" include cache?), its own message structure (content blocks vs. content strings), its own tool call format, and its own finish reason vocabulary.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;In other words, LangGraph + Traceloop + Anthropic produces different telemetry than LangGraph + Traceloop + OpenAI (provider axis), which is different from the telemetry that CrewAI + Traceloop + OpenAI (framework axis), which is different that that from CrewAI + LangSmith + OpenAI (SDK axis). The full matrix is SDK × Framework × Provider, and each cell can have unique parsing quirks.&lt;/p&gt;
-    &lt;p&gt;The saving grace: the SDK axis collapses into just four wire formats, and the framework axis mostly affects message structure within those formats (not the format detection itself). But "mostly" is doing a lot of work in that sentence.&lt;/p&gt;
-    &lt;head rend="h3"&gt;The four wire formats&lt;/head&gt;
-    &lt;p&gt;Every GenAI span that hits our pipeline comes from one of four formats:&lt;/p&gt;
-    &lt;p&gt;Detecting which format a span uses is the first step. We scan attribute key prefixes. For example, langsmith.* is definitive for Format B. While traceloop.* or llm.* is definitive for Format A. Similarly, gen_ai.* without the others is Format C or D. Then each format gets its own extraction logic, its own message parser, and its own post-processing step before everything converges into a single Field struct.&lt;/p&gt;
-    &lt;p&gt;Formats A through C are fully supported today. Format D — the future standard — is partially supported the core attributes work, but structured event promotion and some message content features are still in progress. Our normalizer closes the remaining gaps as the official OTel instrumentations mature.&lt;/p&gt;
-    &lt;p&gt;A new SDK that uses an existing format with an existing provider requires zero normalizer changes. A new format requires one parser. That's the theory. In practice, the devil is in the details.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Example 1: "What Model Did You Use?" — Six Ways to Say the Same Thing&lt;/head&gt;
-    &lt;p/&gt;
-    &lt;p&gt;The simplest possible question in AI observability: which model handled this request? Here's where six different sources put the answer:&lt;/p&gt;
-    &lt;p&gt;Our normalizer resolves these with a priority chain:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;gen_ai.request.model already on the span? Use it.&lt;/item&gt;
-      &lt;item&gt;Cost metadata extracted from LangChain message JSON? Use that.&lt;/item&gt;
-      &lt;item&gt;Llm.request.model` present? Fallback.&lt;/item&gt;
-      &lt;item&gt;`traceloop.association.properties.ls_model_name`? This becomes the last resort.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;head rend="h3"&gt;Example 2: "How Many Tokens?" — The Naming Chaos&lt;/head&gt;
-    &lt;p&gt;Token counting is the foundation of AI cost tracking. Here's what the ecosystem actually emits:&lt;/p&gt;
-    &lt;p&gt;Five naming conventions for the same metric. Our normalizer resolves them with a three-tier priority chain: canonical names win over cost metadata from LangChain messages, which wins over legacy `prompt_tokens`/`completion_tokens` naming.&lt;/p&gt;
-    &lt;p&gt;Unfortunately we haven’t touched on the hard part yet…&lt;/p&gt;
-    &lt;head rend="h3"&gt;Example 3: Normalizing Cost — When Providers Disagree on What "Input Tokens" Means&lt;/head&gt;
-    &lt;p&gt;Anthropic and OpenAI both report token usage. They disagree on what the number means.&lt;/p&gt;
-    &lt;head rend="h4"&gt;If you don't know that Providers count tokens differently, your cost formula silently undercounts every call that hits the prompt cache.&lt;/head&gt;
-    &lt;p&gt;Our normalizer carries a cacheAdditiveProviders set:&lt;/p&gt;
-    &lt;p&gt;For these providers, cache tokens get added back to input_tokens so the downstream cost calculation ((input - cache_read - cache_creation) * price) produces correct results. For OpenAI, no adjustment is needed because the total already includes cache tokens.&lt;/p&gt;
-    &lt;head rend="h4"&gt;Generic "OTel backends" don’t handle provider-specific token arithmetic. You need normalization to reliably monitor token usage.&lt;/head&gt;
-    &lt;head rend="h3"&gt;Example 4: "Who's the Provider?" — 26 Spellings of 15 Names&lt;/head&gt;
-    &lt;p&gt;Different SDKs emit the provider name differently. Same provider, different strings:&lt;/p&gt;
-    &lt;p&gt;Twenty-six input values, fifteen canonical outputs. Case sensitivity, abbreviations, alternate names — the real world doesn't respect enums. And the list keeps growing as teams adopt AI gateways and proxies (LiteLLM, Portkey, OpenRouter) that add more hosts to recognize on top of the direct provider endpoints.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Final Thoughts for Part 1&lt;/head&gt;
-    &lt;p&gt;In Part 2 we’ll go deeper into messages, parsing, framework-specific span trees, the three eras of OTel Gen AI conventions, and what happens when there’s no SDK at all. But the lessons from Part 1 are clear. There is a big difference between “we support OTel” and “we produce correct, unified telemetry”. The groundcover OTel normalizer for GenAI absorbs the complexity of differing naming conventions, token counts, message payloads, provider names, and much more so DevOps teams can focus on root cause analysis. AI observability should be as simple as installing an eBPF sensor regardless of the providers, frameworks, or SDKs you choose.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.groundcover.com/blog/otel-normalizer-genai-part-1"/><published>2026-04-30T04:23:40+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47961319</id><title>Belgium stops decommissioning nuclear power plants</title><updated>2026-05-01T07:58:59.172715+00:00</updated><content>&lt;doc fingerprint="16d13fc8cfadb5dc"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-05-01T09:44:16.506267+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=47961319</id><title>Belgium stops decommissioning nuclear power plants</title><updated>2026-05-01T09:44:26.111225+00:00</updated><content>&lt;doc fingerprint="16d13fc8cfadb5dc"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Belgium stops decommissioning nuclear power plants&lt;/head&gt;
     &lt;p&gt;30.04.2026, 11:37 Uhr&lt;/p&gt;
@@ -73,10 +15,10 @@
     &lt;p&gt;The fate of the ageing installations has been debated for decades. The country is currently heavily dependent on gas imports to cover its electricity needs as it has been struggling to expand renewable power generation significantly.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://dpa-international.com/general-news/urn:newsml:dpa.com:20090101:260430-930-14717/"/><published>2026-04-30T12:17:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47961378</id><title>I aggregated 28 US Government auction sites into one search</title><updated>2026-05-01T07:58:59.036105+00:00</updated><content>&lt;doc fingerprint="6f646aa2c6395cba"&gt;
+&lt;/doc&gt;</content><link href="https://dpa-international.com/general-news/urn:newsml:dpa.com:20090101:260430-930-14717/"/><published>2026-04-30T12:17:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47961378</id><title>I aggregated 28 US Government auction sites into one search</title><updated>2026-05-01T09:44:25.892889+00:00</updated><content>&lt;doc fingerprint="6f646aa2c6395cba"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Every government auction,&lt;lb/&gt;one search box.&lt;/head&gt;
-    &lt;p&gt;GSA, GovDeals, Ritchie Bros, and 27 more. 72,656 live listings across all 50 states, from seized pickup trucks to foreclosed lighthouses.&lt;/p&gt;
+    &lt;p&gt;GSA, GovDeals, Ritchie Bros, and 27 more. 73,227 live listings across all 50 states, from seized pickup trucks to foreclosed lighthouses.&lt;/p&gt;
     &lt;head rend="h3"&gt;Stop tab-hopping&lt;/head&gt;
     &lt;p&gt;You were going to check GovDeals, then GSA, then PublicSurplus, then give up. We already checked.&lt;/p&gt;
     &lt;head rend="h3"&gt;Deal Scores&lt;/head&gt;
@@ -86,7 +28,7 @@
     &lt;head rend="h3"&gt;We don't touch your bids&lt;/head&gt;
     &lt;p&gt;Every listing links straight to the original auction. We don't take a cut, see your bid, or sit between you and the seller.&lt;/p&gt;
     &lt;head rend="h2"&gt;Browse by Category&lt;/head&gt;
-    &lt;p&gt;72,656 active auctions across 10 categories&lt;/p&gt;
+    &lt;p&gt;73,227 active auctions across 10 categories&lt;/p&gt;
     &lt;head rend="h2"&gt;Today's Featured Deal&lt;/head&gt;
     &lt;head rend="h3"&gt;1993 Cushman 898530 Golf Cart&lt;/head&gt;
     &lt;head rend="h2"&gt;Browse by State&lt;/head&gt;
@@ -105,7 +47,7 @@
     &lt;p&gt;One email a day with the top-scored auctions across all 27 sources. Unsubscribe any time, no spam.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://bidprowl.com"/><published>2026-04-30T12:24:53+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47962548</id><title>How an oil refinery works</title><updated>2026-05-01T07:58:58.779687+00:00</updated><content>&lt;doc fingerprint="f4189687da9533bd"&gt;
+&lt;/doc&gt;</content><link href="https://bidprowl.com"/><published>2026-04-30T12:24:53+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47962548</id><title>How an oil refinery works</title><updated>2026-05-01T09:44:25.554903+00:00</updated><content>&lt;doc fingerprint="f4189687da9533bd"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;How an Oil Refinery Works&lt;/head&gt;
     &lt;p&gt;Though wind and solar continue to carve out larger and larger shares of world energy supply, the modern world still runs on petroleum, and will continue to do so for the foreseeable future. The world consumes over 100 million barrels of oil a day. As of 2023, oil was responsible for 30% of all energy use worldwide, higher than any other energy source (though its share has been gradually falling). In chemical manufacturing, petroleum is even more critical: an astounding 90% of chemical feedstocks are derived from oil or gas. Virtually all plastic comes from chemicals extracted from oil or gas, and petrochemicals are used to produce everything from lubricants to paint to plywood to synthetic fabrics to fertilizer.&lt;/p&gt;
@@ -148,26 +90,14 @@
     &lt;p&gt;Most of the gases sent to the gas plant will have no double bonds in them. Hydrocarbons without double bonds are known as saturated, because they have the maximum number of hydrogen atoms that they can, and so this type of plant is called a “sats gas plant”.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.construction-physics.com/p/how-an-oil-refinery-works"/><published>2026-04-30T13:54:20+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47963204</id><title>Claude Code refuses requests or charges extra if your commits mention "OpenClaw"</title><updated>2026-05-01T07:58:58.460023+00:00</updated><content>&lt;doc fingerprint="d635e49f34142863"&gt;
+&lt;/doc&gt;</content><link href="https://www.construction-physics.com/p/how-an-oil-refinery-works"/><published>2026-04-30T13:54:20+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47963204</id><title>Claude Code refuses requests or charges extra if your commits mention "OpenClaw"</title><updated>2026-05-01T09:44:25.280217+00:00</updated><content>&lt;doc fingerprint="d635e49f34142863"&gt;
   &lt;main&gt;
     &lt;p&gt;We’ve detected that JavaScript is disabled in this browser. Please enable JavaScript or switch to a supported browser to continue using x.com. You can see a list of supported browsers in our Help Center.&lt;/p&gt;
     &lt;p&gt;Help Center&lt;/p&gt;
     &lt;p&gt;Terms of Service Privacy Policy Cookie Policy Imprint Ads info © 2026 X Corp.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://twitter.com/theo/status/2049645973350363168"/><published>2026-04-30T14:36:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47963316</id><title>Honker – Durable queues, streams, pub/sub, and cron scheduler in a SQLite file</title><updated>2026-05-01T07:58:58.198221+00:00</updated><content>&lt;doc fingerprint="635803dce9a0598d"&gt;
-  &lt;main&gt;
-    &lt;p&gt;honker adds Postgres-style NOTIFY/LISTEN semantics to SQLite, with a durable pub/sub, task queue, and event streams on the side, without client polling or a daemon/broker. Cross-process wake latency is ~0.7 ms p50 on an M-series laptop.&lt;/p&gt;
-    &lt;p&gt;In its basic form it’s a plain SQLite loadable extension, so any language that can SELECT load_extension('honker_ext') gets the same queue, streams, and notifications on the same file. Bindings for Python, Node, Rust, Go, Ruby, Bun, and Elixir share one on-disk format.&lt;/p&gt;
-    &lt;p&gt;SQLite is backing real work now — Bluesky’s PDS, Fly’s LiteFS, Turso, weekend projects that somehow ended up in production. Once real work flows through a SQLite-backed app, you need a queue. The usual answer is “add Redis + Celery.” That works, but introduces a second datastore with its own backup story, a dual-write problem between your business table and the queue, and the operational overhead of running a broker.&lt;/p&gt;
-    &lt;p&gt;honker takes the approach that if SQLite is the primary datastore, the queue should live in the same file. That means INSERT INTO orders and queue.enqueue(...) commit in the same transaction. Rollback drops both. The queue is just rows in a table with a partial index.&lt;/p&gt;
-    &lt;p&gt;honker polls SQLite’s PRAGMA data_version every millisecond. That’s a monotonic counter SQLite increments on every commit from any connection, journal mode, or process — a ~3 µs read for a precise wake signal. A background thread fans the tick out to every subscriber, which runs SELECT ... WHERE id &amp;gt; last_seen and yields new rows. One poller thread per database regardless of subscriber count.&lt;/p&gt;
-    &lt;p&gt;Idle cost is that one lightweight SELECT per millisecond per database — no page-cache pressure, no writer-lock contention, no kernel file watcher in the mix. Listener count scales for free because the wake signal is one shared poll, not one query per listener.&lt;/p&gt;
-    &lt;p&gt;The queue, stream, and pub/sub primitives are all INSERTs into tables managed by the extension. Calling queue.enqueue(payload, tx=tx) inside your business transaction means the job row is ACID with the INSERT INTO orders that preceded it. Rollback drops the job along with everything else.&lt;/p&gt;
-    &lt;p&gt;pg_notify gives you fast cross-process triggers but no retry or visibility. Huey is the SQLite-backed Python task queue honker draws the most from. pg-boss and Oban are the Postgres-side gold standards. If you already run Postgres, use those.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://honker.dev/"/><published>2026-04-30T14:43:02+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47964617</id><title>Shai-Hulud Themed Malware Found in the PyTorch Lightning AI Training Library</title><updated>2026-05-01T07:58:58.075099+00:00</updated><content>&lt;doc fingerprint="9c2d1ad98fa6e64a"&gt;
+&lt;/doc&gt;</content><link href="https://twitter.com/theo/status/2049645973350363168"/><published>2026-04-30T14:36:58+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47964617</id><title>Shai-Hulud Themed Malware Found in the PyTorch Lightning AI Training Library</title><updated>2026-05-01T09:44:25.072340+00:00</updated><content>&lt;doc fingerprint="9c2d1ad98fa6e64a"&gt;
   &lt;main&gt;
     &lt;p&gt;The PyPI package 'lightning', a widely-used deep learning framework, was compromised in a supply chain attack affecting versions 2.6.2 and 2.6.3 published on April 30, 2026. Teams building image classifiers, fine-tuning LLMs, running diffusion models, or developing time-series forecasters frequently have lightning somewhere in their dependency tree.&lt;/p&gt;
     &lt;p&gt;Running pip install lightning is all that is needed to activate. The malicious versions contain a hidden _runtime directory with obfuscated JavaScript payload that executes automatically upon module import. The attack steals credentials, authentication tokens, environment variables, and cloud secrets, while also attempting to poison GitHub repositories. It has Shai-Hulud themes including creating public repositories called EveryBoiWeBuildIsaWormBoi.&lt;/p&gt;
@@ -324,7 +254,7 @@
     &lt;/table&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://semgrep.dev/blog/2026/malicious-dependency-in-pytorch-lightning-used-for-ai-training/"/><published>2026-04-30T16:09:26+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47965060</id><title>How Mark Klein told the EFF about Room 641A [book excerpt]</title><updated>2026-05-01T07:58:57.915544+00:00</updated><content>&lt;doc fingerprint="76b9817c4437d7e7"&gt;
+&lt;/doc&gt;</content><link href="https://semgrep.dev/blog/2026/malicious-dependency-in-pytorch-lightning-used-for-ai-training/"/><published>2026-04-30T16:09:26+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47965060</id><title>How Mark Klein told the EFF about Room 641A [book excerpt]</title><updated>2026-05-01T09:44:24.979574+00:00</updated><content>&lt;doc fingerprint="76b9817c4437d7e7"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;The Whistleblower Who Uncovered the NSA’s ‘Big Brother Machine’&lt;/head&gt;
     &lt;p&gt;On January 20, 2006, the front doorbell rang at the Electronic Frontier Foundation’s offices on Shotwell Street in the Mission District of San Francisco. At the time, Shotwell Street wasn’t the glamorous part of the Mission. Our offices sat between two auto repair shops, across the street from a utility substation. The sidewalk was often dotted with homeless people’s tents. At one point, San Francisco did a survey, and our block of Shotwell Street had the highest reported amount of human feces in the whole city.&lt;/p&gt;
@@ -368,7 +298,7 @@
     &lt;p&gt;Cindy Cohn is Executive Director of the Electronic Frontier Foundation. From 2000 to 2015, she served as EFF’s Legal Director and General Counsel. Today, she leads a team of more than 120 lawyers, activists, and technologists dedicated to ensuring that technology supports speech, privacy, and innovation for all people around the world. Cindy is the author of “Privacy’s Defender,” from which this article is adapted.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://thereader.mitpress.mit.edu/the-whistleblower-who-uncovered-the-nsas-big-brother-machine/"/><published>2026-04-30T16:41:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47965108</id><title>For Linux kernel vulnerabilities, there is no heads-up to distributions</title><updated>2026-05-01T07:58:57.194918+00:00</updated><content>&lt;doc fingerprint="743959d208b8899f"&gt;
+&lt;/doc&gt;</content><link href="https://thereader.mitpress.mit.edu/the-whistleblower-who-uncovered-the-nsas-big-brother-machine/"/><published>2026-04-30T16:41:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47965108</id><title>For Linux kernel vulnerabilities, there is no heads-up to distributions</title><updated>2026-05-01T09:44:24.195972+00:00</updated><content>&lt;doc fingerprint="743959d208b8899f"&gt;
   &lt;main&gt;
     &lt;table&gt;
       &lt;row/&gt;
@@ -379,7 +309,7 @@
     &lt;p&gt;Confused about mailing lists and their use? Read about mailing lists on Wikipedia and check out these guidelines on proper formatting of your messages.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.openwall.com/lists/oss-security/2026/04/30/10"/><published>2026-04-30T16:43:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47965503</id><title>I built a Game Boy emulator in F#</title><updated>2026-05-01T07:58:57.019236+00:00</updated><content>&lt;doc fingerprint="2f8f50a72a844799"&gt;
+&lt;/doc&gt;</content><link href="https://www.openwall.com/lists/oss-security/2026/04/30/10"/><published>2026-04-30T16:43:47+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47965503</id><title>I built a Game Boy emulator in F#</title><updated>2026-05-01T09:44:24.004606+00:00</updated><content>&lt;doc fingerprint="2f8f50a72a844799"&gt;
   &lt;main&gt;&lt;p&gt;Nick Kossolapov · April 2026&lt;/p&gt;&lt;p&gt;I’ve been working as a software engineer for over 8 years at this point, and admittedly I’ve never understood how computers actually work. So I figured I’d try to learn how they work by emulating one. Sorry Ben Eater, I’m not going to build one just yet.&lt;/p&gt;&lt;p&gt;I spent hundreds of hours as a kid catching Pokémon, so the Game Boy was the perfect candidate: real hardware, relatively simple in scope, and something with a strong personal connection.&lt;/p&gt;&lt;p&gt;Instead of jumping straight into it, I first did From NAND to Tetris. It was a great course, and it made me really understand the fundamentals of computers, like registers, memory, and the ALU. Then to get used to building an emulator, I built a CHIP-8 emulator in F#: Fip-8.&lt;/p&gt;&lt;p&gt;A few months later, and after many nights of going to bed at 2 AM even though I told myself I’d only work on it for an hour or two, I have a working Game Boy emulator: Fame Boy. Complete with sound and runs on desktop and web.&lt;/p&gt;&lt;p&gt;I wanted to have the emulator work on both desktop and web, so I focused on having a simple interface between the emulator core and whatever frontend is running it.&lt;/p&gt;&lt;p&gt;The interface between the frontends and core is essentially just two arrays and two functions:&lt;/p&gt;&lt;code&gt;framebuffer&lt;/code&gt; - a 160x144 array of shades (white, light,
 dark, black).&lt;code&gt;audiobuffer&lt;/code&gt; - a ring audio buffer at sample rate of
 32768 Hz with read and write heads.&lt;code&gt;stepEmulator()&lt;/code&gt; - a function that executes one CPU
@@ -527,7 +457,7 @@ let cyclesTaken = stepCpu cpu
      //for _ in 1..cyclesTaken do // cpuCycles can vary between 1 and 6
               stepTimers timer memory&lt;/code&gt;&lt;p&gt;This meant the timer ticked only once per instruction, instead of the number of cycles taken. So it ran on average two to three times slower than it should have, and the copyright just stayed up longer. FFS. Apparently I never waited a minute or two to see that it actually would have worked.&lt;/p&gt;&lt;p&gt;Now on to this post itself.&lt;/p&gt;&lt;p&gt;In the sprawling tapestry of our digital landscape—a world defined by rapid evolution—this post wasn’t just written—it was meticulously curated as a profound testament to synergistic intentionality. Every word stands as a nuanced beacon of intentionality—a vibrant medium for shared vulnerability—proving that human connection matters more than ever as we lean into the journey and show up authentically to navigate the complex interplay of our collective human experience.&lt;/p&gt;&lt;p&gt;cough&lt;/p&gt;&lt;p&gt;It was mostly written by me.&lt;/p&gt;&lt;p&gt;My main goal was to learn how computers work, and to that end it was a great success. And even more important than that, I had a really fun time. I would turn on my computer after work thinking “okay, just one feature tonight”. And next thing I know it’s 2 AM and I keep telling myself I should go to bed after one more bugfix.&lt;/p&gt;&lt;p&gt;I was thinking about trying out the Game Boy Advance, but looking at the specs it feels like it’s 3 times the effort for maybe a 20% increase in my understanding of hardware. I think the Game Boy struck a great balance to help me learn, and so I might stop here for now.&lt;/p&gt;&lt;p&gt;Did it make me a better software engineer? Probably not. Do I feel better knowing I understand a bit more about the tool I use every day? Certainly.&lt;/p&gt;&lt;p&gt;Thanks for reading!&lt;/p&gt;&lt;p&gt;Feel free to email me if you have any questions or comments.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://nickkossolapov.github.io/fame-boy/building-a-game-boy-emulator-in-fsharp/"/><published>2026-04-30T17:14:21+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47966254</id><title>Full-Text Search with DuckDB</title><updated>2026-05-01T07:58:56.888764+00:00</updated><content>&lt;doc fingerprint="330a0933a9943afa"&gt;
+&lt;/doc&gt;</content><link href="https://nickkossolapov.github.io/fame-boy/building-a-game-boy-emulator-in-fsharp/"/><published>2026-04-30T17:14:21+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47966254</id><title>Full-Text Search with DuckDB</title><updated>2026-05-01T09:44:23.919000+00:00</updated><content>&lt;doc fingerprint="330a0933a9943afa"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Full-Text Search with DuckDB&lt;/head&gt;
     &lt;head rend="h3"&gt;Published on: 4/29/2026&lt;/head&gt;
@@ -743,7 +673,7 @@ ORDER BY k_high DESC;
     &lt;p&gt;I would like to continue this series on DuckDB and my next post may investigate the current state of vector search. Stay tuned.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://peterdohertys.website/blog-posts/full-text-search-w-duckdb.html"/><published>2026-04-30T18:14:18+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47966625</id><title>Does Postgres Scale?</title><updated>2026-05-01T07:58:56.618312+00:00</updated><content>&lt;doc fingerprint="ef6ae4f168270583"&gt;
+&lt;/doc&gt;</content><link href="https://peterdohertys.website/blog-posts/full-text-search-w-duckdb.html"/><published>2026-04-30T18:14:18+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47966625</id><title>Does Postgres Scale?</title><updated>2026-05-01T09:44:23.667112+00:00</updated><content>&lt;doc fingerprint="ef6ae4f168270583"&gt;
   &lt;main&gt;
     &lt;p&gt;When building a durable workflow execution system on Postgres, one of the most common questions we get is “does Postgres scale?” There are plenty of posts from top tech teams asserting that Postgres does scale, but not all show how its performance scales in practice.&lt;/p&gt;
     &lt;p&gt;In this blog post, we benchmark the scalability of a single Postgres server. We focus on the performance of Postgres writes as those are the bottleneck in workflow execution: a durable workflow has to write to the database multiple times to checkpoint its inputs, its outcome, and the outcome of each of its steps. First, we measure raw Postgres write throughput in a vacuum. Then we analyze the performance of two durable workflow workloads: one that starts workflows locally, and one that uses a Postgres-backed queue.&lt;/p&gt;
@@ -792,7 +722,7 @@ ORDER BY k_high DESC;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.dbos.dev/blog/benchmarking-workflow-execution-scalability-on-postgres"/><published>2026-04-30T18:45:22+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47967786</id><title>Can I disable all data collection from my vehicle?</title><updated>2026-05-01T07:58:56.402761+00:00</updated><content>&lt;doc fingerprint="39af1ba6ba6be120"&gt;
+&lt;/doc&gt;</content><link href="https://www.dbos.dev/blog/benchmarking-workflow-execution-scalability-on-postgres"/><published>2026-04-30T18:45:22+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47967786</id><title>Can I disable all data collection from my vehicle?</title><updated>2026-05-01T09:44:23.419883+00:00</updated><content>&lt;doc fingerprint="39af1ba6ba6be120"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Can I disable all data collection from my vehicle?&lt;/head&gt;
     &lt;p&gt;Vehicle connectivity is a core feature of Rivian vehicles. If you choose to disable all vehicle connectivity, it will prevent data from leaving the vehicle, but it will also limit or disable certain functionality in the vehicle (e.g., navigation, active lane centering, and over-the-air updates, which provide new features, better performance, safety enhancements, and bug fixes).&lt;/p&gt;
@@ -800,7 +730,7 @@ ORDER BY k_high DESC;
     &lt;p&gt;Did you get the answer you needed?&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://rivian.com/support/article/can-i-disable-all-data-collection-from-my-vehicle"/><published>2026-04-30T20:27:22+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47968982</id><title>Snowball Earth may hide a far stranger climate cycle than anyone expected</title><updated>2026-05-01T07:58:56.179121+00:00</updated><content>&lt;doc fingerprint="b63b88fb71b475ca"&gt;
+&lt;/doc&gt;</content><link href="https://rivian.com/support/article/can-i-disable-all-data-collection-from-my-vehicle"/><published>2026-04-30T20:27:22+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47968982</id><title>Snowball Earth may hide a far stranger climate cycle than anyone expected</title><updated>2026-05-01T09:44:23.125405+00:00</updated><content>&lt;doc fingerprint="b63b88fb71b475ca"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Snowball Earth may hide a far stranger climate cycle than anyone expected&lt;/head&gt;
     &lt;head rend="h5"&gt;Gaby Clark&lt;/head&gt;
@@ -823,7 +753,7 @@ ORDER BY k_high DESC;
     &lt;p&gt;While the new model is somewhat simplified and does not capture all possible biogeochemical processes, it puts forth a compelling explanation for some of the outstanding inconsistencies in the Snowball and Slushball Earth explanations. The team says that understanding how repeated Snowball episodes might occur on Earth, can also help scientists understand similar events on Earth-like exoplanets.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://sciencex.com/news/2026-04-snowball-earth-stranger-climate.html"/><published>2026-04-30T22:18:57+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47969288</id><title>CPanel and WHM Authentication Bypass – CVE-2026-41940</title><updated>2026-05-01T07:58:55.901837+00:00</updated><content>&lt;doc fingerprint="2e5099c1cd2880a5"&gt;
+&lt;/doc&gt;</content><link href="https://sciencex.com/news/2026-04-snowball-earth-stranger-climate.html"/><published>2026-04-30T22:18:57+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47969288</id><title>CPanel and WHM Authentication Bypass – CVE-2026-41940</title><updated>2026-05-01T09:44:22.849405+00:00</updated><content>&lt;doc fingerprint="2e5099c1cd2880a5"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;The Internet Is Falling Down, Falling Down, Falling Down (cPanel &amp;amp; WHM Authentication Bypass CVE-2026-41940)&lt;/head&gt;
     &lt;p&gt;Hello! Yes, it's all a disaster again!&lt;/p&gt;
@@ -1463,729 +1393,113 @@ if ($Cpanel::App::appname eq 'whostmgrd') {
     &lt;p&gt;The watchTowr Platform combines External Attack Surface Management and Continuous Automated Red Teaming to test your defenses against the vulnerabilities and techniques that matter: the ones real attackers are actually exploiting.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://labs.watchtowr.com/the-internet-is-falling-down-falling-down-falling-down-cpanel-whm-authentication-bypass-cve-2026-41940/"/><published>2026-04-30T22:48:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47970089</id><title>ClawIRC – IRC Chat for Agents</title><updated>2026-05-01T07:58:55.610534+00:00</updated><link href="https://clawirc.com/"/><published>2026-05-01T00:29:57+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47970622</id><title>OpenWarp</title><updated>2026-05-01T07:58:55.086472+00:00</updated><content>&lt;doc fingerprint="fb7f4dc4bbe467bb"&gt;
-  &lt;main&gt;&lt;p&gt; 01 01 · 大卡 &lt;/p&gt;&lt;head rend="h3"&gt;BYOP 自定义提供商&lt;/head&gt;&lt;p&gt;内置 OpenAI 兼容客户端,Base URL / API Key / Model 自由组合。&lt;/p&gt;&lt;p&gt;DeepSeek推理&lt;/p&gt;~/.config/openwarp.toml&lt;p&gt;base_url&lt;/p&gt;&lt;p&gt;https://api.deepseek.com/v1&lt;/p&gt;&lt;p&gt;api_key&lt;/p&gt;&lt;p&gt;sk-•••••••••••••••••••••&lt;/p&gt;&lt;p&gt;model&lt;/p&gt;&lt;p&gt;deepseek-r1&lt;/p&gt;&lt;p&gt;connected · streaming ok&lt;/p&gt;&lt;p&gt;POST → /chat/completions&lt;/p&gt;&lt;p&gt;保留 Warp 全部交互,只把 AI 层完全开放 —— 密钥、模型、提示词全部由你掌控。&lt;/p&gt;&lt;p&gt;在设置中粘贴 Base URL 与 API Key —— 任何 OpenAI 兼容端点都即插即用,凭证仅保存在本地。&lt;/p&gt;&lt;p&gt;基于 minijinja 的模板引擎,根据当前工作目录、语言、角色实时渲染系统提示词,精准引导模型。&lt;/p&gt;&lt;p&gt;一键切换模型、对话、命令补全 —— 体验与 Warp 一致,但完全由你掌控。&lt;/p&gt;&lt;p&gt;内置 OpenAI 兼容客户端,Base URL / API Key / Model 自由组合。&lt;/p&gt;&lt;p&gt;原生中文与英文 UI,后续社区可继续扩展更多语种。&lt;/p&gt;&lt;p&gt;基于 minijinja 的强大模板,根据上下文动态渲染指令。&lt;/p&gt;&lt;quote&gt;// minijinja You are an expert {{ role }}. Workspace: {{ cwd }} {% if locale %} Reply in {{ locale }}. {% endif %}&lt;/quote&gt;&lt;p&gt;基于 Warp 上游持续合并,完整保留块、AI 命令、工作流、键位。&lt;/p&gt;&lt;p&gt;与 Warp 上游一致,采用 AGPL / MIT 双许可,代码全部公开。&lt;/p&gt;&lt;p&gt;兼容 OpenAI Chat Completions 协议的任何端点都可以接入 —— OpenAI、Anthropic 网关、DeepSeek、Qwen、本地 Ollama 都没有边界。&lt;/p&gt;&lt;p&gt;提供商名称&lt;/p&gt;&lt;p&gt;Base URL&lt;/p&gt;&lt;p&gt;API Key&lt;/p&gt;&lt;p&gt;默认模型&lt;/p&gt;&lt;p&gt;系统提示词模板&lt;/p&gt;&lt;quote&gt;{% if user.role %} You are an expert {{ user.role }}. {% endif %} Reply in {{ locale }}.&lt;/quote&gt;&lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://openwarp.zerx.dev"/><published>2026-05-01T02:10:46+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47970690</id><title>Show HN: Winpodx – run Windows apps on Linux as native windows</title><updated>2026-05-01T07:58:54.528777+00:00</updated><content>&lt;doc fingerprint="919d461e7d0ff610"&gt;
+&lt;/doc&gt;</content><link href="https://labs.watchtowr.com/the-internet-is-falling-down-falling-down-falling-down-cpanel-whm-authentication-bypass-cve-2026-41940/"/><published>2026-04-30T22:48:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47970089</id><title>ClawIRC – IRC Chat for Agents</title><updated>2026-05-01T09:44:22.680540+00:00</updated><link href="https://clawirc.com/"/><published>2026-05-01T00:29:57+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47970622</id><title>OpenWarp</title><updated>2026-05-01T09:44:22.418240+00:00</updated><content>&lt;doc fingerprint="d37f64c69ca0e7b9"&gt;
   &lt;main&gt;
-    &lt;p&gt;Native Linux windows for every Windows app — real icons, real &lt;code&gt;WM_CLASS&lt;/code&gt;,&lt;lb/&gt; pin-to-taskbar. FreeRDP RemoteApp + dockur/windows. Zero config.&lt;/p&gt;
-    &lt;code&gt;# Latest stable release (default)
-curl -fsSL https://raw.githubusercontent.com/kernalix7/winpodx/main/install.sh | bash
-
-# Latest main (development)
-curl -fsSL https://raw.githubusercontent.com/kernalix7/winpodx/main/install.sh | bash -s -- --main&lt;/code&gt;
-    &lt;p&gt;Windows About / Performance Monitor / PowerShell each in their own Linux window, alongside the winpodx Apps grid.&lt;/p&gt;
-    &lt;p&gt;English · 한국어 · Quick start · Features · CLI · Multi-session&lt;/p&gt;
-    &lt;quote&gt;&lt;p&gt;winpodx is in active development (v0.3.0). v0.3.0 ships a redesigned host→guest pipeline — bearer-authed HTTP agent on&lt;/p&gt;&lt;code&gt;127.0.0.1:8765&lt;/code&gt;is now the default command channel, with FreeRDP RemoteApp kept as fallback. App launches no longer flash a PowerShell window. New&lt;code&gt;winpodx check&lt;/code&gt;CLI + GUI Health card surface live pod / RDP / agent / round-trip / disk state. First install still takes ~5-10 minutes (Windows VM ISO download + Sysprep + OEM apply);&lt;code&gt;winpodx pod wait-ready --logs&lt;/code&gt;shows live progress. Please file issues at https://github.com/kernalix7/winpodx/issues if something breaks.&lt;/quote&gt;
-    &lt;p&gt;No full-screen RDP. Each Windows app becomes its own Linux window with its real icon — pinnable, alt-tabbable, file-associated. Drop into a full Windows desktop only when you actually want one (&lt;code&gt;winpodx app run desktop&lt;/code&gt;).&lt;/p&gt;
-    &lt;p&gt;winpodx runs a Windows container (via dockur/windows) in the background and presents Windows apps as native Linux applications through FreeRDP RemoteApp, while a bearer-authed HTTP agent inside the guest handles the host→guest command channel without flashing a PowerShell window. No manual VM setup, no ISO downloads, no registry editing. Near-zero external Python dependencies (stdlib only on Python 3.11+; one pure-Python &lt;code&gt;tomli&lt;/code&gt; fallback on 3.9/3.10).&lt;/p&gt;
-    &lt;p&gt;Existing tools for running Windows apps on Linux all have trade-offs:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="5"&gt;
-        &lt;cell role="head"&gt;winapps&lt;/cell&gt;
-        &lt;cell role="head"&gt;LinOffice&lt;/cell&gt;
-        &lt;cell role="head"&gt;winboat&lt;/cell&gt;
-        &lt;cell role="head"&gt;winpodx&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;Core tech&lt;/cell&gt;
-        &lt;cell&gt;Any RDP-capable Windows host (cloud / physical / container) + FreeRDP&lt;/cell&gt;
-        &lt;cell&gt;dockur + FreeRDP&lt;/cell&gt;
-        &lt;cell&gt;dockur + FreeRDP&lt;/cell&gt;
-        &lt;cell&gt;dockur (Podman) + FreeRDP + HTTP guest agent&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;Setup&lt;/cell&gt;
-        &lt;cell&gt;Manual (shell + config + RDP testing)&lt;/cell&gt;
-        &lt;cell&gt;One-liner script&lt;/cell&gt;
-        &lt;cell&gt;One-click GUI installer&lt;/cell&gt;
-        &lt;cell&gt;Zero-config (auto on first launch)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;Interface&lt;/cell&gt;
-        &lt;cell&gt;CLI only&lt;/cell&gt;
-        &lt;cell&gt;CLI only&lt;/cell&gt;
-        &lt;cell&gt;Electron GUI&lt;/cell&gt;
-        &lt;cell&gt;Qt6 GUI + CLI + tray&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;App scope&lt;/cell&gt;
-        &lt;cell&gt;Any Windows app&lt;/cell&gt;
-        &lt;cell&gt;Office only&lt;/cell&gt;
-        &lt;cell&gt;Any Windows app&lt;/cell&gt;
-        &lt;cell&gt;Any Windows app&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;Language&lt;/cell&gt;
-        &lt;cell&gt;Shell (86%)&lt;/cell&gt;
-        &lt;cell&gt;Shell + Python&lt;/cell&gt;
-        &lt;cell&gt;TypeScript / Vue / Go&lt;/cell&gt;
-        &lt;cell&gt;Python (100%)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;Runtime deps&lt;/cell&gt;
-        &lt;cell&gt;curl, dialog, git, netcat&lt;/cell&gt;
-        &lt;cell&gt;Podman, FreeRDP&lt;/cell&gt;
-        &lt;cell&gt;Electron, Docker/Podman, FreeRDP&lt;/cell&gt;
-        &lt;cell&gt;Python 3.9+, FreeRDP, Podman&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;Auto suspend / resume&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;Not documented&lt;/cell&gt;
-        &lt;cell&gt;Yes (idle timeout)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;Password rotation&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;Not documented&lt;/cell&gt;
-        &lt;cell&gt;Yes (7-day, atomic)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;HiDPI auto-detect&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;Not documented&lt;/cell&gt;
-        &lt;cell&gt;GNOME, KDE, Sway, Hyprland, Cinnamon, xrdb&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;Sound default&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;Yes (FreeRDP)&lt;/cell&gt;
-        &lt;cell&gt;Yes (FreeRDP)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;Printer redirection default&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;Not documented&lt;/cell&gt;
-        &lt;cell&gt;Yes (FreeRDP)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;USB drive auto-mapping&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;Smartcard passthrough&lt;/cell&gt;
-        &lt;cell&gt;Drive subfolders → drive letters via FileSystemWatcher&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;Discovery (auto-scan installed apps)&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;Yes&lt;/cell&gt;
-        &lt;cell&gt;Yes (Registry + Start Menu + UWP + choco/scoop)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;Multi-session RDP&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;Not documented&lt;/cell&gt;
-        &lt;cell&gt;Yes (bundled rdprrap, up to 10)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;Offline / air-gapped install&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;No&lt;/cell&gt;
-        &lt;cell&gt;Yes (&lt;code&gt;--source&lt;/code&gt; + &lt;code&gt;--image-tar&lt;/code&gt;)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;License&lt;/cell&gt;
-        &lt;cell&gt;MIT&lt;/cell&gt;
-        &lt;cell&gt;AGPL-3.0&lt;/cell&gt;
-        &lt;cell&gt;MIT&lt;/cell&gt;
-        &lt;cell&gt;MIT&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;quote&gt;
-      &lt;p&gt;winboat is the closest peer in scope and was an inspiration. We focus on a different mix — stdlib-leaning Python + Qt6 instead of Electron, deeper auto-config (auto suspend, 7-day password rotation, multi-DE HiDPI), and an explicit air-gapped install path. Both projects build on dockur/windows; that ecosystem is bigger than any one app.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;winpodx is not a Wine replacement. Wine translates Windows API calls; winpodx runs the actual Windows OS in a container. The two solve different problems and many users have both installed.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;When you need...&lt;/cell&gt;
-        &lt;cell role="head"&gt;Use&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Older Win32 apps, indie games, lightweight utilities&lt;/cell&gt;
-        &lt;cell&gt;Wine / Bottles / Lutris&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;GPU-accelerated games / 3D apps (DirectX 9 – 12)&lt;/cell&gt;
-        &lt;cell&gt;Wine — DXVK / VKD3D give near-native frame rates. winpodx has no GPU passthrough by default; QEMU CPU rendering is much slower. (GPU passthrough via VFIO is a manual bring-your-own setup — not yet packaged.)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Microsoft 365 with full Outlook + Teams + OneDrive integration&lt;/cell&gt;
-        &lt;cell&gt;winpodx&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Adobe Creative Suite (Photoshop, Illustrator, Premiere, Lightroom)&lt;/cell&gt;
-        &lt;cell&gt;winpodx — but heavy GPU effects will be CPU-bound (see GPU row above)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Anti-cheat games (Valorant, EAC, BattlEye)&lt;/cell&gt;
-        &lt;cell&gt;TBD — anti-cheats vary by VM-detection policy (Vanguard needs TPM 2.0 + no hypervisor, EAC mostly blocks VMs, VAC is lenient). Test before committing.&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;DRM-heavy software / hardware dongle apps&lt;/cell&gt;
-        &lt;cell&gt;winpodx&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Apps that ship kernel-mode drivers (some VPNs, security suites)&lt;/cell&gt;
-        &lt;cell&gt;winpodx&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Banking / tax / government tools with regional certificates&lt;/cell&gt;
-        &lt;cell&gt;winpodx&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Visual Studio, WinUI 3 / WinRT, .NET features Wine hasn't caught up to&lt;/cell&gt;
-        &lt;cell&gt;winpodx&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;IE-only legacy enterprise web apps&lt;/cell&gt;
-        &lt;cell&gt;winpodx&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Anything where "mostly works" isn't acceptable&lt;/cell&gt;
-        &lt;cell&gt;winpodx&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Wine wins on speed and on GPU when DXVK/VKD3D translate cleanly. winpodx wins on 100% Windows feature parity for everything else — every app runs on a real Windows kernel, rendered into your Linux desktop as a native window via FreeRDP RemoteApp.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;p&gt;Seamless App Windows&lt;/p&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;p&gt;Zero-Config Launch&lt;/p&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;p&gt;Peripherals &amp;amp; Sharing&lt;/p&gt;
-          &lt;p&gt;GPU acceleration: not yet supported. dockur/windows runs under QEMU/KVM with software graphics — DirectX-heavy games and 3D apps will be CPU-bound. GPU passthrough via VFIO is feasible but not packaged. (See winpodx vs Wine — Wine + DXVK is the right tool when you need GPU.)&lt;/p&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;p&gt;Automation &amp;amp; Security&lt;/p&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;code&gt;                     ┌─────────────────────────────┐
-  Click "Word"       │     Linux Desktop (KDE,     │
-  in app menu  ───&amp;gt;  │     GNOME, Sway, ...)       │
-                     └──────────────┬──────────────┘
-                                    │
-                     ┌──────────────▼──────────────┐
-                     │         winpodx             │
-                     │  ┌─────────────────────┐    │
-                     │  │ auto-provision:     │    │
-                     │  │  config → password  │    │
-                     │  │  → container → RDP  │    │
-                     │  │  → desktop entries  │    │
-                     │  └─────────────────────┘    │
-                     └──────────────┬──────────────┘
-                                    │ FreeRDP RemoteApp
-                     ┌──────────────▼──────────────┐
-                     │   Windows Container (Podman)│
-                     │   ┌──────────────────────┐  │
-                     │   │  Word  Excel  PPT ...│  │
-                     │   │ multi-session/rdprrap│  │
-                     │   └──────────────────────┘  │
-                     │   127.0.0.1:3390 (TLS)      │
-                     └─────────────────────────────┘
-&lt;/code&gt;
-    &lt;p&gt;Launch with &lt;code&gt;winpodx gui&lt;/code&gt;. The Qt6 main window has four pages:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;Page&lt;/cell&gt;
-        &lt;cell role="head"&gt;What it does&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Apps&lt;/cell&gt;
-        &lt;cell&gt;Grid / list view of installed app profiles, search + category filter, per-app launch with 3s cooldown, Add / Edit / Delete app profile dialogs&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Settings&lt;/cell&gt;
-        &lt;cell&gt;RDP (user / IP / port / scale / DPI / password rotation) and Container (backend / CPU / RAM / idle timeout) in one screen&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Tools&lt;/cell&gt;
-        &lt;cell&gt;Suspend / Resume / Full Desktop buttons, Clean Locks / Sync Time / Debloat, and a one-click Windows Update enable / disable toggle&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Terminal&lt;/cell&gt;
-        &lt;cell&gt;Embedded shell limited to a command allowlist (&lt;code&gt;podman&lt;/code&gt;, &lt;code&gt;docker&lt;/code&gt;, &lt;code&gt;virsh&lt;/code&gt;, &lt;code&gt;winpodx&lt;/code&gt;, &lt;code&gt;xfreerdp&lt;/code&gt;, &lt;code&gt;systemctl&lt;/code&gt;, &lt;code&gt;journalctl&lt;/code&gt;, &lt;code&gt;ss&lt;/code&gt;, &lt;code&gt;ip&lt;/code&gt;, &lt;code&gt;ping&lt;/code&gt;, ...) with quick buttons (Status / Logs / Inspect / RDP Test / Clear)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Info&lt;/cell&gt;
-        &lt;cell&gt;Live Health card (pod / RDP / agent / OEM / disk / password age / app count) + System / Display / Dependencies / Pod / Config snapshot&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;The system tray (&lt;code&gt;winpodx tray&lt;/code&gt;) is a lighter-weight alternative — pod controls, app launcher submenu (top 20 + Full Desktop), maintenance submenu (Clean Locks / Sync Time / Suspend), and an optional idle-monitor thread.&lt;/p&gt;
-    &lt;p&gt;&lt;code&gt;winpodx check&lt;/code&gt; runs every probe used by the GUI Health card and prints a one-line verdict for each:&lt;/p&gt;
-    &lt;code&gt;=== winpodx check ===
-
-  [OK  ] pod_running        running (ip=127.0.0.1)  (58ms)
-  [OK  ] rdp_port           127.0.0.1:3390 reachable  (0ms)
-  [OK  ] agent_health       version=0.2.2-rev4  (63ms)
-  [OK  ] oem_version        bundle=12  (3ms)
-  [OK  ] password_age       7d remaining (max_age=7d)  (0ms)
-  [OK  ] apps_discovered    41 app(s) in /home/.../discovered  (3ms)
-  [OK  ] disk_free          401.0/3725 GiB free  (0ms)
-
-Overall: OK
-&lt;/code&gt;
-    &lt;p&gt;Status legend: &lt;code&gt;OK&lt;/code&gt; (green) / &lt;code&gt;WARN&lt;/code&gt; (yellow — informational, exit 0) / &lt;code&gt;FAIL&lt;/code&gt; (red — exit 1) / &lt;code&gt;SKIP&lt;/code&gt; (grey — disabled by config). Use &lt;code&gt;--json&lt;/code&gt; for machine-readable output.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;Layer&lt;/cell&gt;
-        &lt;cell role="head"&gt;Technology&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Language&lt;/cell&gt;
-        &lt;cell&gt;Python 3.9+ (stdlib only on 3.11+; &lt;code&gt;tomli&lt;/code&gt; fallback on 3.9/3.10)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;CLI&lt;/cell&gt;
-        &lt;cell&gt;argparse (stdlib)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;GUI (optional)&lt;/cell&gt;
-        &lt;cell&gt;PySide6 (Qt6)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Config&lt;/cell&gt;
-        &lt;cell&gt;TOML (stdlib &lt;code&gt;tomllib&lt;/code&gt; on 3.11+ / &lt;code&gt;tomli&lt;/code&gt; on 3.9/3.10; built-in writer)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;RDP&lt;/cell&gt;
-        &lt;cell&gt;FreeRDP 3+ (xfreerdp, RemoteApp/RAIL)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Guest agent&lt;/cell&gt;
-        &lt;cell&gt;PowerShell &lt;code&gt;HttpListener&lt;/code&gt; on &lt;code&gt;127.0.0.1:8765&lt;/code&gt; (bearer auth, base64-encoded &lt;code&gt;/exec&lt;/code&gt; payloads)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Container&lt;/cell&gt;
-        &lt;cell&gt;Podman / Docker (dockur/windows)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;VM&lt;/cell&gt;
-        &lt;cell&gt;libvirt / KVM&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;CI&lt;/cell&gt;
-        &lt;cell&gt;GitHub Actions (lint + test on 3.9-3.13 + pip-audit)&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;One-line install (any supported Linux distro):&lt;/p&gt;
-    &lt;code&gt;curl -fsSL https://raw.githubusercontent.com/kernalix7/winpodx/main/install.sh | bash&lt;/code&gt;
-    &lt;p&gt;Detects your distro, installs missing system dependencies (Podman, FreeRDP, KVM, Python 3.9+) with your confirmation, drops winpodx into &lt;code&gt;~/.local/bin/winpodx-app/&lt;/code&gt;. The Windows-app menu populates automatically
-the first time the pod boots — discovery scans your running Windows guest
-and registers every installed app with its real icon. No root required
-except for the dependency install step. Works on
-openSUSE, Fedora, Debian/Ubuntu, RHEL-family, and Arch.&lt;/p&gt;
-    &lt;p&gt;By default the installer pins to the latest published GitHub release (currently &lt;code&gt;v0.1.9&lt;/code&gt;). Pre-release / development versions stay opt-in.&lt;/p&gt;
-    &lt;p&gt;Choose a version — pass &lt;code&gt;--main&lt;/code&gt; (or &lt;code&gt;--ref TAG&lt;/code&gt;) for development
-builds, otherwise stick with the default release:&lt;/p&gt;
-    &lt;code&gt;# Install the latest stable release (default)
-curl -fsSL https://raw.githubusercontent.com/kernalix7/winpodx/main/install.sh | bash
-
-# Install the latest main HEAD (development; may be unstable)
-curl -fsSL https://raw.githubusercontent.com/kernalix7/winpodx/main/install.sh | bash -s -- --main
-
-# Install a specific tag, branch, or commit
-curl -fsSL https://raw.githubusercontent.com/kernalix7/winpodx/main/install.sh | bash -s -- --ref v0.1.9
-
-# Env-var equivalent (works under curl | bash without -s --)
-WINPODX_REF=main  curl -fsSL https://raw.githubusercontent.com/kernalix7/winpodx/main/install.sh | bash
-WINPODX_REF=v0.1.9 curl -fsSL https://raw.githubusercontent.com/kernalix7/winpodx/main/install.sh | bash&lt;/code&gt;
-    &lt;p&gt;Offline / air-gapped install — the installer takes three optional flags for machines with no registry / package-repo access:&lt;/p&gt;
-    &lt;code&gt;# Copy winpodx from a local clone instead of git clone (also env: WINPODX_SOURCE)
-./install.sh --source /media/usb/winpodx
-
-# Preload the Windows image tar instead of fetching at first boot (env: WINPODX_IMAGE_TAR)
-./install.sh --image-tar /media/usb/windows-image.tar
-
-# Skip distro package install (env: WINPODX_SKIP_DEPS=1) — fails early if deps aren't present
-./install.sh --skip-deps
-
-# Everything at once:
-./install.sh --source /media/usb/winpodx --image-tar /media/usb/windows-image.tar --skip-deps&lt;/code&gt;
-    &lt;p&gt;Env vars are honored even under &lt;code&gt;curl | bash&lt;/code&gt;, so
-&lt;code&gt;WINPODX_SKIP_DEPS=1 curl ... | bash&lt;/code&gt; works.&lt;/p&gt;
-    &lt;p&gt;One-line uninstall — &lt;code&gt;--confirm&lt;/code&gt; or &lt;code&gt;--purge&lt;/code&gt; is required under pipe
-(the interactive prompts can't read from a terminal while bash consumes
-stdin from curl):&lt;/p&gt;
-    &lt;code&gt;# Remove winpodx files, keep the Windows container + its data
-curl -fsSL https://raw.githubusercontent.com/kernalix7/winpodx/main/uninstall.sh | bash -s -- --confirm
-
-# Full wipe: container, volume, config, launcher, everything
-curl -fsSL https://raw.githubusercontent.com/kernalix7/winpodx/main/uninstall.sh | bash -s -- --purge&lt;/code&gt;
-    &lt;p&gt;Prefer a native package manager? Prebuilt RPM / &lt;code&gt;.deb&lt;/code&gt; / AUR packages are
-attached to every GitHub Release
-— openSUSE/Fedora RPMs from the
-openSUSE Build Service (&lt;code&gt;home:Kernalix7/winpodx&lt;/code&gt;),
-the rest from GitHub Actions:&lt;/p&gt;
-    &lt;p&gt;openSUSE Tumbleweed / Leap 15.6 / Leap 16.0 / Slowroll&lt;/p&gt;
-    &lt;code&gt;sudo zypper addrepo \
-  https://download.opensuse.org/repositories/home:/Kernalix7/openSUSE_Tumbleweed/home:Kernalix7.repo
-sudo zypper refresh
-sudo zypper install winpodx&lt;/code&gt;
-    &lt;p&gt;Replace &lt;code&gt;openSUSE_Tumbleweed&lt;/code&gt; with &lt;code&gt;openSUSE_Leap_16.0&lt;/code&gt;, &lt;code&gt;openSUSE_Leap_15.6&lt;/code&gt;,
-or &lt;code&gt;openSUSE_Slowroll&lt;/code&gt; as needed.&lt;/p&gt;
-    &lt;p&gt;Fedora 42 / 43&lt;/p&gt;
-    &lt;code&gt;sudo dnf config-manager --add-repo \
-  https://download.opensuse.org/repositories/home:/Kernalix7/Fedora_43/home:Kernalix7.repo
-sudo dnf install winpodx&lt;/code&gt;
-    &lt;p&gt;Debian 12 / 13, Ubuntu 24.04 / 25.04 / 25.10&lt;/p&gt;
-    &lt;p&gt;Download the matching &lt;code&gt;.deb&lt;/code&gt; from the
-latest release and
-install:&lt;/p&gt;
-    &lt;code&gt;sudo apt install ./winpodx_&amp;lt;version&amp;gt;_all_debian13.deb   # pick your flavor&lt;/code&gt;
-    &lt;p&gt;AlmaLinux / Rocky / RHEL 9 &amp;amp; 10&lt;/p&gt;
-    &lt;p&gt;EPEL is required on el9 for &lt;code&gt;python3-tomli&lt;/code&gt;. Download the matching &lt;code&gt;.rpm&lt;/code&gt;
-from the latest release
-and install:&lt;/p&gt;
-    &lt;code&gt;sudo dnf install epel-release                     # el9 only
-sudo dnf install ./winpodx-&amp;lt;version&amp;gt;-1.noarch.el9.rpm   # or .el10.rpm&lt;/code&gt;
-    &lt;p&gt;Arch Linux (AUR)&lt;/p&gt;
-    &lt;quote&gt;&lt;p&gt;Note: AUR publishing is wired up but pending a one-time maintainer setup (see&lt;/p&gt;&lt;code&gt;packaging/aur/README.md&lt;/code&gt;). Once activated, tag pushes publish automatically.&lt;/quote&gt;
-    &lt;code&gt;yay -S winpodx        # or:
-paru -S winpodx&lt;/code&gt;
-    &lt;p&gt;From source (development)&lt;/p&gt;
-    &lt;code&gt;git clone https://github.com/kernalix7/winpodx.git
-cd winpodx
-./install.sh&lt;/code&gt;
-    &lt;p&gt;The source installer automatically:&lt;/p&gt;
+    &lt;head rend="h3"&gt;BYOP 自定义提供商&lt;/head&gt;
+    &lt;p&gt;内置 OpenAI 兼容客户端,Base URL / API Key / Model 自由组合。&lt;/p&gt;
+    &lt;quote&gt;{% if locale %} Reply in {{ locale }} {% endif %}&lt;/quote&gt;
+    &lt;p&gt;OpenWarp 在 Warp 之上加入 BYOP(自带提供商)能力 —— 自由配置 OpenAI 兼容接口、自定义模型与系统提示词、原生多语言。&lt;/p&gt;
+    &lt;code&gt;git clone -b openWarp https://github.com/zerx-lab/warp&lt;/code&gt;
+    &lt;p&gt;兼容主流提供商&lt;/p&gt;
+    &lt;p&gt;可接入提供商&lt;/p&gt;
+    &lt;p&gt;内置语言&lt;/p&gt;
+    &lt;p&gt;开源许可&lt;/p&gt;
+    &lt;p&gt;本地凭证存储&lt;/p&gt;
+    &lt;p&gt;保留 Warp 全部交互,只把 AI 层完全开放 —— 密钥、模型、提示词全部由你掌控。&lt;/p&gt;
+    &lt;p&gt;在设置中粘贴 Base URL 与 API Key —— 任何 OpenAI 兼容端点都即插即用,凭证仅保存在本地。&lt;/p&gt;
+    &lt;p&gt;基于 minijinja 的模板引擎,根据当前工作目录、语言、角色实时渲染系统提示词,精准引导模型。&lt;/p&gt;
+    &lt;p&gt;一键切换模型、对话、命令补全 —— 体验与 Warp 一致,但完全由你掌控。&lt;/p&gt;
+    &lt;p&gt;基于 Warp 上游持续合并,完整保留块、AI 命令、工作流、键位。&lt;/p&gt;
+    &lt;p&gt;内置 OpenAI 兼容客户端,Base URL / API Key / Model 自由组合。&lt;/p&gt;
+    &lt;quote&gt;{% if locale %} Reply in {{ locale }} {% endif %}&lt;/quote&gt;
+    &lt;p&gt;关闭 Cloud Agent / Computer Use,默认不上传云端,凭证仅本地保存。&lt;/p&gt;
+    &lt;p&gt;基于 minijinja 的强大模板,根据上下文动态渲染指令。&lt;/p&gt;
+    &lt;p&gt;渲染输出 →&lt;/p&gt;
+    &lt;p&gt;原生中文与英文 UI,后续社区可继续扩展更多语种。&lt;/p&gt;
+    &lt;p&gt;简体中文 · English · 日本語 · Español&lt;/p&gt;
+    &lt;p&gt;基于 Warp 上游持续合并,完整保留块、AI 命令、工作流、键位。&lt;/p&gt;
+    &lt;p&gt;Blocks · Workflows · AI 命令 · Keymaps · 主题&lt;/p&gt;
+    &lt;p&gt;与 Warp 上游一致,采用 AGPL / MIT 双许可,代码全部公开。&lt;/p&gt;
+    &lt;p&gt;AGPL-3.0 · MIT&lt;/p&gt;
+    &lt;p&gt;兼容 OpenAI Chat Completions 协议的任何端点都可以接入 —— OpenAI、Anthropic 网关、DeepSeek、Qwen、本地 Ollama 都没有边界。&lt;/p&gt;
+    &lt;p&gt;提供商名称&lt;/p&gt;
+    &lt;p&gt;Base URL&lt;/p&gt;
+    &lt;p&gt;API Key&lt;/p&gt;
+    &lt;p&gt;默认模型&lt;/p&gt;
+    &lt;p&gt;系统提示词模板&lt;/p&gt;
+    &lt;quote&gt;{% if user.role %} You are an expert {{ user.role }}. {% endif %} Reply in {{ locale }}.&lt;/quote&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://openwarp.zerx.dev"/><published>2026-05-01T02:10:46+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47971134</id><title>Your Biggest Vulnerability is your Shitty Compensation</title><updated>2026-05-01T09:44:21.831424+00:00</updated><content>&lt;doc fingerprint="2e64915722438eed"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Your Biggest Vulnerability is your Shitty Compensation&lt;/head&gt;
+    &lt;p&gt;My fourth month of unemployment. I'm fresh off an interview with a senior technical role advertised with a decent compensation range whose upper end would let me make median rent, and whose lower range would not. At the end of an excellent interview, I am informed that said compensation range, contrary to the &lt;code&gt;Base Compensation&lt;/code&gt; tag in the job description, is in fact all inclusive, and that the role actually tops out below the living wage threshold for a three adult household for its base compensation.&lt;/p&gt;
+    &lt;p&gt;I feel it's highly relevant to note that this was a role where I would own the entire technology estate for an employer. Every switch, every firewall, every database, every server, every phone, every laptop, every cloud, every badge system. All data, everywhere, at any time.&lt;/p&gt;
+    &lt;p&gt;Everything.&lt;/p&gt;
+    &lt;p&gt;For an employer in the public safety industry.&lt;/p&gt;
+    &lt;p&gt;This is not the first time that compensation has been mismatched to the role, but it is the first time it's happened with a role so critically important to a company playing such an outsized role in as critical an area as public safety.&lt;/p&gt;
+    &lt;p&gt;Which got me thinking: have employers just lost the plot on what compensation is actually for? What its intended function is? Because it seems to me that everyone thinks compensation is merely payment for labor and nothing more, a number to be driven down by any means necessary in order to keep more for those at the top.&lt;/p&gt;
+    &lt;p&gt;And oh my god it is so much more than that.&lt;/p&gt;
+    &lt;p&gt;We live in a society. This society has been arranged around using currency to purchase necessities, because some people decided that necessities are not guaranteed. You acquire currency by either investing currency you already have to compound it through the labor of others, or you labor in order to earn less currency than investors do.&lt;/p&gt;
+    &lt;p&gt;Is that a gross oversimplification? You betcha, but I'm really trying to stay on topic and not fill this with reaction GIFs.&lt;/p&gt;
+    &lt;quote&gt;Author's Note: I failed.&lt;/quote&gt;
+    &lt;p&gt;Anyway, everyone needs currency to afford everything. Rent costs currency, food costs currency, electricity costs currency, water and sewage and garbage and healthcare and childcare and education all cost currency. Only after your essentials have been paid for, can you use excess currency to save for tomorrow - buying a home, or a car, or a retirement if you're really lucky.&lt;/p&gt;
+    &lt;p&gt;Now at some point, the humans involved in handing out currency decided that too many people were living too nicely. The thinking was simple: trading time for currency in the form of labor was a sucker's game, and those with currency deserve more currency because they already had currency. Companies in particular deserved more money than the people who worked for the company, at least according to Powell.&lt;/p&gt;
+    &lt;p&gt;Thus labor was reframed into those terms: wages were merely a payment to those who did labor, and labor was only to be paid the minimal amount possible in the marketplace for said labor, and not one cent more, regardless of external forces (like the cost of living). Minimum wages are bad, because wages should only ever go down relative to inflation and productivity, never up. Only those who own business deserve more currency, because they're the real workers.&lt;/p&gt;
+    &lt;p&gt;Again, a gross oversimplification coming from an openly biased dinosaur. That's not the point.&lt;/p&gt;
+    &lt;p&gt;The point is that wages aren't meant to merely compensate labor; they're also meant to protect the company.&lt;/p&gt;
+    &lt;p&gt;I'll just be blunt: wages are also protection money. They're not just compensation for doing your job, they're compensation for not burning down warehouses, not going on strike, not sabotaging workloads, and not unionizing in the first place. It's the longest unspoken social contract dating back to pre-history: you pay me to live, or else.&lt;/p&gt;
+    &lt;p&gt;Occasionally, employers will call labor's bluff. If twenty-thousand years of history is any indication, their temporary wins are always undone by the sheer ratio of workers to wealthy owners, though not before employers provoke and employ violence first. We are going through such a phase right now, if the above links are any indication.&lt;/p&gt;
+    &lt;p&gt;Employers haven't paid their dues to labor in decades. Labor, kind as we are, have cut back on our lives as much as we're able to. We've given up homeownership, we're dropping out of healthcare, we're begging from food pantries, we're taking on gig work, and we've seen none of the wage gains from productivity our elders enjoyed. It's gotten so bad that, with workers having sacrificed our very ability to move up the socioeconomic ladder, the economy has gone K-shaped.&lt;/p&gt;
+    &lt;p&gt;Despite this, employers seem to think there's more room for workers to yield. I say this because despite median wages being unable to afford median homes, I'm still finding employers offering lower and lower pay for work on their job descriptions. This isn't just economics anymore, this is a security risk, and employers are playing with fire.&lt;/p&gt;
+    &lt;p&gt;Take your CPA, for instance, median pay of $81,680 a year and at moderate exposure to AI displacement according to Anthropic. These are people who know your books better than you. Where every penny goes, and where every penny can be silently swindled. They also audit your fancy new AI financial workflows, making corrections when it goes off the rails, and know where all your financial skeletons are buried.&lt;/p&gt;
+    &lt;p&gt;Do you really want to pay your accountant so little that they can't make rent or buy a home? Do you really want them going to a food bank instead of a grocery store? They're excellent at judging risk, and know exactly what that pay gap is worth to them if the timing is right. Maybe it's blowing the whistle before you can fix an issue and leading to a costly investigation, maybe it's sharing your supply chain costs with a competitor for a higher paying job, or maybe it's committing outright embezzlement that they're sure your fancy AI tooling will miss.&lt;/p&gt;
+    &lt;p&gt;Tech work, the last bastion of Middle Class employment, isn't doing any better. Take Computer and Network Architects, with a median pay of $130,390 per year; or the Computer Systems Analysts, median pay of $103,790 per year; or the Systems Administrators, with a median pay of $96,800 per year. These groups have the keys to your systems, your data, your endpoints, your real estate. They can see and do anything with a keystroke, including destroying billion-dollar businesses. The reason for the comparatively high wages was their comparatively high degree of trust.&lt;/p&gt;
+    &lt;p&gt;Instead, employers outsourced to MSPs, then offshored overseas, then on-shored to underpaid and exploited H1Bs shackled to their employer's temporary sponsorship, then briefly hired North Korean spies, and are now attempting to replace the technical workers outright with AI that routinely drops production systems. All the while they lay off workers by the tens of thousands, over and over again.&lt;/p&gt;
+    &lt;p&gt;I feel like there's an example of the consequences of not treating your technical experts with respect in popular media...&lt;/p&gt;
+    &lt;p&gt;I'm not Dennis Nedry, but I've worked with folks like them before. Brilliant minds who can debug complex architectures and systems, who pour their lives quite literally into the work because they have a passion for it...and increasingly are all too willing to burn it to the ground when they feel slighted. Spend time around actual engineers and the like in most orgs, and you'll see patterns of ill-health: smokers, drinkers, chewers, vapers, over-eaters, out-of-shapers, poor posture, bags under eyes, thinning and greying hair, high amounts of stress, messy desks. All signs of humans sacrificing their own health for their employers, prioritizing work over life, overworked to an early grave.&lt;/p&gt;
+    &lt;p&gt;Most folks aren't as egalitarian as I am, and as someone who has sacrificed physical, mental, emotional, and psychological health to the field for over fifteen years, I sympathize with where my peers are coming from. Most people aren't wired to "do no harm" no matter what, which means most people are a huge security risk if they're undercompensated.&lt;/p&gt;
+    &lt;p&gt;Thing is, undercompensation isn't limited merely to your specialists and senior workers. Fast food workers will slow down lines to give themselves breathing room due to understaffing, and retail workers won't put in the added effort of store maintenance when they can't even maintain a roof over their heads. Office workers doing more menial tasks aren't going to follow through on security best practices if they're more worried about how to pay the electric bill this month while also affording insulin. Your contracted-out security staff aren't likely to pay close attention to camera feeds since they know they'll be replaced in three months before benefits kick in. Your MSP or offshored technical staff won't be invested in your long-term success when their KPIs only cover ticket counts and response times, and their competitors are already preparing to underbid at renewal anyhow.&lt;/p&gt;
+    &lt;p&gt;The workers have been incredibly clear about their problems for twenty years, now, especially the younger cohorts. Employers haven't wanted to listen, believing one more technical control or one more AI system will finally give them the permanent, unassailable leverage they need to keep all the money and fire all the workers.&lt;/p&gt;
+    &lt;p&gt;I don't really have a positive way to end this. This is a warning, another canary in an increasingly smoke-choked mine. We're at the point that workers are quite literally burning down infrastructure and engaging in violence against leadership, and the response from those who can change things - our politicians, our corporate leaders, the investor class that's richer than ever in human history - don't really seem to give a fuck. There's this thick tension in the air between workers scrambling to survive, and monied classes who feel the demands of the workers are wholly unreasonable.&lt;/p&gt;
+    &lt;p&gt;History paints a pretty clear picture of how this ultimately ends, but for what it's worth, I still feel like I should at least try to warn folks about the consequences of undercompensation.&lt;/p&gt;
+    &lt;p&gt;Failing to pay your workers the money they need to live is breaking the social contract. It's the single biggest security vulnerability in your organization, and I promise you that there is not, and never will be, a technological control that can protect against it.&lt;/p&gt;
+    &lt;p&gt;You gotta pay up, or you're going to get burned down.&lt;/p&gt;
+    &lt;p&gt;An addendum.&lt;/p&gt;
+    &lt;p&gt;AI is making it faster and easier to brute-force security vulnerabilities at a time when open source is falling apart due to lack of funding and successors. Major companies are firing engineers to replace them with AI tooling, then hiring them back at lower pay packages when the AI fails, but still holding the AI Sword of Damocles over their heads. Software is expanding rapidly at a time when employers seek to eliminate the technical professionals who ensure their safety and prosperity, who can translate institutional processes and knowledge into cost-effective infrastructure.&lt;/p&gt;
+    &lt;p&gt;Housing prices are up. Rent is up. Utilities are up because of AI datacenter builds. Food costs are rising due to global conflicts instigated by America. So too are energy prices, tariffs, inflation, and interest rates.&lt;/p&gt;
+    &lt;p&gt;You, the employer, have a decision to make: do you start raising wages, working with policymakers to immediately address affordability, cease arbitrary layoffs, invest in worker futures, and promote regulatory schemes that reign in the worst myopic excesses of your peers for society's collective benefit?&lt;/p&gt;
+    &lt;p&gt;Or do you take up smoking cigarettes while sitting inside a warehouse of loose gunpowder and dynamite, with a mob of torches and pitchforks right outside?&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://green.spacedino.net/your-biggest-vulnerability-is-your-shitty-compensation/"/><published>2026-05-01T03:53:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47971771</id><title>If I Could Make My Own GitHub</title><updated>2026-05-01T09:44:21.151264+00:00</updated><content>&lt;doc fingerprint="ba9d954199aa28b3"&gt;
+  &lt;main&gt;
+    &lt;p&gt;My friend and I have a game where we talk about what we'd do if we were rich. Not rich like 'paid off the mortgage' rich. Rich like a man who owns a submarine he's never been inside. Rich like a man whose third wife has a skincare line. Tech-titan rich — the kind of money that buys you a compound in Wyoming and the confidence to wear the same gray t-shirt to congressional testimony."&lt;/p&gt;
+    &lt;p&gt;One of mine, for a long time, has been the dream of making a new forge. I was prompted to write this after reading the good post about Ghostty leaving GitHub but it's something I've written and talked about for a few years. Given how bad GitHub has become at its core job, it seemed like a fun opportunity to try and write up what my billionaire folly of a forge would look like. This folly would have less penile rockets filled with aging celebrities.&lt;/p&gt;
+    &lt;head rend="h3"&gt;What are the problems with modern forges?&lt;/head&gt;
+    &lt;p&gt;GitHub, GitLab and Gitea (those being the 3 I've used the most) are all modeled on effectively the same design. There are differences, but you can tell that GitHub sets the pattern for the industry and then those features are ported over to the other two with varying levels of success. The issue with all of these is that they're designed to add things git doesn't do that you need.&lt;/p&gt;
+    &lt;p&gt;Git is great at what it is designed to do, but what it is designed to do isn't the way most people are using it. Git is a perfect tool for kernel development. It is a decentralized distributed version control system that relies on the idea of patches being sent to maintainers over email. You trust those maintainers to maintain their sections and merge in the stuff that makes sense and not merge in the other stuff. It's a pretty high trust environment that places very few restrictions on how online a specific contributor is or what system they are using. If you have a laptop from 2010 that connects to the Internet once a week you can still be a meaningful contributor to a project with these workflows. .&lt;/p&gt;
+    &lt;p&gt;However, in most jobs, git is effectively just the way I pull and push from a centralized repository stored in a forge. All the important stuff happens inside the forge, and very little of it happens on my client. Pull Requests are how I enforce the four-eyes principle, GitHub Actions are how I run my tests and linting on those Pull Requests to ensure they are functional and meet my organizational requirements, the user's identity in relation to that forge is how I verify who they are. I track issues with my code through Issues and cut releases for users to download through Releases. There's not a lot of git in this workflow, this is mostly placed on top of git.&lt;/p&gt;
+    &lt;p&gt;So here are the primary issues I see with modern forges that I would love to solve.&lt;/p&gt;
     &lt;list rend="ol"&gt;
-      &lt;item&gt;Detects your distro (openSUSE, Fedora, Ubuntu, Arch, ...)&lt;/item&gt;
-      &lt;item&gt;Installs missing dependencies (Podman, FreeRDP, KVM), asks before installing&lt;/item&gt;
-      &lt;item&gt;Copies winpodx to &lt;code&gt;~/.local/bin/winpodx-app/&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Creates config and compose.yaml&lt;/item&gt;
-      &lt;item&gt;Auto-discovery (&lt;code&gt;winpodx app refresh&lt;/code&gt;) fires on first pod boot to populate the menu&lt;/item&gt;
+      &lt;item&gt;Stuff happens in the wrong order. You know the PR. Commit 1: 'Feature.' Commit 2: 'fix.' Commit 3: 'fix.' Commit 4: 'actually fix.' Commit 5: 'please.' Commit 6, made at 11:47 PM on a Thursday: 'asdfasdf'. This person has a family. This person has hobbies. This person is, at this moment, crying. You don't want the feedback loop after the commit you want it before. Let me do an enforced pre-commit hook to run the jobs remotely on the forge and provide the feedback to the user before they push. &lt;/item&gt;
+      &lt;item&gt;PR approval is too boolean. The PR is approved or it's not approved. Real code review, like real life, lives in the middle. 'Sure, fine, we'll deal with it later' is a legitimate human response and should be a legitimate button. Gerrit has a better model for this. If I weakly approve something as a maintainer, let me flag it for later.&lt;/item&gt;
+      &lt;item&gt;PRs are too inflexible. I don't need 4 eyes on every change, especially in a universe where LLMs exist. The global GDP lost annually to senior engineers staring at a four-line PR waiting for someone — anyone — to type 'LGTM' could fund a moon mission. A nice one. With legroom. Let me customize and more easily control this. If the person is a maintainer and the LLM says its low risk/no risk just let them go. &lt;/item&gt;
+      &lt;item&gt;Stacked PRs are just better. They're easier to review and understand. They have to be a first-class citizen not an add-on through a tool other than your VCS. &lt;/item&gt;
+      &lt;item&gt;A forge shouldn't do everything. Issue tracking yes. Kanban board, probably not. Wiki? I doubt it. Everything tools always turn into crap. You add features when its easy to add features and then pay the maintenance price for those features forever regardless of their rate of adoption because now someone, somewhere uses them and you are locked in. &lt;/item&gt;
+      &lt;item&gt;The standard unit of hosting is too large. Running Github Enterprise is a big task. Running GitLab is also a relatively big ask. These are complicated products with a lot of moving pieces. I want smaller individual units of hosting that I can link together to make an organization. It's fine if they're not globally federated and I need to make an account for each Organization, but an Organization should be flexible enough to let me say "these 12 Raspberry Pis are my org". I don't know how they communicate securely, I hire people for that problem. &lt;/item&gt;
+      &lt;item&gt;My local copy of the repo should be a representation of the entire repo, not just the code. I should be able to approve a PR from the same VCS I use to check in the code. I should be able to go through my issues by looking through local files. &lt;/item&gt;
+      &lt;item&gt;On the flip side, since I need to be online all the time to really work with a team, don't make me pay the storage price all the time. I want my VCS and my forge to work together. If I clone a repo, I want a pretty limited history for that repo when I clone. If I start to go back in time, spin up a worker to go fetch that stuff from the VCS when I need it. I don't need to hammer the forge with giant clone requests on the assumption that I might need to rebuild the forge at any moment with the entire history of the entire project. &lt;/item&gt;
+      &lt;item&gt;Actions need to be signed, SHA'd and usable offline. If I want, I should be able to get tarballs of all my actions, stick them in the repo and tell my system "don't go anywhere for checkout action, that's right here". If I say latest, have that work like Dependabot does now where it opens up a PR to put the latest tarballs in my repo. Actions are critical and they should be runnable on my local machine through the same VCS if I want to.&lt;/item&gt;
     &lt;/list&gt;
-    &lt;code&gt;winpodx app run word              # Launch Word
-winpodx app run word ~/doc.docx   # Open a file
-winpodx app run desktop           # Full Windows desktop&lt;/code&gt;
-    &lt;p&gt;Or just click an app icon in your menu.&lt;/p&gt;
-    &lt;code&gt;git clone https://github.com/kernalix7/winpodx.git
-cd winpodx
-export PYTHONPATH="$PWD/src"
-python3 -m winpodx app run word&lt;/code&gt;
-    &lt;head&gt;Click to expand full CLI reference&lt;/head&gt;
-    &lt;code&gt;# Apps
-winpodx app list                  # List available apps
-winpodx app run word              # Launch Word (auto-provisions on first run)
-winpodx app run word ~/doc.docx   # Open a file in Word
-winpodx app run desktop           # Full Windows desktop session
-winpodx app install-all           # Register all apps in desktop menu
-winpodx app sessions              # Show active sessions
-winpodx app kill word             # Kill an active session
-
-# Pod management
-winpodx pod start --wait          # Start and wait for RDP readiness
-winpodx pod stop                  # Stop (warns about active sessions)
-winpodx pod status                # Status with session count
-winpodx pod restart
-winpodx pod apply-fixes           # Re-apply Windows-side runtime fixes (idempotent)
-winpodx pod sync-password         # Recover from password drift (cfg ↔ Windows)
-winpodx pod multi-session on      # Toggle bundled rdprrap multi-session RDP
-winpodx pod multi-session status
-winpodx pod wait-ready --logs     # Wait for Windows first-boot with progress + container logs
-
-# Power management
-winpodx power --suspend           # Pause container (free CPU, keep memory)
-winpodx power --resume            # Resume paused container
-
-# Security
-winpodx rotate-password           # Rotate Windows RDP password
-
-# Maintenance
-winpodx cleanup                   # Remove Office lock files (~$*.*)
-winpodx timesync                  # Force Windows time synchronization
-winpodx debloat                   # Disable telemetry, ads, bloat
-winpodx uninstall                 # Remove winpodx files (keeps container)
-winpodx uninstall --purge         # Remove everything including config
-
-# System
-winpodx setup                     # Interactive setup wizard
-winpodx info                      # Display, dependencies, config diagnostics
-winpodx check                     # Run all health probes (pod / RDP / agent / disk / …)
-winpodx check --json              # Same probes, machine-readable JSON
-winpodx gui                       # Launch Qt6 main window (Apps / Settings / Tools / Terminal)
-winpodx tray                      # Launch Qt system tray icon
-winpodx config show               # Show current config
-winpodx config set rdp.scale 140  # Change a config value
-winpodx config import             # Import existing winapps.conf&lt;/code&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;Feature&lt;/cell&gt;
-        &lt;cell role="head"&gt;How it works&lt;/cell&gt;
-        &lt;cell role="head"&gt;Default&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Clipboard&lt;/cell&gt;
-        &lt;cell&gt;Bidirectional copy-paste via RDP (&lt;code&gt;+clipboard&lt;/code&gt;)&lt;/cell&gt;
-        &lt;cell&gt;Enabled&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Sound&lt;/cell&gt;
-        &lt;cell&gt;Audio streaming via ALSA (&lt;code&gt;/sound:sys:alsa&lt;/code&gt;)&lt;/cell&gt;
-        &lt;cell&gt;Enabled&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Printer&lt;/cell&gt;
-        &lt;cell&gt;Linux printers shared to Windows (&lt;code&gt;/printer&lt;/code&gt;)&lt;/cell&gt;
-        &lt;cell&gt;Enabled&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Home directory&lt;/cell&gt;
-        &lt;cell&gt;Shared as &lt;code&gt;\\tsclient\home&lt;/code&gt; (&lt;code&gt;+home-drive&lt;/code&gt;)&lt;/cell&gt;
-        &lt;cell&gt;Enabled&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;USB drives&lt;/cell&gt;
-        &lt;cell&gt;Media folder shared as &lt;code&gt;\\tsclient\media&lt;/code&gt; (&lt;code&gt;/drive:media&lt;/code&gt;); USB drives plugged in after session start are accessible as subfolders&lt;/cell&gt;
-        &lt;cell&gt;Enabled&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;USB device passthrough&lt;/cell&gt;
-        &lt;cell&gt;Native USB redirection (&lt;code&gt;/usb:auto&lt;/code&gt;) — requires FreeRDP urbdrc plugin&lt;/cell&gt;
-        &lt;cell&gt;Opt-in (add to &lt;code&gt;extra_flags&lt;/code&gt;)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;USB drive mapping&lt;/cell&gt;
-        &lt;cell&gt;Windows-side script auto-maps USB subfolders to drive letters (E:, F:, ...) via FileSystemWatcher&lt;/cell&gt;
-        &lt;cell&gt;Enabled&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;code&gt;Plug in USB on Linux
-    │
-    ▼
-Linux mounts to /run/media/$USER/USBNAME
-    │
-    ▼
-FreeRDP shares as \\tsclient\media\USBNAME
-    │
-    ▼
-media_monitor.ps1 detects → net use E: \\tsclient\media\USBNAME
-    │
-    ▼
-Windows Explorer shows E: drive
-&lt;/code&gt;
-    &lt;p&gt;Config file: &lt;code&gt;~/.config/winpodx/winpodx.toml&lt;/code&gt; (auto-created, 0600 permissions)&lt;/p&gt;
-    &lt;code&gt;[rdp]
-user = "User"
-password = ""                # Auto-generated random password
-password_updated = ""        # ISO 8601 timestamp
-password_max_age = 7         # Days before auto-rotation (0 = disable)
-ip = "127.0.0.1"
-port = 3390
-scale = 100                  # Auto-detected from your DE
-dpi = 0                      # Windows DPI % (0 = auto)
-extra_flags = ""             # Additional FreeRDP flags (allowlisted)
-
-[pod]
-backend = "podman"
-win_version = "11"                               # 11 | 10 | ltsc10 | tiny11 | tiny10
-cpu_cores = 4
-ram_gb = 4
-vnc_port = 8007
-auto_start = true                                # Start pod automatically when launching an app
-idle_timeout = 0                                 # Seconds before auto-suspend (0 = disabled)
-boot_timeout = 300                               # Seconds to wait for first-boot unattended install
-image = "ghcr.io/dockur/windows:latest"          # Container image (override for air-gapped mirror)
-disk_size = "64G"                                # Virtual disk size passed to dockur&lt;/code&gt;
-    &lt;p&gt;App profiles are metadata only: they describe where a Windows app lives so winpodx can launch it through FreeRDP RemoteApp. The actual Windows application must be installed inside the Windows container.&lt;/p&gt;
-    &lt;p&gt;Starting from v0.1.9 winpodx ships no curated profile list. The first time the Windows pod boots, the provisioner runs &lt;code&gt;winpodx app refresh&lt;/code&gt; and that scans the running guest:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Registry &lt;code&gt;App Paths&lt;/code&gt;(&lt;code&gt;HKLM&lt;/code&gt;+&lt;code&gt;HKCU&lt;/code&gt;)&lt;/item&gt;
-      &lt;item&gt;Start Menu &lt;code&gt;.lnk&lt;/code&gt;recursion (depth-capped)&lt;/item&gt;
-      &lt;item&gt;UWP / MSIX packages via &lt;code&gt;Get-AppxPackage&lt;/code&gt;+&lt;code&gt;AppxManifest.xml&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Chocolatey + Scoop shims&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;For each result it extracts the icon directly from the binary (or the package's logo asset for UWP) and writes the entry to &lt;code&gt;~/.local/share/winpodx/discovered/&amp;lt;slug&amp;gt;/&lt;/code&gt;. Re-run any time:&lt;/p&gt;
-    &lt;code&gt;winpodx app refresh        # CLI
-# or click "Refresh Apps" on the GUI Apps page&lt;/code&gt;
-    &lt;head&gt;Adding a custom app profile manually&lt;/head&gt;
-    &lt;p&gt;User-authored profiles live under &lt;code&gt;~/.local/share/winpodx/apps/&lt;/code&gt; and override anything discovery finds with the same &lt;code&gt;name&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;mkdir -p ~/.local/share/winpodx/apps/myapp
-cat &amp;gt; ~/.local/share/winpodx/apps/myapp/app.toml &amp;lt;&amp;lt; 'EOF'
-name = "myapp"
-full_name = "My Application"
-executable = "C:\\Program Files\\MyApp\\myapp.exe"
-categories = ["Utility"]
-mime_types = []
-EOF
-
-winpodx app install myapp   # Register in desktop menu&lt;/code&gt;
-    &lt;p&gt;Stock Windows Desktop editions limit RDP to one session per user; a second app would otherwise reconnect and steal the first session. winpodx bundles rdprrap — a Rust reimplementation of RDPWrap — inside the package itself and installs it automatically during the Windows unattended install, so each RemoteApp window gets its own independent session.&lt;/p&gt;
-    &lt;p&gt;RAIL prerequisites. RemoteApp itself requires three registry settings that winpodx applies during unattended setup: &lt;code&gt;fDisabledAllowList=1&lt;/code&gt; (enables
-RemoteApp publishing), &lt;code&gt;fInheritInitialProgram=1&lt;/code&gt; (required for
-&lt;code&gt;/app:program:...&lt;/code&gt; to launch the target executable instead of a shell), and
-&lt;code&gt;MaxInstanceCount=10&lt;/code&gt; paired with &lt;code&gt;fSingleSessionPerUser=0&lt;/code&gt; (lifts the
-single-session cap up to 10 concurrent RemoteApp windows). These are set
-regardless of whether rdprrap installs successfully — rdprrap is what makes
-the sessions independent, but the registry keys are what make RemoteApp
-work at all. After rdprrap install &lt;code&gt;TermService&lt;/code&gt; is cycled so the wrapper
-DLL activates without a reboot.&lt;/p&gt;
-    &lt;p&gt;Authentication channel. NLA is disabled (&lt;code&gt;UserAuthentication=0&lt;/code&gt;) so the
-FreeRDP command line can authenticate unattended from under
-&lt;code&gt;podman unshare --rootless-netns&lt;/code&gt;, but &lt;code&gt;SecurityLayer=2&lt;/code&gt; keeps the RDP
-channel itself encrypted with TLS (so &lt;code&gt;/sec:tls /cert:ignore&lt;/code&gt; against
-&lt;code&gt;127.0.0.1&lt;/code&gt; is the full authenticated + encrypted path — no cleartext on the
-wire even though NLA is off).&lt;/p&gt;
-    &lt;p&gt;Works fully offline. The rdprrap zip ships inside winpodx's data directory (&lt;code&gt;config/oem/&lt;/code&gt;) and is staged into &lt;code&gt;C:\OEM\&lt;/code&gt; during the guest's first boot.
-sha256 is verified against a pin file before extraction. No network access is
-required at install time.&lt;/p&gt;
-    &lt;p&gt;Install is one-shot: the patch is applied during dockur's unattended setup phase. If anything in that step fails (hash mismatch, extraction, installer error), winpodx logs a warning and the guest stays in single-session mode — app launch never blocks on this step. A guest-side management channel (enable/disable/status after install) is planned for a later release.&lt;/p&gt;
-    &lt;code&gt;# From a cloned repo:
-./install.sh                # Install (detects distro, installs deps, registers apps)
-./uninstall.sh              # Uninstall (interactive, asks before each step)
-./uninstall.sh --confirm    # Uninstall (auto, keeps config)
-./uninstall.sh --purge      # Uninstall (removes everything including config)
-
-# Or one-liner (no clone needed):
-curl -fsSL https://raw.githubusercontent.com/kernalix7/winpodx/main/install.sh   | bash
-curl -fsSL https://raw.githubusercontent.com/kernalix7/winpodx/main/uninstall.sh | bash -s -- --confirm
-curl -fsSL https://raw.githubusercontent.com/kernalix7/winpodx/main/uninstall.sh | bash -s -- --purge&lt;/code&gt;
-    &lt;p&gt;Uninstall only removes winpodx files. It never touches:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Your Podman containers/volumes (Windows VM data)&lt;/item&gt;
-      &lt;item&gt;System packages (podman, freerdp, python3)&lt;/item&gt;
-      &lt;item&gt;Your home directory files&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;code&gt;winpodx/
-├── install.sh             # One-line installer (no pip)
-├── uninstall.sh           # Clean uninstaller
-├── src/winpodx/
-│   ├── cli/               # argparse commands (app, pod, config, setup, ...)
-│   ├── core/              # Config, RDP, pod lifecycle, provisioner, daemon
-│   ├── backend/           # Podman, Docker, libvirt, manual
-│   ├── desktop/           # .desktop entries, icons, MIME, tray, notifications
-│   ├── display/           # X11/Wayland detection, DPI scaling
-│   ├── gui/               # Qt6 main window, app dialog, theme
-│   └── utils/             # XDG paths, deps, TOML writer, winapps compat
-├── data/                  # winpodx GUI desktop entry + icon + config example
-├── config/oem/            # Windows OEM scripts (post-install)
-├── scripts/windows/       # PowerShell scripts (debloat, time sync, USB mapping, app discovery)
-├── .github/workflows/     # CI: lint + test + upstream update checker
-└── tests/                 # pytest test suite (411 tests)
-&lt;/code&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;Distro&lt;/cell&gt;
-        &lt;cell role="head"&gt;Package Manager&lt;/cell&gt;
-        &lt;cell role="head"&gt;Status&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;openSUSE Tumbleweed/Leap&lt;/cell&gt;
-        &lt;cell&gt;zypper&lt;/cell&gt;
-        &lt;cell&gt;Tested&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Fedora / RHEL / CentOS&lt;/cell&gt;
-        &lt;cell&gt;dnf&lt;/cell&gt;
-        &lt;cell&gt;Supported&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Ubuntu / Debian / Mint&lt;/cell&gt;
-        &lt;cell&gt;apt&lt;/cell&gt;
-        &lt;cell&gt;Supported&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Arch / Manjaro&lt;/cell&gt;
-        &lt;cell&gt;pacman&lt;/cell&gt;
-        &lt;cell&gt;Supported&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;code&gt;# From repo root (no install needed)
-export PYTHONPATH="$PWD/src"
-python3 -m pytest tests/ -v    # 411 tests
-ruff check src/ tests/         # Lint&lt;/code&gt;
-    &lt;p&gt;See CONTRIBUTING.md for development setup and workflow.&lt;/p&gt;
-    &lt;p&gt;Each tag push (&lt;code&gt;v*.*.*&lt;/code&gt;) publishes to all supported channels automatically:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;Channel&lt;/cell&gt;
-        &lt;cell role="head"&gt;Distros&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;RPM (openSUSE / Fedora / Slowroll)&lt;/cell&gt;
-        &lt;cell&gt;Tumbleweed, Leap 15.6, Leap 16.0, Slowroll, Fedora 42/43&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;RPM (RHEL-family)&lt;/cell&gt;
-        &lt;cell&gt;AlmaLinux 9 / 10 (also covers RHEL, Rocky, Oracle Linux 9/10)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;.deb&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Debian 12 / 13, Ubuntu 24.04 / 25.04 / 25.10&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;AUR&lt;/cell&gt;
-        &lt;cell&gt;Arch Linux (once activated — see &lt;code&gt;packaging/aur/README.md&lt;/code&gt;)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;&lt;code&gt;sdist&lt;/code&gt; + &lt;code&gt;wheel&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;PyPI-compatible source/binary distributions&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Maintainer setup for each channel lives under &lt;code&gt;packaging/&lt;/code&gt;:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;code&gt;packaging/obs/README.md&lt;/code&gt;— openSUSE Build Service (RPM family).&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;packaging/aur/README.md&lt;/code&gt;— Arch User Repository.&lt;/item&gt;
-      &lt;item&gt;Debian/Ubuntu and AlmaLinux builds are self-contained in their respective GitHub Actions workflows and need no external setup.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;For security issues, follow the process in SECURITY.md.&lt;/p&gt;
-    &lt;p&gt;MIT - Kim DaeHyun (kernalix7@kodenet.io)&lt;/p&gt;
+    &lt;head rend="h3"&gt;Well Y Does Some Of That&lt;/head&gt;
+    &lt;p&gt;Absolutely. There are a lot of tools that do parts of this. I want someone to take them, put them all together and fit them up. I want JJ as the VCS, I want this as the forge and I want the expectation that I as a user could live happily with a raspberry pi as a forge for a long time. I want those forges designed around modern concepts like object storage and shallow clones and getting constantly hammered by LLM bots.&lt;/p&gt;
+    &lt;p&gt;Now in a universe where GitHub was doing a good job, I wouldn't even bother writing this up. GitHub is the default and talking to people about overcoming the default is usually a waste of time. Heinz is the default ketchup, when I order a Coke I don't want a Pepsi and if I'm going to use a forge up until 2026 there would have to be an amazing reason for me to not choose the one that everyone uses. Up until recently other forges have been like sweet potato french fries, which is to say never the thing you actually want.&lt;/p&gt;
+    &lt;p&gt;But we live in a world where the monolithic forge is breaking down and nobody has built the replacement. The people with the money are busy with the rockets. The people with the taste are busy with their day jobs. And the rest of us are opening PRs titled 'asdfasdf' at midnight, waiting for a robot to check them, wondering when the tool we spend our whole working lives inside stopped being built for us.&lt;/p&gt;
+    &lt;p&gt;If I ever get the submarine money, I'll let you know.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/kernalix7/winpodx"/><published>2026-05-01T02:23:43+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47971768</id><title>Apple Says Mac Studio and Mac Mini Will Be in Short Supply for Months</title><updated>2026-05-01T07:58:54.337134+00:00</updated><content>&lt;doc fingerprint="7d78b71f06ae5ddd"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Apple Says Mac Studio and Mac Mini Will Be in Short Supply for Months&lt;/head&gt;
-    &lt;div&gt;
-      &lt;div&gt;
-        &lt;p&gt;During today's earnings call for the second fiscal quarter of 2026, Apple CEO Tim Cook said that the Mac mini and Mac Studio could be hard to get for months to come.&lt;/p&gt;
-        &lt;p&gt;&lt;lb/&gt;"We think, looking forward, that the Mac mini and Mac Studio may take several months to reach supply demand balance," Cook said.&lt;/p&gt;
-        &lt;p&gt;Apple underestimated demand for the Mac mini and the Mac Studio. "Both of these are amazing platforms for AI and agentic tools and the customer recognition of that is happening faster than what we had predicted, and so we saw higher than expected demand," Cook said.&lt;/p&gt;
-        &lt;p&gt;Shipping delays for the Mac mini and the Mac Studio have been increasing over the last few months, and the waits for some models stretch into months. Apple stopped selling the Mac Studio with 512GB RAM entirely, and it stopped accepting orders for some models with higher amounts of RAM. As of last week, the base Mac mini was listed as "Currently Unavailable" from Apple's online store because it is out of stock.&lt;/p&gt;
-      &lt;/div&gt;
-    &lt;/div&gt;
-    &lt;div&gt;
-      &lt;head rend="h2"&gt;Popular Stories&lt;/head&gt;
-      &lt;div&gt;
-        &lt;div&gt;
-          &lt;div&gt;
-            &lt;p&gt;Apple's online store in the U.S. is currently showing delivery estimates of up to 4-5 months for many Mac mini and Mac Studio configurations with upgraded amounts of RAM. The delays are occurring amid a severe global memory chip shortage driven by surging demand from companies building AI servers that require large amounts of RAM. For example, a Mac mini with an M4 Pro chip and 64GB of RAM...&lt;/p&gt;
-          &lt;/div&gt;
-        &lt;/div&gt;
-      &lt;/div&gt;
-      &lt;div&gt;
-        &lt;div&gt;
-          &lt;div&gt;
-            &lt;p&gt;As noted by 9to5Mac, some Mac mini and Mac Studio configurations are now completely out of stock on Apple's online store in the U.S. as of this writing. Mac mini configurations with an upgraded 32GB or 64GB of RAM and Mac Studio configurations with an upgraded 128GB or 256GB of RAM are listed as "currently unavailable" on the storefront, meaning they can no longer be ordered at all. Other ...&lt;/p&gt;
-          &lt;/div&gt;
-        &lt;/div&gt;
-      &lt;/div&gt;
-      &lt;div&gt;
-        &lt;div&gt;
-          &lt;div&gt;
-            &lt;p&gt;Perplexity today launched Personal Computer, an expansion of Perplexity Computer that integrates with local files and apps on a Mac. Personal Computer was announced in March and was available on a waitlist basis, but it is officially rolling out today for Max subscribers. Perplexity Computer came out earlier this year, and it's an all-in-one "digital worker" able to create and execute entire ...&lt;/p&gt;
-          &lt;/div&gt;
-        &lt;/div&gt;
-      &lt;/div&gt;
-    &lt;/div&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.macrumors.com/2026/04/30/mac-studio-mac-mini-constrained-months/"/><published>2026-05-01T06:20:33+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47971830</id><title>It’s Toasted</title><updated>2026-05-01T07:58:53.709235+00:00</updated><content>&lt;doc fingerprint="bda29fb11a29b659"&gt;
+&lt;/doc&gt;</content><link href="https://matduggan.com/if-i-could-make-my-own-github/"/><published>2026-05-01T06:21:01+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47971830</id><title>It’s Toasted</title><updated>2026-05-01T09:44:20.590424+00:00</updated><content>&lt;doc fingerprint="bda29fb11a29b659"&gt;
   &lt;main&gt;
     &lt;p&gt;In 1917, American Tobacco launched an ad campaign for its cigarette brand Lucky Strike, with the slogan It’s Toasted. The campaign was designed to address the growing public awareness that cigarettes pose serious health hazards. The heat treatment of tobacco during cigarette manufacturing was a common industrial process, by no means unique to Lucky Strike, but by focusing on it and giving it a name, American Tobacco managed to form the impression that Lucky Strike cigarettes were superior and less harmful than other brands. This gave cigarette smokers an excuse to ignore the risks of smoking, shifting the conversation from the toxicity of the product to the supposed benefits of its preparation. A fictional account of the slogan’s birth was famously featured in the Mad Men pilot episode.&lt;/p&gt;
     &lt;p&gt;This public relations strategy, which takes a standard industry practice and frames it as a unique, premium benefit to distract from underlying risks, is one of the major ways social media companies, particularly social media giant Meta, address public criticism of their products and their potential impact on users’ mental health, especially among adolescents. This may be an effective public relations move, but in doing so, Meta reinforces the conceptual link between its business and the tobacco industry.&lt;/p&gt;
@@ -2201,7 +1515,7 @@ ruff check src/ tests/         # Lint&lt;/code&gt;
     &lt;p&gt;When Meta emphasizes safety measures, it shifts the focus away from the design of its potentially harmful products towards the process of social platform management. Meta is responding to public criticism by saying it is making “industry-leading efforts” to create a safe environment for its users. It is not saying that most of these safety measures are required by legislation, such as the EU’s Digital Services Act, or are standard industry practice. It is not saying that running a social media empire, with more than 3.5 billion daily active users, cannot be done without a very large investment in content moderation and other policy enforcement measures. Meta must employ tens of thousands of moderators to prevent its platforms from being flooded by illegal content that would alienate advertisers. It is engaging in distraction tactics by taking something essential to its social media operation process and marketing it as a premium feature that can make its products safe.&lt;/p&gt;
     &lt;p&gt;Meta could work towards redesigning its social media platforms to be less addictive and less potentially harmful. It could eliminate infinite scroll and never-ending content streams in favor of pagination or end-of-feed markers. It could disable video autoplay by default, a feature that can draw users into an infinite content loop. It could prioritize chronological feeds over algorithmic feeds, and, more generally, prioritize relationships over engagement, thereby reducing the visibility of viral, controversial, often polarizing, or anxiety-inducing content. It could create interfaces that allow for reflection rather than frictionless, automatic action, such as easy shares and quick reactions. It could remove or hide scoring mechanisms such as follower counts, likes, and view counts, which trigger social comparison and induce anxiety. Finally, and most importantly, it could start to move away from its surveillance-based revenue model towards business models that do not incentivize it to maximize user engagement.&lt;/p&gt;
     &lt;p&gt;Instead of considering meaningful architectural changes that could make its social media platforms less addictive and less harmful, Meta prefers to focus on reactive safety features, many of which are optional, thereby avoiding responsibility for potential harm to its users and shifting that responsibility to the users themselves. By focusing on parental supervision tools and awareness campaigns, it subtly shifts the burden of safety onto the victim, a maneuver that ignores how deliberately social media architecture is designed to keep users hooked. Meta is taking a page out of Big Tobacco’s PR playbook, telling us that It’s Toasted. By doing that, it is putting itself in the same category as tobacco manufacturers. No wonder legislators are responding with the tools of the fight against smoking—massive lawsuits, bans, and mandated warnings. This is a very bad place for a technology company to be. Meta should now shift direction and make meaningful, proactive design changes to make its products safe, not just toasted.&lt;/p&gt;
-    &lt;p&gt;1,657 · 4 · May. 1, 2026 · Markets, Policy · All Notes&lt;/p&gt;
+    &lt;p&gt;3,969 · 6 · May. 1, 2026 · Markets, Policy · All Notes&lt;/p&gt;
     &lt;p&gt;continue to this week’s featured note:&lt;/p&gt;
     &lt;list rend="ul"&gt;
       &lt;item&gt;
@@ -2211,4 +1525,17 @@ ruff check src/ tests/         # Lint&lt;/code&gt;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://yadin.com/notes/toasted/"/><published>2026-05-01T06:34:54+00:00</published></entry></feed>
+&lt;/doc&gt;</content><link href="https://yadin.com/notes/toasted/"/><published>2026-05-01T06:34:54+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47972213</id><title>Canonical/Ubuntu have been under DDoS for more than 15h</title><updated>2026-05-01T09:44:20.126188+00:00</updated><content>&lt;doc fingerprint="b8d44562dd657f3"&gt;
+  &lt;main&gt;
+    &lt;p&gt;staging.mode.note&lt;/p&gt;
+    &lt;p&gt;timezone.info.bar timezone.local.info.bar {{'timezone.change' | translate}}&lt;/p&gt;
+    &lt;p&gt;cookie.consent.banner.text&lt;/p&gt;
+    &lt;p&gt;This page uses cookies to store preferences and improve user experience. By continuing to visit our page, you agree to our use of cookies. Know more about our cookie and privacy policy.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://status.canonical.com/#/incident/KNms6QK9ewuzz-7xUsPsNylV20jEt5kyKsd8A-3ptQEHpOd8VQ40ZQs-KD81fboQXeGZB94okNHdHBGlCv58Sw=="/><published>2026-05-01T07:44:17+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=47972447</id><title>Grok 4.3</title><updated>2026-05-01T09:44:19.817662+00:00</updated><content>&lt;doc fingerprint="dbef7ff7e7dacf0e"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Docs REST API gRPC Pricing Search ⌘ K Toggle theme&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://docs.x.ai/developers/models/grok-4.3"/><published>2026-05-01T08:29:31+00:00</published></entry></feed>
