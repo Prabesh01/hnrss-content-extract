@@ -1,790 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-05-12T10:22:06.133652+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=48085685</id><title>Training an LLM in Swift, Part 1: Taking matrix mult from Gflop/s to Tflop/s</title><updated>2026-05-12T10:22:12.036781+00:00</updated><content>&lt;doc fingerprint="765a1195b00c16b8"&gt;
-  &lt;main&gt;&lt;p&gt;In this article, I try to get my own handwritten matrix multiplication code running as fast as possible for training a Large Language Model (LLM) in Swift. The aim is to give some insight into the key steps for optimizing mathematics code in Swift. I also hope that these examples will offer a sense of scale about the capabilities of the different units on Apple Silicon â CPU, SIMD, AMX and GPU.&lt;/p&gt;&lt;p&gt;This will be the first in a series where I look at training neural networks in Swift on Apple Silicon. Future articles will look at the maybe-too-many frameworks Apple offer for machine learning on the Mac. Those established frameworks are what you should really use for matrix multiplication and machine learning (they’ve spent a few more years optimizing matrix kernels than I have).&lt;/p&gt;&lt;p&gt;But until then, I’m having fun writing everything for myself in a “no frameworks, no libraries” plain code approach.&lt;/p&gt;&lt;p&gt;And I’m not just writing matrix multiplication kernels. The sample app will use these kernels as part of a full LLM implementation and the numbers I’ll quote will be for entire forward and backward training iterations. The reference implementation for this series will be Andrej Karpathy’s llm.c (a plain C implementation of a GPT2-compatible model). It’s a fairly basic model but it does contain all the necessary components and is representative of real-world workloads.&lt;/p&gt;&lt;p&gt;That means itâs time for my favorite game: optimize Swift until itâs faster than C.&lt;/p&gt;&lt;head rend="h2"&gt;Backstory&lt;/head&gt;&lt;p&gt;About two years ago, I dug up my engineering thesis from the early 2000s. It’s an image recognizer written in C++ that uses a neural network for classifying images. I wanted to get my old code running again but I hadn’t worked on ML code in a long time. It got annoying and I gave up.&lt;/p&gt;&lt;p&gt;For all the discussion around LLMs in early 2024, it felt like no one was training neural networks on the Mac. At least, not in languages like Swift. I played with some Python libraries like PyTorch and TensorFlow but Python never does the calculations itself â it operates more like an orchestrator of another computational engine under the hood â and the separation left me feeling like I wasn’t in control.&lt;/p&gt;&lt;p&gt;A month later, Andrej Karpathy released llm.c. This reached me in a way that other machine learning content didn’t because nothing is hidden. It is around 1000 lines of plain C and (although it’s filled with some pretty cryptic variable names) it’s relatively readable.&lt;/p&gt;&lt;p&gt;So naturally, I immediately rewrote it in Swift. And it was a lot of fun to play with.&lt;/p&gt;&lt;p&gt;Of course, playing with the code required some work to make it run fast. Some foreshadowing, here: the initial Swift implementation was really super slow. But optimization is a constant process: there’s always something more you can try.&lt;/p&gt;&lt;p&gt;Which finally brings me to this article: I’m going to walk through the different explorations I wrote then (and a couple I’ve added in the last week) to make an LLM train fairly quickly without resorting to using a library. Most of the code will be in Swift (although I’ll show a Metal implementation at the end).&lt;/p&gt;&lt;p&gt;By the way, I will not be explaining how a neural network or an LLM works. If you’re interested, Karpathy’s video Let’s build GPT: from scratch, in code, spelled out. is practically the definitive guide to learning how GPT-like LLMs work and his earlier series starting with The spelled-out intro to language modeling: building makemore covers plenty of introductory concepts in a 5 video series if you want a more introductory lesson. Of course, both are in Python, so please come back here when you’re ready to see how we can do things in Swift.&lt;/p&gt;&lt;head rend="h2"&gt;llm.c&lt;/head&gt;&lt;p&gt;Machine learning is essentially the application of model weights to input data (called the forward pass, a.k.a. inference), then the calculation of error gradients and an update to those weights (the backward pass).&lt;/p&gt;&lt;p&gt;We typically package these calculations together and try to make them run as fast as possible. These packages of operations might be called: “linear tensor projection”, “matrix multiplication”, or even a series of “vector dot products” (depending on how big or small you slice the units of work). It’s ultimately a loop that performs &lt;code&gt;z += x * y&lt;/code&gt; a lot of times.&lt;/p&gt;&lt;p&gt;Since these matrix multiplications represent so much of the work in machine learning, I’m going to focus on the code that does this. I will be updating the rest of the implementation as I go, but only using the same improvements I’m showing to matrix multiplication.&lt;/p&gt;&lt;p&gt;Let’s start by looking at the &lt;code&gt;matmul_forward&lt;/code&gt; from llm.c which is the core matrix multiplication used on the forward pass. It iterates over the input (&lt;code&gt;inp&lt;/code&gt;), multiplies by model weights (&lt;code&gt;weight&lt;/code&gt;), and adds the result to the running total (&lt;code&gt;val&lt;/code&gt;).&lt;/p&gt;&lt;code&gt;void matmul_forward(float* out, const float* inp, const float* weight, const float* bias, int B, int T, int C, int OC) {
-    for (int b = 0; b &amp;lt; B; b++) {
-        for (int t = 0; t &amp;lt; T; t++) {
-            int bt = b * T + t;
-            for (int o = 0; o &amp;lt; OC; o++) {
-                float val = (bias != NULL) ? bias[o] : 0.0f;
-                for (int i = 0; i &amp;lt; C; i++) {
-                    val += inp[bt * C + i] * weight[o*C + i];
-                }
-                out[bt * OC + o] = val;
-            }
-        }
-    }
-}
-&lt;/code&gt;&lt;p&gt;The four layers of loops add some visual complexity but in reality, that &lt;code&gt;val += inp[bt * C + i] * weight[o*C + i];&lt;/code&gt; line is the heart of a neural network. Like I said: &lt;code&gt;z += x * y&lt;/code&gt; a lot.&lt;/p&gt;&lt;p&gt;How much?&lt;/p&gt;&lt;p&gt;The &lt;code&gt;val&lt;/code&gt; line contains 2 floating point operations but Karpathy says the number of floating point operations in a full training iteration should be roughly &lt;code&gt;6 x N x D&lt;/code&gt; where &lt;code&gt;N&lt;/code&gt; is the number of weights in the model (124,439,808 in our case) and &lt;code&gt;D&lt;/code&gt; is &lt;code&gt;B * T = 4 * 64 = 256&lt;/code&gt; for our app. So we’re talking about 6 x 124,439,808 x 256 â 1.911Ã10Â¹Â¹ â 0.2 trillion floating point operations per training iteration.&lt;/p&gt;&lt;p&gt;So it’s got to run quick.&lt;/p&gt;&lt;table&gt;&lt;row span="3"&gt;&lt;cell role="head"&gt;Model&lt;/cell&gt;&lt;cell role="head"&gt;Tokens/s&lt;/cell&gt;&lt;cell role="head"&gt;Training iterations/s&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;llm.c&lt;/cell&gt;&lt;cell&gt;0.92&lt;/cell&gt;&lt;cell&gt;0.174&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;The plain C code runs easily in a Swift Package. I’ve fixed the C implementation to always run at &lt;code&gt;-O3&lt;/code&gt; optimization level (regardless of Xcode settings). Even at this optimization level, the C implementation manages just one training iteration every 7 seconds and inference at less than 1 token per second. A wonderful proof of concept but 10 times slower than would ever be useful.&lt;/p&gt;&lt;head rend="h2"&gt;Basic Swift&lt;/head&gt;&lt;p&gt;I’ve tried my best to keep the basic Swift version as true to the C version as possible:&lt;/p&gt;&lt;code&gt;static func matmul_forward(out: inout [Float], inp: [Float], weight: [Float], bias: [Float]?, B: Int, T: Int, C: Int, OC: Int) {
-    for b in 0..&amp;lt;B {
-        for t in 0..&amp;lt;T {
-            let bt = b * T + t
-            for o in 0..&amp;lt;OC {
-                var value = bias?[o] ?? 0
-                for i in 0..&amp;lt;C {
-                    value += inp[bt * C + i] * weight[o * C + i]
-                }
-                out[bt * OC + o] = value
-            }
-        }
-    }
-}
-&lt;/code&gt;&lt;p&gt;Since the C code is inherently “unsafe”, I went ahead and gave the Swift code the same advantage by setting it to run with &lt;code&gt;-remove-runtime-asserts&lt;/code&gt; (removing the runtime checking on array indices) and made sure to always run the app in “Release” configuration. So the Swift and C implementations should be fairly equivalent, right?&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Don’t run in Debug. I will only be quoting Release configuration numbers. While I have run sections of this in Debug, I’ve never waited around for a full 20 iteration training run in Debug. I usually keep the Scheme in Xcode set to “Release” â even during debugging.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;If you read the backstory, I’ve already mentioned: this was “extremely slow”.&lt;/p&gt;&lt;table&gt;&lt;row span="4"&gt;&lt;cell role="head"&gt;Model&lt;/cell&gt;&lt;cell role="head"&gt;Tokens/s&lt;/cell&gt;&lt;cell role="head"&gt;Training iterations/s&lt;/cell&gt;&lt;cell role="head"&gt;Training versus llm.c&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;llm.c&lt;/cell&gt;&lt;cell&gt;0.926&lt;/cell&gt;&lt;cell&gt;0.175&lt;/cell&gt;&lt;cell&gt;100%&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Basic Swift&lt;/cell&gt;&lt;cell&gt;0.054&lt;/cell&gt;&lt;cell&gt;0.014&lt;/cell&gt;&lt;cell&gt;7.3%&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;The Swift code is between 15 and 20 times slower. That’s an LLM producing 1 token every 19 seconds. Running 20 training iterations on this engine takes nearly 30 minutes. What on Earth is going on?&lt;/p&gt;&lt;quote&gt;&lt;p&gt;This performance represents about 2.8 Gflop/s. In 1999 Apple ran ads for the PowerMax G4 claiming its 1 Gflop/s capability made it a weapon in the eyes of the US military. Now 2.8 Gflop/s is completely unacceptable.&lt;/p&gt;&lt;/quote&gt;&lt;head rend="h2"&gt;Span, Egg and Span&lt;/head&gt;&lt;p&gt;Inspecting in Instruments, by far the biggest performance cost in the previous run is &lt;code&gt;_ArrayBuffer.beginCOWMutation()&lt;/code&gt;. Swift thinks someone else could be using our &lt;code&gt;Array&lt;/code&gt;s and even though they are unique (so we’re not getting array copies), the uniqueness checks alone are our biggest overhead.&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Huh? Sometimes you run into issues that might just be a bug. This might be one of them. When I first worked on this code in 2024, my memory is that this wasn’t a problem. I don’t know if there’s been a regression or a safety hole was covered over leading to&lt;/p&gt;&lt;code&gt;_ArrayBuffer.beginCOWMutation()&lt;/code&gt;clogging up performance. This problem also moves around when I disable function inlining with&lt;code&gt;inline(none)&lt;/code&gt;so it feels like the optimizer is just not able to do its job properly.&lt;/quote&gt;&lt;p&gt;In any case, we can’t use &lt;code&gt;Array&lt;/code&gt; and get the performance we need. Fortunately, Swift 6.2 gives us a reliable fix with basically zero overhead: &lt;code&gt;MutableSpan&lt;/code&gt;.&lt;/p&gt;&lt;code&gt;static func matmul_forward(out: inout [Float], inp: [Float], weight: [Float], bias: [Float]?, B: Int, T: Int, C: Int, OC: Int) {
-    var out = out.mutableSpan
-    for b in 0..&amp;lt;B {
-        for t in 0..&amp;lt;T {
-            let bt = b * T + t
-            for o in 0..&amp;lt;OC {
-                var value = bias?[o] ?? 0
-                for i in 0..&amp;lt;C {
-                    value += inp[bt * C + i] * weight[o * C + i]
-                }
-                out[bt * OC + o] = value
-            }
-        }
-    }
-}
-&lt;/code&gt;&lt;p&gt;All I’ve added is the &lt;code&gt;var out = out.mutableSpan&lt;/code&gt; line at the top, shadowing &lt;code&gt;out&lt;/code&gt; with its own &lt;code&gt;mutableSpan&lt;/code&gt;. I’ve also applied the same pattern throughout the file.&lt;/p&gt;&lt;table&gt;&lt;row span="4"&gt;&lt;cell role="head"&gt;Model&lt;/cell&gt;&lt;cell role="head"&gt;Tokens/s&lt;/cell&gt;&lt;cell role="head"&gt;Training iterations/s&lt;/cell&gt;&lt;cell role="head"&gt;Training versus llm.c&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;llm.c&lt;/cell&gt;&lt;cell&gt;0.926&lt;/cell&gt;&lt;cell&gt;0.175&lt;/cell&gt;&lt;cell&gt;100%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Basic Swift&lt;/cell&gt;&lt;cell&gt;0.054&lt;/cell&gt;&lt;cell&gt;0.014&lt;/cell&gt;&lt;cell&gt;7.3%&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Basic Swift + mutableSpan&lt;/cell&gt;&lt;cell&gt;0.056&lt;/cell&gt;&lt;cell&gt;0.042&lt;/cell&gt;&lt;cell&gt;24.0%&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;Curiously, while this change didn’t have much impact on the forward pass, it did make the training iterations (forward + backward + update) more than 3 times faster.&lt;/p&gt;&lt;head rend="h2"&gt;Chill vibes&lt;/head&gt;&lt;p&gt;But we need to turn our attention to why the forward pass is slow. Instruments confirms what we already know: the hottest line on the forward pass is the center of our loop &lt;code&gt;value += inp[bt * C + i] * weight[o * C + i]&lt;/code&gt;.&lt;/p&gt;&lt;p&gt;It’s time to face a hard truth: C has some compiler optimization flags that Swift doesn’t have. In this specific case, C has &lt;code&gt;-ffast-math&lt;/code&gt; which allows C t use fused-multiply-addition (FMA) commands which perform a floating-point multiply and addition in a single command and generally doesn’t worry too much about precise correctness.&lt;/p&gt;&lt;code&gt;+0xa34   fmadd               s0, s17, s16, s0
-+0xa38   ldr                 s17, [x20, #0x4]
-+0xa3c   fmadd               s7, s17, s16, s7
-+0xa40   ldr                 s17, [x21, #0x4]
-+0xa44   fmadd               s4, s17, s16, s4
-+0xa48   ldr                 s17, [x22, #0x4]
-+0xa4c   fmadd               s6, s17, s16, s6
-+0xa50   ldr                 s17, [x23, #0x4]
-+0xa54   fmadd               s1, s17, s16, s1
-+0xa58   ldr                 s17, [x24, #0x4]
-+0xa5c   fmadd               s2, s17, s16, s2
-+0xa60   ldr                 s17, [x25, #0x4]
-+0xa64   fmadd               s3, s17, s16, s3
-+0xa68   ldr                 s17, [x26, #0x4]
-+0xa6c   fmadd               s5, s17, s16, s5
-&lt;/code&gt;&lt;p&gt;The C inner loop is mostly just 8 unrolled applications of &lt;code&gt;fmadd&lt;/code&gt; (the fused-multiply-add instruction).&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Fun fact: we live in the future, so if things like assembly language don’t make sense to you, you can drop them into your favorite LLM and it will translate it for you.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;We don’t have &lt;code&gt;-ffast-math&lt;/code&gt; in Swift, so instead we get separate multiplies and adds.&lt;/p&gt;&lt;code&gt;+0x164   fmul.4s             v1, v1, v5
-+0x168   mov                 s5, v1[3]
-+0x16c   mov                 s17, v1[2]
-+0x170   mov                 s18, v1[1]
-+0x174   fmul.4s             v2, v2, v6
-+0x178   mov                 s6, v2[3]
-
-/*...*/
-
-+0x1d0   fadd                s0, s0, s7
-+0x1d4   fadd                s0, s0, s4
-+0x1d8   fadd                s0, s0, s24
-+0x1dc   fadd                s0, s0, s23
-+0x1e0   fadd                s0, s0, s16
-&lt;/code&gt;&lt;p&gt;Swift is trying to do a 4x loop unroll â that &lt;code&gt;fmul.4s&lt;/code&gt; is a SIMD operation for performing 4 multiplies â but all those &lt;code&gt;mov&lt;/code&gt; instructions and the separate additions at the end are hurting us.&lt;/p&gt;&lt;p&gt;We need to use fused-multiply-add, like C is using.&lt;/p&gt;&lt;p&gt;Fortunately, we have Swift-Numerics which offers &lt;code&gt;Relaxed&lt;/code&gt; for our own version of fast math. Like the “Don’t panic” on the Hitchhiker’s Guide to the Galaxy, I’m sure the word “Relax” is just here to make us all calmer and enjoy chill vibes. Or it lets us relax the rules around rounding results so FMA is possible.&lt;/p&gt;&lt;p&gt;All of our &lt;code&gt;a += b * c&lt;/code&gt; and &lt;code&gt;x = y + z&lt;/code&gt; operations can be improved with &lt;code&gt;Relaxed.multiplyAdd&lt;/code&gt; and &lt;code&gt;Relaxed.sum&lt;/code&gt; but I will specifically avoid applying these functions to the &lt;code&gt;gelu_backward&lt;/code&gt; function since the C implementation explicitly disables &lt;code&gt;-ffast-math&lt;/code&gt; around that function.&lt;/p&gt;&lt;code&gt;static func matmul_forward(out: inout [Float], inp: [Float], weight: [Float], bias: [Float]?, B: Int, T: Int, C: Int, OC: Int) {
-    var out = out.mutableSpan
-    for b in 0..&amp;lt;B {
-        for t in 0..&amp;lt;T {
-            let bt = b * T + t
-            for o in 0..&amp;lt;OC {
-                var val = bias?[o] ?? 0
-                for i in 0..&amp;lt;C {
-                    val = Relaxed.multiplyAdd(inp[bt * C + i], weight[o * C + i], val)
-                }
-                out[bt * OC + o] = val
-            }
-        }
-    }
-}
-&lt;/code&gt;&lt;p&gt;The one change is there in the middle: &lt;code&gt;val = Relaxed.multiplyAdd(inp[bt * C + i], weight[o * C + i], val)&lt;/code&gt;. Not as pretty to read but let’s see the performance.&lt;/p&gt;&lt;p&gt;Now our assembly looks like this:&lt;/p&gt;&lt;code&gt;+0x178   fmla.4s             v1, v16, v4
-+0x17c   fmla.4s             v0, v17, v5
-+0x180   fmla.4s             v2, v18, v6
-+0x184   fmla.4s             v3, v19, v7
-+0x188   add                 x6, x6, #0x40
-+0x18c   add                 x30, x30, #0x40
-+0x190   subs                x13, x13, #0x10
-+0x194   b.ne                "specialized static LLMBasicSwift.matmul_forward(out:inp:weight:bias:B:T:C:OC:)+0x168"
-+0x198   fadd.4s             v0, v0, v1
-+0x19c   fadd.4s             v0, v2, v0
-+0x1a0   fadd.4s             v0, v3, v0
-+0x1a4   faddp.4s            v0, v0, v0
-+0x1a8   faddp.2s            s0, v0
-&lt;/code&gt;&lt;p&gt;Interestingly, Swift is choosing the SIMD vectorized version of &lt;code&gt;fmadd&lt;/code&gt; (&lt;code&gt;fmla&lt;/code&gt;) but the premise is the same.&lt;/p&gt;&lt;table&gt;&lt;row span="4"&gt;&lt;cell role="head"&gt;Model&lt;/cell&gt;&lt;cell role="head"&gt;Tokens/s&lt;/cell&gt;&lt;cell role="head"&gt;Training iterations/s&lt;/cell&gt;&lt;cell role="head"&gt;Training versus llm.c&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;llm.c&lt;/cell&gt;&lt;cell&gt;0.926&lt;/cell&gt;&lt;cell&gt;0.175&lt;/cell&gt;&lt;cell&gt;100%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Basic Swift&lt;/cell&gt;&lt;cell&gt;0.054&lt;/cell&gt;&lt;cell&gt;0.014&lt;/cell&gt;&lt;cell&gt;7.3%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Basic Swift + mutableSpan&lt;/cell&gt;&lt;cell&gt;0.056&lt;/cell&gt;&lt;cell&gt;0.042&lt;/cell&gt;&lt;cell&gt;24.0%&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Basic Swift + mutableSpan + Relaxed&lt;/cell&gt;&lt;cell&gt;0.533&lt;/cell&gt;&lt;cell&gt;0.148&lt;/cell&gt;&lt;cell&gt;85.1%&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;That’s a nearly 10x speed increase in tokens per second. But our training performance remains 15% slower than C. How can we close the final gap?&lt;/p&gt;&lt;head rend="h2"&gt;They see me rollin'&lt;/head&gt;&lt;p&gt;Time to admit something: I’ve been showing the “naive” version of matrix multiplication from C. The real C function is a little uglier as it strides over the outer loop by 8 steps at a time, hoping the compiler will unroll the innermost loop. And C’s &lt;code&gt;-O3&lt;/code&gt; obliges by delivering 8x loop unrolling.&lt;/p&gt;&lt;code&gt;for (int obt = 0; obt &amp;lt; B * T; obt += LOOP_UNROLL) {
-    for (int o = 0; o &amp;lt; OC; o++) {
-        float result[LOOP_UNROLL];
-        for (int ibt = 0; ibt &amp;lt; LOOP_UNROLL; ibt++) {
-            result[ibt] = (bias != NULL) ? bias[o] : 0.0f;
-        }
-        for (int i = 0; i &amp;lt; C; i++) {
-            float w = weight[i + o * C];
-            for (int ibt = 0; ibt &amp;lt; LOOP_UNROLL; ibt++) {
-                int bt = obt + ibt;
-                result[ibt] += inp[bt * C + i] * w;
-            }
-        }
-        for (int ibt = 0; ibt &amp;lt; LOOP_UNROLL; ibt++) {
-            int bt = obt + ibt;
-            out[bt * OC + o] = result[ibt];
-        }
-    }
-}
-&lt;/code&gt;&lt;p&gt;It might not seem obvious but the critical line here in the C implementation is the &lt;code&gt;float result[LOOP_UNROLL];&lt;/code&gt; buffer to store 8 result values.&lt;/p&gt;&lt;p&gt;Previously we simply couldn’t do this in Swift. Allocating an &lt;code&gt;Array&amp;lt;Float&amp;gt;&lt;/code&gt; in the loop was simply too high a cost. In my 2024 implementation, all I could do was manually unroll the loop 8 times (something that’s fairly hideous to read).&lt;/p&gt;&lt;p&gt;However, Swift 6.2 has given us another useful feature here: &lt;code&gt;InlineArray&lt;/code&gt; which finally matches C stack allocated arrays.&lt;/p&gt;&lt;code&gt;for obt in stride(from: 0, to: BT, by: LOOP_UNROLL) {
-    for o in 0..&amp;lt;OC {
-        var result = InlineArray&amp;lt;8, Float&amp;gt;(repeating: bias?[o] ?? 0)
-        let bt = inp.span.extracting(droppingFirst: obt * C)
-        let w = weight.span.extracting(droppingFirst: o * C)
-
-        for i in 0..&amp;lt;C {
-            for r in result.indices {
-                result[r] = Relaxed.multiplyAdd(bt[r * C + i], w[i], result[r])
-            }
-        }
-      
-        for r in result.indices {
-            out[(obt + r) * OC + o] = result[r]
-        }
-    }
-}
-&lt;/code&gt;&lt;p&gt;The assembly is just the same &lt;code&gt;fmla.4s&lt;/code&gt; and &lt;code&gt;fadd.4s&lt;/code&gt; instructions as the last example but more of them so there are slightly fewer branches and other overheads. Importantly: we’re now as similar as we can be to the C implementation.&lt;/p&gt;&lt;table&gt;&lt;row span="4"&gt;&lt;cell role="head"&gt;Model&lt;/cell&gt;&lt;cell role="head"&gt;Tokens/s&lt;/cell&gt;&lt;cell role="head"&gt;Training iterations/s&lt;/cell&gt;&lt;cell role="head"&gt;Training versus llm.c&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;llm.c&lt;/cell&gt;&lt;cell&gt;0.926&lt;/cell&gt;&lt;cell&gt;0.175&lt;/cell&gt;&lt;cell&gt;100%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Basic Swift + mutableSpan + Relaxed&lt;/cell&gt;&lt;cell&gt;0.533&lt;/cell&gt;&lt;cell&gt;0.148&lt;/cell&gt;&lt;cell&gt;85.1%&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Fast Swift&lt;/cell&gt;&lt;cell&gt;0.918&lt;/cell&gt;&lt;cell&gt;0.189&lt;/cell&gt;&lt;cell&gt;106.6%&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;C and Swift are essentially the same speed for inference and Swift is now slightly faster at training.&lt;/p&gt;&lt;p&gt;While Swift is faster here, I’m sure you could shake a few more flags at the C compiler and get it to spit out SIMD instructions and C would jump ahead again. The key point is that the two are now roughly equivalent.&lt;/p&gt;&lt;head rend="h2"&gt;Multi-threaded&lt;/head&gt;&lt;p&gt;The llm.c code contains many &lt;code&gt;#pragma&lt;/code&gt; annotations like &lt;code&gt;#pragma omp parallel for&lt;/code&gt; ahead of loops.&lt;/p&gt;&lt;p&gt;While it doesn’t run in the regular clang-compiled output used by the Swift package manager, these annotations are for OpenMP (Open Multi-Processing). OpenMP usually requires a modified C compiler but that’s how the llm.c code is intended to be run.&lt;/p&gt;&lt;p&gt;This is where I think Swift finally loses to C in terms of readability. Not only is there no easy way to tag a loop for parallelism but there’s no Swift 6 safe way to slice an Array and concurrently work on the separate slices. Approaches like &lt;code&gt;MutableSpan&lt;/code&gt; will complain that you’re concurrently accessing variables (even if they’re made from separate slices).&lt;/p&gt;&lt;code&gt;TaskGroup&lt;/code&gt; does exist, and can partly fill the same role, &lt;code&gt;DispatchQueue.concurrentPerform&lt;/code&gt; blocks until completion which is important since our &lt;code&gt;Span&lt;/code&gt; instances aren’t allowed to escape&lt;p&gt;Which means that all our mutable arrays will need to resort to using &lt;code&gt;withUnsafeMutableBufferPointer&lt;/code&gt; and &lt;code&gt;@unchecked Sendable&lt;/code&gt; wrappers so the compiler doesn’t complain about what we’re trying to do.&lt;/p&gt;&lt;p&gt;Our concurrency of choice will be &lt;code&gt;DispatchQueue.concurrentPerform&lt;/code&gt;. This is important because its closure is not marked as &lt;code&gt;@escaping&lt;/code&gt; so we can pass our immutable arrays as &lt;code&gt;Span&lt;/code&gt; without incurring copying, reference count checks or other overhead.&lt;/p&gt;&lt;code&gt;let tileCount = BT / LOOP_UNROLL
-let workerCount = max(1, ProcessInfo.processInfo.activeProcessorCount)
-let chunkSize = max(1, (tileCount + workerCount - 1) / workerCount)
-let chunkCount = (tileCount + chunkSize - 1) / chunkSize
-let bias = bias?.span
-let inp = inp.span
-let weight = weight.span
-
-out.withUnsafeMutableBufferPointer { outBuffer in
-    let outStorage = SendableUnsafeMutableBuffer(baseAddress: outBuffer.baseAddress!)
-
-    DispatchQueue.concurrentPerform(iterations: chunkCount) { chunk in
-        let startTile = chunk * chunkSize
-        let endTile = min(tileCount, startTile + chunkSize)
-
-        for tile in startTile..&amp;lt;endTile {
-            let obt = tile * LOOP_UNROLL
-
-            for o in 0..&amp;lt;OC {
-                var result = InlineArray&amp;lt;8, Float&amp;gt;(repeating: bias?[o] ?? 0)
-                let bt = inp.extracting(droppingFirst: obt * C)
-                let w = weight.extracting(droppingFirst: o * C)
-
-                for i in 0..&amp;lt;C {
-                    for r in result.indices {
-                        result[r] = Relaxed.multiplyAdd(bt[r * C + i], w[i], result[r])
-                    }
-                }
-
-                for r in result.indices {
-                    outStorage[(obt + r) * OC + o] = result[r]
-                }
-            }
-        }
-    }
-}
-&lt;/code&gt;&lt;p&gt;It’s not literally the worst code ever but:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;there’s a lot of overhead calculating the tiles and chunks and shadowing with &lt;code&gt;span&lt;/code&gt;&lt;/item&gt;&lt;item&gt;the &lt;code&gt;out.withUnsafeMutableBufferPointer&lt;/code&gt;scope and the&lt;code&gt;DispatchQueue.concurrentPerform&lt;/code&gt;scope definitely add visual clutter&lt;/item&gt;&lt;/list&gt;&lt;p&gt;This is the iteration where I think: the C code looks better. It would be a lot nicer to have a slice-and-perform-concurrently operation on &lt;code&gt;RangeReplaceableCollection&lt;/code&gt; that made this look as simple as replacing the &lt;code&gt;for&lt;/code&gt; loop line.&lt;/p&gt;&lt;p&gt;I’ve applied this pattern to the four hottest loops in the training iterations: &lt;code&gt;matmul_forward&lt;/code&gt;, &lt;code&gt;matmul_backward&lt;/code&gt;, &lt;code&gt;attention_forward&lt;/code&gt; and &lt;code&gt;attention_backward&lt;/code&gt;.&lt;/p&gt;&lt;table&gt;&lt;row span="4"&gt;&lt;cell role="head"&gt;Model&lt;/cell&gt;&lt;cell role="head"&gt;Tokens/s&lt;/cell&gt;&lt;cell role="head"&gt;Training iterations/s&lt;/cell&gt;&lt;cell role="head"&gt;Training versus llm.c&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;llm.c&lt;/cell&gt;&lt;cell&gt;0.926&lt;/cell&gt;&lt;cell&gt;0.175&lt;/cell&gt;&lt;cell&gt;100%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;llm.c (omp)&lt;/cell&gt;&lt;cell&gt;n/a&lt;/cell&gt;&lt;cell&gt;0.776&lt;/cell&gt;&lt;cell&gt;446%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Fast Swift&lt;/cell&gt;&lt;cell&gt;0.918&lt;/cell&gt;&lt;cell&gt;0.189&lt;/cell&gt;&lt;cell&gt;106.6%&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Multithreaded Swift&lt;/cell&gt;&lt;cell&gt;4.356&lt;/cell&gt;&lt;cell&gt;1.014&lt;/cell&gt;&lt;cell&gt;558.5%&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;A 5.4x improvement. Pretty good, although I have 16 cores in my CPU so a mere 5x improvement for multi-threading isn’t perfect utilization. We’re likely getting constrained by our memory traversal, now.&lt;/p&gt;&lt;p&gt;The biggest problem I see is that between loop unrolling, unsafe pointers, unchecked sendable wrappers and tracking the iterations for concurrent performing, the code is now so hideous it’s very unwieldy.&lt;/p&gt;&lt;p&gt;We can do better.&lt;/p&gt;&lt;head rend="h2"&gt;Top-secret hacks&lt;/head&gt;&lt;p&gt;I think we’ve done admirably. But it’s time to accept that if we want the fastest CPU-based matrix multiplication on Macs, we’re going to need more than the basic SIMD performance optimization that &lt;code&gt;Relaxed.multiplyAdd&lt;/code&gt; and the underlying &lt;code&gt;fmla.4s&lt;/code&gt; instructions get us.&lt;/p&gt;&lt;p&gt;So… what’s the fastest CPU instruction on Apple Silicon for matrix multiplication?&lt;/p&gt;&lt;p&gt;That’s where we arrive at a strange position: it’s a secret.&lt;/p&gt;&lt;p&gt;Apple Silicon contains a unit called the AMX (Apple Matrix Coprocessor, no relation to Intel’s AMX). I’m not sure this is the official name of this unit because Apple have never officially called it anything other than “machine learning accelerators”. The only public way to access AMX instructions is through the Accelerate framework’s BLAS implementation but using a library conflicts with this article’s premise of framework-free implementations.&lt;/p&gt;&lt;p&gt;Fortunately, people have reverse engineered how the AMX unit works so based on some of the instructions from there, let’s see if we can write a faster matrix multiplication implementation.&lt;/p&gt;&lt;quote&gt;&lt;p&gt;I’m having fun here but it should be clear: don’t use Apple’s AMX instructions directly. Go through the Accelerate framework for your own apps. Apple keep this “undocumented” so they can break binary compatibility at any time. The Accelerate framework will continue to work but this code will fail. And spoilers for the next article: Apple’s implementation is about 20% faster than mine, anyway.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;The core instruction we need is &lt;code&gt;AMX_MATFP&lt;/code&gt;. This instruction multiplies each element in a 16 element vector by each element in another 16 element vector, producing a 16 x 16 tile which is accumulated in the output tile. Doing this 16 times with appropriate input vectors can multiply an entire 16 x 16 matrix. We need to load the inputs so we also have &lt;code&gt;AMX_LDX&lt;/code&gt; and  &lt;code&gt;AMX_LDY&lt;/code&gt; and at the end, we emit the 16 x 16 accumulated tile using &lt;code&gt;AMX_STZ&lt;/code&gt;. Along with &lt;code&gt;AMX_LDZ&lt;/code&gt; (used to reset the accumulator tiles to a predefined zero tile) gives us a way to handle the inner loop of a tiled matrix multiply.&lt;/p&gt;&lt;p&gt;That means that this algorithm doesn’t show the whole loop: it’s just the inner loop and an outer loop is needed to prepare the data and unify the result. I’m just going to show the inner loop.&lt;/p&gt;&lt;code&gt;private static func amxF32_16x64(
-    outTiles: UnsafeMutablePointer&amp;lt;Float&amp;gt;,
-    lhsPanel: UnsafePointer&amp;lt;Float&amp;gt;,
-    rhsPanels: UnsafePointer&amp;lt;Float&amp;gt;,
-    innerCount: Int
-) {
-    zeroTileRow.withUnsafeBufferPointer { zeroBuffer in
-        guard let zeroBase = zeroBuffer.baseAddress else { return }
-
-        for tile in 0..&amp;lt;accumulatorCount {
-            for row in 0..&amp;lt;tileRows {
-                amx_ldz(zeroBase.amxZOperand(row: UInt32(tile + (row * accumulatorCount))))
-            }
-        }
-
-        for k in 0..&amp;lt;innerCount {
-            let lhsBase = lhsPanel + (k * tileRows)
-            amx_ldx(lhsBase.amxXYOperand)
-            for tile in 0..&amp;lt;accumulatorCount {
-                let rhsBase = rhsPanels + (tile * innerCount * tileRows) + (k * tileRows)
-                amx_ldy(rhsBase.amxXYOperand)
-                amx_matfp(amxMatFPF32 | (UInt64(tile) &amp;lt;&amp;lt; 20))
-            }
-        }
-
-        for tile in 0..&amp;lt;accumulatorCount {
-            let tileBase = outTiles + (tile * tileRows * tileRows)
-            for row in 0..&amp;lt;tileRows {
-                let rowBase = UnsafePointer&amp;lt;Float&amp;gt;(tileBase + (row * tileRows))
-                amx_stz(rowBase.amxZOperand(row: UInt32(tile + (row * accumulatorCount))))
-            }
-        }
-    }
-}
-&lt;/code&gt;&lt;p&gt;Once again, it’s not that different in shape to the &lt;code&gt;LOOP_UNROLL&lt;/code&gt; implementations that I called “Fast Swift”.&lt;/p&gt;&lt;table&gt;&lt;row span="4"&gt;&lt;cell role="head"&gt;Model&lt;/cell&gt;&lt;cell role="head"&gt;Tokens/s&lt;/cell&gt;&lt;cell role="head"&gt;Training iterations/s&lt;/cell&gt;&lt;cell role="head"&gt;Training versus llm.c&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;llm.c&lt;/cell&gt;&lt;cell&gt;0.926&lt;/cell&gt;&lt;cell&gt;0.175&lt;/cell&gt;&lt;cell&gt;100%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Multithreaded Swift&lt;/cell&gt;&lt;cell&gt;4.356&lt;/cell&gt;&lt;cell&gt;1.014&lt;/cell&gt;&lt;cell&gt;558.5%&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;AMX&lt;/cell&gt;&lt;cell&gt;5.884&lt;/cell&gt;&lt;cell&gt;1.678&lt;/cell&gt;&lt;cell&gt;958.8%&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;Another 1.67 times faster on training. Tiling requires a lot of packing and scattering of data to get our row-major matrices into the required tile shape and I’m pretty sure I could be doing a better job, there. If I was more efficient with this, it would be easily over 2 times faster.&lt;/p&gt;&lt;head rend="h2"&gt;Maximum power draw&lt;/head&gt;&lt;quote&gt;&lt;p&gt;The Metal code in this implementation is derived from an implementation by James Thompson in llm.metal. However, they used a library for matrix multiplication, so I’ve written my own Metal matrix multiplication code to keep the framework-free approach going.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;In the previous section, I was careful to say “the fastest CPU instruction on Apple Silicon for matrix multiplication” because, of course, we also have the GPU.&lt;/p&gt;&lt;p&gt;What does Metal code look like for matrix multiplication? Unlike the C and Swift code, it’s in two parts: the inner kernel (which we write in Metal/C++) and the outer invocation machinery (which stays on the Swift side).&lt;/p&gt;&lt;p&gt;First, the inner kernel:&lt;/p&gt;&lt;code&gt;kernel void matmul_forward_kernel(
-    device float* out [[buffer(0)]],
-    const device float* inp [[buffer(1)]],
-    const device float* weight [[buffer(2)]],
-    const device float* bias [[buffer(3)]],
-    constant uint&amp;amp; BT [[buffer(4)]],
-    constant uint&amp;amp; C [[buffer(5)]],
-    constant uint&amp;amp; OC [[buffer(6)]],
-    uint2 gid [[thread_position_in_grid]]
-) {
-    uint oc = gid.x;
-    uint bt = gid.y;
-    if (bt &amp;gt;= BT || oc &amp;gt;= OC) {
-        return;
-    }
-
-    float sum = bias[oc];
-    for (uint i = 0; i &amp;lt; C; i++) {
-        sum += inp[bt * C + i] * weight[oc * C + i];
-    }
-    out[bt * OC + oc] = sum;
-}
-&lt;/code&gt;&lt;p&gt;Skipping over the somewhat heavy parameter block, you can see that all this really contains is the innermost loop of the four loops in the C and Basic Swift &lt;code&gt;matmul_forward&lt;/code&gt;. Instead of loops over &lt;code&gt;B&lt;/code&gt;, &lt;code&gt;T&lt;/code&gt;, &lt;code&gt;OC&lt;/code&gt; and &lt;code&gt;C&lt;/code&gt;, we just have the loop over &lt;code&gt;C&lt;/code&gt; here.&lt;/p&gt;&lt;p&gt;Iterating over &lt;code&gt;B * T&lt;/code&gt; and &lt;code&gt;OC&lt;/code&gt; is handled in the outer machinery:&lt;/p&gt;&lt;code&gt;func matmul_forward(out: MTLBuffer, inp: MTLBuffer, weight: MTLBuffer, bias: MTLBuffer, B: Int, T: Int, C: Int, OC: Int, ctx: MetalCommandContext) {
-    ctx.compute.compute2D(
-        pipelines.matmulForward,
-        width: OC,
-        height: B * T,
-        threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1),
-        buffers: [out, inp, weight, bias],
-        uints: [UInt32(B * T), UInt32(C), UInt32(OC)]
-    )
-    ctx.endCompute()
-}
-&lt;/code&gt;&lt;p&gt;where I’ve implemented compute2D as a helper that looks like this:&lt;/p&gt;&lt;code&gt;func compute2D(
-    _ pipeline: MTLComputePipelineState,
-    width: Int,
-    height: Int,
-    threadsPerThreadgroup: MTLSize,
-    buffers: [MTLBuffer],
-    uints: [UInt32] = []
-) {
-    setComputePipelineState(pipeline)
-    for (i, buf) in buffers.enumerated() {
-        setBuffer(buf, offset: 0, index: i)
-    }
-    var uintsCopy = uints
-    for i in 0..&amp;lt;uintsCopy.count {
-        setBytes(&amp;amp;uintsCopy[i], length: MemoryLayout&amp;lt;UInt32&amp;gt;.stride, index: buffers.count + i)
-    }
-    dispatchThreads(
-        MTLSize(width: width, height: height, depth: 1),
-        threadsPerThreadgroup: threadsPerThreadgroup
-    )
-}
-&lt;/code&gt;&lt;p&gt;Do you remember when I said, about multi-threaded Swift: “It would be a lot nicer to have a slice-and-perform-concurrently operation”? That’s really what this is: carving up the &lt;code&gt;buffers&lt;/code&gt; into a set of tiles that can be concurrently acted upon. The &lt;code&gt;width&lt;/code&gt; and &lt;code&gt;height&lt;/code&gt; parameters here get translated into the &lt;code&gt;gid.x&lt;/code&gt; and &lt;code&gt;gid.y&lt;/code&gt; parameters in the kernel code, allowing us to index into the &lt;code&gt;inp&lt;/code&gt; and &lt;code&gt;weight&lt;/code&gt; buffers, in an almost identical fashion to the Basic Swift code.&lt;/p&gt;&lt;p&gt;You can see that we’re invoking the &lt;code&gt;matmulForward&lt;/code&gt; pipeline as a two dimensional set of “threads” (not CPU threads but GPU workers). If you imagine the &lt;code&gt;B&lt;/code&gt; and &lt;code&gt;T&lt;/code&gt; loops from the Basic Swift implementation flattened into a single &lt;code&gt;B * T&lt;/code&gt; then we’re literally doing the same work, just on power-hungry GPU, not the CPU.&lt;/p&gt;&lt;table&gt;&lt;row span="4"&gt;&lt;cell role="head"&gt;Model&lt;/cell&gt;&lt;cell role="head"&gt;Tokens/s&lt;/cell&gt;&lt;cell role="head"&gt;Training iterations/s&lt;/cell&gt;&lt;cell role="head"&gt;Training versus llm.c&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;llm.c&lt;/cell&gt;&lt;cell&gt;0.926&lt;/cell&gt;&lt;cell&gt;0.175&lt;/cell&gt;&lt;cell&gt;100%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;AMX&lt;/cell&gt;&lt;cell&gt;5.884&lt;/cell&gt;&lt;cell&gt;1.678&lt;/cell&gt;&lt;cell&gt;958.8%&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Basic Metal&lt;/cell&gt;&lt;cell&gt;4.29&lt;/cell&gt;&lt;cell&gt;2.302&lt;/cell&gt;&lt;cell&gt;1315.3%&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;It’s not a huge improvement over the AMX implementation. Training is slightly faster but inference is slower. For a power-hungry, high end GPU, it’s not much of an improvement.&lt;/p&gt;&lt;p&gt;As with everything else, we don’t magically get top-tier performance with the simplest, most naive approach.&lt;/p&gt;&lt;p&gt;Of course, adding “threading” on the GPU is much simpler than it was on the CPU. Doing nothing more than changing that &lt;code&gt;threadsPerThreadgroup&lt;/code&gt; parameter to &lt;code&gt;MTLSize(width: 16, height: 16, depth: 1)&lt;/code&gt; will bump our times up to&lt;/p&gt;&lt;table&gt;&lt;row span="4"&gt;&lt;cell role="head"&gt;Model&lt;/cell&gt;&lt;cell role="head"&gt;Tokens/s&lt;/cell&gt;&lt;cell role="head"&gt;Training iterations/s&lt;/cell&gt;&lt;cell role="head"&gt;Training versus llm.c&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;llm.c&lt;/cell&gt;&lt;cell&gt;0.926&lt;/cell&gt;&lt;cell&gt;0.175&lt;/cell&gt;&lt;cell&gt;100%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;AMX&lt;/cell&gt;&lt;cell&gt;5.884&lt;/cell&gt;&lt;cell&gt;1.678&lt;/cell&gt;&lt;cell&gt;958.8%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Basic Metal&lt;/cell&gt;&lt;cell&gt;4.29&lt;/cell&gt;&lt;cell&gt;2.302&lt;/cell&gt;&lt;cell&gt;1315.3%&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Threaded Metal&lt;/cell&gt;&lt;cell&gt;6.211&lt;/cell&gt;&lt;cell&gt;3.858&lt;/cell&gt;&lt;cell&gt;2204.6%&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;An easy win, if not a huge improvement.&lt;/p&gt;&lt;p&gt;What we really need to do is start tiling the matrix â similar to how the AMX solution worked â so we’re accessing memory in a more-local way (rather than traversing the entire long rows on each inner loop).&lt;/p&gt;&lt;p&gt;There are people who love writing tight kernels and tile packing and scattering, but it’s not really my strength. Here’s my best effort at a Metal tiling kernel:&lt;/p&gt;&lt;code&gt;kernel void matmul_forward_kernel(
-    device float* out [[buffer(0)]],
-    const device float* inp [[buffer(1)]],
-    const device float* weight [[buffer(2)]],
-    constant uint&amp;amp; BT [[buffer(3)]],
-    constant uint&amp;amp; C [[buffer(4)]],
-    constant uint&amp;amp; OC [[buffer(5)]],
-    uint2 gid [[thread_position_in_grid]],
-    uint2 lid [[thread_position_in_threadgroup]]
-) {
-    threadgroup float inpTile[MATMUL_TILE][MATMUL_TILE];
-    threadgroup float weightTile[MATMUL_TILE][MATMUL_TILE];
-
-    uint oc = gid.x;
-    uint bt = gid.y;
-    bool inBounds = bt &amp;lt; BT &amp;amp;&amp;amp; oc &amp;lt; OC;
-    float sum = 0.0f;
-
-    for (uint kBase = 0; kBase &amp;lt; C; kBase += MATMUL_TILE) {
-        uint inpK = kBase + lid.x;
-        uint weightK = kBase + lid.y;
-        inpTile[lid.y][lid.x] = (bt &amp;lt; BT &amp;amp;&amp;amp; inpK &amp;lt; C) ? inp[bt * C + inpK] : 0.0f;
-        weightTile[lid.y][lid.x] = (oc &amp;lt; OC &amp;amp;&amp;amp; weightK &amp;lt; C) ? weight[oc * C + weightK] : 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint k = 0; k &amp;lt; MATMUL_TILE; k++) {
-            sum += inpTile[lid.y][k] * weightTile[k][lid.x];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (inBounds) {
-        out[bt * OC + oc] = sum;
-    }
-}
-&lt;/code&gt;&lt;p&gt;As we’ve seen in previous attempts to optimize: this is much harder to read but it does provide another incremental improvement.&lt;/p&gt;&lt;p&gt;Since this is as far as I’m going to go with it, let’s take a look at the complete table:&lt;/p&gt;&lt;table&gt;&lt;row span="4"&gt;&lt;cell role="head"&gt;Model&lt;/cell&gt;&lt;cell role="head"&gt;Tokens/s&lt;/cell&gt;&lt;cell role="head"&gt;Training iterations/s&lt;/cell&gt;&lt;cell role="head"&gt;Training versus llm.c&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;llm.c&lt;/cell&gt;&lt;cell&gt;0.926&lt;/cell&gt;&lt;cell&gt;0.175&lt;/cell&gt;&lt;cell&gt;100%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;llm.c (omp)&lt;/cell&gt;&lt;cell&gt;n/a&lt;/cell&gt;&lt;cell&gt;0.776&lt;/cell&gt;&lt;cell&gt;446%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Basic Swift&lt;/cell&gt;&lt;cell&gt;0.054&lt;/cell&gt;&lt;cell&gt;0.014&lt;/cell&gt;&lt;cell&gt;7.3%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Basic Swift + mutableSpan&lt;/cell&gt;&lt;cell&gt;0.056&lt;/cell&gt;&lt;cell&gt;0.042&lt;/cell&gt;&lt;cell&gt;24.0%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Basic Swift + mutableSpan + Relaxed&lt;/cell&gt;&lt;cell&gt;0.533&lt;/cell&gt;&lt;cell&gt;0.148&lt;/cell&gt;&lt;cell&gt;85.1%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Fast Swift&lt;/cell&gt;&lt;cell&gt;0.918&lt;/cell&gt;&lt;cell&gt;0.189&lt;/cell&gt;&lt;cell&gt;106.6%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Multithreaded Swift&lt;/cell&gt;&lt;cell&gt;4.356&lt;/cell&gt;&lt;cell&gt;1.014&lt;/cell&gt;&lt;cell&gt;558.5%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;AMX&lt;/cell&gt;&lt;cell&gt;5.884&lt;/cell&gt;&lt;cell&gt;1.678&lt;/cell&gt;&lt;cell&gt;958.8%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Basic Metal&lt;/cell&gt;&lt;cell&gt;4.29&lt;/cell&gt;&lt;cell&gt;2.302&lt;/cell&gt;&lt;cell&gt;1315.3%&lt;/cell&gt;&lt;/row&gt;&lt;row span="4"&gt;&lt;cell&gt;Threaded Metal&lt;/cell&gt;&lt;cell&gt;6.211&lt;/cell&gt;&lt;cell&gt;3.858&lt;/cell&gt;&lt;cell&gt;2204.6%&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Tiled Metal&lt;/cell&gt;&lt;cell&gt;11.123&lt;/cell&gt;&lt;cell&gt;5.351&lt;/cell&gt;&lt;cell&gt;3057.7%&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;We’ve finally exceeded a TFLOP/s of computing performance.&lt;/p&gt;&lt;p&gt;Is 1.1 Tflop/s good? Theoretically, the GPU on my M3 Max is capable of around 15 Tflop/s. But the real ceiling for this kind of task is going to be 3-5 Tflop/s (for a number of different reasons) â definitely more than the performance I’m getting out of my handwritten Metal matrix code but not an order of magnitude more.&lt;/p&gt;&lt;p&gt;There’s an interesting question here: I have a high-end GPU. On a base M-series chip, would the performance ratio between AMX unit and GPU change?&lt;/p&gt;&lt;head rend="h2"&gt;Test harness&lt;/head&gt;&lt;p&gt;You can download the code and test harness app from CwlLlmSwift. You will also need to download the llmc-starter-pack used by Andrej Karpathy’s llm.c. NOTE that cloning llmc-starter-pack correctly requires &lt;code&gt;git-xet&lt;/code&gt; installed:&lt;/p&gt;&lt;code&gt;brew install git-xet
-git xet install
-&lt;/code&gt;&lt;p&gt;Without git-xet, the files in the starter pack won’t download correctly and selecting them in the app will give errors about the training file not being UInt16 weights.&lt;/p&gt;&lt;p&gt;When you start the app for the first time, it’ll show an open dialog but you’ll want to hit the “New document” button. This will show a blank document that will require you to select the following documents from the llmc-starter-pack:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;gpt2_124M.bin (checkpoint)&lt;/item&gt;&lt;item&gt;tiny_shakespeare_train.bin (training data)&lt;/item&gt;&lt;item&gt;tiny_shakespeare_val.bin (validation data)&lt;/item&gt;&lt;item&gt;gpt2_tokenizer.bin (tokenizer)&lt;/item&gt;&lt;/list&gt;&lt;p&gt;Then hit the “Create” button to create the dataset. Once the dataset is created, you can run training, inference or comparisons and save the dataset as a document.&lt;/p&gt;&lt;p&gt;To be clear: the actual GPT-2 style LLM is pretty mediocre (it is only a 124-million-parameter model, where most LLMs start in the billions of parameters). Here’s an example of the model at the gpt2_124M.bin checkpoint (before running any post-training):&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Prompt: The quick brown fox&lt;/p&gt;&lt;lb/&gt;Generation: would register the decision to slowdown his steps as he held out his right paw to hold up place. As Cas mornarye yelped as the fox clutched at his paw his temper ground up. “You sure you’re not scared of birds?”&lt;/quote&gt;&lt;p&gt;And after 500 iterations of post-training on Shakespeare:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Prompt: The quick brown fox&lt;/p&gt;&lt;lb/&gt;Generation: charged,&lt;lb/&gt;Barking as he did,&lt;lb/&gt;To fight withanna in his bosom,&lt;lb/&gt;On one occasion dying:&lt;lb/&gt;No fault is his life, for there blood being out. ’tis I;&lt;lb/&gt;I did mean death, though it be by the water.&lt;/quote&gt;&lt;p&gt;Both examples look okay from a distance but are somewhat incoherent in the details. Not exactly AGI.&lt;/p&gt;&lt;p&gt;For comparison, here’s what I get out of &lt;code&gt;LanguageModelSession&lt;/code&gt;, Apple’s Foundation model built into iOS/macOS 26, where the only “training” needed is the prompt you give it:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Prompt: Turn the prompt “The quick brown fox” into a few lines of verse in Shakespearean language and meter.&lt;/p&gt;&lt;lb/&gt;Generation: Upon the heath, a swift fox doth roam,&lt;lb/&gt;His coat of brown, like autumn’s golden hue,&lt;lb/&gt;With nimble steps, he darts through the foam,&lt;lb/&gt;A creature swift, both bold and true.&lt;/quote&gt;&lt;p&gt;I don’t think this model has really nailed iambic pentameter but it’s at least coherent. If you need a quick and readily available LLM on macOS, use Apple’s Foundation model. But the point of this series isn’t to show how to create the best model, it’s merely to explore how to run a model and perform post-training.&lt;/p&gt;&lt;head rend="h2"&gt;Conclusion&lt;/head&gt;&lt;quote&gt;&lt;p&gt;This article was about looking at how to optimize code and gaining appreciation for the work that needs to go into optimizing the matrix multiplications in machine learning libraries. None of this code should be considered a good choice for production. In the next article, I’ll look at BLAS, BNNS, CoreML, MPSGraph and other high performance libraries built into macOS. These libraries are all either more efficient or more performant than the options I’ve shown here.&lt;/p&gt;&lt;/quote&gt;&lt;p&gt;We took a basic Swift implementation of matrix multiplication and made it 382 times faster, taking it from 2.8 Gflop/s to 1.1 Tflop/s. In the process, we’ve seen the scaling capability from unoptimized code, slightly improved code, to SIMD optimized code, to multithreaded code, to running on special units, to GPU compute shaders.&lt;/p&gt;&lt;p&gt;The first 72 times increase occurred due to the basic Swift optimizations you should consider for any algorithm:&lt;/p&gt;&lt;list rend="ul"&gt;&lt;item&gt;Avoid &lt;code&gt;Array&lt;/code&gt;copy-on-write/reference-check overhead (Swift should have applied this automatically; it is maybe just a bug)&lt;/item&gt;&lt;item&gt;Use some SIMD optimized fused-multiply-add instructions in Swift (by “relaxing” constraints using the Numerics library)&lt;/item&gt;&lt;item&gt;Restructured loops so the traversal is more efficient and SIMD pipelining works better&lt;/item&gt;&lt;item&gt;Parallelize using &lt;code&gt;DispatchQueue.concurrentPerform&lt;/code&gt;&lt;/item&gt;&lt;/list&gt;&lt;p&gt;As always, high performance Swift has plenty of curve-balls to throw but it’s always possible to get Swift as fast as C. This time, Swift ended up faster due to Swift choosing slightly better SIMD instructions (although I’m sure there’s a way to get C to use the same SIMD versions of FMA for the same performance).&lt;/p&gt;&lt;p&gt;The question is never whether Swift can be fast, but rather: will Swift look better when you get there? I think Swift held up well until the multi-threaded implementation. Using &lt;code&gt;withUnsafeMutableBuffer&lt;/code&gt; ruins the aesthetics of any function. I wish Swift had functions for performing mutations over subranges of an array to do this elegantly, safely and with good performance.&lt;/p&gt;&lt;p&gt;Moving beyond typical Swift optimization, using AMX instructions got us another 70% faster using operations on Apple Silicon designed for larger matrix operations. The final boost came from moving to the graphics card. In both these cases, you’d get much better results from a developer skilled in tiled matrix operations. My efforts were “okay” but I know that performance could be 30% better if I really knew what I was doing.&lt;/p&gt;&lt;p&gt;But 382 times faster still isn’t fast enough. Even this example gave us less than 12 tokens per second â a speed which might be barely passable in some cases but for a model this small is laughably slow.&lt;/p&gt;&lt;p&gt;Clearly, we’ve got further to go.&lt;/p&gt;&lt;p&gt;Apple have lots of other frameworks for training neural networks and the final implementation in this series will knock out more than 20 training iterations before most of the implementations in this article have spat out their first.&lt;/p&gt;&lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.cocoawithlove.com/blog/matrix-multiplications-swift.html"/><published>2026-05-10T17:05:05+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48094641</id><title>Google says criminal hackers used AI to find a major software flaw</title><updated>2026-05-12T10:22:11.933110+00:00</updated><content/><link href="https://www.nytimes.com/2026/05/11/us/politics/google-hackers-attack-ai.html"/><published>2026-05-11T13:20:14+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48096842</id><title>Show HN: TikTok but for scientific papers</title><updated>2026-05-12T10:22:11.884940+00:00</updated><content>&lt;doc fingerprint="ffce7abb0d7ebaba"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Discover the right papers, understand them faster, and stay close to the conversations shaping your field.&lt;/p&gt;
-    &lt;p&gt;From personalized discovery to AI-powered understanding — Papel transforms how you interact with academic research.&lt;/p&gt;
-    &lt;p&gt;Papers ranked by your interests, trending topics, freshness, and community engagement. Choose a feed mode in Settings when you want Latest instead of recommendations.&lt;/p&gt;
-    &lt;p&gt;Ask questions about any paper and get grounded answers from the full PDF — powered entirely on-device using Apple Intelligence or local MLX models.&lt;/p&gt;
-    &lt;p&gt;AI-generated quizzes on every paper. Score perfectly to earn +50 XP, maintain streaks, and climb the academic ranks from Undergrad to Nobel Laureate.&lt;/p&gt;
-    &lt;p&gt;Like and comment on papers, share discoveries with colleagues via direct messages, and build your academic profile in a community that values knowledge.&lt;/p&gt;
-    &lt;p&gt;Be the first to know when Papel hits the App Store. Drop your email and we'll notify you on launch day.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://andreaturchet.github.io/website/index.html"/><published>2026-05-11T16:05:50+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48097078</id><title>Interfaze: A new model architecture built for high accuracy at scale</title><updated>2026-05-12T10:22:11.667805+00:00</updated><content>&lt;doc fingerprint="55e8fba1d3286ae"&gt;
-  &lt;main&gt;
-    &lt;p&gt;copy markdown&lt;/p&gt;
-    &lt;p&gt;tl;dr: Interfaze is a new model architecture that outperforms models like Gemini-3-Flash, Claude-Sonnet-4.6, GPT-5.4-Mini, and Grok-4.3 across 9 head-to-head benchmarks in OCR, vision, STT, and structured output.&lt;/p&gt;
-    &lt;p&gt;Humans are inefficient at computer-level tasks. We make mistakes, but we're great at decision-making and understanding nuance.&lt;/p&gt;
-    &lt;p&gt;Imagine telling a human to read a 50-page PDF, map every word to another document with its XY position, and translate the whole thing into Chinese. You'd get tons of mistakes, pay a lot to keep that human on payroll, and wait a long time for the result.&lt;/p&gt;
-    &lt;p&gt;Transformer models are similar. They're amazing at nuance and human-level tasks, and they make mistakes like a human, but that's also what keeps them creative.&lt;/p&gt;
-    &lt;p&gt;We've been using the wrong models for the wrong tasks.&lt;/p&gt;
-    &lt;p&gt;CNNs/DNNs have existed since the early 90s, from LeNet-5 to ResNet, and more recently CRNN-CTC.&lt;/p&gt;
-    &lt;p&gt;These are deep neural network architectures that are task-specific for things like OCR, translation, or GUI detection. The way they consume and see data is trained to be task specific, which makes them up to 100x more accurate at their specific task. They also produce useful metadata like bounding boxes and confidence scores, letting developers build predictable workflows they can rely on.&lt;/p&gt;
-    &lt;p&gt;So why do so many of us still go for transformers/LLMs for deterministic tasks?&lt;/p&gt;
-    &lt;p&gt;DNNs are not flexible. They're only as good as their training data, and they aren't great at human-level nuance.&lt;/p&gt;
-    &lt;p&gt;They might be cheap to serve but expensive to maintain and retrain for new tasks. Take a passport: a CNN can extract the date of birth with bounding boxes and a confidence score, but it can't calculate the person's age.&lt;/p&gt;
-    &lt;p&gt;A new model architecture that merges the specialization of DNN/CNN models with omni-transformers, giving you the best of both worlds.&lt;/p&gt;
-    &lt;p&gt;That means high accuracy and low cost on deterministic tasks:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;Feature&lt;/cell&gt;
-        &lt;cell role="head"&gt;Value&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Context window&lt;/cell&gt;
-        &lt;cell&gt;1M tokens&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Max output tokens&lt;/cell&gt;
-        &lt;cell&gt;32k tokens&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Input modalities&lt;/cell&gt;
-        &lt;cell&gt;Text, Images, Audio, File&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Reasoning&lt;/cell&gt;
-        &lt;cell&gt;Available (default: disabled)&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;While Pro tier models like Claude Opus 4.7 and GPT 5.5 are the best generalist models in the market today for things like coding and complex reasoning tasks, they aren't commonly used for high volume tasks like OCR or translation due to high cost and slow response times.&lt;/p&gt;
-    &lt;p&gt;Interfaze is benchmarked against models in similar pricing tiers and feature sets that are optimized to squeeze the most performance out of the model at the fastest speed, while keeping cost low at scale.&lt;/p&gt;
-    &lt;p&gt;Today, most people reach for two model categories for deterministic developer tasks:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="6"&gt;
-        &lt;cell role="head"&gt;Benchmark&lt;/cell&gt;
-        &lt;cell role="head"&gt;Interfaze&lt;/cell&gt;
-        &lt;cell role="head"&gt;Gemini-3-Flash&lt;/cell&gt;
-        &lt;cell role="head"&gt;Claude-Sonnet-4.6&lt;/cell&gt;
-        &lt;cell role="head"&gt;GPT-5.4-Mini&lt;/cell&gt;
-        &lt;cell role="head"&gt;Grok-4.3&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="6"&gt;
-        &lt;cell&gt;OCRBench V2&lt;/cell&gt;
-        &lt;cell&gt;70.7%&lt;/cell&gt;
-        &lt;cell&gt;55.8%&lt;/cell&gt;
-        &lt;cell&gt;54.7%&lt;/cell&gt;
-        &lt;cell&gt;52.7%&lt;/cell&gt;
-        &lt;cell&gt;54.7%&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="6"&gt;
-        &lt;cell&gt;olmOCR&lt;/cell&gt;
-        &lt;cell&gt;85.7%&lt;/cell&gt;
-        &lt;cell&gt;75.3%&lt;/cell&gt;
-        &lt;cell&gt;73.9%&lt;/cell&gt;
-        &lt;cell&gt;80.1%&lt;/cell&gt;
-        &lt;cell&gt;81.9%&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="6"&gt;
-        &lt;cell&gt;RefCOCO&lt;/cell&gt;
-        &lt;cell&gt;82.1%&lt;/cell&gt;
-        &lt;cell&gt;75.2%&lt;/cell&gt;
-        &lt;cell&gt;75.5%&lt;/cell&gt;
-        &lt;cell&gt;67.0%&lt;/cell&gt;
-        &lt;cell&gt;25.0%&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="6"&gt;
-        &lt;cell&gt;VoxPopuli (WER) ↓&lt;/cell&gt;
-        &lt;cell&gt;2.4%&lt;/cell&gt;
-        &lt;cell&gt;4.0%&lt;/cell&gt;
-        &lt;cell&gt;—&lt;/cell&gt;
-        &lt;cell&gt;—&lt;/cell&gt;
-        &lt;cell&gt;—&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="6"&gt;
-        &lt;cell&gt;Spider 2.0-Lite&lt;/cell&gt;
-        &lt;cell&gt;52.9%&lt;/cell&gt;
-        &lt;cell&gt;45.2%&lt;/cell&gt;
-        &lt;cell&gt;49.6%&lt;/cell&gt;
-        &lt;cell&gt;26.7%&lt;/cell&gt;
-        &lt;cell&gt;45.9%&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="6"&gt;
-        &lt;cell&gt;GPQA Diamond&lt;/cell&gt;
-        &lt;cell&gt;89.9%&lt;/cell&gt;
-        &lt;cell&gt;88.5%&lt;/cell&gt;
-        &lt;cell&gt;89.9%&lt;/cell&gt;
-        &lt;cell&gt;82.8%&lt;/cell&gt;
-        &lt;cell&gt;73.6%&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="6"&gt;
-        &lt;cell&gt;MMMLU&lt;/cell&gt;
-        &lt;cell&gt;90.9%&lt;/cell&gt;
-        &lt;cell&gt;88.7%&lt;/cell&gt;
-        &lt;cell&gt;84.9%&lt;/cell&gt;
-        &lt;cell&gt;75.3%&lt;/cell&gt;
-        &lt;cell&gt;89.7%&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="6"&gt;
-        &lt;cell&gt;MMMU-Pro&lt;/cell&gt;
-        &lt;cell&gt;71.1%&lt;/cell&gt;
-        &lt;cell&gt;67.6%&lt;/cell&gt;
-        &lt;cell&gt;46.3%&lt;/cell&gt;
-        &lt;cell&gt;40.4%&lt;/cell&gt;
-        &lt;cell&gt;68.7%&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;SOB Value Acc&lt;/cell&gt;
-        &lt;cell&gt;79.5%&lt;/cell&gt;
-        &lt;cell&gt;77.3%&lt;/cell&gt;
-        &lt;cell&gt;77.9%&lt;/cell&gt;
-        &lt;cell&gt;75.1%&lt;/cell&gt;
-        &lt;cell&gt;78.4%&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;↓ = lower is better (word error rate). — = not scored (model has no native audio input). All other rows: higher is better.&lt;/p&gt;
-    &lt;p&gt;Each model is compared head-to-head across nine benchmarks: OCRBench V2, olmOCR, RefCOCO, VoxPopuli-Cleaned-AA, SOB Value, Spider-2.0-Lite, GPQA Diamond, MMMLU, and MMMU-Pro.&lt;/p&gt;
-    &lt;p&gt;Interfaze leads in almost every benchmark, against both specialized models in each category and the generalist flash/mini models.&lt;/p&gt;
-    &lt;p&gt;Our goal isn't to replace LLMs. It's to specialize in deterministic tasks. The benchmarks focus on categories like OCR, object detection, and structured output, with a few general benchmarks like GPQA Diamond to show the level of problem-solving and understanding you'd expect from any transformer model.&lt;/p&gt;
-    &lt;p&gt;Interfaze is priced in a similar range as Gemini-3-Flash, at $1.50 per million input tokens and $3.50 per million output tokens.&lt;/p&gt;
-    &lt;p&gt;Our number one use case from users has been OCR for images and complex, long PDFs.&lt;/p&gt;
-    &lt;p&gt;Interfaze outperforms OCR providers like Chandra OCR and Reducto, and generalist models like Gemini-3-Flash and GPT-5.4-Mini.&lt;/p&gt;
-    &lt;p&gt;It isn't just the task-specific CNN encoder doing a good job. It's the ability to lean on object detection for figures and graphics, or lean on the translation layers of the transformer all in a shared vector space.&lt;/p&gt;
-    &lt;p&gt;Most LLMs today are great at following a JSON schema, but pretty bad at filling it with accurate values. No public benchmark measures the accuracy of those values, so we released SOB (the Structured Output Benchmark) last week.&lt;/p&gt;
-    &lt;p&gt;TL;DR: SOB gives the model the correct answer in its context, then asks it to generate a JSON output with data it already has. We measure who is the most accurate, with the fewest mistakes and hallucinations, across text, image, and audio modalities (all normalized to text).&lt;/p&gt;
-    &lt;p&gt;Compared against the same flash/mini set used throughout this post. See the full SOB leaderboard for all 28 models, including frontier Pro-tier models like Gemini-3.1-Pro, GPT-5.5, and Claude-Opus-4.7.&lt;/p&gt;
-    &lt;p&gt;There's still huge room for improving structured output without raising cost or compute. Follow us on X or LinkedIn to follow our research journey.&lt;/p&gt;
-    &lt;p&gt;Interfaze has great multilingual performance across a wide range of languages.&lt;/p&gt;
-    &lt;p&gt;On VoxPopuli-Cleaned-AA, Interfaze comes in second on word error rate.&lt;/p&gt;
-    &lt;p&gt;Interfaze transcribes 209 seconds of audio per second of compute, ~1.5× faster than Deepgram Nova-3, ~8× faster than Scribe v2, and over 11× faster than Gemini-3-Flash.&lt;/p&gt;
-    &lt;p&gt;View full VoxPopuli benchmarks →&lt;/p&gt;
-    &lt;p&gt;Interfaze speaks the Chat Completions API standard, so any AI SDK that supports OpenAI works out of the box: just point it at &lt;code&gt;https://api.interfaze.ai/v1&lt;/code&gt;. Grab your API key from the Interfaze dashboard and drop it in.&lt;/p&gt;
-    &lt;p&gt;OpenAI SDK&lt;/p&gt;
-    &lt;p&gt;Vercel AI SDK&lt;/p&gt;
-    &lt;p&gt;LangChain SDK&lt;/p&gt;
-    &lt;code&gt;import OpenAI from "openai";
-
-const interfaze = new OpenAI({
-	baseURL: "https://api.interfaze.ai/v1",
-	apiKey: "&amp;lt;your-api-key&amp;gt;",
-});&lt;/code&gt;
-    &lt;p&gt;The same &lt;code&gt;interfaze&lt;/code&gt; client is reused in every example below.&lt;/p&gt;
-    &lt;p&gt;A magazine page with dense multi-column text and three illustrations. Interfaze runs OCR and object detection on the same image in one request, returning the full text plus pixel-coordinates for every figure, all under your schema.&lt;/p&gt;
-    &lt;p&gt;OpenAI SDK&lt;/p&gt;
-    &lt;p&gt;Vercel AI SDK&lt;/p&gt;
-    &lt;p&gt;LangChain SDK&lt;/p&gt;
-    &lt;code&gt;import { z } from "zod";
-import { zodResponseFormat } from "openai/helpers/zod";
-
-const OCRObjectDetectionSchema = z.object({
-	text: z.string().describe("all text in the image"),
-	graphic_objects: z
-		.array(
-			z.object({
-				description: z.string(),
-				top_left_x: z.number(),
-				top_left_y: z.number(),
-				bottom_right_x: z.number(),
-				bottom_right_y: z.number(),
-			})
-		)
-		.describe("graphics objects found in the image"),
-});
-
-const response = await interfaze.chat.completions.create({
-	model: "interfaze-beta",
-	messages: [
-		{
-			role: "user",
-			content: [
-				{ type: "text", text: "Extract the text and graphics from the image based on the schema." },
-				{
-					type: "image_url",
-					image_url: {
-						url: "https://r2public.jigsawstack.com/interfaze/examples/dense_text_ocr_figures.png",
-					},
-				},
-			],
-		},
-	],
-	response_format: zodResponseFormat(OCRObjectDetectionSchema, "ocr_object_detection_schema"),
-});
-
-console.log(response.choices[0].message.content);
-
-//@ts-expect-error precontext is not typed
-const precontext = response.precontext;
-console.log("OCR bounding boxes + confidence:", precontext[0]?.result);&lt;/code&gt;
-    &lt;p&gt;JSON output&lt;/p&gt;
-    &lt;p&gt;&lt;code&gt;object&lt;/code&gt; carries the schema response: full page text plus a &lt;code&gt;graphic_objects&lt;/code&gt; array with a description and pixel coordinates for each illustration. &lt;code&gt;precontext&lt;/code&gt; carries the raw OCR (per-line and per-word bounding boxes, confidence scores) on the same response.&lt;/p&gt;
-    &lt;code&gt;{
-  "object": {
-    "text": "cane stopped on the corner and yelled... acter named Dick Manly. He was so observant... STOMPING GROUND ... \"The Adding Machine,\" from 1923, is about Mr. Zero, a repressed number cruncher who gets replaced by an adding machine... 12 THE NEW YORKER, APRIL 27, 2026",
-    "graphic_objects": [
-      {
-        "description": "A drawing located at the top left under the \"STOMPING GROUND\" heading, featuring a cityscape with a moon and a whimsical character.",
-        "top_left_x": 84,
-        "top_left_y": 484,
-        "bottom_right_x": 394,
-        "bottom_right_y": 630
-      },
-      {
-        "description": "A detailed line drawing of Daphne Rubin-Vega in front of a building facade, matching the main profile story.",
-        "top_left_x": 77,
-        "top_left_y": 1367,
-        "bottom_right_x": 517,
-        "bottom_right_y": 1878
-      },
-      {
-        "description": "A drawing in the bottom right corner depicting a person interacting with a device, situated above the spray-on condom text.",
-        "top_left_x": 985,
-        "top_left_y": 1581,
-        "bottom_right_x": 1264,
-        "bottom_right_y": 1737
-      }
-    ]
-  },
-  "precontext": [
-    {
-      "name": "ocr",
-      "result": {
-        "extracted_text": "cane stopped on the corner and yelled he wrote science fiction-and observant. acter named Dick Manly. He was so\nout, \"What is that?\" \"I remember my mother coming home...",
-        "sections": [
-          {
-            "lines": [
-              {
-                "text": "cane stopped on the corner and yelled he wrote science fiction-and observant. acter named Dick Manly. He was so",
-                "bounds": {
-                  "top_left": { "x": 83, "y": 80 },
-                  "top_right": { "x": 1406, "y": 78 },
-                  "bottom_right": { "x": 1406, "y": 111 },
-                  "bottom_left": { "x": 83, "y": 110 },
-                  "width": 1323,
-                  "height": 30
-                },
-                "average_confidence": 0.99
-              }
-              // ... hundreds more lines with per-word boxes and confidences
-            ]
-          }
-        ]
-      }
-    }
-  ]
-}&lt;/code&gt;
-    &lt;p&gt;With our hybrid architecture, you can activate parts of the model to run a specific task without using the full weights.&lt;/p&gt;
-    &lt;p&gt;It's faster and cheaper, with some tradeoffs, you get a fixed structured output that's deterministic and consistent on every run, and you can only run one task per request.&lt;/p&gt;
-    &lt;p&gt;Using the &lt;code&gt;&amp;lt;task&amp;gt;&lt;/code&gt; tag in the system prompt, you control which part of the model activates. Below, we run pure OCR on a handwritten poem.&lt;/p&gt;
-    &lt;p&gt;OpenAI SDK&lt;/p&gt;
-    &lt;p&gt;Vercel AI SDK&lt;/p&gt;
-    &lt;p&gt;LangChain SDK&lt;/p&gt;
-    &lt;code&gt;import { z } from "zod";
-import { zodResponseFormat } from "openai/helpers/zod";
-
-const response = await interfaze.chat.completions.create({
-	model: "interfaze-beta",
-	messages: [
-		{ role: "system", content: "&amp;lt;task&amp;gt;ocr&amp;lt;/task&amp;gt;" },
-		{
-			role: "user",
-			content: [
-				{ type: "text", text: "Extract all text from this image" },
-				{
-					type: "image_url",
-					image_url: {
-						url: "https://r2public.jigsawstack.com/interfaze/examples/handwriting.jpeg",
-					},
-				},
-			],
-		},
-	],
-	response_format: zodResponseFormat(z.any(), "empty_schema"),
-});
-
-console.log(response.choices[0].message.content);&lt;/code&gt;
-    &lt;p&gt;JSON output&lt;/p&gt;
-    &lt;p&gt;The response is the raw task result with &lt;code&gt;name&lt;/code&gt; and &lt;code&gt;result&lt;/code&gt;, ready to consume directly.&lt;/p&gt;
-    &lt;code&gt;{
-  "name": "ocr",
-  "result": {
-    "extracted_text": "The lovely Song night may song linen shined\nWelcome and faint wei my heart was beating\nthe reseach on the moon the violet beautifull\nThe artist's evening song our love new life\n...",
-    "sections": [
-      {
-        "lines": [
-          {
-            "text": "The lovely Song night may song linen shined",
-            "bounds": {
-              "top_left": { "x": 27, "y": 22 },
-              "top_right": { "x": 422, "y": 21 },
-              "bottom_right": { "x": 423, "y": 47 },
-              "bottom_left": { "x": 27, "y": 51 },
-              "width": 395.5,
-              "height": 27.5
-            },
-            "average_confidence": 0.78
-          }
-          // ... more lines with per-word boxes and confidences
-        ]
-      }
-    ]
-  }
-}&lt;/code&gt;
-    &lt;p&gt;Learn more about running tasks →&lt;/p&gt;
-    &lt;p&gt;Interfaze comes built in with its own web index from scraping multiple SERP indexes and our own crawler.&lt;/p&gt;
-    &lt;p&gt;OpenAI SDK&lt;/p&gt;
-    &lt;p&gt;Vercel AI SDK&lt;/p&gt;
-    &lt;p&gt;LangChain SDK&lt;/p&gt;
-    &lt;code&gt;import { z } from "zod";
-import { zodResponseFormat } from "openai/helpers/zod";
-
-const GarryTanSchema = z.object({
-	linkedin_url: z.string(),
-	x_url: z.string(),
-	first_name: z.string(),
-	last_name: z.string(),
-	location: z.string(),
-	latest_education: z.string(),
-	current_job: z.string(),
-	followers: z.number(),
-	experience: z.array(
-		z.object({
-			company: z.string(),
-			title: z.string(),
-			start_date: z.string(),
-			end_date: z.string(),
-		})
-	),
-});
-
-const response = await interfaze.chat.completions.create({
-	model: "interfaze-beta",
-	messages: [{ role: "user", content: "Enrichment information of Garry Tan, Y Combinator" }],
-	response_format: zodResponseFormat(GarryTanSchema, "garry_tan_enrichment_schema"),
-});
-
-console.log(response.choices[0].message.content);
-
-//@ts-expect-error precontext is not typed
-const precontext = response.precontext;
-console.log("Web search results:", precontext[0]?.result);&lt;/code&gt;
-    &lt;p&gt;JSON output&lt;/p&gt;
-    &lt;p&gt;&lt;code&gt;object&lt;/code&gt; returns the enriched profile typed exactly to the schema, while &lt;code&gt;precontext&lt;/code&gt; includes the raw web search results Interfaze pulled in to ground the answer.&lt;/p&gt;
-    &lt;code&gt;{
-  "object": {
-    "linkedin_url": "https://linkedin.com/in/garrytan",
-    "x_url": "https://x.com/garrytan",
-    "first_name": "Garry",
-    "last_name": "Tan",
-    "location": "San Francisco, California, United States",
-    "latest_education": "Stanford University (1999-2003), BS in Computer Systems Engineering",
-    "current_job": "President &amp;amp; CEO at Y Combinator, Founder at Garry's List, Board Partner &amp;amp; Advisor at Initialized Capital",
-    "followers": 319863,
-    "experience": [
-      {
-        "company": "Garry's List",
-        "title": "Founder",
-        "start_date": "Jan 2026",
-        "end_date": "Present"
-      },
-      {
-        "company": "Y Combinator",
-        "title": "President &amp;amp; CEO",
-        "start_date": "Jan 2023",
-        "end_date": "Present"
-      },
-      {
-        "company": "Initialized Capital",
-        "title": "Founder &amp;amp; Managing Partner",
-        "start_date": "Jan 2012",
-        "end_date": "Dec 2022"
-      },
-      {
-        "company": "Posterous.com",
-        "title": "Cofounder",
-        "start_date": "Jan 2008",
-        "end_date": "Jan 2011"
-      },
-      {
-        "company": "Palantir Technologies",
-        "title": "Lead Engineer, Designer",
-        "start_date": "Sep 2005",
-        "end_date": "Oct 2007"
-      }
-      // ... more roles
-    ]
-  },
-  "precontext": [
-    {
-      "name": "search",
-      "result": [
-        {
-          "title": "Garry Tan - President &amp;amp; CEO, Y Combinator - LinkedIn",
-          "description": "President &amp;amp; CEO of Y Combinator. Y Combinator funds hundreds of companies per year...",
-          "url": "https://www.linkedin.com/in/garrytan"
-        }
-        // ... more search results
-      ]
-    }
-  ]
-}&lt;/code&gt;
-    &lt;p&gt;The clip below is 1 hour 35 minutes of a podcast episode. Interfaze transcribes it in ~50 seconds with per-chunk timestamps.&lt;/p&gt;
-    &lt;p&gt;OpenAI SDK&lt;/p&gt;
-    &lt;p&gt;Vercel AI SDK&lt;/p&gt;
-    &lt;p&gt;LangChain SDK&lt;/p&gt;
-    &lt;code&gt;import { z } from "zod";
-import { zodResponseFormat } from "openai/helpers/zod";
-
-const response = await interfaze.chat.completions.create({
-	model: "interfaze-beta",
-	messages: [
-		{ role: "system", content: "&amp;lt;task&amp;gt;speech_to_text&amp;lt;/task&amp;gt;" },
-		{
-			role: "user",
-			content: [
-				{ type: "text", text: "Transcribe the audio file https://r2public.jigsawstack.com/interfaze/examples/stt_long_audio_sample_3.mp3" },
-			],
-		},
-	],
-	response_format: zodResponseFormat(z.any(), "empty_schema"),
-});
-
-console.log(response.choices[0].message.content);&lt;/code&gt;
-    &lt;p&gt;JSON output&lt;/p&gt;
-    &lt;p&gt;The response is the raw task result as shown below.&lt;/p&gt;
-    &lt;code&gt;{
-  "name": "speech_to_text",
-  "result": {
-    "text": "We don't teach leaders how to have uncomfortable conversations. We don't teach students how to have uncomfortable conversations. You tell me which is going to be more valuable for the rest of your life. How to have a difficult conversation or trigonometry?...",
-    "chunks": [
-      { "timestamp": [0, 3.39], "text": "We don't teach leaders how to have uncomfortable conversations. We don't teach students how" },
-      { "timestamp": [3.39, 6.79], "text": "to have uncomfortable conversations. You tell me which is going to be more valuable" },
-      { "timestamp": [6.79, 10.18], "text": "for the rest of your life. How to have a difficult conversation or trigonometry?" }
-      // ... thousands more timestamped chunks across the full 1h 35m
-    ]
-  }
-}&lt;/code&gt;
-    &lt;p&gt;We're excited to keep experimenting, growing and discovering new research that makes deterministic AI more efficient and accessible to all developers!&lt;/p&gt;
-    &lt;p&gt;Get started for free and try it on your own documents, images and prompts. We're excited to see what you build!&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://interfaze.ai/blog/interfaze-a-new-model-architecture-built-for-high-accuracy-at-scale"/><published>2026-05-11T16:22:31+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48098122</id><title>Bild AI (YC W25) Is Hiring Founding Product Engineers</title><updated>2026-05-12T10:22:11.247852+00:00</updated><content>&lt;doc fingerprint="e10fcdab2cdf53e4"&gt;
-  &lt;main&gt;
-    &lt;p&gt;You need to enable JavaScript to run this app.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://bild.ai/jobs"/><published>2026-05-11T17:43:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48098261</id><title>UCLA discovers first stroke rehabilitation drug to repair brain damage (2025)</title><updated>2026-05-12T10:22:11.120561+00:00</updated><content>&lt;doc fingerprint="a93bb745f8e1dcf0"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;UCLA discovers first stroke rehabilitation drug to repair brain damage&lt;/head&gt;
-    &lt;head rend="h2"&gt; Key Takeaways &lt;/head&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;UCLA researchers identified a loss of brain connections that stroke produces that are remote from the site of the stroke damage.&lt;/item&gt;
-      &lt;item&gt;The UCLA team found that some of the connections lost after stroke occur in a cell called a parvalbumin neuron, which helps a brain rhythm function.&lt;/item&gt;
-      &lt;item&gt;The researchers found that a drug called DDL-920, developed in the UCLA lab of Varghese John, produced significant recovery in movement control in mice.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;A new study by UCLA Health has discovered what researchers say is the first drug to fully reproduce the effects of physical stroke rehabilitation in model mice.&lt;/p&gt;
-    &lt;p&gt;The findings, published in Nature Communications, tested two candidate drugs derived from their studies on the mechanism of the brain effects of rehabilitation, one of which resulted in significant recovery in movement control after stroke in mice.&lt;/p&gt;
-    &lt;p&gt;Stroke is the leading cause of adult disability because most patients do not fully recover from the effects of stroke. There are no drugs in the field of stroke recovery, requiring stroke patients to undergo physical rehabilitation, which has shown to be only modestly effective.&lt;/p&gt;
-    &lt;p&gt;“The goal is to have a medicine that stroke patients can take that produces the effects of rehabilitation,” said Dr. S. Thomas Carmichael, the study’s lead author and professor and chair of UCLA Neurology. “Rehabilitation after stroke is limited in its actual effects because most patients cannot sustain the rehab intensity needed for stroke recovery.&lt;/p&gt;
-    &lt;p&gt;“Further, stroke recovery is not like most other fields of medicine, where drugs are available that treat the disease — such as cardiology, infectious disease or cancer,” Carmichael said. “Rehabilitation is a physical medicine approach that has been around for decades; we need to move rehabilitation into an era of molecular medicine.”&lt;/p&gt;
-    &lt;p&gt;In the study, Carmichael and his team sought to determine how physical rehabilitation improved brain function after a stroke and whether they could generate a drug that could produce these same effects.&lt;/p&gt;
-    &lt;p&gt;Working in laboratory mouse models of stroke and with stroke patients, the UCLA researchers identified a loss of brain connections that stroke produces that are remote from the site of the stroke damage. Brain cells located at a distance from the stroke site get disconnected from other neurons. As a result, brain networks do not fire together for things like movement and gait.&lt;/p&gt;
-    &lt;p&gt;The UCLA team found that some of the connections that are lost after stroke occur in a cell called a parvalbumin neuron. This type of neuron helps generate a brain rhythm, termed a gamma oscillation, which links neurons together so that they form coordinated networks to produce a behavior, such as movement. Stroke causes the brain to lose gamma oscillations. Successful physical rehabilitation in both laboratory mice and humans brought gamma oscillations back into the brain and, in the mouse model, repaired the lost connections of parvalbumin neurons.&lt;/p&gt;
-    &lt;p&gt;Carmichael and the team then identified two candidate drugs that might produce gamma oscillations after stroke. These drugs specifically work to excite parvalbumin neurons.&lt;/p&gt;
-    &lt;p&gt;The researchers found one of the drugs, DDL-920, developed in the UCLA lab of Varghese John, who coauthored the study, produced significant recovery in movement control in mice.&lt;/p&gt;
-    &lt;p&gt;This study has two major areas of impact: First, it identifies a brain substrate and circuity that underlies the effect of rehabilitation in the brain. Second, the paper then identifies a unique drug target in this rehab brain circuity to promote recovery by mimicking the main effect of physical rehab.&lt;/p&gt;
-    &lt;p&gt;Further studies are needed to understand the safety and efficacy of DDL-920 before it could be considered for human trials.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://stemcell.ucla.edu/news/ucla-discovers-first-stroke-rehabilitation-drug-repair-brain-damage"/><published>2026-05-11T17:53:08+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48099616</id><title>Library for fast mapping of Java records to native memory</title><updated>2026-05-12T10:22:10.568078+00:00</updated><content>&lt;doc fingerprint="34f88c398c15a4b8"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-05-12T12:22:06.321938+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=48099616</id><title>Library for fast mapping of Java records to native memory</title><updated>2026-05-12T12:22:16.768548+00:00</updated><content>&lt;doc fingerprint="34f88c398c15a4b8"&gt;
   &lt;main&gt;
     &lt;p&gt;Typed off-heap memory for Java 25 and greater.&lt;/p&gt;
     &lt;p&gt;TypedMemory is a Java library for working with contiguous off-heap memory through strongly typed views. It builds on the Java Foreign Function &amp;amp; Memory (FFM) API and lets you map Java record types onto native memory with a simple, expressive API.&lt;/p&gt;
@@ -1020,7 +235,7 @@ mem.type();&lt;/code&gt;
     &lt;p&gt;TypedMemory is licensed under Apache License 2.0&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/mamba-studio/TypedMemory"/><published>2026-05-11T19:33:31+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48100433</id><title>If AI writes your code, why use Python?</title><updated>2026-05-12T10:22:10.436083+00:00</updated><content>&lt;doc fingerprint="f78319bfafef29c"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/mamba-studio/TypedMemory"/><published>2026-05-11T19:33:31+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48100433</id><title>If AI writes your code, why use Python?</title><updated>2026-05-12T12:22:16.640080+00:00</updated><content>&lt;doc fingerprint="f78319bfafef29c"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;If AI Writes Your Code, Why Use Python?&lt;/head&gt;
     &lt;head rend="h3"&gt;For the last decade, fast-to-ship beat fast-to-run. Not anymore.&lt;/head&gt;
@@ -1090,10 +305,10 @@ mem.type();&lt;/code&gt;
     &lt;p&gt;The next project you start doesn’t have to default to Python.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://medium.com/@NMitchem/if-ai-writes-your-code-why-use-python-bf8c4ba1a055"/><published>2026-05-11T20:45:55+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48100500</id><title>GitLab announces workforce reduction and end of their CREDIT values</title><updated>2026-05-12T10:22:10.283056+00:00</updated><content>&lt;doc fingerprint="f7c4091f19ace49c"&gt;
+&lt;/doc&gt;</content><link href="https://medium.com/@NMitchem/if-ai-writes-your-code-why-use-python-bf8c4ba1a055"/><published>2026-05-11T20:45:55+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48100500</id><title>GitLab announces workforce reduction and end of their CREDIT values</title><updated>2026-05-12T12:22:16.498230+00:00</updated><content>&lt;doc fingerprint="f7c4091f19ace49c"&gt;
   &lt;main&gt;&lt;p&gt;Published on: May 11, 2026&lt;/p&gt;&lt;p&gt;19 min read&lt;/p&gt;&lt;p&gt;A letter to our customers and our investors.&lt;/p&gt;&lt;p&gt;We've been working through some significant changes inside GitLab over the past few days, and I want to share them with you directly. The email I sent the team is included below for full context.&lt;/p&gt;&lt;p&gt;The agentic era affords GitLab the largest opportunity in our history as a company, and we're making the structural and strategic decisions to meet it.&lt;/p&gt;&lt;p&gt;This letter has three parts. First, the operational and structural news, which is hard. Second, the strategic thesis we're betting on. And finally, what this means specifically for you, our customers and investors.&lt;/p&gt;&lt;p&gt;This morning we shared with team members that we're beginning a restructuring process at GitLab, and we're running it differently than most. The planning is happening openly, including a voluntary separation window. That creates real uncertainty for our team over the next few weeks, but we believe the outcome will be better for it. Where we can, we plan to finalize the new shape of the company on or before June 1. Where local requirements apply we will not make any changes until the local process is complete.&lt;/p&gt;&lt;p&gt;Four operational changes are part of the workforce reduction.&lt;/p&gt;&lt;p&gt;Operational changes and the update to our strategy are happening together: they are related but independent. Operationally, we grew into a shape that was right for the last era and isn't right for this one. The strategy below is what we're betting on next, and stands on its own.&lt;/p&gt;&lt;p&gt;We are reaffirming our Q1 and full year FY27 guidance today. The final scope and financial impact of the restructuring will be shared on our June 2 earnings call, once weâve finished the plan and received approval by our board.&lt;/p&gt;&lt;p&gt;Underpinning the changes weâre making today, and our go forward strategy are 10 core beliefs that span the world weâre building for, the architectural bets weâre making and how weâll deliver.&lt;/p&gt;&lt;p&gt;Weâre evolving our strategy to optimize for the future state of software engineering:&lt;/p&gt;&lt;p&gt;Platforms that weren't built for machine scale are starting to break under it. Winning means investing in the fundamentals that really matter: security, performance, scalability, reliability and user experience. We're making five, fundamental architectural bets. Each one is underway and we plan to deliver without disruption to GitLab customers that depend on us every day.&lt;/p&gt;&lt;p&gt;For our customers, the most important thing today is what doesn't change. The support, roadmap commitments, contractual terms â all of it continues without disruption. Your account team is available to walk you through today's news if you'd like a conversation.&lt;/p&gt;&lt;p&gt;Where you should expect to see us evolve is in the quality, depth and pace of innovation we ship. We will lead the way in agentic engineering by being customer zero of our platform, demonstrating with our innovation and our results the success you can bet on as our customers. Our vision for the product and business model is clearer than it has ever been and we're accelerating the work. We'll share the next wave of our innovation roadmap at GitLab Transcend on June 10, 2026 and hope you'll join us.&lt;/p&gt;&lt;p&gt;Today's announcement is a deliberate move to lead in a market we believe is in the middle of its largest shift in twenty years. The opportunity here isn't incremental growth on a DevSecOps platform â we're building toward becoming the trusted enterprise platform for software creation in the AI era.&lt;/p&gt;&lt;p&gt;We look forward to sharing an update on the business and our Q1 results in our upcoming earnings call on June 2, 2026. Weâll also share the final scope and financial impact of the restructuring at that time, although we anticipate reinvesting the majority of savings into accelerating our progress against the specific growth and technological initiatives that we've outlined.&lt;/p&gt;&lt;p&gt;This is the most consequential work we've taken on as a company. We'll prove it in the innovation we bring to market, how we serve our customers, and how we create value for our shareholders over the near- and long-term.&lt;/p&gt;&lt;p&gt;Thank you,&lt;/p&gt;&lt;p&gt;Bill Staples CEO, GitLab&lt;/p&gt;&lt;p&gt;A letter to our team.&lt;/p&gt;&lt;p&gt;Today is hard. I want to acknowledge how difficult today is given the volume of change weâre asking you to take in, and the uncertainty of a transparent restructuring process.&lt;/p&gt;&lt;p&gt;We've spent three days together on the why, the what, and the how of where GitLab is going. This letter is the written summary, so you have something to reflect on as we navigate the coming week together.&lt;/p&gt;&lt;p&gt;This restructure process is not like others you may be seeing in the news. Of course AI is changing the way we work and is part of our transformation plan, but this is not an AI optimization or cost cutting exercise. We intend to reinvest the vast majority of savings back into the business to accelerate our unique opportunity in the agentic era as defined in our Act 2 Core Beliefs.&lt;/p&gt;&lt;p&gt;One way our restructure process is different is that we are doing it transparently and including every team member in the process. Starting today, managers across the company are entering deeper conversations with leadership about how the restructuring principles land inside their teams. Those conversations will inform the decision of impacted roles. The reason we're not landing the full decision today is that getting the shape of the next GitLab right matters more than getting it fast â and a transparent process with input from you, your managers, leaders across the organization, and our employee representatives is the best way to land this change with an organization ready to move forward.&lt;/p&gt;&lt;p&gt;As we discussed today, we are planning a workforce reduction driven by a concentration of our country footprint, flattening how we're organized, and role right-sizing designed to optimize the shape and size of our teams. In addition, weâre establishing a new set of operating principles, founded on a culture of excellence.&lt;/p&gt;&lt;p&gt;I want to be direct: I want to do this once, and do it right, and not revisit our structure anytime in the foreseeable future. The team that comes through this restructure is the team that builds Act 2, and you should be able to plan your life and your work without bracing for what comes next. Letâs talk about whatâs changing and how we get it right.&lt;/p&gt;&lt;p&gt;Reduced operational footprint: Weâre reducing our country footprint because operating in nearly 60 countries does not allow us to give every team member a great experience. We anticipate reducing the number of countries by 30% focused on geos where we have only a handful of people or fewer. Team members who are in good standing and would like to relocate are welcome to do so. We'll continue to serve customers in those markets through our partner network where appropriate.&lt;/p&gt;&lt;p&gt;Flatter organization: Weâre flattening our organization because eight layers is too deep for a company our size and management layers are slowing us down. Every layer of management increases the number of places where priorities and communication gets filtered. A flatter organization will better connect every team member with leadership.&lt;/p&gt;&lt;p&gt;Role right-sizing: As we shift to a new strategy and way of working, powered by AI, we must revisit the size of staffing for each role to ensure we are optimizing for speed and customer outcomes. In some cases, AI can augment and accelerate what team members have been doing, in other places we need to expand certain roles to go faster. We do expect daily use of AI by every individual in the company and we are launching AI acceleration programs to support every role as part of our transformation.&lt;/p&gt;&lt;p&gt;We will be retiring CREDIT as our values framework. CREDIT was the right framework for the very successful Act 1 that took the company to $1B ARR. Those values shaped a company that thrived through COVID and our IPO to become one of the most recognized names in DevSecOps. We are not retiring them because they were wrong, we are choosing instead to focus on something different for this era which demands a different operating posture. Many of the same values we have been living and often talk about are still directly applicable in this era. Our three new operating principles are:&lt;/p&gt;&lt;p&gt;Speed with Quality means we move faster than we have, with the discipline that lets others rely on the work, especially our customers. We achieve this with smaller teams, tighter cycles, and stronger guardrails. We will hold a higher bar for what we commit to and what we deliver against those commitments. Here are some specific examples we shared today of what we expect every team member to embody:&lt;/p&gt;&lt;p&gt;Ownership Mindset means we expect every individual to act as a steward for the company and with autonomy. The people closest to the work make the decisions about it, and they own the result. Layers of management between leaders and the work coming out, and handoffs that dilute accountability are eliminated. Some examples of the mindset we expect every team member to embody:&lt;/p&gt;&lt;p&gt;Customer Outcomes means we measure ourselves by what changes for the customer, not by the activity on our side. Internal milestones matter only to the extent that they connect to customer impact. Examples of behaviors we expect from everyone:&lt;/p&gt;&lt;p&gt;These are built on a culture of excellence, which we expect every team member to uphold. That means:&lt;/p&gt;&lt;p&gt;Our transparent restructure process creates uncertainty that is real and it's hard, and I'm not going to pretend otherwise. I ask that you reflect on the why, what and how and engage your manager in a real conversation about the work, the questions and concerns you have, and what the next chapter looks like for you. Your manager may not have all the answers, because they too are going through this period of uncertainty. The conversation still matters and your input shapes how we land as a team.&lt;/p&gt;&lt;p&gt;The voluntary window exists for you. After three days walking through Act 2 together, you have the picture you need to decide whether GitLab is the right place for you in the next chapter of your career. If it isn't, talk to your manager or director and, where local requirements allow, apply for a separation before May 18. If approved, we'll include you in the same separation package as anyone else. The approval process exists because individual circumstances and local requirements vary and have to be weighed case by case. This process is meant to provide something we all deserve once the restructure is complete: a team that is excited and committed to the future of GitLab. Please take a moment to listen to what Sid, our founder and Exec Chair, thinks about the changes weâre making today.&lt;/p&gt;&lt;p&gt;I want to spend the rest of this letter convincing you to stay, if the âWhyâ and the âWhatâ sessions havenât already convinced you.&lt;/p&gt;&lt;p&gt;Better employee experience. Our overriding objective is to bring a significant improvement to the joy and impact of each team member participating in Act 2. We know that by doing that, we can better capture the creativity and impact of every individual and build a world class business.&lt;/p&gt;&lt;p&gt;Better pay. Once approved, our new bonus program will give every team member who isnât on an incentive compensation plan or bonus plan today, the opportunity to earn a cash bonus based on their individual performance, targeting 10% of salary, awarded at their managerâs discretion.&lt;/p&gt;&lt;p&gt;Smaller, empowered R&amp;amp;D teams with a clear vision. We aspire to double the number of smaller, R&amp;amp;D teams - up to 60 - with more autonomy and ownership.&lt;/p&gt;&lt;p&gt;Less friction, less overhead. The handoffs that have slowed us down are going to be significantly reduced. The layers between you and the decisions that affect your work are being reduced. If you've ever been frustrated at GitLab by how long it took to get something obvious done, Act 2 is engineered around removing that friction.&lt;/p&gt;&lt;p&gt;Solve big technical problems. Our five architectural bets provide deep, technical problems that will redefine GitLab for the agentic era, including a new git for agents that supports machine scale, an orchestration layer for humans, agents and full lifecycle orchestration, a connected graph of full lifecycle data as a service, brand new policy service to provide centralized governance and a fully autonomous software engineering experience.&lt;/p&gt;&lt;p&gt;More flexible buying programs. Our new consumption buying programs will make it far easier to sell GitLab and for customers to buy GitLab seats + credits and unlock adoption faster than ever before.&lt;/p&gt;&lt;p&gt;Career growth. Bold bets like Act 2 are rare and bring with them opportunities for every team member at every level to learn faster and develop skills and experience that will matter for the rest of your career, here or wherever your path takes you.&lt;/p&gt;&lt;p&gt;Aligned leadership with the will to win. We have a leadership team with e-group, and our SLT, that is committed to win, make the hard decisions and align the organization cross functionally to accelerate results. We will hold ourselves accountable to help you succeed and create a winning organization.&lt;/p&gt;&lt;p&gt;Uniquely positioned to win. We are uniquely positioned to not only participate, but to lead in our category where the TAM is exploding at a step function rate. We have structural advantages in data, technology and customer trust that give us an advantage over AI labs and start-ups that we can harness to redefine how software is built in the agentic era. By being part of Act 2, you will be part of a winning organization that helps shape software engineering in the agentic era.&lt;/p&gt;&lt;p&gt;Whether by choice or otherwise: the work you did here mattered, and it continues to matter. You came to GitLab when it needed you. You built things the next chapter is built on. We owe you real support through the transition, and our genuine respect. If we're asking our team to be world-class, we have a reciprocal obligation to be world-class in how we treat people leaving us. That's the standard we're holding ourselves to.&lt;/p&gt;&lt;p&gt;â&lt;/p&gt;&lt;p&gt;I'll close with this. None of what I've written makes today easier. It isn't supposed to. What I want you to know is that we've made these decisions carefully, our intention is to make them only once, and we're going to do right by the people leaving and by the people staying.&lt;/p&gt;&lt;p&gt;Thank you for what you've built. Thank you for what comes next.&lt;/p&gt;&lt;p&gt;Bill Staples, CEO, GitLab&lt;/p&gt;&lt;p&gt;Enjoyed reading this blog post or have questions or feedback? Share your thoughts by creating a new topic in the GitLab community forum.&lt;/p&gt;Share your feedback&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://about.gitlab.com/blog/gitlab-act-2/"/><published>2026-05-11T20:51:57+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48100524</id><title>Interaction Models</title><updated>2026-05-12T10:22:10.113852+00:00</updated><content>&lt;doc fingerprint="254b89d72d1a13cb"&gt;
+&lt;/doc&gt;</content><link href="https://about.gitlab.com/blog/gitlab-act-2/"/><published>2026-05-11T20:51:57+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48100524</id><title>Interaction Models</title><updated>2026-05-12T12:22:16.341394+00:00</updated><content>&lt;doc fingerprint="254b89d72d1a13cb"&gt;
   &lt;main&gt;
     &lt;p&gt;Today, we’re announcing a research preview of interaction models: models that handle interaction natively rather than through external scaffolding. We think interactivity should scale alongside intelligence; the way we work with AI should not be treated as an afterthought. Interaction models let people collaborate with AI the way we naturally collaborate with each other—they continuously take in audio, video, and text, and think, respond, and act in real time.&lt;/p&gt;
     &lt;p&gt;We train an interaction model from scratch. To ensure real-time responsiveness, we adopt a multi-stream, micro-turn design. Our research preview demonstrates qualitatively new interaction capabilities, as well as state-of-the-art combined performance in intelligence and responsiveness.&lt;/p&gt;
@@ -1301,7 +516,7 @@ Thinking Machines Lab: Connectionism, May 2026.
 &lt;/code&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://thinkingmachines.ai/blog/interaction-models/"/><published>2026-05-11T20:53:37+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48100662</id><title>I let AI build a tool to help me figure out what was waking me up at night</title><updated>2026-05-12T10:22:09.760898+00:00</updated><content>&lt;doc fingerprint="24421177316008f0"&gt;
+&lt;/doc&gt;</content><link href="https://thinkingmachines.ai/blog/interaction-models/"/><published>2026-05-11T20:53:37+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48100662</id><title>I let AI build a tool to help me figure out what was waking me up at night</title><updated>2026-05-12T12:22:16.048422+00:00</updated><content>&lt;doc fingerprint="24421177316008f0"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;I Let AI Build a Tool to Help Me Figure Out What Was Waking Me Up at Night&lt;/head&gt;
     &lt;p&gt;I try to pay attention to the small things that affect my quality of life. When something keeps bothering me, I want to investigate, find a likely cause, and act on it.&lt;/p&gt;
@@ -1393,7 +608,7 @@ Thinking Machines Lab: Connectionism, May 2026.
     &lt;p&gt;*= I do not like Garmin, I think they're a fraudulent company systematically breaching consumer rights and I'm looking for alternatives. Already converted multiple people to Coros.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://martin.sh/i-let-ai-build-a-tool-to-help-me-figure-out-what-was-waking-me-up-at-night/"/><published>2026-05-11T21:04:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48100706</id><title>Postmortem: TanStack NPM supply-chain compromise</title><updated>2026-05-12T10:22:09.176492+00:00</updated><content>&lt;doc fingerprint="cc257d1a813043c3"&gt;
+&lt;/doc&gt;</content><link href="https://martin.sh/i-let-ai-build-a-tool-to-help-me-figure-out-what-was-waking-me-up-at-night/"/><published>2026-05-11T21:04:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48100706</id><title>Postmortem: TanStack NPM supply-chain compromise</title><updated>2026-05-12T12:22:15.473600+00:00</updated><content>&lt;doc fingerprint="cc257d1a813043c3"&gt;
   &lt;main&gt;
     &lt;p&gt;by Tanner Linsley on May 11, 2026.&lt;/p&gt;
     &lt;p&gt;Last updated: 2026-05-11&lt;/p&gt;
@@ -1558,7 +773,7 @@ jobs:
     &lt;p&gt;See the GitHub Security Advisory for the full list of affected versions: GHSA-g7cv-rxg3-hmpx&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://tanstack.com/blog/npm-supply-chain-compromise-postmortem"/><published>2026-05-11T21:08:25+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48102700</id><title>They Live (1988) inspired Adblocker</title><updated>2026-05-12T10:22:08.585502+00:00</updated><content>&lt;doc fingerprint="6b7103eba0aa72ba"&gt;
+&lt;/doc&gt;</content><link href="https://tanstack.com/blog/npm-supply-chain-compromise-postmortem"/><published>2026-05-11T21:08:25+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48102700</id><title>They Live (1988) inspired Adblocker</title><updated>2026-05-12T12:22:15.327955+00:00</updated><content>&lt;doc fingerprint="6b7103eba0aa72ba"&gt;
   &lt;main&gt;
     &lt;p&gt;A fork of uBlock Origin Lite that, instead of hiding cosmetically-blocked ads, replaces them with white tiles bearing slogans from John Carpenter's 1988 film They Live: OBEY, CONSUME, WATCH TV, SLEEP, SUBMIT, CONFORM, STAY ASLEEP, BUY, WORK, NO INDEPENDENT THOUGHT, DO NOT QUESTION AUTHORITY.&lt;/p&gt;
     &lt;p&gt;Each blocked ad gets a single phrase, picked at random from the list.&lt;/p&gt;
@@ -1598,7 +813,7 @@ tools/make-mv3.sh chromium       # or: firefox | edge | safari&lt;/code&gt;
     &lt;p&gt;GPL-3.0, same as upstream uBlock Origin / uBO Lite.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/davmlaw/they_live_adblocker"/><published>2026-05-12T00:37:54+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48103042</id><title>Claude Platform on AWS</title><updated>2026-05-12T10:22:08.400414+00:00</updated><content>&lt;doc fingerprint="556d0e3f1f93c445"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/davmlaw/they_live_adblocker"/><published>2026-05-12T00:37:54+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48103042</id><title>Claude Platform on AWS</title><updated>2026-05-12T12:22:15.152260+00:00</updated><content>&lt;doc fingerprint="556d0e3f1f93c445"&gt;
   &lt;main&gt;
     &lt;list rend="ul"&gt;
       &lt;item&gt;May 11, 2026&lt;/item&gt;
@@ -1638,7 +853,7 @@ tools/make-mv3.sh chromium       # or: firefox | edge | safari&lt;/code&gt;
     &lt;p&gt;Product updates, how-tos, community spotlights, and more. Delivered monthly to your inbox.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://claude.com/blog/claude-platform-on-aws"/><published>2026-05-12T01:24:29+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48103511</id><title>Software Internals Book Club</title><updated>2026-05-12T10:22:08.115243+00:00</updated><content>&lt;doc fingerprint="778b534139a502b9"&gt;
+&lt;/doc&gt;</content><link href="https://claude.com/blog/claude-platform-on-aws"/><published>2026-05-12T01:24:29+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48103511</id><title>Software Internals Book Club</title><updated>2026-05-12T12:22:14.922792+00:00</updated><content>&lt;doc fingerprint="778b534139a502b9"&gt;
   &lt;main&gt;
     &lt;p&gt;I run a little email book club reading the highest-caliber books that we might otherwise be intimidated to read on our own; typically covering topics in databases, distributed systems, and software performance.&lt;/p&gt;
     &lt;p&gt;We are currently reading Operating Systems: Three Easy Pieces.&lt;/p&gt;
@@ -1652,7 +867,7 @@ tools/make-mv3.sh chromium       # or: firefox | edge | safari&lt;/code&gt;
     &lt;p&gt;Have a book that fits the above criteria? Let me know!&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://eatonphil.com/bookclub.html"/><published>2026-05-12T02:28:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48104041</id><title>Extremely Low Frequencies</title><updated>2026-05-12T10:22:07.536965+00:00</updated><content>&lt;doc fingerprint="fe0cd95f5820d079"&gt;
+&lt;/doc&gt;</content><link href="https://eatonphil.com/bookclub.html"/><published>2026-05-12T02:28:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48104041</id><title>Extremely Low Frequencies</title><updated>2026-05-12T12:22:14.234230+00:00</updated><content>&lt;doc fingerprint="fe0cd95f5820d079"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;extremely low frequencies&lt;/head&gt;
     &lt;p&gt;The submarine is a surprisingly ancient technology—at least in its early, primitive forms. The idea is quite simple, that a well-enough-sealed boat ought to be able to submerge and resurface. It's the practicalities that make the whole thing difficult. It is generally considered that the US Civil War was the first use of submarines in combat; these were primitive machines with very limited operating endurance and navigational capabilities. These submarines were more like torpedoes: you pointed them in the right direction and hoped they went straight.&lt;/p&gt;
@@ -1735,7 +950,7 @@ tools/make-mv3.sh chromium       # or: firefox | edge | safari&lt;/code&gt;
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://computer.rip/2026-05-09-extremely-low-frequencies.html"/><published>2026-05-12T03:59:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48104428</id><title>Screenshots of Old Desktop OSes</title><updated>2026-05-12T10:22:06.910040+00:00</updated><content>&lt;doc fingerprint="e7a4bd0d21a4e0ff"&gt;
+&lt;/doc&gt;</content><link href="https://computer.rip/2026-05-09-extremely-low-frequencies.html"/><published>2026-05-12T03:59:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48104428</id><title>Screenshots of Old Desktop OSes</title><updated>2026-05-12T12:22:13.783143+00:00</updated><content>&lt;doc fingerprint="e7a4bd0d21a4e0ff"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Retrotechnology Media&lt;/head&gt;
     &lt;p&gt;10 March 2024&lt;/p&gt;
@@ -2523,19 +1738,33 @@ tools/make-mv3.sh chromium       # or: firefox | edge | safari&lt;/code&gt;
     &lt;/table&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="http://www.typewritten.org/Media/"/><published>2026-05-12T05:11:24+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48105297</id><title>Toxicity on Social Media – The Noisy Room</title><updated>2026-05-12T10:22:06.750723+00:00</updated><content>&lt;doc fingerprint="2489d35a6e2e859f"&gt;
+&lt;/doc&gt;</content><link href="http://www.typewritten.org/Media/"/><published>2026-05-12T05:11:24+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48105297</id><title>Toxicity on Social Media – The Noisy Room</title><updated>2026-05-12T12:22:13.583276+00:00</updated><content>&lt;doc fingerprint="2489d35a6e2e859f"&gt;
   &lt;main&gt;&lt;p&gt;A Story About Common Confusion&lt;/p&gt;&lt;p&gt;It began with a study. In December of 2025, Stanford researchers analyzed 2.2 billion social media posts looking for a pattern. They wanted to know what percentage of users posted severely toxic content. Not rudeness, not sarcasm, but speech that was so hateful that 90% of the world would flag it as being problematic.1&lt;/p&gt;&lt;p&gt;With this data in hand, they then asked thousands of people to answer a simple question:&lt;/p&gt;&lt;p&gt;They were surprised by the results. They had discovered an enormous reservoir of misperception that had been hidden in plain view.&lt;/p&gt;&lt;p&gt;Here is the simplest version of the problem. Imagine walking into a bar with a hundred people inside.&lt;/p&gt;&lt;p&gt;Three of them are shouting — about politics, about each other, about whatever gets a reaction. The other ninety-seven are talking at a normal volume. But there's a bouncer at the door, and he gets paid by the minute you spend staring. So he's wired the three loudest people into the sound system and turned it all the way up.&lt;/p&gt;&lt;p&gt;You walk in, hear the roar, and conclude: this place is full of lunatics. Never hearing the 97 people having normal conversations a few feet away. You could leave, but all your friends are inside. You're stuck.&lt;/p&gt;&lt;p&gt;This is how social media deals with contentious topics. The bouncer is an algorithm. And whether you like it or not, you've been a bystander.&lt;/p&gt;&lt;p&gt;Pick a contentious topic. This is what your feed might look like.&lt;/p&gt;&lt;p&gt;Reading this feed, you might reasonably conclude that the country is split between unhinged extremes. It is not. And the gap between what Americans actually believe and what the feed suggests they believe may be the most consequential thing the platforms haven't shown you.&lt;/p&gt;&lt;p&gt;Let's visualize this as a single room with 100 people inside. This is what it looks like:&lt;/p&gt;&lt;p&gt;This pattern repeats across platforms. On Twitter/X, toxic tweets receive ~86% more retweets and ~27% more visibility than non-toxic ones, 0.3% of users shared 80% of all contested news,14 and just 6% of users produce roughly 73% of all political tweets.16 On TikTok, 25% of users produce 98% of all public videos.15 The specific numbers vary. The dynamic is the same: a small minority of highly active users overwhelms the majority.&lt;/p&gt;&lt;p&gt;After a time consuming content in this room, your brain performs a kind of ambient demography. The feed becomes a sort of census. You conclude — logically — that the behavior must be widespread. The room might just be full of extreme people! Maybe most people do believe these crazy things.&lt;/p&gt;&lt;p&gt;If this were just about tone of our social posts, it wouldn't matter very much. But this distortion ends up causing some seriously bad patterns of behavior.&lt;/p&gt;Pattern 1 The Majority Goes Silent&lt;p&gt;When the majority of people looks at the feed and assumes they're outnumbered, people will often self-censor.3 The dynamic replicates on social media17 — fear of social isolation suppresses opinion expression on platforms where it's perceived to be unwelcome. They go quiet, or they leave a platform entirely. They cede the space to users with more extreme politics.&lt;/p&gt;Pattern 2 The Loud Minority Thinks It's the Majority&lt;p&gt;The minority who aggressively post end up with their own distortion – believing they are part of the majority.5&lt;/p&gt;&lt;p&gt;A study of 17 extremist forums found the same pattern: the more someone posted, the more they believed the public agreed with them. More engaged participation bred false consensus.&lt;/p&gt;Pattern 3 Everyone Gets Each Other Wrong&lt;p&gt;Both sides develop wildly inaccurate beliefs about who the other side actually is.6 See how some of your own beliefs line up:&lt;/p&gt;&lt;p&gt;The distortion extends to policy beliefs. Step through to see the perception gap on the issue of immigration.&lt;/p&gt;&lt;p&gt;Elected officials are very good at sensing political sentiment. It's literally their job. (They are not elected to correct people's beliefs.)&lt;/p&gt;&lt;p&gt;Politicians who can build a coalition about a perceived belief are more likely to win. They position themselves against an opponent that doesn't exist, but their supporters think exists.&lt;/p&gt;&lt;p&gt;And remember: most of our politics now happens on social media. Candidates often read the same distorted feed. They are unlikely to change their minds.&lt;/p&gt;&lt;p&gt;The window of discourse shifts. Not because opinions changed, but because perceptions of opinions did.&lt;/p&gt;Pattern 5 Misperception Turns into Hostility&lt;p&gt;When you believe the other side is extreme, you become more willing to treat them as a threat.7&lt;/p&gt;&lt;p&gt;Both Democrats and Republicans vastly overestimate how many on the other side support political violence. The result is a populace primed to assume the other side is ready to do horrible things.&lt;/p&gt;&lt;p&gt;Each step feeds the next. The distortion is self-reinforcing.&lt;/p&gt;&lt;p&gt;Okay. So now you know that a small minority dominates the feed.&lt;/p&gt;&lt;p&gt;You know that Republicans and Democrats actually have a far more nuanced set of opinions about contested issues.&lt;/p&gt;&lt;p&gt;Does that fix it? Not really. You also know that everyone else doesn't know it. And if the world continues operating as if the distortion is real, you should probably act the same — even though you know it's wrong. The room hasn't changed, even if you know people inside it are confused.&lt;/p&gt;&lt;p&gt;This is called a common knowledge problem.&lt;/p&gt;&lt;p&gt;Steven Pinker lays this out cleanly in his excellent recent book When Everyone Knows That Everyone Knows.8 Learning a fact changes what you know. Seeing it displayed publicly — where everyone else can see it too — where you know others can also see it, changes what everyone knows, and subsequently how they act.&lt;/p&gt;&lt;p&gt;Social media has no public square. It has 300 million private windows, each showing a different distortion of the same room. Illuminating the common thoughts between us has the potential to radically change it.&lt;/p&gt;&lt;p&gt;So what can we do about this?&lt;/p&gt;&lt;p&gt;Fortunately, there's some good evidence showing how it can be fixed. Multiple studies show that when misperceptions are corrected in a public way, hostility drops. Mernyk et al. found that a single correction reduced partisan hostility for a full month.7 Lee et al. found that correcting overestimates of toxic users improved how people felt about their country and each other.1&lt;/p&gt;&lt;p&gt;We can do this today.&lt;/p&gt;&lt;p&gt;Imagine every post on a contested topic had a quiet link beneath it. Not a fact check, a label, or a warning. Instead — what if it had a Community Check?&lt;/p&gt;&lt;p&gt;A Community Check is an open-source design layer that could be deployed across social media, beneath contentious posts, to help users understand how other people on the platform (or the nation) actually feel about an issue.&lt;/p&gt;&lt;p&gt;It is a way of quickly adding context to the most hot-button viral issues, giving people more visibility into the opinions of the public.&lt;/p&gt;&lt;p&gt;Let's explore this intervention with a topic that cuts across political identity:&lt;/p&gt;&lt;p&gt;On the surface, this seems contentious. But it's actually a supermajority issue: 81% are concerned about the influence of money on elections, including 78% of Republicans and 90% of Democrats. 75% say unlimited spending weakens democracy. Only 15% believe unlimited political spending is protected free speech.&lt;/p&gt;&lt;p&gt;And yet, very little changes, largely because everyone assumes the other side is fine with it. The feed is full of people defending their team's donors and attacking the other team's. It might look like a 50/50 partisan battle, but it's not. It's a majority consensus that cannot see itself.&lt;/p&gt;&lt;p&gt;What if you could see this consensus?&lt;/p&gt;&lt;p&gt;Community Check draws from a random sample of platform users + robust national polls, surveyed independently of the content. The sample is statistically representative. The results update continuously. And critically: everyone sees the same numbers.&lt;/p&gt;&lt;p&gt;Traditional fact-checking is a top-down approach that often feels like it's dictating from above. This is hard for people to stomach. Content moderation for many years now has been perceived as removing speech. This simply adds context, much like the crowdsourced feature Community Notes (an inspiration for this project).&lt;/p&gt;&lt;p&gt;Nor is this just a user-poll under a post. Instead it's drawing from all platform users, coupled with statistically significant national surveys. It's an actual window into the views of the majority, not just the views of those looking at the post.&lt;/p&gt;&lt;p&gt;Short-form video is the fastest-growing vector for political distortion. The same dynamic applies — a small minority of creators produce the vast majority of political content — but video bypasses the pause that text gives you. Community Check can adapt. Tap through to see how.&lt;/p&gt;&lt;p&gt;Platforms already have a lot of these capabilities. They already survey users. They even know how to run sophisticated polls. There are a few technical details to work out (spec here), but this is not a hard problem to solve.&lt;/p&gt;&lt;p&gt;The unseen majority is the public. And the public deserves to know itself.&lt;/p&gt;&lt;p&gt;A tiny minority, dominating the feed. That's all it ever was. The rest of us were here the whole time, quiet and decent and waiting to be seen.&lt;/p&gt;&lt;p&gt;How Community Check would work in practice, from data sources to platform integration.&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://thenoisyroom.com"/><published>2026-05-12T07:31:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48105874</id><title>HDMI 2.1 Display Stream Compression (DSC) Ready for Amdgpu Linux Driver</title><updated>2026-05-12T10:22:06.634345+00:00</updated><content>&lt;doc fingerprint="8eb90812f984b5cc"&gt;
+&lt;/doc&gt;</content><link href="https://thenoisyroom.com"/><published>2026-05-12T07:31:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48105670</id><title>Music has scales / raagas. What about storytelling in movies and prestige shows?</title><updated>2026-05-12T12:22:12.648460+00:00</updated><content>&lt;doc fingerprint="2510e5a703f2ce1e"&gt;
   &lt;main&gt;
-    &lt;head rend="h1"&gt;HDMI 2.1 Display Stream Compression "DSC" Also Ready For AMDGPU Linux Driver&lt;/head&gt;
-    &lt;p&gt; At the beginning of the month was the surprise milestone of AMD posting AMDGPU kernel driver patches for HDMI 2.1 Fixed Rate Link (FRL) support. The HDMI FRL patches have since been updated to also enable HDMI 2.1's Display Stream Compression (DSC) functionality for higher resolutions and higher refresh rates with the open-source AMDGPU driver. &lt;lb/&gt;Display Stream Compression with HDMI 2.1+ allows for higher refresh rates and resolutions like 4K@240Hz and 8K@120Hz with this visually lossless, low-latency compression for better bandwidth efficiency. AMD tacked on HDMI FRL DSC support to the HDMI FRL patch series they've been working through to get into the mainline Linux kernel.&lt;lb/&gt;As noted as an update in the earlier Phoronix article, it's been confirmed via our forums that ultimately AMD is working on a full HDMI 2.1 implementation for the AMDGPU open-source Linux driver. As for what changed to ultimately allow AMD to publish the open-source code for their HDMI 2.1 driver support still isn't clear as previously it was blocked by the HDMI Forum. There is some speculation that it may be due to Valve's involvement that a workaround or compromise was achieved.&lt;lb/&gt;Sent out today was the latest patches for HDMI FRL and FRL DSC for the AMDGPU driver. The patch cover letter notes that the patch series should land with the next AMDGPU Display Core (DC) patch series. With that said, it's quite likely then we will see this support upstreamed to the mainline Linux kernel with the upcoming Linux 7.2 cycle.&lt;/p&gt;
-    &lt;p&gt;Display Stream Compression with HDMI 2.1+ allows for higher refresh rates and resolutions like 4K@240Hz and 8K@120Hz with this visually lossless, low-latency compression for better bandwidth efficiency. AMD tacked on HDMI FRL DSC support to the HDMI FRL patch series they've been working through to get into the mainline Linux kernel.&lt;/p&gt;
-    &lt;p&gt;As noted as an update in the earlier Phoronix article, it's been confirmed via our forums that ultimately AMD is working on a full HDMI 2.1 implementation for the AMDGPU open-source Linux driver. As for what changed to ultimately allow AMD to publish the open-source code for their HDMI 2.1 driver support still isn't clear as previously it was blocked by the HDMI Forum. There is some speculation that it may be due to Valve's involvement that a workaround or compromise was achieved.&lt;/p&gt;
-    &lt;p&gt;Sent out today was the latest patches for HDMI FRL and FRL DSC for the AMDGPU driver. The patch cover letter notes that the patch series should land with the next AMDGPU Display Core (DC) patch series. With that said, it's quite likely then we will see this support upstreamed to the mainline Linux kernel with the upcoming Linux 7.2 cycle.&lt;/p&gt;
+    &lt;p&gt;15 structural archetypes derived from 405 films. Each archetype is defined by five parameters borrowed from Hindustani classical music, a system built on the idea that melody is not just sound but emotional territory. We extended this logic to narrative structure: screen time replaces note duration, dramatic registers replace musical registers, and the characteristic phrase of a raaga becomes the beat trajectory of a story. The result is a structural grammar for film that is precise enough to classify and legible enough to write from.&lt;/p&gt;
+    &lt;p&gt;In music: In Hindustani classical music, the vadi is the most important note of a raaga, the one the melody keeps returning to, the note that gives the raaga its fundamental character.&lt;/p&gt;
+    &lt;p&gt;In story: The emotional register with the most screen time. The vadi tells you what a story is fundamentally about: whether it is a story of pursuit, reversal, crisis, incitement, or revelation.&lt;/p&gt;
+    &lt;p&gt;In music: The samvadi is the vadi's consonant partner, always a fourth or fifth away. It complements and supports without displacing the dominant note.&lt;/p&gt;
+    &lt;p&gt;In story: The secondary structural engine. The samvadi provides contrast and complicates the vadi, often determining the specific character of a story within its family. Two stories can share the same vadi but feel very different because of their samvadi.&lt;/p&gt;
+    &lt;p&gt;In music: The graha is the note on which a classical composition begins, the first structural commitment, setting the register from which everything unfolds.&lt;/p&gt;
+    &lt;p&gt;In story: The register of the first beat. Whether a story opens in stability (Sa), disruption (Ri), or crisis (Pa) sets a structural contract with the audience about what kind of world they are entering and what has already happened before the frame.&lt;/p&gt;
+    &lt;p&gt;In music: The nyasa is the note on which a melodic phrase comes to rest, not necessarily the final note of the piece, but the note that signals a phrase is complete. In a raaga, the nyasa determines whether a phrase feels resolved or suspended.&lt;/p&gt;
+    &lt;p&gt;In story: The register of the final beat. The nyasa determines resolution level: full resolution (Sa'/Ni), mid-register tension (Pa/Dha/Ma), or irresolution (Ri/Ga/Sa). It is the structural decision that most determines how an audience leaves the cinema.&lt;/p&gt;
+    &lt;p&gt;In music: The pakad is the short melodic phrase that fingerprints a raaga. A trained listener hears the pakad and immediately knows which raaga is being played, even before the full composition unfolds. It is the raaga's signature movement through its own scale.&lt;/p&gt;
+    &lt;p&gt;In story: The trajectory modifier: the beat movement pattern that distinguishes stories within the same archetype family. Two films can share the same vadi, samvadi, graha, and nyasa, yet feel structurally different because one Dwells in a single register while another Rebounds or Returns. The pakad is what separates variants of the same archetype.&lt;/p&gt;
+    &lt;p&gt;Stories in the Ga-Dominant family live in the act of doing. The process of pursuit, not the reversals or crises along the way, is the primary narrative substance.&lt;/p&gt;
+    &lt;p&gt;Stories in the Ma-Dominant family are driven by plot machinery. Reversals, twists, and shifting ground are the story's primary language. Whether triumphant or tragic, Ma-Dominant films are about the experience of the ground shifting beneath the protagonist.&lt;/p&gt;
+    &lt;p&gt;Stories in the Pa-Dominant family are defined by sustained darkness. Crisis is not a single beat but a condition the protagonist inhabits for an extended period.&lt;/p&gt;
+    &lt;p&gt;Stories in the Ri-Dominant family are defined by a disruption that never fully leaves the room. The inciting event, the wound, the mystery, the displacement, retains structural weight throughout the story rather than receding after Act 1.&lt;/p&gt;
+    &lt;p&gt;There is only one Dha-Dominant archetype in the library, a reflection of how rare it is for revelation to structurally dominate a story rather than serve as a single scene.&lt;/p&gt;
+    &lt;p&gt;This classification framework was developed by the Quanten Arc research team through structural analysis of 405 films across Drama, Thriller, Action, Horror, Comedy, Romance, Adventure, Mystery, Science Fiction, and Fantasy. Each film was manually segmented into narrative beats and scored on the five Hindustani classical music parameters.&lt;/p&gt;
+    &lt;p&gt;The rule-based classifier was derived from the most statistically significant parameter combinations observed across the corpus. The framework is descriptive, not prescriptive: it identifies structural patterns in completed works and does not claim that all strong films follow these patterns.&lt;/p&gt;
+    &lt;p&gt;Film counts and IMDb averages are derived from the 405-film Quanten Arc library. Browse all titles to explore individual narrative analyses.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.phoronix.com/news/HDMI-2.1-DSC-AMDGPU-FRL"/><published>2026-05-12T09:01:32+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48106024</id><title>Learning Software Architecture</title><updated>2026-05-12T10:22:06.577203+00:00</updated><content>&lt;doc fingerprint="f635857ec7503bc"&gt;
+&lt;/doc&gt;</content><link href="https://arc.quanten.co/archetype"/><published>2026-05-12T08:28:45+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48106024</id><title>Learning Software Architecture</title><updated>2026-05-12T12:22:12.553030+00:00</updated><content>&lt;doc fingerprint="f635857ec7503bc"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Learning Software Architecture&lt;/head&gt;
     &lt;p&gt;In reply to an email asking about learning software design skills as a researcher physicist:&lt;/p&gt;
@@ -2578,4 +1807,111 @@ tools/make-mv3.sh chromium       # or: firefox | edge | safari&lt;/code&gt;
     &lt;p&gt;As for the actual books, Software Engineering at Google and Ousterhout’s The Philosophy of Software Design are often recommended. They are good. SWE, in particular, helped me with a couple of important names. But they weren’t ground breaking for me.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://matklad.github.io/2026/05/12/software-architecture.html"/><published>2026-05-12T09:30:21+00:00</published></entry></feed>
+&lt;/doc&gt;</content><link href="https://matklad.github.io/2026/05/12/software-architecture.html"/><published>2026-05-12T09:30:21+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48106114</id><title>Unitree GD01: China's $537k rideable transformer robot is now in production</title><updated>2026-05-12T12:22:08.171282+00:00</updated><content>&lt;doc fingerprint="a0846ab3b6a7cba1"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Unitree GD01: China's $537k rideable transformer robot is now in production&lt;/head&gt;
+    &lt;p&gt;Unitree Robotics has launched the GD01, a rider-carrying robot it describes as the world's first mass-produced manned mech suit, starting at RMB 3.9 million — roughly $537,000. That's a significant correction from the $650,000 figure that circulated at launch; ChinaBizInsider confirmed the actual price alongside details of Unitree's concurrent Shanghai IPO filing. For now, it's a China-only story — no US or UK distributor has been announced.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The machine&lt;/head&gt;
+    &lt;p&gt;The GD01 weighs around 500kg with a pilot on board and stands more than twice the height of an average person when fully upright. Its headline trick is transformation: the robot shifts between two-legged and four-legged movement, with the frame also tilting from vertical to horizontal for rough terrain. Bipedal mode mimics a walking gait; quad mode adds stability on uneven ground. Think of it less as a humanoid robot and more as a walking vehicle.&lt;/p&gt;
+    &lt;quote&gt;&lt;p&gt;Unitree Unveils: GD01, A Manned Transformable Mecha, from $650,000 ?&lt;/p&gt;— Unitree (@UnitreeRobotics) May 12, 2026&lt;lb/&gt;The world's first production-ready manned mecha. It can transform. It's a civilian vehicle. It weighs ~500kg with you inside.&lt;lb/&gt;Please everyone be sure to use the robot in a Friendly and Safe manner. pic.twitter.com/xa6eNiRDdV&lt;/quote&gt;
+    &lt;p&gt;Unitree CEO Wang Xingxing piloted the unit himself during the May 12 reveal on Weibo — a pointed way of demonstrating confidence in a 500kg machine. The demo included knocking down a brick wall, underlining the platform's raw structural strength. Unitree has built its reputation on affordable, agile robot dogs that nipped at Boston Dynamics' heels; the GD01 is a different kind of ambition entirely.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The market reality&lt;/head&gt;
+    &lt;p&gt;At $537k, the GD01 sits firmly in corporate-demo and ultra-luxury territory. Early buyers are likely theme parks, industrial operators, or deep-pocketed enthusiasts rather than anyone planning to commute in one. Unitree positions the platform for tourism and commercial applications, though specifics remain thin.&lt;/p&gt;
+    &lt;p&gt;Western buyers face additional barriers beyond price. No regulatory pathway for the US or EU has been disclosed. In the UK and Europe, machines that interact physically with humans in commercial settings face increasingly strict safety assessments — the EU's updated Machinery Regulation applies fully from 2027. None of that groundwork has been laid for the GD01 yet.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What's next&lt;/head&gt;
+    &lt;p&gt;Unitree is simultaneously pursuing a $610 million Shanghai A-share IPO, which would make it the first humanoid robotics company to list publicly in China. The IPO signals a clear priority: consolidate in Asia-Pacific before eyeing Western markets. Key specs — battery runtime, autonomous range, payload per limb — haven't been published, so the performance picture is still incomplete.&lt;/p&gt;
+    &lt;p&gt;The GD01 is a genuine milestone in rideable robotics. Whether it ever reaches a showroom outside China depends on regulatory work and distributor deals that haven't started yet.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://gagadget.com/en/709729-unitree-gd01-chinas-537k-rideable-transformer-robot-is-now-in-production/"/><published>2026-05-12T09:49:26+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48106316</id><title>A HN post with negative points – how?</title><updated>2026-05-12T12:22:07.731940+00:00</updated><content>&lt;doc fingerprint="21752d709e052fce"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Hacker News new | past | comments | ask | show | jobs | submit login How and Why I Journal ( miksovsky.com ) 6 points by OuterVale 6 hours ago | hide | past | favorite | 9 comments help Waterluvian 7 minutes ago | next [–] Hacker News uses the D&amp;amp;D 2e ruleset. You’re doing great… if you want everyone to miss your post. reply commanderj 25 minutes ago | prev | next [–] I have been here at - 1 reply joegibbs 6 hours ago | prev | next [–] -4 points on this submission? What? How did that happen? I've never seen it go negative. reply teddyh 9 minutes ago | parent | next [–] Because it’s obvious AI slop? reply ramon156 4 minutes ago | root | parent | next [–] It's generic, but I wouldn't say there are any obvious LLM patterns. Unless I'm missing something? reply OuterVale 5 hours ago | parent | prev | next [–] Do a get a biscuit or something for somehow managing this? Interestingly on the Harmonic client on my Android phone it is claiming -10 points. Very odd. reply minimaxir 6 hours ago | parent | prev | next [–] This is...a first. reply bigyabai 6 hours ago | parent | prev | next [–] It won't even upvote it to -3. Integer overflow? reply donohoe 1 hour ago | prev [–] Just posting to be part of this historical record. reply Guidelines | FAQ | Lists | API | Security | Legal | Apply to YC | Contact Search:&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://news.ycombinator.com/item?id=48104663"/><published>2026-05-12T10:29:24+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48106345</id><title>Yabasic (Yet Another Basic)</title><updated>2026-05-12T12:22:07.531361+00:00</updated><content>&lt;doc fingerprint="730860b6682c2e0"&gt;
+  &lt;main&gt;&lt;head rend="h1"&gt;Yabasic&lt;/head&gt;&lt;table&gt;&lt;row span="2"&gt;&lt;cell role="head"&gt;Yabasic&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;Developer&lt;/cell&gt;&lt;cell&gt;Marc-Oliver Ihm&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;Stable release&lt;/cell&gt;&lt;cell&gt;&lt;p&gt;2.91.4[1] / 31 August 2025&lt;/p&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;Platform&lt;/cell&gt;&lt;cell&gt;x86, MIPS (EE)&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;OS&lt;/cell&gt;&lt;cell&gt;Microsoft Windows, Unix, PS2&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;License&lt;/cell&gt;&lt;cell&gt;MIT License&lt;/cell&gt;&lt;/row&gt;&lt;row span="2"&gt;&lt;cell&gt;Filename extensions&lt;/cell&gt;&lt;cell&gt;&lt;code&gt;.bas&lt;/code&gt;,&lt;code&gt;.yab&lt;/code&gt;&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Website&lt;/cell&gt;&lt;cell&gt;www&lt;p&gt;github&lt;/p&gt;&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;Yabasic (Yet Another BASIC) is a free, open-source BASIC interpreter for Microsoft Windows and Unix platforms.[2] Yabasic was originally developed by Marc-Oliver Ihm. From version 2.77.1, the project adopted the MIT License and the source code was moved to GitHub to encourage others to participate in its development.[3]&lt;/p&gt;&lt;head rend="h2"&gt;Features&lt;/head&gt;[edit]&lt;list rend="ul"&gt;&lt;item&gt;No compulsory line numbers (they can be used but are optional)&lt;/item&gt;&lt;item&gt;Line graphics in color&lt;/item&gt;&lt;item&gt;Structured programming—various block structures, named subroutines with local variables and return values&lt;/item&gt;&lt;item&gt;Code modules/libraries with separate namespaces (On the other hand, composite data structures are missing)&lt;/item&gt;&lt;item&gt;Option to use a graphical user interface based on the GTK library&lt;/item&gt;&lt;item&gt;Self-modifying code&lt;/item&gt;&lt;item&gt;"Binding" a Yabasic program to the interpreter, creating a standalone executable in a single file&lt;/item&gt;&lt;/list&gt;&lt;head rend="h2"&gt;Other versions&lt;/head&gt;[edit]&lt;head rend="h3"&gt;Yab&lt;/head&gt;[edit]&lt;p&gt;A version optimized for BeOS, ZETA and Haiku.[4]&lt;/p&gt;&lt;head rend="h3"&gt;Flyab&lt;/head&gt;[edit]&lt;p&gt;A port of Yabasic to the Fltk toolkit called "Flyab" was under development. It would have been source-compatible with programs written in yab, a variant of Yabasic that enables graphical programs to be written using the BeOS API. After BeOS and its successor ZETA finally were gone, the team members around yab for BeOS decided to move to Linux and therefore chose FLTK to implement the UI parts. Ports for Microsoft Windows, Mac OS X, and Linux would have been possible. Flyab added the ability to Yabasic to create native graphical user interfaces on all supported platforms. Main difficulty was to fully implement the layout commands to FLTK, as used from the BeOS version. [citation needed] As of November 2008, the project appears to be halted.&lt;/p&gt;&lt;head rend="h3"&gt;PlayStation 2&lt;/head&gt;[edit]&lt;p&gt;Sony also packaged a version of Yabasic for the PlayStation 2 on the demo disc[5] shipped with PS2 consoles in PAL territories so it could be considered a home computer, not just a games machine, thus bypassing European import taxes.[6]&lt;/p&gt;&lt;head rend="h3"&gt;Yabasic 3.0 (Unofficial)&lt;/head&gt;[edit]&lt;p&gt;As a continuation of the project prior to new changes by the original author, version 3 was being developed by a team centered on Pedro Sá and Thomas Larsen, but development has halted and the project now appears to be abandoned.[citation needed]&lt;/p&gt;&lt;head rend="h2"&gt;Yabasic example&lt;/head&gt;[edit]&lt;code&gt;#!/usr/bin/yabasic
+
+REM Program Name: cbm-mtudemo.yab
+REM Author: mtu
+REM 
+REM Purpose: demonstration for their CBM-PET graphics card 320x200
+
+open window 320, 200
+
+20 P=160: Q=100
+30 XP=144: XR=1.5*3.1415927
+40 YP=56: YR=1: ZP=64
+50 XF=XR/XP: YF=YP/YR: ZF=XR/ZP
+60 FOR ZI=-Q TO Q-l
+70 IF ZI&amp;lt;-ZP OR ZI&amp;gt;ZP GOTO 150
+80 ZT=ZI*XP/ZP: ZZ=ZI
+90 XL=INT(0.5+SQRT(XP*XP-ZT*ZT))
+100 FOR XI=-XL TO XL
+110 XT=SQRT(XI*XI+ZT*ZT)*XF: XX=XI
+120 YY=(SIN(XT)+0.4*SIN(3.0*XT))*YF
+130 GOSUB 170
+140 NEXT XI
+150 NEXT ZI
+160 PAUSE 10
+END
+170 X1=XX+ZZ+P
+180 Y1=YY-ZZ+Q:Y1=199-Y1
+190 LINE X1,Y1,X1,Y1-1
+200 IF Y1=0 GOTO 220
+210 CLEAR LINE X1,Y1+1,X1,199
+220 RETURN
+&lt;/code&gt;&lt;head rend="h2"&gt;References&lt;/head&gt;[edit]&lt;list rend="ol"&gt;&lt;item&gt;^ "Yabasic, Yet another Basic for Unix and Windows".&lt;/item&gt;&lt;item&gt;^ Marc-Oliver Ihm. "Yabasic, Yet another Basic for Unix and Windows". Yabasic.de. Retrieved 22 April 2013.&lt;/item&gt;&lt;item&gt;^ Ihm, Marc (3 April 2020), marcIhm/yabasic, retrieved 21 April 2020&lt;/item&gt;&lt;item&gt;^ Albrecht, Christian (2 October 2022). "yab Beginners tutorial". BeSly - BeOS, Haiku &amp;amp; Zeta. Translation by Luc Schrijvers (Begasus). Archived from the original on 24 February 2024. Retrieved 25 February 2024.&lt;/item&gt;&lt;item&gt;^ Archived at Ghostarchive and the Wayback Machine: Cameron Gray (26 February 2018), How/Why Sony Classed the PlayStation 2 as a Home Computer - Demo of Yabasic, retrieved 26 February 2018&lt;/item&gt;&lt;item&gt;^ Smith, Tony (11 July 2000). "Sony adds Basic to PlayStation to sidestep EC import tax". The Register. Retrieved 8 September 2014.&lt;/item&gt;&lt;/list&gt;&lt;head rend="h2"&gt;External links&lt;/head&gt;[edit]&lt;list rend="ul"&gt;&lt;item&gt;Official website — Downloads and documentation for Yabasic 2.90.2&lt;/item&gt;&lt;item&gt;Yabasic GitHub — Source code for Yabasic on GitHub.&lt;/item&gt;&lt;/list&gt;&lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://en.wikipedia.org/wiki/Yabasic"/><published>2026-05-12T10:33:49+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48106367</id><title>Coursera and Udemy are now one company</title><updated>2026-05-12T12:22:07.257237+00:00</updated><content>&lt;doc fingerprint="e0d8941515a5afe8"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Today, I’m excited to share that we have completed the Coursera-Udemy combination, bringing together two mission-driven companies to create one of the world’s most comprehensive skills development platforms.&lt;lb/&gt;This marks an important step forward in our ability to better serve our learners, customers, partners, and instructors around the world. Together, we now reach over 290 million learners, 18,000 enterprise customers, and a global ecosystem of 95,000 content creators, alongside hundreds of university and industry partners.&lt;lb/&gt;We’re joining forces at a pivotal moment. AI is transforming every job across every industry. To adapt and thrive, learners and organizations need a platform that keeps pace with technology acceleration and helps them master new and emerging skills with confidence.&lt;lb/&gt;By bringing together our highly complementary strengths, we can deliver more choice, more value, and faster innovation for learners and organizations worldwide — while better connecting skill discovery, skill development, and credentialing into a more unified learning experience.&lt;/p&gt;
+    &lt;p&gt;The combination fundamentally expands what we can build for the AI era. We’re moving from a content catalog to a true skills delivery platform — one that connects learning with real-world outcomes. Built on the foundation of more than 315,000 courses from world-class university, industry, and subject-matter experts and our growing investment in AI, we can connect every learner to the right skill at the right moment. This enables a more seamless path from fluency to mastery, while expanding our global reach to better serve diverse learners and distributed workforces at scale.&lt;lb/&gt;This is also Day 1. We’re being thoughtful and deliberate in how we bring our platforms together to deliver a unified, seamless experience.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What this means for you today:&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Learners: Nothing about your experience, access, subscription, or pricing changes today. You’ll continue to have access to your courses, content, and any certificates you’ve earned as before. Over time, you’ll begin to see expanded access to a combined catalog across our platforms, along with a suite of AI-powered tools and experiences to help you build the right skills to grow your career.&lt;/item&gt;
+      &lt;item&gt;Content Partners and Instructors: There are no immediate changes to any existing agreements, contracts, economics, or support structures, and you can continue to create, publish, and optimize content as before. We will not be integrating our two platforms on Day 1 — your content, and the learning experience it provides, will remain as it is today on either Coursera.org or Udemy.com. We are focused on building a unified platform that will better serve our combined and growing base of 290 million learners and 18,000 customers, creating more opportunity for all our content creators. Once integrated, we’ll be able to provide a wider range of teaching and publishing tools, along with deeper skills-driven insights, to support you in creating more effective content.&lt;/item&gt;
+      &lt;item&gt;Customers: There are no immediate changes to course offerings, pricing, platform access, or existing agreements. By bringing together the strengths of Coursera and Udemy, we can better support you in building job-relevant and business-critical skills at scale — with greater breadth, flexibility, and speed to measure and empower your talent. We will be thoughtful in how we bring the benefits of both platforms into a unified experience.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Today is the beginning of our next chapter. Together, we have the opportunity to reshape how the world learns and applies skills — and to help millions of people participate in the new economy. I’m excited for what we will build together.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://blog.coursera.org/coursera-and-udemy-are-now-one-company-creating-the-worlds-most-comprehensive-skills-platform/"/><published>2026-05-12T10:37:44+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48106534</id><title>EU to crack down on TikTok, Instagram's 'addictive design' targeting kids</title><updated>2026-05-12T12:22:07.057043+00:00</updated><content>&lt;doc fingerprint="25bc98549ec2dfe5"&gt;
+  &lt;main&gt;
+    &lt;p&gt;The EU is clamping down on social media firms and plans to target "addictive design" features on TikTok and Instagram as governments worldwide look to protect children from the harms of social media.&lt;/p&gt;
+    &lt;p&gt;The region will take action against certain features on social media platforms later in the year, EU Commission President Ursula von der Leyen said Tuesday at the European Summit on Artificial Intelligence and Children in Denmark.&lt;/p&gt;
+    &lt;p&gt;CNBC has approached ByteDance and Meta for comment.&lt;/p&gt;
+    &lt;p&gt;"We are taking action against TikTok and its addictive design – endless scrolling, autoplay, and push notifications. The same applies to Meta, because we believe Instagram and Facebook are failing to enforce their own minimum age of 13," Von der Leyen said.&lt;/p&gt;
+    &lt;p&gt;"We are investigating platforms that allow children to go down 'rabbit holes' of harmful content – such as videos that promote eating disorders or self-harm," she added.&lt;/p&gt;
+    &lt;p&gt;The EU's executive arm has also developed its own age verification app, which has the "highest privacy standards in the world," according to Von der Leyen.&lt;/p&gt;
+    &lt;p&gt;Member states will soon be able to integrate it into their digital wallets, and it can easily be enforced by online platforms. "No more excuses – the technology for age-verification is available," the EU chief said.&lt;/p&gt;
+    &lt;p&gt;The EU Commission could have a legal proposal prepared as soon as the summer, as it awaits the advice and findings of its 'Special Panel of experts on Child Safety Online.'&lt;/p&gt;
+    &lt;head rend="h2"&gt;U.S. crackdown&lt;/head&gt;
+    &lt;p&gt;The EU has been cracking down on U.S Big Tech in the past year as it enforces legislation aimed at strengthening accountability of the tech giants. A slew of fines has drawn criticism from U.S. officials who have warned the bloc risks missing out on partaking in the AI economy.&lt;/p&gt;
+    &lt;p&gt;U.S. President Donald Trump is combating the penalties against U.S. businesses, which have totalled over $7 billion in the past two years.&lt;/p&gt;
+    &lt;p&gt;Apple, Meta, and Google, are among the companies facing fines over violations of the bloc's antitrust and competition laws, which they have contested.&lt;/p&gt;
+    &lt;p&gt;Trump signed a memorandum in February that would consider issuing tariffs to "combat digital service taxes (DSTs), fines, practices, and policies that foreign governments levy on American companies."&lt;/p&gt;
+    &lt;p&gt;Earlier this year, the EU Commission launched an investigation against Elon Musk's X, formerly known as Twitter, for the spreading of sexually explicit non-consensual content of women and children generated by its chatbot Grok.&lt;/p&gt;
+    &lt;p&gt;The increased legal scrutiny around child safety on social media platforms comes after Meta and YouTube lost a high-profile court ruling in the U.S. in March, which found that design features such as infinite scrolling and autoplay contributed to addiction and mental health harms in teenagers.&lt;/p&gt;
+    &lt;p&gt;More recently, the Commission found that Meta breached the EU's Digital Services Act by failing to keep under-13s off its platforms, with a preliminary investigation determining that minors are easily able to bypass checks.&lt;/p&gt;
+    &lt;p&gt;Meanwhile, a social ban for under-16s is gaining traction with governments worldwide, after Australia became the first country to enforce a sweeping ban in December. Several European countries including Spain, France, and the U.K., are proposing their own legislation to keep children off social media.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://www.cnbc.com/2026/05/12/tiktok-instagram-social-media-addictive-eu-crack-down.html"/><published>2026-05-12T11:00:07+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48107024</id><title>Text Blaze (YC W21) Is Hiring for a No-AI Summer Internship</title><updated>2026-05-12T12:22:06.673119+00:00</updated><content>&lt;doc fingerprint="ac5f6a7a77bc626f"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Slash commands anywhere&lt;/p&gt;
+    &lt;p&gt;We are excited to open applications to our “No AI Summer” internship.&lt;/p&gt;
+    &lt;p&gt;We invite dedicated late-college or early career candidates to apply for this role. You’ll be a great fit for this role if you:&lt;/p&gt;
+    &lt;p&gt;Also, you aren’t allowed to use AI. At all. All summer.&lt;/p&gt;
+    &lt;p&gt;We want to train you, not LLMs, to become an excellent full-stack engineer. You’ll spend the summer tackling hard challenges and learning. It will be a lot of work, but you’ll have the opportunity to really develop yourself.&lt;/p&gt;
+    &lt;p&gt;Over the past two years we have seen as an industry an over-reliance on AI tools that have limited growth and development of new junior engineers. Once you move beyond simple tasks, this over-reliance can lead to poor quality work and wasted time for all involved.&lt;/p&gt;
+    &lt;p&gt;We want rockstars on our team to help us build amazing products – (ironic em-dash) to do that we’re banning AI in this internship.&lt;/p&gt;
+    &lt;p&gt;Not at all. AI is a very helpful tool. You can get a double-digit productivity improvement using it. We use it extensively. Part of our product suite is AI. Don’t apply if you hate AI.&lt;/p&gt;
+    &lt;p&gt;We’re a global company and hire around the world.&lt;/p&gt;
+    &lt;p&gt;We build productivity products, our primary product is Text Blaze with over 700,000 users with a 4.9/5 ★ rating with 1,800 reviews. The team works hard to make our products simple but also extremely powerful. To make this happen there are a lot of challenges and difficult tradeoffs in our work. We want to work hard with you to help you become a great engineer who thinks critically and can do amazing work.&lt;/p&gt;
+    &lt;p&gt;If you’re interested in joining, reach out. We’re a small team and you have the potential to have a high impact. This application role is for junior developers, but we’re also hiring for senior roles.&lt;/p&gt;
+    &lt;p&gt;Please send a short cover letter/note that shares:&lt;/p&gt;
+    &lt;p&gt;This note should be no longer than five sentences.&lt;/p&gt;
+    &lt;p&gt;Text Blaze saves time and increases comms quality by automating repeated tasks. Users save smart templates and insert them anywhere on the web using keyboard shortcuts. Templates can include placeholders, logic, dynamic fields, integrations with other apps, and more.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://www.ycombinator.com/companies/text-blaze/jobs/P4CCN62-the-blaze-no-ai-summer-internship"/><published>2026-05-12T12:00:46+00:00</published></entry></feed>
