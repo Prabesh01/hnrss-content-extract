@@ -1,92 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 16 May 2026 15:31:32 +0000</lastBuildDate><item><title>Additive Blending on the Nintendo 64</title><link>https://phoboslab.org/log/2026/05/n64-additive-blending</link><description>&lt;doc fingerprint="365fca53c20a83be"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Additive Blending on the Nintendo 64&lt;/head&gt;
-    &lt;p&gt;Did you ever wonder why explosions and other effects looked so much cooler on the original PlayStation than they did on the Nintendo 64?&lt;/p&gt;
-    &lt;p&gt;The reason is additive blending! Or rather, in the N64 case, the lack thereof. While the N64 actually did support additive blending, it was practically unusable.&lt;/p&gt;
-    &lt;head rend="h3"&gt;PSX&lt;/head&gt;
-    &lt;p&gt;The PSX supports 4 different blend modes (in addition to just overwriting pixels) to control how sprites and geometry are mixed into the existing frame buffer:&lt;/p&gt;
-    &lt;code&gt;0: (src + dst) / 2
-1: src + dst
-2: dst - src
-3: dst + src/4&lt;/code&gt;
-    &lt;p&gt;The one you see here in Silent Bomber is conceptually the simplest one: &lt;code&gt;src + dst&lt;/code&gt;. 
-That is, colors are just added to the existing ones in the frame buffer.&lt;/p&gt;
-    &lt;code&gt;                      |   R |   G |   B |
-|   src (sprite)      | 171 |  42 | 226 | 
-| + dst (framebuffer) |  63 | 141 | 170 | 
-| = result            | 234 | 183 | 255 | &lt;/code&gt;
-    &lt;p&gt;Drawing a sprite over a scene can only ever make it brighter, never darker. Perfect for explosions, plasma beams and magic spells. Importantly, note how the &lt;code&gt;B&lt;/code&gt; value in this example adds up to &lt;code&gt;396&lt;/code&gt;, but the PSX GPU helpfully clamps
-it to the maximum range of &lt;code&gt;255&lt;/code&gt;. &lt;/p&gt;
-    &lt;p&gt;(Aside: the PSX GPU actually only works in 16bit precision with 5bit color components, so values range from &lt;code&gt;0 .. 31&lt;/code&gt;; the math is the same.)&lt;/p&gt;
-    &lt;head rend="h3"&gt;N64&lt;/head&gt;
-    &lt;p&gt;The N64's “Reality Display Processor” (the fixed-function rasterizer, short RDP) has a much more flexible way to control blending: a configurable “Color Combiner”. This is somewhat similar to OpenGL's &lt;code&gt;glBlendFunc()&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;Libdragon exposes this functionality with the &lt;code&gt;RDPQ_BLENDER((P, A, Q, B))&lt;/code&gt; macro that instructs the RDP to execute 
-&lt;code&gt;(P * A) + (Q * B)&lt;/code&gt;, where each slot can be one of several inputs. &lt;/p&gt;
-    &lt;p&gt;Setting up additive blending with this is trivial:&lt;/p&gt;
-    &lt;code&gt;RDPQ_BLENDER(( IN_RGB, IN_ALPHA, MEMORY_RGB, ONE ))&lt;/code&gt;
-    &lt;p&gt;The problem is, the RDP doesn't clamp the result.&lt;/p&gt;
-    &lt;code&gt;                      |   R |   G |   B |
-|   src (sprite)      | 171 |  42 | 226 | 
-| + dst (framebuffer) |  63 | 141 | 170 | 
-| = result            | 234 | 183 | 140 | 
-                                     ^
-                                     wraps around!&lt;/code&gt;
-    &lt;p&gt;The resulting output is less than desirable:&lt;/p&gt;
-    &lt;p&gt;Now, you could of course fall back to draw such effects on the “Reality Signal Processor” (RSP), the vector co-processor of the N64. But that gets complicated quickly if you want to do rotation, scaling or any actual 3D stuff. The RDP is much better suited for this. Displaying is its job!&lt;/p&gt;
-    &lt;p&gt;While the RDP can draw into a 32bit buffer, it was very uncommon for games to do so. Almost all N64 games used a 16bit framebuffer for the final output. But with this in mind, I came up with a different plan:&lt;/p&gt;
-    &lt;p&gt;Let the RDP draw onto a 32bit &lt;code&gt;RGBA 8888&lt;/code&gt; (8 bits per component) buffer, but have 
-all our sprites in the 16bit &lt;code&gt;RGBA 5551&lt;/code&gt; (5 bits per color component, 1 bit alpha) 
-range. I could just pre-process assets by dividing RGB by &lt;code&gt;8&lt;/code&gt; (or right shifting
-by &lt;code&gt;3&lt;/code&gt; bits).  This will essentially draw everything way too dark, but in turn
-gives us lots of headroom for additive blending.&lt;/p&gt;
-    &lt;p&gt;Better yet, we don't have to do this image pre-processing offline. We can just instruct the color combiner to do it for us when drawing. For free!&lt;/p&gt;
-    &lt;code&gt;// Abuse the fog alpha value to draw all colors at 1/8th intensity
-rdpq_set_fog_color(RGBA32(0, 0, 0, 256/8));
-rdpq_mode_blender(RDPQ_BLENDER(( IN_RGB, FOG_ALPHA, MEMORY_RGB, ONE )));    &lt;/code&gt;
-    &lt;p&gt;So how do we get this back to normal brightness? Simple: use a 16bit frame buffer for displaying and “copy” all the 32bit colors into it. We just have to be careful to clamp all 8bit color components into the 5bit range.&lt;/p&gt;
-    &lt;code&gt;void cpu_rgba_8888_to_5551(uint32_t *rgba32_in, uint16_t *rgba16_out) {
-    for (int i = 0; i &amp;lt; 320 * 240; i++) {
-        color_t c = color_from_packed32(rgba32_in[i]);
-        if (c.r &amp;gt; 31) { c.r = 31; }
-        if (c.g &amp;gt; 31) { c.g = 31; }
-        if (c.b &amp;gt; 31) { c.b = 31; }
-        rgba16_out[i] = (c.r &amp;lt;&amp;lt; 11) | (c.g &amp;lt;&amp;lt; 6) | (c.b &amp;lt;&amp;lt; 1) | 0x1;
-    }
-}&lt;/code&gt;
-    &lt;p&gt;Doing this on the CPU is of course prohibitively expensive. It takes about 70ms for a 320×240 frame. But this is where the RSP co-processor shines. The problem now became simple enough.&lt;/p&gt;
-    &lt;p&gt;The RSP's 128bit vector instructions can process 8 pixels at a time. With some help from HailToDodongo on the #N64Brew discord optimizing the GPU microcode, this now runs in about 3.1ms for the whole frame!&lt;/p&gt;
-    &lt;p&gt;(Trivia: I'd like to interject for a moment. What is commonly referred to as “GPU microcode” in the context of the N64 is in fact, MIPS/assembly that runs on the RSP, or as I've recently taken to calling it, MIPS plus assembly.)&lt;/p&gt;
-    &lt;p&gt;Modern tooling for N64 development is phenomenal. While it helps to have some understanding of assembly, you don't have to write MIPS assembly by hand anymore. HailToDodongo invented a C-like language called RSPL that directly compiles to it.&lt;/p&gt;
-    &lt;p&gt;So the whole setup looks like this:&lt;/p&gt;
-    &lt;code&gt;// Init the display with a 16bit frame buffer
-display_init(RESOLUTION_320x240, DEPTH_16_BPP, 3, GAMMA_NONE, FILTERS_DISABLED);
-
-// Create a secondary 32bit render buffer and set it as render target
-surface_t render32 = surface_alloc(FMT_RGBA32, 320, 240);
-rdpq_set_color_image(render32);
-
-// Configure the color combiner to draw at 1/8th intensity
-rdpq_set_fog_color(RGBA32(0, 0, 0, 256/8));
-rdpq_mode_blender(RDPQ_BLENDER((IN_RGB, FOG_ALPHA, MEMORY_RGB, ONE)));
-
-// Draw your scene with lots of additive blended sprites
-render_scene();
-
-// Kick of the conversion from the 32bit render buffer to the 
-// 16bit frame buffer on the RSP
-rsp_rgba_8888_to_5551(render32-&amp;gt;buffer, screen-&amp;gt;buffer);
-
-// Present the 16bit framebuffer
-display_show(screen);&lt;/code&gt;
-    &lt;p&gt;Resulting in lots of gloriously additive blended sprites without any wrap around artifacts.&lt;/p&gt;
-    &lt;p&gt;There was of course a reason that most games used a 16bit frame buffer to begin with: the atrocious memory throughput of the N64. Drawing onto a 32bit buffer takes almost twice the time compared to a 16bit buffer, because the RDP has to shuffle twice the amount of bytes from and back to the frame buffer stored in RDRAM.&lt;/p&gt;
-    &lt;p&gt;Still, this technique worked out better than I expected. It's certainly good enough for some applications.&lt;/p&gt;
-    &lt;p&gt;I can also see further optimization potential by only drawing those sprites that need additive blending to the 32bit buffer – maybe even at a lower resolution — and then combine it with the rest of scene's 16bit buffer on the RSP…&lt;/p&gt;
-    &lt;p&gt;A simple demo project for the above video can be found on github:&lt;lb/&gt; github.com/phoboslab/n64_addblend&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48149259</guid><pubDate>Fri, 15 May 2026 14:39:51 +0000</pubDate></item><item><title>Project Gutenberg – keeps getting better</title><link>https://www.gutenberg.org/</link><description>&lt;doc fingerprint="2ba0365d4174041"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 16 May 2026 16:43:05 +0000</lastBuildDate><item><title>Project Gutenberg – keeps getting better</title><link>https://www.gutenberg.org/</link><description>&lt;doc fingerprint="2ba0365d4174041"&gt;
   &lt;main&gt;
     &lt;div&gt;
       &lt;head rend="h1"&gt; Project Gutenberg is a library of over 75,000 free eBooks &lt;/head&gt;
@@ -362,7 +275,7 @@ display_show(screen);&lt;/code&gt;
     &lt;p&gt;Terms of Service Privacy Policy Cookie Policy Imprint Ads info © 2026 X Corp.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48153379</guid><pubDate>Fri, 15 May 2026 20:26:47 +0000</pubDate></item><item><title>How to Write to SSDs [pdf]</title><link>https://www.vldb.org/pvldb/vol19/p1469-lee.pdf</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48154711</guid><pubDate>Fri, 15 May 2026 22:23:38 +0000</pubDate></item><item><title>Orthrus-Qwen3: up to 7.8×tokens/forward on Qwen3, identical output distribution</title><link>https://github.com/chiennv2000/orthrus</link><description>&lt;doc fingerprint="f70aa27a26f2ebd2"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48153379</guid><pubDate>Fri, 15 May 2026 20:26:47 +0000</pubDate></item><item><title>Orthrus-Qwen3: up to 7.8×tokens/forward on Qwen3, identical output distribution</title><link>https://github.com/chiennv2000/orthrus</link><description>&lt;doc fingerprint="f70aa27a26f2ebd2"&gt;
   &lt;main&gt;
     &lt;p&gt;Official implementation and model checkpoints for Orthrus, a dual-architecture framework that unifies the exact generation fidelity of autoregressive Large Language Models (LLMs) with the high-speed parallel token generation of diffusion models.&lt;/p&gt;
     &lt;head class="tmp-px-3 py-2"&gt;demo_orthrus.mp4&lt;/head&gt;
@@ -1599,4 +1512,21 @@ dotp xs ys = fold (+) 0 (zipWith (*) xs ys)
     &lt;quote&gt;&lt;p&gt;LLM-generated skills work, if you generate them afterwards&lt;/p&gt;&lt;p&gt;LLM “skills” are a short explanatory prompt for a particular task, typically bundled with helper scripts. A recent paper showed that while skills are useful to LLMs, LLM-authored skills are not. From the abstract:&lt;/p&gt;&lt;p&gt;Self-generated skills provide no benefit on average, showing that models cannot reliably author the procedural knowledge they benefit from consuming&lt;/p&gt;&lt;p&gt;For the moment, I don’t really want to dive into the paper. I just want to note that the way the paper uses LLMs to generate skills is bad, and you shouldn’t do this. Here’s how the paper prompts a LLM to produce skills:&lt;/p&gt;&lt;lb/&gt;Continue reading...&lt;/quote&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48160807</guid><pubDate>Sat, 16 May 2026 14:58:16 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48160807</guid><pubDate>Sat, 16 May 2026 14:58:16 +0000</pubDate></item><item><title>How an Australian Teen Team Is Making Radio Astronomy Affordable for Schools</title><link>https://mag.openrockets.com/p/how-an-australian-teen-team-is-making-radio-astronomy-affordable-for-rural-schools-4894opuisyhfdisubgi/?b=2</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48160914</guid><pubDate>Sat, 16 May 2026 15:12:17 +0000</pubDate></item><item><title>Tesla reveals two Robotaxi crashes involving teleoperators</title><link>https://techcrunch.com/2026/05/15/tesla-reveals-two-robotaxi-crashes-involving-teleoperators/</link><description>&lt;doc fingerprint="21c20f1cbc37d3c2"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Tesla Robotaxis have crashed at least twice since July 2025 while a teleoperator was remotely driving the vehicles, according to newly unredacted information submitted to the National Highway Traffic Safety Administration (NHTSA).&lt;/p&gt;
+    &lt;p&gt;Both crashes happened in Austin, Texas, and occurred at low speeds. In each case, there was a safety monitor behind the wheel and no passengers were onboard.&lt;/p&gt;
+    &lt;p&gt;The new information comes just a few months after Tesla told lawmakers that it allows remote operators to pilot one of the company’s vehicles as long as they stay under 10 miles per hour. “This capability enables Tesla to promptly move a vehicle that may be in a compromising position, thereby mitigating the need to wait for a first responder or Tesla field representative to manually recover the vehicle,” the company said at the time.&lt;/p&gt;
+    &lt;p&gt;Tesla, like other companies working on autonomous vehicle technology, is required to submit detailed information about any crashes to the NHTSA. Unlike most of those other companies, though, Tesla had always redacted the descriptions of its crashes, claiming they were confidential business information.&lt;/p&gt;
+    &lt;p&gt;It’s not clear why, but Tesla changed course this week, and the latest version of the data released by the NHTSA now provides a narrative description for all 17 crashes Tesla has recorded since last year with its nascent Robotaxi network.&lt;/p&gt;
+    &lt;p&gt;In July 2025, shortly after Tesla first started operating the network in Austin, the company’s automated driving system (ADS) apparently had trouble moving forward while stopped on a street. The safety monitor requested help from Tesla’s remote assistance team, and a teleoperator “took over vehicle control and gradually increased vehicle speed and turned the Tesla ADS left toward the left side of the street.”&lt;/p&gt;
+    &lt;p&gt;The teleoperator then drove “up the curb and made contact with a metal fence.”&lt;/p&gt;
+    &lt;p&gt;A similar sequence played out in January 2026. The Tesla ADS was driving the vehicle straight on a street, when the safety monitor "requested support to assist with vehicle navigation."&lt;/p&gt;
+    &lt;p&gt;"The teleoperator took over vehicle control when the ADS was stopped and proceeded straight on the street. The Tesla vehicle made contact with a temporary barricade for a construction site at approximately 9MPH, scraping the front-left fender and tire," according to the data submitted to the NHTSA.&lt;/p&gt;
+    &lt;p&gt;Similar to other autonomous vehicle companies like Waymo, most of the other newly unredacted crashes involve Tesla Robotaxi vehicles being crashed into instead of causing crashes.&lt;/p&gt;
+    &lt;p&gt;But at least two of them involve a Tesla Robotaxi clipping its mirrors on other vehicles. In one crash, from September 2025, the Tesla ADS was unable to avoid hitting a dog that ran into the street. (Tesla reported the dog was able to run away.)&lt;/p&gt;
+    &lt;p&gt;In another September 2025 crash, a Tesla Robotaxi made an unprotected left turn into a parking lot and ran into a metal chain. (The NHTSA recently closed an investigation into the occasional tendency of Tesla's Full Self-Driving software to crash into parking lot bollards, chains, and gates. Waymo also issued a recall last year related to a similar problem.)&lt;/p&gt;
+    &lt;p&gt;While other robotaxi companies like Waymo and Zoox have reported more crashes than Tesla, Elon Musk's company is operating at a fraction of the scale. The details that were revealed this week in the newly unredacted data may help explain why Tesla is scaling up its nascent autonomous ride-hailing network so slowly. Musk himself admitted last month that "making sure things are completely safe" is the biggest limiting factor to Tesla expanding the network, saying the company is being "very cautious."&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48160991</guid><pubDate>Sat, 16 May 2026 15:21:45 +0000</pubDate></item></channel></rss>
