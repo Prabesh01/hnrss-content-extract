@@ -1,558 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 30 May 2026 20:07:53 +0000</lastBuildDate><item><title>MCP is dead?</title><link>https://www.quandri.io/engineering-blog/mcp-is-dead</link><description>&lt;doc fingerprint="30f96c75adb5a0e"&gt;
-  &lt;main&gt;&lt;p&gt;Backend Engineer @ Quandri&lt;/p&gt;&lt;p&gt;TL;DR: MCP eats context, has low reliability, and overlaps with existing CLI/API.&lt;/p&gt;&lt;p&gt;💡&lt;/p&gt;&lt;p&gt;Reference: MCP is dead. Long live the CLI&lt;/p&gt;&lt;p&gt;After reading the above article, we ran the experiments on our actual stack. This document covers the original argument, additional research, and our measurements.&lt;lb/&gt;&lt;/p&gt;&lt;p&gt;📌&lt;/p&gt;&lt;p&gt;Update: Since these measurements were taken, Claude Code has rolled out Tool Search with Deferred Loading, which loads MCP tool schemas on-demand and reduces context usage by 85%+. The context bloat described in Problem 1 is largely addressed for users on current Claude Code versions. The performance, debugging, and architectural arguments below still apply.&lt;/p&gt;&lt;p&gt;MCP (Model Context Protocol) connects LLMs to external tools (GitHub, Linear, Notion, Slack, etc.).&lt;/p&gt;&lt;p&gt;Since its launch in late 2024, it's been called "the USB-C of the AI ecosystem." But developers actually using it day-to-day are starting to think differently.&lt;lb/&gt;&lt;/p&gt;&lt;p&gt;TL;DR: MCP eats context, has low reliability, and overlaps with existing CLI/API.&lt;/p&gt;&lt;p&gt;The context window is the LLM's desk. When you connect MCP servers, tool definitions alone take up a significant chunk of that desk.&lt;/p&gt;&lt;p&gt;Restaurant analogy:&lt;/p&gt;&lt;p&gt;We extracted and measured the actual tool definitions from the MCP servers connected in our environment. With all 4 servers connected, 10.5% of the context window is consumed by tool definitions alone.&lt;/p&gt;&lt;p&gt;Linear alone accounts for over 12,800 tokens. That's 42 tool definitions always loaded, even if you only ever use &lt;code&gt;get_issue&lt;/code&gt; and &lt;code&gt;save_issue&lt;/code&gt;.&lt;/p&gt;&lt;p/&gt;&lt;p/&gt;&lt;p&gt;Performance is a known issue. The author of the original article benchmarked Jira MCP against its REST API directly and found MCP was 3x slower per call, and 9.4x slower on first call including initialization. This isn't Jira-specific, it's architectural: every MCP server adds a process layer between the LLM and the underlying API. The same overhead applies to the Linear, Notion, and Slack servers in our stack.&lt;/p&gt;&lt;p&gt;How many tokens does it cost to look up the same Linear issue?&lt;lb/&gt;MCP consumes ~65x more tokens than the CLI approach.&lt;/p&gt;&lt;code&gt;[ CLI approach: ~200 tokens ]
-curl -s -H "Authorization: Bearer $LINEAR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"query":"{ issue(id: \"ISSUE-ID\") { title state { name } assignee { name } } }"}' \
-  https://api.linear.app/graphql
-
--&amp;gt; Prompt (curl command): ~50 tokens
--&amp;gt; Response: ~150 tokens
-
-[ MCP approach: ~12,957 tokens ]
--&amp;gt; Tool definitions (always loaded): ~12,807 tokens (42 tools)
--&amp;gt; Tool call + response: ~150 tokens&lt;/code&gt;&lt;p&gt;&lt;code/&gt;&lt;/p&gt;&lt;p&gt;Provide CLI -&amp;gt; API -&amp;gt; docs, in that order. LLMs already learned from man pages and StackOverflow.&lt;/p&gt;&lt;p&gt;Using existing CLI directly:&lt;/p&gt;&lt;p&gt;If MCP is "spreading all menus on the table upfront", Skills is "asking the librarian for only the book you need".&lt;/p&gt;&lt;p/&gt;&lt;p&gt;&lt;lb/&gt;The key is embedding CLI usage instructions inside Skills. Combined with Alternative 1's CLI-first strategy, this is most efficient. For example, a Linear skill:&lt;lb/&gt;&lt;/p&gt;&lt;code&gt;# Linear Issue Lookup Skill
-- Linear API: https://api.linear.app/graphql
-- Auth: Bearer Token ($LINEAR_TOKEN env var)
-- Get issue: curl -s -H "Authorization: Bearer $LINEAR_TOKEN" -H "Content-Type: application/json" -d '{"query":"{ issue(id: \"ISSUE-ID\") { title state { name } assignee { name } } }"}' https://api.linear.app/graphql
-- Search issues (GraphQL): adjust the query field for JQL-like filtering
-- Results are JSON, parse with jq&lt;/code&gt;&lt;p&gt;&lt;code/&gt;&lt;/p&gt;&lt;p&gt;&lt;lb/&gt;This way, the LLM only loads the above into context when the skill is invoked. No need to carry 42 tool definitions at all times. Just the CLI commands it needs.&lt;/p&gt;&lt;p&gt;&lt;lb/&gt;Not entirely. MCP is still valid when:&lt;/p&gt;&lt;p&gt;Short answer: it depends.&lt;/p&gt;&lt;p&gt;&lt;lb/&gt;DBs are just query execution at the end of the day. LLMs already know SQL and MongoDB queries well. Put DB info and CLI usage in a skill, and it works fine without MCP. Just give it the schema and it writes the queries.&lt;/p&gt;&lt;code&gt;# Postgres Skill
-- Host: postgres://localhost:5432/myapp
-- Tables: users (id, name, email), orders (id, user_id, status)
-- CLI: psql -h localhost -d myapp -c "SELECT * FROM users WHERE ..."&lt;/code&gt;&lt;p&gt;&lt;code/&gt;&lt;/p&gt;&lt;p&gt;However, MCP has advantages for databases:&lt;/p&gt;&lt;code&gt;DROP TABLE&lt;/code&gt;.&lt;p&gt;&lt;lb/&gt;But for most developer workflows, MCP is over-engineering.&lt;/p&gt;&lt;p&gt;These days, every SaaS landing page has "MCP supported" in the feature list. Whether the MCP server is stable or how much context it eats doesn't matter - the goal is checking the "we do MCP too" box. Same pattern as "AI-powered" and "blockchain-based" marketing from years past. When users actually connect, they get dozens of tool definitions loaded, initialization failures, and mid-session crashes.&lt;/p&gt;&lt;p&gt;At Quandri we use all three approaches side by side, picking what fits each service:&lt;/p&gt;&lt;code&gt;gh&lt;/code&gt;, &lt;code&gt;psql&lt;/code&gt;, &lt;code&gt;aws&lt;/code&gt;). Zero context cost, full flexibility, debugs straight in the terminal.&lt;p&gt;We don't force one path. If a CLI already exists and authenticates locally, that's usually the lightest option. If a service has no CLI or we need uniform auth across the team, MCP earns its keep.&lt;/p&gt;&lt;p/&gt;&lt;p&gt;Teaching well matters more than connecting everything.&lt;/p&gt;&lt;p&gt;For us, replacing MCP servers with Skills that wrap existing CLIs freed up ~21K tokens of context, removed init failures from our daily workflow, and kept debugging in the terminal where it belongs.&lt;/p&gt;&lt;p&gt;Load only the tools you need, only when you need them, with CLI instructions baked in. MCP might evolve to solve these problems, but right now, Skills win.&lt;/p&gt;&lt;p/&gt;&lt;p&gt;&lt;lb/&gt;Measurement methodology: &lt;lb/&gt;Tool definition sizes were measured by extracting the JSON schema of each tool (name + description + parameters) from actually loaded MCP servers in our Claude Code environment. Token estimates use the ~4 chars/token heuristic. Full server estimates are extrapolated from sampled tool averages.&lt;/p&gt;&lt;p/&gt;&lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48330436</guid><pubDate>Fri, 29 May 2026 22:56:49 +0000</pubDate></item><item><title>Macsurf, "modern" web browser for macOS 9</title><link>https://github.com/mplsllc/macsurf</link><description>&lt;doc fingerprint="a1c6503916c87fe2"&gt;
-  &lt;main&gt;
-    &lt;p&gt;The modern web, on a 25-year-old Mac.&lt;/p&gt;
-    &lt;p&gt;MacSurf is a web browser for Classic Mac OS 9 PowerPC. CSS3, ES5 JavaScript, PNGs with alpha, running on a G3 iMac.&lt;/p&gt;
-    &lt;p&gt;Warning&lt;/p&gt;
-    &lt;p&gt;MacSurf is early alpha. It runs, it renders, it talks TLS 1.2 natively to real HTTPS sites (as of May 2026), and it executes JavaScript on a 233 MHz G3. That doesn't mean it's ready for daily driving — most of the modern web still won't work in it. Heavy SPAs, modern CSS features we haven't shipped, missing form interactions, slow JS on real hardware. Plenty is rough.&lt;/p&gt;
-    &lt;p&gt;But it's ready for people to try. If you've got a Power Mac G3 or G4 sitting around, please load it and see what breaks. Bug reports and screenshots from real hardware are exactly what this project needs. Contributors welcome too — there's a lot of CSS, DOM, and JS surface left to fill in, and the code is plain C89 (the same C you'd have written in 1999). See docs/status.md for the current punch list.&lt;/p&gt;
-    &lt;p&gt;What you can expect: hand-built pages, retro-style sites, a respectable chunk of CSS Grid, native HTTPS with the full Mozilla CA bundle, and the strange thrill of running ES5 JavaScript on a PowerPC. What you shouldn't expect yet: smooth browsing on arbitrary modern sites, video, audio, WebGL, service workers, anything heavy on React.&lt;/p&gt;
-    &lt;p&gt;First numbered release was 0.1a1 in May 2026. Latest is v1.3.1 — Forward, refined (2026-05-29): multi-curve ECDHE in TLS 1.3. macTLS now offers X25519, secp256r1 (P-256), and secp384r1 (P-384) in &lt;code&gt;supported_groups&lt;/code&gt;, with HelloRetryRequest handled cleanly so servers that mandate a NIST curve can drive the rekey. That unblocks 68kmla.org — one of the largest active Classic Mac communities, XenForo on nginx with NIST-only curve config — which now renders fully on a G3 iMac via TLS 1.3 + P-384. Predecessor v1.3 — Forward landed the first native TLS 1.3 implementation on Classic Mac OS, ever — RFC 8446 handshake on BearSSL primitives, ChaCha20-Poly1305 + AES-128-GCM, verified end-to-end on a G3 iMac by Cloudflare's &lt;code&gt;/cdn-cgi/trace&lt;/code&gt;, Akamai, BrowserLeaks, and How's My SSL. The day before, v1.2 — Sealed closed the documented insecure-stub entropy hole with macEntropy v1.0, wired POST forms through both fetchers, and shipped a real download manager. Full v1.3.1 notes in docs/release-notes/MacSurf-1.3.1.md. Predecessors: v1.3 notes, v1.2 notes, v1.0 notes.&lt;/p&gt;
-    &lt;p&gt;The web outgrew Classic Mac OS twenty years ago. Modern HTTPS finished it off around 2016. Pull a G3 or G4 out of the closet today and it can barely reach a single live website.&lt;/p&gt;
-    &lt;p&gt;MacSurf is an attempt to fix that on the machine itself — no screenshot proxy, no remote terminal trick. A native browser, built with the tools that were already on the platform: CodeWarrior, Carbon, QuickDraw, Open Transport. Real CSS3 layouts and real JavaScript, running inside the 64 MB memory floor of a 1999 iMac. Since late May 2026 it speaks TLS 1.2 directly to the modern web through macTLS, a BearSSL-based stack that ships inside the browser binary with 121 trust anchors from the Mozilla CA bundle. No proxy needed anymore.&lt;/p&gt;
-    &lt;p&gt;As far as we can tell, this is the first serious NetSurf port to Classic Mac OS, and the first browser ever shipped on Mac OS 9 with native CSS Grid, CSS custom properties, and ES5 JavaScript.&lt;/p&gt;
-    &lt;p&gt;Each shot below is a real milestone, captured on a Power Macintosh G3 running Mac OS 9. The fix-number annotations match this repo's commit history.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;&lt;p&gt;v0.2: JavaScript on Mac OS 9&lt;/p&gt;&lt;p&gt;First real-world JS-bearing page. Duktape 2.7.0 ES5 evaluating live:&lt;/p&gt;&lt;code&gt;Math.sqrt&lt;/code&gt;, JSON, ES5 array methods.
-&lt;/cell&gt;
-        &lt;cell&gt;&lt;p&gt;fixes73: CSS transforms&lt;/p&gt;&lt;p&gt;Native&lt;/p&gt;&lt;code&gt;transform: rotate() / scale() / translate()&lt;/code&gt;. Integer Q15 sin/cos table, no FPU dependency, arbitrary angles on QuickDraw.
-&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;&lt;p&gt;fixes74d: radial gradients&lt;/p&gt;&lt;p&gt;2-stop radial gradients via concentric&lt;/p&gt;&lt;code&gt;PaintOval&lt;/code&gt; stack. 16 levels smeared on decode. Shape + position keywords parsed.
-&lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;p&gt;fixes77: CSS animations&lt;/p&gt;
-          &lt;p&gt;Linear ping-pong animation player on top of fixes73 rotation. Wiggle, swing, and full 0°→359° spin.&lt;/p&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;
-          &lt;p&gt;fixes79b: PNG transparency&lt;/p&gt;
-          &lt;p&gt;QuickTime Graphics Importer feeding the NetSurf image content handler. PNG + GIF + BMP, all with real transparency.&lt;/p&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;&lt;p&gt;fixes136: word-break / overflow-wrap&lt;/p&gt;&lt;code&gt;word-break: break-all&lt;/code&gt;, &lt;code&gt;keep-all&lt;/code&gt;, &lt;code&gt;white-space: nowrap&lt;/code&gt;, legacy &lt;code&gt;word-wrap: break-word&lt;/code&gt;. URL-style aggressive wrapping.
-&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;&lt;p&gt;fixes147: stacking contexts&lt;/p&gt;&lt;p&gt;CSS 2.1 painting order. Opacity, transforms, and explicit&lt;/p&gt;&lt;code&gt;z-index&lt;/code&gt; all create new stacking contexts, properly painted on real hardware.
-&lt;/cell&gt;
-        &lt;cell&gt;&lt;p&gt;fixes151: CSS Grid column placement&lt;/p&gt;&lt;code&gt;grid-column: span N&lt;/code&gt;, &lt;code&gt;1 / -1&lt;/code&gt; full-row hero, positional &lt;code&gt;start / end&lt;/code&gt;, span + auto-wrap. Real Grid layout on OS 9.
-&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;p&gt;v1.0: Showcase&lt;/p&gt;
-          &lt;p&gt;The new tool-belt toolbar, razor-sharp URL field, and matted icons rendering home.macsurf.org on a G3 iMac running OS 9.2.2. Native HTTPS via macTLS direct to the origin, server-rendered portal, true-colour images end to end.&lt;/p&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;Component&lt;/cell&gt;
-        &lt;cell role="head"&gt;Language&lt;/cell&gt;
-        &lt;cell role="head"&gt;Purpose&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;browser/&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;C (C89, CW8)&lt;/cell&gt;
-        &lt;cell&gt;NetSurf fork with a &lt;code&gt;macos9&lt;/code&gt; frontend. Carbon for the UI, QuickDraw for drawing, Open Transport for networking, Duktape for JS.&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;proxy/&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Go (stdlib only)&lt;/cell&gt;
-        &lt;cell&gt;The old TLS-stripping HTTP proxy. Largely retired now that macTLS works natively, but still useful as a fallback or on machines without CarbonLib. Mac sends plain HTTP, proxy fetches via HTTPS, returns plain HTTP.&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;macTLS&lt;/code&gt;
-          &lt;p&gt;sibling repo&lt;/p&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;C (CW8)&lt;/cell&gt;
-        &lt;cell&gt;Native TLS 1.2 library for OS 9 — modern HTTPS straight from the Mac, no proxy required. BearSSL underneath, 121 trust anchors baked in.&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;table&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;p&gt;Rendering pipeline&lt;/p&gt;
-          &lt;p&gt;CSS — around 150 properties consumed in layout&lt;/p&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;p&gt;JavaScript — Duktape 2.7.0, full ES5&lt;/p&gt;
-          &lt;p&gt;Images — all five formats&lt;/p&gt;
-          &lt;p&gt;Networking&lt;/p&gt;
-          &lt;p&gt;Browser chrome&lt;/p&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Latest is MacSurf v1.3.1 — Forward, refined (2026-05-29): multi-curve ECDHE in TLS 1.3. X25519, P-256, P-384 all offered in &lt;code&gt;supported_groups&lt;/code&gt;, with HelloRetryRequest handled cleanly so NIST-only servers like 68kmla.org can pick a curve and drive the rekey — the forum now renders fully on a G3 iMac via TLS 1.3 + P-384. Predecessor v1.3 "Forward" shipped the first native TLS 1.3 on Classic Mac OS; v1.2 "Sealed" closed the entropy hole and wired POST forms + the download manager; v1.0 "Showcase" was the chrome-redesign release; v0.6.2 "Speed-Run" was the cold-load speedup (mactrove.com 30+s → ~2-3s); first numbered alpha at v0.1a1.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;MacSurf.sit — the v1.3.1 binary, ready to run. Expand on Mac OS 9.1+ with CarbonLib 1.5+ and launch.&lt;/item&gt;
-      &lt;item&gt;Building from source: clone the repo, then on the Mac side open &lt;code&gt;browser/netsurf/frontends/macos9/MacSurf.mcp&lt;/code&gt;in CodeWarrior 8 and choose Build. v1.3.1 is a transparent macTLS engine upgrade — no MacSurf project file changes vs v1.3, just rebuild against the updated macTLS tree. v1.3 builders pulling onto a v1.2 workspace need to add four macTLS files to enable TLS 1.3:&lt;code&gt;bearssl/src/ec/ec_c25519_m15.c&lt;/code&gt;,&lt;code&gt;os9/ostls_tls13_keysched.c&lt;/code&gt;,&lt;code&gt;os9/ostls_tls13_record.c&lt;/code&gt;,&lt;code&gt;os9/ostls_tls13_handshake.c&lt;/code&gt;. v1.2 builders on a 1.0 workspace need to add&lt;code&gt;desktop/download.c&lt;/code&gt;to the project file list. The earliest release also ships a BuildPack.sit snapshot with the CW8 project pre-wired, but current builds work straight from a fresh clone.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Earlier alpha notes if you want context: docs/release-notes/MacSurf-0.1a1.md.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;p&gt;MacSurf is built on Mac OS 9 with CodeWarrior 8 Pro (8.3 update). The source is cross-compile-clean against Retro68 PowerPC GCC, which is what we use for fast Linux-side syntax checks.&lt;/p&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;p&gt;A single Go binary. No config files. No dependencies beyond stdlib.&lt;/p&gt;
-          &lt;code&gt;cd proxy
-go build -o macsurf-proxy
-./macsurf-proxy&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48333440</guid><pubDate>Sat, 30 May 2026 06:58:23 +0000</pubDate></item><item><title>Zig: Build System Reworked</title><link>https://ziglang.org/devlog/2026/#2026-05-26</link><description>&lt;doc fingerprint="2e54b2196c251990"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Devlog&lt;/head&gt;
-    &lt;p&gt;This page contains a curated list of recent changes to main branch Zig.&lt;/p&gt;
-    &lt;p&gt;Also available as an RSS feed.&lt;/p&gt;
-    &lt;p&gt;This page contains entries for the year 2026. Other years are available in the Devlog archive page.&lt;/p&gt;
-    &lt;head rend="h1"&gt;ELF Linker Improvements&lt;/head&gt;
-    &lt;p&gt;Author: Matthew Lugg&lt;/p&gt;
-    &lt;p&gt;Iâve spent the past few weeks working on our new ELF linker which debuted in Zig 0.16.0. At the time of the 0.16.0 release, this linker implementation was in its fairly early stages, and only really supported linking Zig-only code without any external libraries (even libc)âhence why it was (and still is) disabled by default (it can be enabled with &lt;code&gt;-fnew-linker&lt;/code&gt;). However, quite a lot of progress has been made since that initial release!&lt;/p&gt;
-    &lt;p&gt;Hereâs a nice milestoneâas of my latest PR, the new ELF linker is capable of building the self-hosted Zig compiler with LLVM and LLD libraries enabled, a task which requires quite a few features under the hood.&lt;/p&gt;
-    &lt;code&gt;[mlugg@nebula master]$ # Build the Zig compiler using the new linker:
-[mlugg@nebula master]$ zig build -Dno-lib -Dnew-linker -Denable-llvm
-[mlugg@nebula master]$ # Use that compiler to build something with LLVM and LLD:
-[mlugg@nebula master]$ ./zig-out/bin/zig build-exe ~/hello.zig -fllvm -flld
-[mlugg@nebula master]$ ./hello
-Hello, World!
-[mlugg@nebula master]$
-&lt;/code&gt;
-    &lt;p&gt;Of course, an ELF linker isnât necessarily the most exciting thing in the world, which is why the headline feature of this new linker is its support for fast incremental compilation. After the recent enhancements, it is now possible (on x86_64 Linux) to perform incremental rebuilds while linking external libraries, C sources, etcâwithout any additional performance overhead! Hereâs a clip of me trying it out on Andrewâs Tetris clone:&lt;/p&gt;
-    &lt;p&gt;Oh, and fast incremental rebuilds also work nicely on the Zig compiler itself:&lt;/p&gt;
-    &lt;code&gt;[mlugg@nebula master]$ zig build -Dno-lib -Denable-llvm -fincremental --watch
-Build Summary: 4/4 steps succeeded
-install success
-ââ install zig success
-   ââ compile exe zig Debug native success 36s
-
-Build Summary: 4/4 steps succeeded
-install success
-ââ install zig success
-   ââ compile exe zig Debug native success 244ms
-
-Build Summary: 4/4 steps succeeded
-install success
-ââ install zig success
-   ââ compile exe zig Debug native success 228ms
-
-Build Summary: 4/4 steps succeeded
-install success
-ââ install zig success
-   ââ compile exe zig Debug native success 288ms
-
-Build Summary: 4/4 steps succeeded
-install success
-ââ install zig success
-   ââ compile exe zig Debug native success 283ms
-&lt;/code&gt;
-    &lt;p&gt;The biggest missing feature of this linker implementation right now is that it still does not yet support generating DWARF debug information for Zig codeâthatâs definitely my next priority. But even without that support, itâs amazing just how useful instant rebuilds can be, for example in any situation where youâre doing a lot of print debugging.&lt;/p&gt;
-    &lt;p&gt;If youâre using the master branch of Zig and youâre on x86_64 Linux, consider trying out incremental compilation with the new ELF linker if it previously wasnât working with your project! I expect many codebases to already work great with it, unlocking the ability to rebuild your project in milliseconds. Of course, if you come across any bugs, please do open an issue.&lt;/p&gt;
-    &lt;p&gt;And if youâre currently sticking to tagged releases of Zig, donât worryâas Andrew mentioned in his last devlog, Zig 0.17.0 is just around the corner, so it wonât be long before you can try this too!&lt;/p&gt;
-    &lt;head rend="h1"&gt;Build System Reworked&lt;/head&gt;
-    &lt;p&gt;Author: Andrew Kelley&lt;/p&gt;
-    &lt;p&gt;Big branch just landed: separate the maker process from the configurer process&lt;/p&gt;
-    &lt;p&gt;This devlog entry is essentially a preview of the upcoming release notes, but serves as an advanced notice to those who want to help test out the new features and provide feedback that will guide the Zig project moving forward.&lt;/p&gt;
-    &lt;p&gt;Before, &lt;code&gt;build.zig&lt;/code&gt; files plus the build system implementation were all compiled into one bloated process, in Debug mode. After &lt;code&gt;build.zig&lt;/code&gt; logic finished constructing a build graph in memory, the âbuild runnerâ code executed it.&lt;/p&gt;
-    &lt;p&gt;Now, &lt;code&gt;build.zig&lt;/code&gt; files are compiled into a small process (the âconfigurerâ) in debug mode. After this logic finishes constructing a build graph in memory, it is serialized to a binary configuration file. The parent &lt;code&gt;zig build&lt;/code&gt; process is aware of this file and caches it for next time. While waiting for all that, it asynchronously compiles the build graph execution process (the âmakerâ) in release mode. Once the configuration file is available and the maker process is finished compiling, the maker process is executed, passing it the configuration file. The maker process only needs to be compiled once per &lt;code&gt;zig version&lt;/code&gt; thanks to the global cache. The maker process then executes the build graph, which is contained within the serialized configuration file.&lt;/p&gt;
-    &lt;p&gt;The primary motivation of this change was to make &lt;code&gt;zig build&lt;/code&gt; faster, in three ways:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;&lt;p&gt;Only the userâs&lt;/p&gt;&lt;code&gt;build.zig&lt;/code&gt;logic will be compiled with each change, rather than the entire build system along with it. This is starting to become more valuable now that we have introduced&lt;code&gt;--watch&lt;/code&gt;,&lt;code&gt;--fuzz&lt;/code&gt;and&lt;code&gt;--webui&lt;/code&gt;. The build system can grow more features without making&lt;code&gt;zig build&lt;/code&gt;take longer.&lt;/item&gt;
-      &lt;item&gt;&lt;p&gt;Now the build system can skip rerunning the&lt;/p&gt;&lt;code&gt;build.zig&lt;/code&gt;logic entirely when it knows nothing will change, for example if you add&lt;code&gt;-freference-trace&lt;/code&gt;to your&lt;code&gt;zig build&lt;/code&gt;command line, it now avoids re-running your&lt;code&gt;build.zig&lt;/code&gt;logic redundantly, using the same configuration as last time.&lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Now the process that actually executes the build graph is compiled with optimizations enabled.&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;To demonstrate points 2 and 3, here is the difference between running &lt;code&gt;zig build --help&lt;/code&gt; before and after:&lt;/p&gt;
-    &lt;code&gt;Benchmark 1 (34 runs): master/zig build -h
-  measurement          mean Â± Ï            min â¦ max           outliers         delta
-  wall_time           150ms Â± 5.52ms     145ms â¦  165ms          4 (12%)        0%
-  peak_rss           84.8MB Â±  275KB    84.2MB â¦ 85.1MB          0 ( 0%)        0%
-  cpu_cycles          593M  Â± 4.01M      588M  â¦  608M           2 ( 6%)        0%
-  instructions        995M  Â± 52.5K      995M  â¦  995M           0 ( 0%)        0%
-  cache_references   25.8M  Â±  165K     25.4M  â¦ 26.1M           0 ( 0%)        0%
-  cache_misses        651K  Â± 20.1K      619K  â¦  697K           0 ( 0%)        0%
-  branch_misses       918K  Â± 7.44K      906K  â¦  935K           0 ( 0%)        0%
-Benchmark 2 (348 runs): branch/zig build -h
-  measurement          mean Â± Ï            min â¦ max           outliers         delta
-  wall_time          14.3ms Â±  744us    13.2ms â¦ 23.3ms          8 ( 2%)        â¡- 90.4% Â±  0.4%
-  peak_rss           78.5MB Â±  562KB    77.1MB â¦ 81.4MB          7 ( 2%)        â¡-  7.4% Â±  0.2%
-  cpu_cycles         24.1M  Â±  821K     22.8M  â¦ 27.1M           3 ( 1%)        â¡- 95.9% Â±  0.1%
-  instructions       43.7M  Â± 23.8K     43.7M  â¦ 43.8M          56 (16%)        â¡- 95.6% Â±  0.0%
-  cache_references   1.46M  Â± 14.6K     1.40M  â¦ 1.50M          19 ( 5%)        â¡- 94.3% Â±  0.1%
-  cache_misses        142K  Â± 4.87K      127K  â¦  157K           2 ( 1%)        â¡- 78.1% Â±  0.4%
-  branch_misses       126K  Â± 1.37K      120K  â¦  129K          12 ( 3%)        â¡- 86.3% Â±  0.1%
-&lt;/code&gt;
-    &lt;p&gt;Itâs dramatic because before, &lt;code&gt;build.zig&lt;/code&gt; logic was being executed with each &lt;code&gt;zig build&lt;/code&gt; command, but now, the build system uses the cached, serialized configuration instead.&lt;/p&gt;
-    &lt;p&gt;Aside from performance, I expect third-party tooling such as ZLS to benefit from consuming the serialized configuration file rather than maintaining a fork of the build runner.&lt;/p&gt;
-    &lt;p&gt;This changeset heavily reworks the internal mechanism of the zig build system, however, it is mostly non-breaking from an API perspective, with the exceptions noted in the PR linked above.&lt;/p&gt;
-    &lt;p&gt;For most people Iâm guessing this is the main breaking change theyâll hit:&lt;/p&gt;
-    &lt;code&gt;if (b.args) |args| {
-    run_cmd.addArgs(args);
-}
-&lt;/code&gt;
-    &lt;p&gt;â¬ï¸&lt;/p&gt;
-    &lt;code&gt;run_cmd.addPassthruArgs();
-&lt;/code&gt;
-    &lt;p&gt;This removes a capability from build scripts since they can no longer observe those arguments. In exchange, it means that when changing those arguments, build scripts no longer must be rebuilt from source.&lt;/p&gt;
-    &lt;p&gt;If youâre someone who wants to influence the direction of Zig, this is a good time to upgrade your projects to the development version and try out these changes. Weâll be releasing 0.17.0 within a couple weeks from now. However, if you donât have time, and you find out that 0.17.0 broke your build, donât worry, there will be plenty of opportunity to get fixes in for the 0.17.1 tag as well.&lt;/p&gt;
-    &lt;head rend="h1"&gt;Incremental compilation with LLVM&lt;/head&gt;
-    &lt;p&gt;Author: Matthew Lugg&lt;/p&gt;
-    &lt;p&gt;Iâve been spending a bit of time working on personal projects after merging my type resolution changes last month, but I did find the time recently to make some improvements to the LLVM codegen backend. This involved a few different enhancements with various goals, but one nice user-facing change was that I managed to get incremental compilation working with the LLVM backend.&lt;/p&gt;
-    &lt;p&gt;Sadly this canât do anything to speed up the dreaded LLVM Emit Object: that time is entirely down to LLVM. However, what incremental compilation does help with is minimizing the time spent in the actual Zig compiler code, which means that if your code has compile errors (so âLLVM Emit Objectâ will be skipped), youâll usually get those errors very quickly. (Of course, it does still give you a slight speed-up in successful builds too.)&lt;/p&gt;
-    &lt;p&gt;This support is available in master branch builds right now, and will be in the 0.16.0 release (which weâll be tagging very soon).&lt;/p&gt;
-    &lt;p&gt;For anyone who still hasnât tried it, especially if youâre using Zigâs master branch, please do try out incremental compilation by passing &lt;code&gt;-fincremental --watch&lt;/code&gt; to &lt;code&gt;zig build&lt;/code&gt;! The Zig core team have benefited from incremental compilation in our workflows for a good year now, and weâre also hearing good things from users. The feature is relatively stable at this point, and people are often surprised how much time they can save just by getting up-to-date compile errors in milliseconds rather than seconds.&lt;/p&gt;
-    &lt;p&gt;I havenât really personally used incremental compilation with the LLVM backend, but all of the incremental test coverage in CI is now enabled for the LLVM backend, and Iâve had positive feedback from users, so itâs definitely worth giving a shot. As always, if you encounter bugs in incremental compilation, please report them if you can!&lt;/p&gt;
-    &lt;p&gt;Thank you, and I hope you find this useful :)&lt;/p&gt;
-    &lt;head rend="h1"&gt;Type resolution redesign, with language changes to taste&lt;/head&gt;
-    &lt;p&gt;Author: Matthew Lugg&lt;/p&gt;
-    &lt;p&gt;Today, I merged a 30,000 line PR after two (arguably three) months of work. The goal of this branch was to rework the Zig compilerâs internal type resolution logic to a more logical and straightforward design. Itâs a quite exciting change for me personally, because it allowed me to clean up a bunch of the compiler guts, but it also has some nice user-facing changes which you might be interested in!&lt;/p&gt;
-    &lt;p&gt;For one thing, the Zig compiler is now lazier about analyzing the fields of types: if the type is never initialized, then thereâs no need for Zig to care what that type âlooks likeâ. This is important when you have a type which doubles as a namespace, a common pattern in modern Zig. For instance, when using &lt;code&gt;std.Io.Writer&lt;/code&gt;, you donât want the compiler to also pull in a bunch of code in &lt;code&gt;std.Io&lt;/code&gt;! Hereâs a straightforward example:&lt;/p&gt;
-    &lt;code&gt;const Foo = struct {
-    bad_field: @compileError("i am an evil field, muahaha"),
-    const something = 123;
-};
-comptime {
-    _ = Foo.something; // `Foo` only used as a namespace
-}
-&lt;/code&gt;
-    &lt;p&gt;Previously, this code emitted a compile error. Now, it compiles just fine, because Zig never actually looks at the &lt;code&gt;@compileError&lt;/code&gt; call.&lt;/p&gt;
-    &lt;p&gt;Another improvement weâve made is in the âdependency loopâ experience. Anyone who has encountered a dependency loop compile error in Zig before knows that the error messages for them are entirely unhelpfulâbut thatâs now changed! If you encounter one (which is also a bit less likely now than it used to be), youâll get a detailed error message telling you exactly where the dependency loop comes from. Check it out:&lt;/p&gt;
-    &lt;code&gt;const Foo = struct { inner: Bar };
-const Bar = struct { x: u32 align(@alignOf(Foo)) };
-comptime {
-    _ = @as(Foo, undefined);
-}
-&lt;/code&gt;
-    &lt;code&gt;$ zig build-obj repro.zig
-error: dependency loop with length 2
-    repro.zig:1:29: note: type 'repro.Foo' depends on type 'repro.Bar' for field declared here
-    const Foo = struct { inner: Bar };
-                                ^~~
-    repro.zig:2:44: note: type 'repro.Bar' depends on type 'repro.Foo' for alignment query here
-    const Bar = struct { x: u32 align(@alignOf(Foo)) };
-                                               ^~~
-    note: eliminate any one of these dependencies to break the loop
-&lt;/code&gt;
-    &lt;p&gt;Of course, dependency loops can get much more complicated than this, but in every case Iâve tested, the error message has had enough information to easily see whatâs going on.&lt;/p&gt;
-    &lt;p&gt;Additionally, this PR made big improvements to the Zig compilerâs âincremental compilationâ feature. The short version is that it fixed a huge amount of known bugs, but in particular, âover-analysisâ problems (where an incremental update did more work than should be necessary, sometimes by a big margin) should finally be all but eliminatedâmaking incremental compilation significantly faster in many cases! If youâve not already, consider trying out incremental compilation: it really is a lovely development experience. This is for sure the improvement which excites me the most, and a large part of what motivated this change to begin with.&lt;/p&gt;
-    &lt;p&gt;There are a bunch more changes that come with this PRâdozens of bugfixes, some small language changes (mostly fairly niche), and compiler performance improvements. Itâs far too much to list here, but if youâre interested in reading more about it, you can take a look at the PR on Codebergâand of course, if you encounter any bugs, please do open an issue. Happy hacking!&lt;/p&gt;
-    &lt;head rend="h1"&gt;io_uring and Grand Central Dispatch std.Io implementations landed&lt;/head&gt;
-    &lt;p&gt;Author: Andrew Kelley&lt;/p&gt;
-    &lt;p&gt;As we approach the end of the 0.16.0 release cycle, Jacob has been hard at work, bringing &lt;code&gt;std.Io.Evented&lt;/code&gt; up to speed with all the latest API changes:&lt;/p&gt;
-    &lt;p&gt;Both of these are based on userspace stack switching, sometimes called âfibersâ, âstackful coroutinesâ, or âgreen threadsâ.&lt;/p&gt;
-    &lt;p&gt;They are now available to tinker with, by constructing oneâs application using &lt;code&gt;std.Io.Evented&lt;/code&gt;. They should be considered experimental because there is important followup work to be done before they can be used reliably and robustly:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;better error handling&lt;/item&gt;
-      &lt;item&gt;remove the logging&lt;/item&gt;
-      &lt;item&gt;diagnose the unexpected performance degradation when using &lt;code&gt;IoMode.evented&lt;/code&gt;for the compiler&lt;/item&gt;
-      &lt;item&gt;a couple functions still unimplemented&lt;/item&gt;
-      &lt;item&gt;more test coverage is needed&lt;/item&gt;
-      &lt;item&gt;builtin function to tell you the maximum stack size of a given function to make these implementations practical to use when overcommit is off.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;With those caveats in mind, it seems we are indeed reaching the Promised Land, where Zig code can have Io implementations effortlessly swapped out:&lt;/p&gt;
-    &lt;code&gt;const std = @import("std");
-
-pub fn main(init: std.process.Init.Minimal) !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    const gpa = debug_allocator.allocator();
-
-    var threaded: std.Io.Threaded = .init(gpa, .{
-        .argv0 = .init(init.args),
-        .environ = init.environ,
-    });
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    return app(io);
-}
-
-fn app(io: std.Io) !void {
-    try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
-}
-&lt;/code&gt;
-    &lt;code&gt;$ strace ./hello_threaded
-execve("./hello_threaded", ["./hello_threaded"], 0x7ffc1da88b20 /* 98 vars */) = 0
-mmap(NULL, 262207, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f583f338000
-arch_prctl(ARCH_SET_FS, 0x7f583f378018) = 0
-prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8192*1024, rlim_max=RLIM64_INFINITY}) = 0
-prlimit64(0, RLIMIT_STACK, {rlim_cur=16384*1024, rlim_max=RLIM64_INFINITY}, NULL) = 0
-sigaltstack({ss_sp=0x7f583f338000, ss_flags=0, ss_size=262144}, NULL) = 0
-sched_getaffinity(0, 128, [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31]) = 8
-rt_sigaction(SIGIO, {sa_handler=0x1019d90, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x10328c0}, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=0}, 8) = 0
-rt_sigaction(SIGPIPE, {sa_handler=0x1019d90, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x10328c0}, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=0}, 8) = 0
-writev(1, [{iov_base="Hello, World!\n", iov_len=14}], 1Hello, World!
-) = 14
-rt_sigaction(SIGIO, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x10328c0}, NULL, 8) = 0
-rt_sigaction(SIGPIPE, {sa_handler=SIG_DFL, sa_mask=[], sa_flags=SA_RESTORER, sa_restorer=0x10328c0}, NULL, 8) = 0
-exit_group(0)                           = ?
-+++ exited with 0 +++
-&lt;/code&gt;
-    &lt;p&gt;Swapping out only the I/O implementation:&lt;/p&gt;
-    &lt;code&gt;const std = @import("std");
-
-pub fn main(init: std.process.Init.Minimal) !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    const gpa = debug_allocator.allocator();
-
-    var evented: std.Io.Evented = undefined;
-    try evented.init(gpa, .{
-        .argv0 = .init(init.args),
-        .environ = init.environ,
-        .backing_allocator_needs_mutex = false,
-    });
-    defer evented.deinit();
-    const io = evented.io();
-
-    return app(io);
-}
-
-fn app(io: std.Io) !void {
-    try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
-}
-&lt;/code&gt;
-    &lt;code&gt;execve("./hello_evented", ["./hello_evented"], 0x7fff368894f0 /* 98 vars */) = 0
-mmap(NULL, 262215, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f70a4c28000
-arch_prctl(ARCH_SET_FS, 0x7f70a4c68020) = 0
-prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8192*1024, rlim_max=RLIM64_INFINITY}) = 0
-prlimit64(0, RLIMIT_STACK, {rlim_cur=16384*1024, rlim_max=RLIM64_INFINITY}, NULL) = 0
-sigaltstack({ss_sp=0x7f70a4c28008, ss_flags=0, ss_size=262144}, NULL) = 0
-sched_getaffinity(0, 128, [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31]) = 8
-mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f70a4c27000
-mmap(0x7f70a4c28000, 548864, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f70a4ba1000
-io_uring_setup(64, {flags=IORING_SETUP_COOP_TASKRUN|IORING_SETUP_SINGLE_ISSUER, sq_thread_cpu=0, sq_thread_idle=1000, sq_entries=64, cq_entries=128, features=IORING_FEAT_SINGLE_MMAP|IORING_FEAT_NODROP|IORING_FEAT_SUBMIT_STABLE|IORING_FEAT_RW_CUR_POS|IORING_FEAT_CUR_PERSONALITY|IORING_FEAT_FAST_POLL|IORING_FEAT_POLL_32BITS|IORING_FEAT_SQPOLL_NONFIXED|IORING_FEAT_EXT_ARG|IORING_FEAT_NATIVE_WORKERS|IORING_FEAT_RSRC_TAGS|IORING_FEAT_CQE_SKIP|IORING_FEAT_LINKED_FILE|IORING_FEAT_REG_REG_RING|IORING_FEAT_RECVSEND_BUNDLE|IORING_FEAT_MIN_TIMEOUT|IORING_FEAT_RW_ATTR|IORING_FEAT_NO_IOWAIT, sq_off={head=0, tail=4, ring_mask=16, ring_entries=24, flags=36, dropped=32, array=2112, user_addr=0}, cq_off={head=8, tail=12, ring_mask=20, ring_entries=28, overflow=44, cqes=64, flags=40, user_addr=0}}) = 3
-mmap(NULL, 2368, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, 3, 0) = 0x7f70a4ba0000
-mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE, 3, 0x10000000) = 0x7f70a4b9f000
-io_uring_enter(3, 1, 1, IORING_ENTER_GETEVENTS, NULL, 8Hello, World!
-) = 1
-io_uring_enter(3, 1, 1, IORING_ENTER_GETEVENTS, NULL, 8) = 1
-munmap(0x7f70a4b9f000, 4096)            = 0
-munmap(0x7f70a4ba0000, 2368)            = 0
-close(3)                                = 0
-munmap(0x7f70a4ba1000, 548864)          = 0
-exit_group(0)                           = ?
-+++ exited with 0 +++
-&lt;/code&gt;
-    &lt;p&gt;Key point here being that the &lt;code&gt;app&lt;/code&gt; function is identical between those two snippets.&lt;/p&gt;
-    &lt;p&gt;Moving beyond Hello World, the Zig compiler itself works fine using &lt;code&gt;std.Io.Evented&lt;/code&gt;, both with io_uring and with GCD, but as mentioned above, there is a not-yet-diagnosed performance degradation when doing so.&lt;/p&gt;
-    &lt;p&gt;Happy hacking,&lt;/p&gt;
-    &lt;p&gt;Andrew&lt;/p&gt;
-    &lt;head rend="h1"&gt;Two Package Management Workflow Enhancements&lt;/head&gt;
-    &lt;p&gt;Author: Andrew Kelley&lt;/p&gt;
-    &lt;p&gt;If you have a Zig project with dependencies, two big changes just landed which I think you will be interested to learn about.&lt;/p&gt;
-    &lt;p&gt;Fetched packages are now stored locally in the &lt;code&gt;zig-pkg&lt;/code&gt; directory of the project root (next to your &lt;code&gt;build.zig&lt;/code&gt; file).&lt;/p&gt;
-    &lt;p&gt;For example here are a few results from awebo after running &lt;code&gt;zig build&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;$ du -sh zig-pkg/*
-13M    freetype-2.14.1-alzUkTyBqgBwke4Jsot997WYSpl207Ij9oO-2QOvGrOi
-20K    opus-0.0.2-vuF-cMAkAADVsm707MYCtPmqmRs0gzg84Sz0qGbb5E3w
-4.3M   pulseaudio-16.1.1-9-mk_62MZkNwBaFwiZ7ZVrYRIf_3dTqqJR5PbMRCJzSuLw
-5.2M   uucode-0.1.0-ZZjBPvtWUACf5dqD_f9I37VGFsN24436CuceC5pTJ25n
-728K   vaxis-0.5.1-BWNV_AxECQCj3p4Hcv4U3Yo1WMUJ7Z2FUj0UkpuJGxQQ
-&lt;/code&gt;
-    &lt;p&gt;It is highly recommended to add this directory to the project-local source control ignore file (e.g. &lt;code&gt;.gitignore&lt;/code&gt;). However, by being outside of &lt;code&gt;.zig-cache&lt;/code&gt;, it provides the possibility of distributing self-contained source tarballs, which contain all dependencies and therefore can be used to build offline, or for archival purposes.&lt;/p&gt;
-    &lt;p&gt;Meanwhile, an additional copy of the dependency is cached globally. After filtering out all the unused files based on the &lt;code&gt;paths&lt;/code&gt; filter, the contents are recompressed:&lt;/p&gt;
-    &lt;code&gt;$ du -sh ~/.cache/zig/p/*
-2.4M    freetype-2.14.1-alzUkTyBqgBwke4Jsot997WYSpl207Ij9oO-2QOvGrOi.tar.gz
-4.0K    opus-0.0.2-vuF-cMAkAADVsm707MYCtPmqmRs0gzg84Sz0qGbb5E3w.tar.gz
-636K    pulseaudio-16.1.1-9-mk_62MZkNwBaFwiZ7ZVrYRIf_3dTqqJR5PbMRCJzSuLw.tar.gz
-880K    uucode-0.1.0-ZZjBPvtWUACf5dqD_f9I37VGFsN24436CuceC5pTJ25n.tar.gz
-120K    vaxis-0.5.1-BWNV_BFECQBbXeTeFd48uTJRjD5a-KD6kPuKanzzVB01.tar.gz
-&lt;/code&gt;
-    &lt;p&gt;The motivation for this change is to make it easier to tinker. Go ahead and edit those files, see what happens. Swap out your package directory with a git clone. Grep your dependencies all together. Configure your IDE to auto-complete based on the &lt;code&gt;zig-pkg&lt;/code&gt; directory. Run baobab on your dependency tree. Furthermore, by having the global cache have compressed files instead makes it easier to share that cached data between computers. In the future, it is planned to support peer-to-peer torrenting of dependency trees. By recompressing packages into a canonical form, this will allow peers to share Zig packages with minimal bandwidth. I love this idea because it simultaneously provides resilience to network outages, as well as a popularity contest. Find out which open source packages are popular based on number of seeders!&lt;/p&gt;
-    &lt;p&gt;The second change here is the addition of the &lt;code&gt;--fork&lt;/code&gt; flag to &lt;code&gt;zig build&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;In retrospect, it seems so obvious, I donât know why I didnât think of it since the beginning. It looks like this:&lt;/p&gt;
-    &lt;code&gt;zig build --fork=[path]
-&lt;/code&gt;
-    &lt;p&gt;This is a project override option. Given a path to a source checkout of a project, all packages matching that project across the entire dependency tree will be overridden.&lt;/p&gt;
-    &lt;p&gt;Thanks to the fact that package content hashes include name and fingerprint, this resolves before the package is potentially fetched.&lt;/p&gt;
-    &lt;p&gt;This is an easy way to temporarily use one or more forks which are in entirely separate directories. You can iterate on your entire dependency tree until everything is working, while using comfortably the development environment and source control of the dependency projects.&lt;/p&gt;
-    &lt;p&gt;The fact that it is a CLI flag makes it appropriately ephemeral. The moment you drop the flags, youâre back to using your pristine, fetched dependency tree.&lt;/p&gt;
-    &lt;p&gt;If the project does not match, an error occurs, preventing confusion:&lt;/p&gt;
-    &lt;code&gt;$ zig build --fork=/home/andy/dev/mime
-error: fork /home/andy/dev/mime matched no mime packages
-$
-&lt;/code&gt;
-    &lt;p&gt;If the project does match, you get a reminder that you are using a fork, preventing confusion:&lt;/p&gt;
-    &lt;code&gt;$ zig build --fork=/home/andy/dev/dvui
-info: fork /home/andy/dev/dvui matched 1 (dvui) packages
-...
-&lt;/code&gt;
-    &lt;p&gt;This functionality is intended to enhance the workflow of dealing with ecosystem breakage. I already tried it a bit and found it to be quite pleasant to work with. The new workflow goes like this:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Fail to build from source due to ecosystem breakage.&lt;/item&gt;
-      &lt;item&gt;Tinker with &lt;code&gt;--fork&lt;/code&gt;until your project works again. During this time you can use the actual upstream source control, test suite,&lt;code&gt;zig build test --watch -fincremental&lt;/code&gt;, etc.&lt;/item&gt;
-      &lt;item&gt;Now you have a new option: be selfish and just keep working on your own stuff, or you can proceed to submit your patches upstream.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;â¦and you can probably skip the step where you switch your &lt;code&gt;build.zig.zon&lt;/code&gt; to your fork unless you expect upstream to take a long time to merge your fixes.&lt;/p&gt;
-    &lt;head rend="h1"&gt;Bypassing Kernel32.dll for Fun and Nonprofit&lt;/head&gt;
-    &lt;p&gt;Author: Andrew Kelley&lt;/p&gt;
-    &lt;p&gt;The Windows operating system provides a large ABI surface area for doing things in the kernel. However, not all ABIs are created equally. As Casey Muratori points out in his lecture, The Only Unbreakable Law, the organizational structure of software development teams has a direct impact on the structure of the software they produce.&lt;/p&gt;
-    &lt;p&gt;The DLLs on Windows are organized into a heirarchy, with some of the APIs being high-level wrappers around lower-level ones. For example, whenever you call functions of &lt;code&gt;kernel32.dll&lt;/code&gt;, ultimately, the actual work is done by &lt;code&gt;ntdll.dll&lt;/code&gt;. You can observe this directly by using ProcMon.exe and examining stack traces.&lt;/p&gt;
-    &lt;p&gt;What weâve learned empirically is that the ntdll APIs are generally well-engineered, reasonable, and powerful, but the kernel32 wrappers introduce unnecessary heap allocations, additional failure modes, unintentional CPU usage, and bloat.&lt;/p&gt;
-    &lt;p&gt;This is why the Zig standard library policy is to Prefer the Native API over Win32. Weâre not quite there yet - we have plenty of calls into kernel32 remaining - but weâve taken great strides recently. Iâll give you two examples.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Example 1: Entropy&lt;/head&gt;
-    &lt;p&gt;According to the official documentation, Windows does not have a straightforward way to get random bytes.&lt;/p&gt;
-    &lt;p&gt;Many projects including Chromium, boringssl, Firefox, and Rust call &lt;code&gt;SystemFunction036&lt;/code&gt; from &lt;code&gt;advapi32.dll&lt;/code&gt; because it worked on versions older than Windows 8.&lt;/p&gt;
-    &lt;p&gt;Unfortunately, starting with Windows 8, the first time you call this function, it dynamically loads &lt;code&gt;bcryptprimitives.dll&lt;/code&gt; and calls ProcessPrng. If loading the DLL fails (for example due to an overloaded system, which we have observed on Zig CI several times), it returns error 38 (from a function that has &lt;code&gt;void&lt;/code&gt; return type and is documented to never fail).&lt;/p&gt;
-    &lt;p&gt;The first thing &lt;code&gt;ProcessPrng&lt;/code&gt; does is heap allocate a small, constant number of bytes. If this fails it returns &lt;code&gt;NO_MEMORY&lt;/code&gt; in a &lt;code&gt;BOOL&lt;/code&gt; (documented behavior is to never fail, and always return &lt;code&gt;TRUE&lt;/code&gt;).&lt;/p&gt;
-    &lt;p&gt;&lt;code&gt;bcryptprimitives.dll&lt;/code&gt; apparently also runs a test suite every time you load it.&lt;/p&gt;
-    &lt;p&gt;All that &lt;code&gt;ProcessPrng&lt;/code&gt; is really doing is &lt;code&gt;NtOpenFile&lt;/code&gt; on &lt;code&gt;"\\Device\\CNG"&lt;/code&gt; and reading 48 bytes with &lt;code&gt;NtDeviceIoControlFile&lt;/code&gt; to get a seed, and then initializing a per-CPU AES-based CSPRNG.&lt;/p&gt;
-    &lt;p&gt;So the dependency on &lt;code&gt;bcryptprimitives.dll&lt;/code&gt; and &lt;code&gt;advapi32.dll&lt;/code&gt; can both be avoided, and the nondeterministic failure and latencies on first RNG read can also be avoided.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Example 2: NtReadFile and NtWriteFile&lt;/head&gt;
-    &lt;p&gt;&lt;code&gt;ReadFile&lt;/code&gt; looks like this:&lt;/p&gt;
-    &lt;code&gt;pub extern "kernel32" fn ReadFile(
-    hFile: HANDLE,
-    lpBuffer: LPVOID,
-    nNumberOfBytesToRead: DWORD,
-    lpNumberOfBytesRead: ?*DWORD,
-    lpOverlapped: ?*OVERLAPPED,
-) callconv(.winapi) BOOL;
-&lt;/code&gt;
-    &lt;p&gt;&lt;code&gt;NtReadFile&lt;/code&gt; looks like this:&lt;/p&gt;
-    &lt;code&gt;pub extern "ntdll" fn NtReadFile(
-    FileHandle: HANDLE,
-    Event: ?HANDLE,
-    ApcRoutine: ?*const IO_APC_ROUTINE,
-    ApcContext: ?*anyopaque,
-    IoStatusBlock: *IO_STATUS_BLOCK,
-    Buffer: *anyopaque,
-    Length: ULONG,
-    ByteOffset: ?*const LARGE_INTEGER,
-    Key: ?*const ULONG,
-) callconv(.winapi) NTSTATUS;
-&lt;/code&gt;
-    &lt;p&gt;As a reminder, the above function is implemented by calling the below function.&lt;/p&gt;
-    &lt;p&gt;Already we can see some nice things about using the lower level API. For instance, the real API simply gives us the error code as the return value, while the kernel32 wrapper hides the status code somewhere, returns a &lt;code&gt;BOOL&lt;/code&gt; and then requires you to call &lt;code&gt;GetLastError&lt;/code&gt; to find out what went wrong. Imagine! Returning a value from a function ð&lt;/p&gt;
-    &lt;p&gt;Furthermore, &lt;code&gt;OVERLAPPED&lt;/code&gt; is a fake type. The Windows kernel doesnât actually know or care about it at all! The actual primitives here are events, APCs, and &lt;code&gt;IO_STATUS_BLOCK&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;If you have a synchronous file handle, then &lt;code&gt;Event&lt;/code&gt; and &lt;code&gt;ApcRoutine&lt;/code&gt; must be &lt;code&gt;null&lt;/code&gt;. You get the answer in the &lt;code&gt;IO_STATUS_BLOCK&lt;/code&gt; immediately. If you pass an APC routine here then some old bitrotted 32-bit code runs and you get garbage results.&lt;/p&gt;
-    &lt;p&gt;On the other hand if you have an asynchronous file handle, then you need to either use an &lt;code&gt;Event&lt;/code&gt; or an &lt;code&gt;ApcRoutine&lt;/code&gt;. &lt;code&gt;kernel32.dll&lt;/code&gt; uses events, which means that itâs doing extra, unnecessary resource allocation and management just to read from a file. Instead, Zig now passes an APC routine and then calls &lt;code&gt;NtDelayExecution&lt;/code&gt;. This integrates seamlessly with cancelation, making it possible to cancel tasks while they perform file I/O, regardless of whether the file was opened in synchronous mode or asynchronous mode.&lt;/p&gt;
-    &lt;p&gt;For a deeper dive into this topic, please refer to this issue:&lt;/p&gt;
-    &lt;head rend="h1"&gt;zig libc&lt;/head&gt;
-    &lt;p&gt;Author: Andrew Kelley&lt;/p&gt;
-    &lt;p&gt;Over the past month or so, several enterprising contributors have taken an interest in the zig libc subproject. The idea here is to incrementally delete redundant code, by providing libc functions as Zig standard library wrappers rather than as vendored C source files. In many cases, these functions are one-to-one mappings, such as &lt;code&gt;memcpy&lt;/code&gt; or &lt;code&gt;atan2&lt;/code&gt;, or trivially wrap a generic function, like &lt;code&gt;strnlen&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;fn strnlen(str: [*:0]const c_char, max: usize) callconv(.c) usize {
-    return std.mem.findScalar(u8, @ptrCast(str[0..max]), 0) orelse max;
-}
-&lt;/code&gt;
-    &lt;p&gt;So far, roughly 250 C source files have been deleted from the Zig repository, with 2032 remaining.&lt;/p&gt;
-    &lt;p&gt;With each function that makes the transition, Zig gains independence from third party projects and from the C programming language, compilation speed improves, Zigâs installation size is simplified and reduced, and user applications which statically link libc enjoy reduced binary size.&lt;/p&gt;
-    &lt;p&gt;Additionally, a recent enhancement now makes zig libc share the Zig Compilation Unit with other Zig code rather than being a separate static archive, linked together later. This is one of the advantages of Zig having an integrated compiler and linker. When the exported libc functions share the ZCU, redundant code is eliminated because functions can be optimized together. Itâs kind of like enabling LTO (Link-Time Optimization) across the libc boundary, except itâs done properly in the frontend instead of too late, in the linker.&lt;/p&gt;
-    &lt;p&gt;Furthermore, when this work is combined with the recent std.Io changes, there is potential for users to seamlessly control how libc performs I/O - for example forcing all calls to &lt;code&gt;read&lt;/code&gt; and &lt;code&gt;write&lt;/code&gt; to participate in an io_uring event loop, even though that code was not written with such use case in mind. Or, resource leak detection could be enabled for third-party C code. For now this is only a vaporware idea which has not been experimented with, but the idea intrigues me.&lt;/p&gt;
-    &lt;p&gt;Big thanks to Szabolcs Nagy for libc-test. This project has been a huge help in making sure that we donât regress any math functions.&lt;/p&gt;
-    &lt;p&gt;As a reminder to our users, now that Zig is transitioning to being the static libc provider, if you encounter issues with the musl, mingw-w64, or wasi-libc libc functionality provided by Zig, please file bug reports in Zig first so we donât annoy maintainers for bugs that are in Zig, and no longer vendored by independent libc implementation projects.&lt;/p&gt;
-    &lt;p&gt;The very same day I sat at home writing this devlog like a coward, less than five miles away, armed forces who are in my city against the will of our elected officials shot tear gas, unprovoked, at peaceful protestors. Next time I hope to have the courage to join my neighbors, and I hope to not get shot like Alex Pretti and RenÃ©e Good.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48334048</guid><pubDate>Sat, 30 May 2026 08:38:28 +0000</pubDate></item><item><title>Pandoc Templates</title><link>https://pandoc-templates.org/</link><description>&lt;doc fingerprint="742e1e797aac1df0"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Results&lt;/p&gt;
-    &lt;p&gt;A clean pandoc LaTeX template to convert your markdown files to PDF or LaTeX. It is designed for lecture notes and exercises with a focus on computer science. The template is compatible with pandoc 3.&lt;/p&gt;
-    &lt;p&gt;This template allows you to write letters in Markdown and convert them to nice looking PDFs using Pandoc and LaTeX. It accepts arguments used in the LaTeX letter class.&lt;/p&gt;
-    &lt;p&gt;The Markdown Resume template lets you write your résumé in plain Markdown and convert it to PDF or HTML using pandoc. It offers a simple build process, either locally or through Docker. The setup is lightweight, making it easy to maintain and update your résumé over time.&lt;/p&gt;
-    &lt;p&gt;The IEEE Paper Template for Pandoc is a LaTeX-based template that helps create IEEE-compliant papers from markdown files. It formats key sections like the title, abstract, and references according to IEEE standards. This template simplifies the process of preparing papers for IEEE conferences and journals.&lt;/p&gt;
-    &lt;p&gt;A template for creating a PhD thesis in markdown with pandoc.&lt;/p&gt;
-    &lt;p&gt;This repository provides a framework for writing a PhD thesis in Markdown. I used the template for my PhD submission to University College London (UCL), but it should be straightforward to adapt suit other universities too.&lt;/p&gt;
-    &lt;p&gt;Generate MLA-formatted PDFs with Markdown and Pandoc.&lt;/p&gt;
-    &lt;p&gt;Journal templates for several major journals (incl. JASA, TAS, JBES, JCGS, SBP, Technometrics, Biometrical Journal, Biometrics, Biometrika, Biostatistics, AOAS, AOP, AAP, AOS, SSY, Journal of Statistical Software, Statistics in Medicine, and The R Journal).&lt;/p&gt;
-    &lt;p&gt;Pandoc Thesis Template: A Template for Thesis Documents written in Markdown.&lt;/p&gt;
-    &lt;p&gt;Pandoc Markdown Lecture Template: This project defines a skeleton repo for creating lecture slides and handouts including lecture notes out of Pandoc Markdown using a single source approach.&lt;/p&gt;
-    &lt;p&gt;A sound and versatile pandoc LaTeX boilerplate to produce academic books using Markdown files featuring YAML, KOMA-Script, BibLaTeX and CSL.&lt;/p&gt;
-    &lt;p&gt;A sound and versatile pandoc LaTeX boilerplate to produce academic articles using Markdown files featuring YAML, KOMA-Script, BibLaTeX and CSL.&lt;/p&gt;
-    &lt;p&gt;Starter files for using Pandoc Markdown with Tufte CSS&lt;/p&gt;
-    &lt;p&gt;This project provides CSS files and a template for using Pandoc to generate standalone HTML files.&lt;/p&gt;
-    &lt;p&gt;A template for creating epub books from markdown using pandoc.&lt;/p&gt;
-    &lt;p&gt;A simple Pandoc-powered static site generator for your recipe collection – it effortlessly turns a set of Markdown-formatted recipes into a lightweight, responsive, searchable website.&lt;/p&gt;
-    &lt;p&gt;Dissertation template modified from the Eisvogel template.&lt;/p&gt;
-    &lt;p&gt;The AcademiCL template helps you create academic cover letters using Markdown or R Markdown with pandoc.&lt;/p&gt;
-    &lt;p&gt;Neurips template modified from the 2023 Neurips Template.&lt;/p&gt;
-    &lt;p&gt;A Pandoc HTML template with TOC on the sidebar, using Bootstrap 3&lt;/p&gt;
-    &lt;p&gt;A Template for reveal.js Slides written in Markdown&lt;/p&gt;
-    &lt;p&gt;A smart and elegant tool to convert Markdown-based resumes to beautifully formatted PDFs using Pandoc and LaTeX templates.&lt;/p&gt;
-    &lt;p&gt;A pandoc template and custom CSS to produce HTML output with a responsive table-of-contents.&lt;/p&gt;
-    &lt;p&gt;Template for a basic academic page that is ready to use and easy to customise.&lt;/p&gt;
-    &lt;p&gt;A Python script and pandoc template for converting Markdown homeworks to PDFs with toggle-able solutions&lt;/p&gt;
-    &lt;p&gt;Latex Template für Hausarbeiten an der Universität Passau&lt;/p&gt;
-    &lt;p&gt;Simple formatting for writers: Pandoc templates to turn a plain text Markdown file with your poem or story into a polished PDF or Word document in Standard Manuscript Format — fast.&lt;/p&gt;
-    &lt;p&gt;Contains the pandoc templates used by the Journal for the History of Analytical Philosophy to create its output PDF, ePub and HTML files.&lt;/p&gt;
-    &lt;p&gt;A template to create PDF/ePub/HTML/docx books by Markdown via Pandoc.&lt;/p&gt;
-    &lt;p&gt;An adaptive Bootstrap template with a sticky menu.&lt;/p&gt;
-    &lt;p&gt;Template directory for authoring AASTeX-formatted journal articles using Pandoc and pdflatex&lt;/p&gt;
-    &lt;p&gt;Bootstrap template for Pandoc - Converts markdown files into Twitter Bootstrap styled HTML.&lt;/p&gt;
-    &lt;p&gt;Application for converting Markdown files into bootstrap styled HTML pages by Pandoc.&lt;/p&gt;
-    &lt;p&gt;This holds templates and Macros aimed to help writers using Pandoc or other tools. All templates work with Microsoft Word or LibreOffice but can be freely adapted, as you so wish.&lt;/p&gt;
-    &lt;p&gt;A literal cookbook. Typeset with Pandoc.&lt;/p&gt;
-    &lt;p&gt;A simple recipe template for rendering recipes from YAML with Pandoc&lt;/p&gt;
-    &lt;p&gt;A pandoc UIkit html template. Includes a sticky adaptive menu and some other nice things.&lt;/p&gt;
-    &lt;p&gt;An opinionated set of pandoc templates and scripts for converting markdown to DOCX manuscripts that adhere to William Shunn's Proper Manuscript Format guidelines using pandoc.&lt;/p&gt;
-    &lt;p&gt;A pandoc template, styled with new.css. new.css is a classless CSS framework to write modern websites using only HTML.&lt;/p&gt;
-    &lt;p&gt;pandoc template, that just applies water.css to your HTML output. water.css is a classless CSS framework and a collection of CSS styles to make simple websites just a little nicer.&lt;/p&gt;
-    &lt;p&gt;R markdown templates for data analysts working for the Scottish Government. sgtemplates lets you use RStudio to quickly produce professional, accessible, Government-branded HTML documents and websites.&lt;/p&gt;
-    &lt;p&gt;Automation script to easily create multiple formats of your résumé from a single markdown file. A Makefile is provided so that you can compile it into both a LaTeX PDF and an HTML file using pandoc.&lt;/p&gt;
-    &lt;p&gt;This template aims to simplify the grant proposal formatting process in order to allow grantwriters to concentrate more on the writing.&lt;/p&gt;
-    &lt;p&gt;This project provides a modern workflow to create beautiful, two-column PDF documents for tabletop RPG campaigns (like Daggerheart) using Markdown. It uses a custom LaTeX template, Pandoc Lua filters, and an organized folder structure to make the process easy—even for users with no LaTeX experience.&lt;/p&gt;
-    &lt;p&gt;A Pandoc+LaTeX template for exams.&lt;/p&gt;
-    &lt;p&gt;This is some simple CSS for stand-alone Pandoc documents that serves as a good default. Regardless of how your compose your document, we'll make it look good.&lt;/p&gt;
-    &lt;p&gt;Template for a single self-contained, very mobile-friendly HTML document. The template uses Pure CSS for styling.&lt;/p&gt;
-    &lt;p&gt;GitHub-like CSS for pandoc standalone HTML files (perfect for HTML5 output). Based on Marked.app's GitHub CSS.&lt;/p&gt;
-    &lt;p&gt;Pandoc is an incredibly powerful tool – which comes at the cost of being sometimes seemingly too complex. This project aims to lower the hurdles and make document creating an easy thing. Morris provides you with everything you need to quickly generate beautiful documents from your Markdown.&lt;/p&gt;
-    &lt;p&gt;Effortlessly write professional letters with the Pandoc Letter Template. Simply create and customize your letters in Markdown and convert them to stunning PDFs with one command. The template defaults to the German DIN 5008 standard for added convenience.&lt;/p&gt;
-    &lt;p&gt;A featherweight (4kb gzipped) theme for pandoc's html output.&lt;/p&gt;
-    &lt;p&gt;The original pandoc template is, by most respects, passable, but not exactly great; it's mediocre at best. So, I went ahead and made a template for myself. It's nothing fancy---there isn't any beamer functionality or anything built into it, and I'm yet to define a color palette for it---but overall it's usable.&lt;/p&gt;
-    &lt;p&gt;patat (Presentations Atop The ANSI Terminal) is a feature-rich presentation tool that runs in the terminal.&lt;/p&gt;
-    &lt;p&gt;author cool slide decks, text-only, offline-ready, collaborative&lt;/p&gt;
-    &lt;p&gt;A boilerplate to ease the pain of building and maintaining a CV or résumé using LaTeX.&lt;/p&gt;
-    &lt;p&gt;Simple automated LaTeX invoicing system for freelancers.&lt;/p&gt;
-    &lt;p&gt;A boilerplate to quickly and painlessly generate high-quality letters through LaTeX.&lt;/p&gt;
-    &lt;p&gt;Custom Pandoc templates to create HTML (using Bootstrap 5 with dark-mode, and Font Awesome) and PDF format files using LuaLaTeX.&lt;/p&gt;
-    &lt;p&gt;A template to add some basic bootstrap architecture around a document.&lt;/p&gt;
-    &lt;p&gt;Template for LaTeX and/or Pandoc to quickly write reviews and (author) response letters&lt;/p&gt;
-    &lt;p&gt;A Markdown-based LaTeX Letter Template. This package leans on earlier work by Aaron Wolen in his pandoc-letter repository, and extends it for use from R via the rmarkdown package.&lt;/p&gt;
-    &lt;p&gt;R package for comfortable writing of beautiful PDF letters in Markdown.&lt;/p&gt;
-    &lt;p&gt;A simple Pandoc LaTeX template for German DIN5008A and DIN5008B conforming letters. Internally, this template is based on the default Pandoc LaTeX template as well as the scrletter KOMA class.&lt;/p&gt;
-    &lt;p&gt;This is a letterhead for Augusta University. This template respects the brand strategy of the University and was approved by Augusta University's graphic designers.&lt;/p&gt;
-    &lt;p&gt;This template was designed for Ms and PhD students from the School of Cyber and Computer Sciences at Augusta University as an alternative to the standard, "ETD" template offered by the Graduate School. Students more comfortable with the docx format or not willing to learn to use LaTeX and / or markdown should use this standard template instead.&lt;/p&gt;
-    &lt;p&gt;Templates for generating beautiful printable recipes from YAML metadata. These templates include the themes 'Just One Cookbook' and 'Cuisine AZ'.&lt;/p&gt;
-    &lt;p&gt;A simple Pandoc template to build documents and ebooks.&lt;/p&gt;
-    &lt;p&gt;This is a template project for generating a novel or story collection from markdown files and building an ePub file, a printable PDF book suitable for Amazon KDP, and a SFFMS format manuscript PDF.&lt;/p&gt;
-    &lt;p&gt;Uploads of some extra pandoc material which might be of interest to others. It contains numbered-sections.docx, a docx-template for numbered sections.&lt;/p&gt;
-    &lt;p&gt;A collection of portable pandoc templates with no dependencies. It contains the templates 'elegant bootstrap', 'uikit' and 'bootstrap'.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48334515</guid><pubDate>Sat, 30 May 2026 09:56:42 +0000</pubDate></item><item><title>Openrsync: An implementation of rsync, by the OpenBSD team</title><link>https://github.com/kristapsdz/openrsync</link><description>&lt;doc fingerprint="a42ef88256e909d3"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 30 May 2026 21:29:42 +0000</lastBuildDate><item><title>Leo's first encyclical attacks technological messianism</title><link>https://www.economist.com/europe/2026/05/28/leos-first-encyclical-attacks-technological-messianism</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48334710</guid><pubDate>Sat, 30 May 2026 10:30:50 +0000</pubDate></item><item><title>Openrsync: An implementation of rsync, by the OpenBSD team</title><link>https://github.com/kristapsdz/openrsync</link><description>&lt;doc fingerprint="a42ef88256e909d3"&gt;
   &lt;main&gt;
     &lt;p&gt;This system has been merged into OpenBSD base. If you'd like to contribute to openrsync, please mail your patches to tech@openbsd.org. This repository is simply the OpenBSD version plus some glue for portability.&lt;/p&gt;
     &lt;p&gt;This is an implementation of rsync with a BSD (ISC) license. It's compatible with a modern rsync (3.1.3 is used for testing, but any supporting protocol 27 will do), but accepts only a subset of rsync's command-line arguments.&lt;/p&gt;
@@ -691,34 +138,7 @@ openrsync host:source path/to/destination
     &lt;p&gt;Plug-in solar is in regulatory limbo here — the kits available elsewhere in Europe aren't legally for sale in Britain yet. We're tracking the market. Leave your email and we'll let you know when things change.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48334949</guid><pubDate>Sat, 30 May 2026 11:08:37 +0000</pubDate></item><item><title>Memory decline after menopause linked to loss of estrogen production in brain</title><link>https://news.northwestern.edu/stories/2026/05/memory-decline-after-menopause-linked-to-loss-of-estrogen-production-in-brain-tissue</link><description>&lt;doc fingerprint="37eeb72188bb0ba1"&gt;
-  &lt;main&gt;
-    &lt;p&gt;A largely overlooked space between cells in women’s brains may hold the key to understanding memory loss tied to estrogen decline after menopause, reports a new preclinical Northwestern Medicine study.&lt;/p&gt;
-    &lt;p&gt;Nearly two-thirds of Americans with Alzheimer’s disease (AD) are women, but the reasons why women are more vulnerable are still not fully understood. Scientists have long theorized that the loss of estrogen after menopause may reduce the brain’s natural protection against memory loss and neurodegeneration.&lt;/p&gt;
-    &lt;p&gt;In the new study, the scientists examined young and old male and female mice, with or without loss of brain estrogen, which allowed them to pinpoint the effects specifically relevant to older females. They found estrogen loss, aging and female sex are closely linked to problems in an important but frequently ignored aspect of brain biology called the extracellular matrix (ECM), which is highly abundant in the hippocampus.&lt;/p&gt;
-    &lt;p&gt;“This study tells us that females — but not males — may be uniquely sensitive to loss of brain estrogen at old age, potentially contributing to an increased risk of Alzheimer’s disease,” said corresponding author Dr. Hong Zhao, research professor of obstetrics and gynecology in the division of reproductive science in medicine at Northwestern University Feinberg School of Medicine.&lt;/p&gt;
-    &lt;p&gt;The findings, published in the journal Aging Cell, provide new insight into how estrogen loss may affect the aging female brain and could help explain why women are at higher risk for AD.&lt;/p&gt;
-    &lt;p&gt;“We have provided some of the most compelling evidence that estrogen is so important for memory function and other mood functions in the female brain,” said senior author Dr. Serdar Bulun, chair of the department of obstetrics and gynecology at Feinberg and a Northwestern Medicine physician. “This should motivate clinicians to be more aware of the essential role of estrogen for women’s brains, because once memory is gone, it’s gone.”&lt;/p&gt;
-    &lt;head rend="h2"&gt;Looking in the space between cells&lt;/head&gt;
-    &lt;p&gt;Like the mortar between bricks, the ECM is a network of molecules that fills the spaces between brain cells. It’s important for memory, brain development and brain health, and makes up nearly 20% of the brain’s volume. ECM acts like a supportive scaffold between cells that helps brain cells communicate and function properly.&lt;/p&gt;
-    &lt;p&gt;Scientists have traditionally focused on studying brain cells such as neurons and glial cells and have paid much less attention to the space between the cells. This is the first study to examine estrogen loss in the ECM.&lt;/p&gt;
-    &lt;p&gt;“Our findings will hopefully motivate future studies to better understand how this matrix is altered in postmenopausal women, and how it could potentially induce susceptibility to Alzheimer’s disease,” Zhao said.&lt;/p&gt;
-    &lt;head rend="h2"&gt;New treatment approach focused on the ECM?&lt;/head&gt;
-    &lt;p&gt;Current anti-amyloid treatments for AD, such as lecanemab and donanemab, can remove the abnormal amyloid protein buildup in the brain, which is one of the main signs of the disease. But it is still unclear how much these treatments truly help slow memory loss or improve daily functioning. Some studies show small benefits, while others show little meaningful improvement.&lt;/p&gt;
-    &lt;p&gt;These findings suggest a possible new treatment approach focused on restoring the brain’s supportive environment — the ECM — to help protect memory and fight this devastating disease.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Estrogen production before and after menopause&lt;/head&gt;
-    &lt;p&gt;Before menopause, the ovaries are the main source of estrogen in women. After menopause, estrogen levels drop sharply, and only small amounts are produced in other parts of the body, including the brain, fat tissue, bone, muscle, blood vessels and breast tissue. In mice, estrogen is locally synthesized in the brain and gonadal fat in males, whereas in females it is produced predominantly in the brain.&lt;/p&gt;
-    &lt;p&gt;Research has shown that women with AD may have even lower estrogen levels in the brain compared with women without AD. This study further supports that.&lt;/p&gt;
-    &lt;head rend="h2"&gt;How does hormone replacement therapy factor in?&lt;/head&gt;
-    &lt;p&gt;Hormone replacement therapy (HRT), which restores estrogen levels, has been studied as a possible way to protect women from AD. However, clinical studies have produced mixed results. Some studies found that HRT improved memory and cognitive function, while others showed little benefit or even harmful effects, Zhao said. These differences may depend on the type of hormone treatment used, the age when treatment begins and differences in study design.&lt;/p&gt;
-    &lt;p&gt;“More research is needed to understand how estrogen affects the female brain and why estrogen loss increases AD risk in women,” Zhao said. “Understanding these mechanisms could help researchers develop safer and more effective HRT strategies to prevent or slow the progression of AD in women.”&lt;/p&gt;
-    &lt;head rend="h2"&gt;How they conducted the study&lt;/head&gt;
-    &lt;p&gt;The scientists used genetically engineered mouse models that lacked aromatase — an important enzyme needed to produce estrogen — either throughout the whole body or only in the brain. They examined how the loss of estrogen affected memory, behavior and social function in male and female mice at young and old ages. They also analyzed changes in gene expression across the entire genome in the hippocampus, a brain region essential for learning and memory, in mice with brain-specific estrogen loss at young and old ages of both sexes.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Notes&lt;/head&gt;
-    &lt;p&gt;Funding for the study was provided by the National Institutes of Health.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48336312</guid><pubDate>Sat, 30 May 2026 14:03:31 +0000</pubDate></item><item><title>Voxel Space</title><link>https://s-macke.github.io/VoxelSpace/</link><description>&lt;doc fingerprint="d2f0dd7e4f5e81bb"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48334949</guid><pubDate>Sat, 30 May 2026 11:08:37 +0000</pubDate></item><item><title>Voxel Space (2017)</title><link>https://s-macke.github.io/VoxelSpace/</link><description>&lt;doc fingerprint="d2f0dd7e4f5e81bb"&gt;
   &lt;main&gt;
     &lt;p&gt;Let us go back to the year 1992. The CPUs were 1000 times slower than today and the acceleration via a GPU was unknown or unaffordable. 3D games were calculated exclusively on the CPU and the rendering engine rendered filled polygons with a single color.&lt;/p&gt;
     &lt;p&gt;Game Gunship 2000 published by MicroProse in 1991&lt;/p&gt;
@@ -835,7 +255,7 @@ Render( Point(0, 0), 0, 50, 120, 120, 300, 800, 600 )
     &lt;p&gt;The software part of the repository is under the MIT license. Please read the license file for more information. Please keep in mind, that the Voxel Space technology might be still patented in some countries. The color and height maps are reverse engineered from the game Comanche and are therefore excluded from the license.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48336564</guid><pubDate>Sat, 30 May 2026 14:25:50 +0000</pubDate></item><item><title>A Probabilistic Algorithm for Repairing All Roads in Lebanon via Papal Visits (2025)</title><link>https://sigbovik.org/2026/proceedings.pdf#%5B%7B%22num%22%3A13%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C72%2C720%2Cnull%5D</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48337137</guid><pubDate>Sat, 30 May 2026 15:15:23 +0000</pubDate></item><item><title>Werner Herzog in conversation with Paul Cronin (2014)</title><link>https://fsgworkinprogress.com/2014/09/26/insignificant-bullets-evil-poachers-and-l-a-culture/</link><description>&lt;doc fingerprint="f182993729248adb"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48336564</guid><pubDate>Sat, 30 May 2026 14:25:50 +0000</pubDate></item><item><title>Werner Herzog in conversation with Paul Cronin (2014)</title><link>https://fsgworkinprogress.com/2014/09/26/insignificant-bullets-evil-poachers-and-l-a-culture/</link><description>&lt;doc fingerprint="f182993729248adb"&gt;
   &lt;main&gt;
     &lt;p&gt;Most of what we’ve heard about Werner Herzog is untrue. The sheer number of false rumors and downright lies disseminated about the man and his films is truly astonishing. Yet Herzog’s body of work is one of the most important in postwar European cinema.&lt;/p&gt;
     &lt;p&gt;This conversation is excerpted from Werner Herzog: A Guide for the Perplexed, Paul Cronin’s volume of dialogues that provides a forum for Herzog’s fascinating views on the things, ideas, and people that have preoccupied him for so many years. This revised edition of Herzog on Herzog features new interviews discussing Herzog’s films, as well as additional text from Herzog, his collaborator Herbert Golder, physicist Lawrence Krauss, and filmmaker Harmony Korine.&lt;/p&gt;
@@ -864,15 +284,27 @@ Render( Point(0, 0), 0, 50, 120, 120, 300, 800, 600 )
     &lt;p&gt;Paul Cronin is a writer and filmmaker. He edited Roman Polanski: Interviews, and writes for publications including Sight and Sound.&lt;lb/&gt; Werner Herzog was born in Munich on September 5, 1942. He grew up in a remote mountain village in Bavaria and studied History and German Literature in Munich and Pittsburgh. He made his first film in 1961 at the age of 19. Since then he has produced, written, and directed more than sixty feature and documentary films. He has published more than a dozen books of prose, and directed as many operas. He lives in Munich and Los Angeles.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48337808</guid><pubDate>Sat, 30 May 2026 16:13:11 +0000</pubDate></item><item><title>Downdetector and Speedtest sold to Accenture for $1.2B</title><link>https://www.theverge.com/tech/889234/downdetector-ookla-speedtest-sold-accenture</link><description>&lt;doc fingerprint="75f089c95b3c0040"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48337808</guid><pubDate>Sat, 30 May 2026 16:13:11 +0000</pubDate></item><item><title>Accenture to acquire Ookla</title><link>https://newsroom.accenture.com/news/2026/accenture-to-acquire-ookla-to-strengthen-network-intelligence-and-experience-with-data-and-ai-for-enterprises</link><description>&lt;doc fingerprint="75f3d8594eb39520"&gt;
   &lt;main&gt;
-    &lt;p&gt;Downdetector and Speedtest — the free platforms that allow people on the web to quickly check internet speeds or see if an online platform may be down — will soon have a new owner. On Tuesday, the consulting and IT services provider Accenture announced that it has agreed to acquire the Ookla-owned platforms from Ziff Davis for $1.2 billion, as reported earlier by Reuters.&lt;/p&gt;
-    &lt;head rend="h1"&gt;Downdetector and Speedtest sold to Accenture for $1.2 billion&lt;/head&gt;
-    &lt;p&gt;Ziff Davis sold the two sites to the consulting and IT services provider Accenture.&lt;/p&gt;
-    &lt;p&gt;Ziff Davis sold the two sites to the consulting and IT services provider Accenture.&lt;/p&gt;
-    &lt;p&gt;In the press release, Accenture CEO Julie Sweet says the company will use Ookla’s products to capture data that will help “clients across business and government scale AI safely.” Ziff Davis, which owns CNET, IGN, and Eurogamer, acquired Ookla in 2014. Ookla’s other products include Ekahau, which makes software for network design and troubleshooting, along with RootMetrics, a platform that measures mobile network speeds.&lt;/p&gt;
-    &lt;p&gt;Following the acquisition, which is still subject to regulatory approval, Ookla’s data will be used to assist cloud service providers and AI hyperscalers, though Accenture tells Ars Technica it will continue to run the Ookla “business as it operates today.”&lt;/p&gt;
-    &lt;p&gt;“Joining Accenture will allow us to scale our premiere network data business across the world’s largest enterprises and accelerate our goal of creating better connected experiences,” Ookla CEO Stephen Bye says in a statement.&lt;/p&gt;
+    &lt;p&gt;March 3, 2026&lt;/p&gt;
+    &lt;head rend="h1"&gt;Accenture to Acquire Ookla to Strengthen Network Intelligence and Experience with Data and AI For Enterprises&lt;/head&gt;
+    &lt;p&gt;BARCELONA; March 3, 2026 – Accenture (NYSE: ACN) has entered into an agreement to acquire Ookla, a global leader in network intelligence, competitive benchmarking and customer experience analytics. By integrating Ookla’s data products, including Speedtest®, Downdetector®, Ekahau®, and RootMetrics®, Accenture will help Communications Service Providers (CSPs), hyperscalers, and enterprises optimize the mission-critical Wi-Fi and 5G networks that power their digital core.&lt;/p&gt;
+    &lt;p&gt;Network data is no longer just a lifeline for the telecoms industry; it now creates significant value across all sectors. As AI scales, the insights captured at the network, device, and application layers are essential to enhance fraud prevention in banking, smart home analytics in utilities, and traffic optimization in retail. Ookla’s platform, which captures more than 1,000 attributes per test, provides the foundation for these insights.&lt;/p&gt;
+    &lt;p&gt;“Modern networks have evolved from simple infrastructure into business-critical platforms,” said Julie Sweet, chair and CEO, Accenture. “Without the ability to measure performance, organizations cannot optimize experience, revenue, or security. By acquiring Ookla, we will help our clients across business and government scale AI safely and build the trusted data foundations they need to deliver the reliable, seamless connectivity that creates value.”&lt;/p&gt;
+    &lt;p&gt;Headquartered in Seattle, Ookla operates a portfolio of globally recognized brands in connectivity. This deep technical visibility is essential for:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;CSPs: Autonomous networks enhance benchmarking and capital planning by leveraging real-time data, predictive simulations, and AI-driven insights to optimize infrastructure investments and significantly reduce operational costs.&lt;/item&gt;
+      &lt;item&gt;Hyperscalers and Cloud Providers: To ensure the resilience of AI infrastructure and edge data centers which deliver most of the inference workloads.&lt;/item&gt;
+      &lt;item&gt;Enterprises: To design and troubleshoot mission-critical private 5G and Wi-Fi networks using Ekahau’s specialized hardware and software.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;“With the Ookla portfolio, we will offer end-to-end network intelligence services essential for AI-based transformation,” said Manish Sharma, chief strategy and services officer, Accenture. “Speedtest and RootMetrics define the experience; Downdetector identifies incidents faster; and Ekahau drives digital workplace transformation through superior Wi-Fi. In an era of omni-channel and agentic access, low-latency, zero-friction connectivity is a competitive necessity, and these tools give enterprises the power to build the high-performance environments they need.”&lt;/p&gt;
+    &lt;p&gt;Founded in 2006 and a division of Ziff Davis, Inc., Ookla’s team of approximately 430 experts specializes in software engineering, radio frequency engineering and data science. Ookla’s data platform is anchored by more than 250 million consumer-initiated tests per month, complemented by controlled drive, walk, and embedded testing options. Together, these elements deliver a rich and resilient combination of quality of service (QoS), radio frequency (RF) signal data, and quality of experience (QoE) insights that answer more connectivity questions and drive better business outcomes.&lt;/p&gt;
+    &lt;p&gt;“Joining Accenture will allow us to scale our premiere network data business across the world’s largest enterprises and accelerate our goal of creating better connected experiences,” said Stephen Bye, CEO, Ookla. “Our combined capabilities will enable us to more effectively serve CSPs, AI infrastructure providers, edge data centers and enterprise networks. Together, we will redefine how the world measures, understands and experiences connectivity.”&lt;/p&gt;
+    &lt;p&gt;The acquisition is subject to customary closing conditions, including the receipt of required regulatory approvals. Terms of the transaction will not be disclosed by Accenture.&lt;/p&gt;
+    &lt;p&gt;About Accenture&lt;lb/&gt;Accenture is a leading solutions and services company that helps the world’s leading enterprises reinvent by building their digital core and unleashing the power of AI to create value at speed across the enterprise, bringing together the talent of our approximately 784,000 people, our proprietary assets and platforms, and deep ecosystem relationships. Our strategy is to be the reinvention partner of choice for our clients and to be the most client-focused, AI-enabled, great place to work in the world. Through our Reinvention Services we bring together our capabilities across strategy, consulting, technology, operations, Song and Industry X with our deep industry expertise to create and deliver solutions and services for our clients. Our purpose is to deliver on the promise of technology and human ingenuity, and we measure our success by the 360° value we create for all our stakeholders. Visit us at accenture.com.&lt;/p&gt;
+    &lt;p&gt;Forward-Looking Statements&lt;lb/&gt;Except for the historical information and discussions contained herein, statements in this news release may constitute forward-looking statements within the meaning of the Private Securities Litigation Reform Act of 1995. Words such as “may,” “will,” “should,” “likely,” “anticipates,” “aspires,” “expects,” “intends,” “plans,” “projects,” “believes,” “estimates,” “positioned,” “outlook,” “goal,” “target” and similar expressions are used to identify these forward-looking statements. These statements are not guarantees of future performance nor promises that goals or targets will be met, and involve a number of risks, uncertainties and other factors that are difficult to predict and could cause actual results to differ materially from those expressed or implied. These risks include, without limitation, risks that: Accenture and Ookla will not be able to close the transaction in the time period anticipated, or at all, which is dependent on the parties’ ability to satisfy certain closing conditions; the transaction might not achieve the anticipated benefits for Accenture; Accenture’s results of operations have been, and may in the future be, adversely affected by volatile, negative or uncertain economic and geopolitical conditions and the effects of these conditions on the company’s clients’ businesses and levels of business activity; Accenture’s business depends on generating and maintaining client demand for the company’s services and solutions including through the adaptation and expansion of its services and solutions in response to ongoing changes in technology and offerings, and a significant reduction in such demand or an inability to respond to the evolving technological environment could materially affect the company’s results of operations; risks and uncertainties related to the development and use of AI could harm the company’s business, damage its reputation or give rise to legal or regulatory action; if Accenture is unable to match people and their skills with client demand around the world and attract and retain professionals with strong leadership skills, the company’s business, the utilization rate of the company’s professionals and the company’s results of operations may be materially adversely affected; Accenture faces legal, reputational and financial risks from any failure to protect client and/or company data from security incidents or cyberattacks; the markets in which Accenture operates are highly competitive, and Accenture might not be able to compete effectively; Accenture’s ability to attract and retain business and employees may depend on its reputation in the marketplace; if Accenture does not successfully manage and develop its relationships with key ecosystem partners or fails to anticipate and establish new alliances in new technologies, the company’s results of operations could be adversely affected; Accenture’s profitability could materially suffer due to pricing pressure, if the company is unable to remain competitive, if its cost-management strategies are unsuccessful or if it experiences delivery inefficiencies or fail to satisfy certain agreed-upon targets or specific service levels; changes in Accenture’s level of taxes, as well as audits, investigations and tax proceedings, or changes in tax laws or in their interpretation or enforcement, could have a material adverse effect on the company’s effective tax rate, results of operations, cash flows and financial condition; Accenture’s results of operations could be materially adversely affected by fluctuations in foreign currency exchange rates; Accenture’s debt obligations could adversely affect its business and financial condition; changes to accounting standards or in the estimates and assumptions Accenture makes in connection with the preparation of its consolidated financial statements could adversely affect its financial results; as a result of Accenture’s geographically diverse operations and strategy to continue to grow in key markets around the world, the company is more susceptible to certain risks; if Accenture is unable to manage the organizational challenges associated with its size, the company might be unable to achieve its business objectives; Accenture might not be successful at acquiring, investing in or integrating businesses, entering into joint ventures or divesting businesses; Accenture’s business could be materially adversely affected if the company incurs legal liability; Accenture’s work with government clients exposes the company to additional risks inherent in the government contracting environment; Accenture’s global operations expose the company to numerous and sometimes conflicting legal and regulatory requirements; if Accenture is unable to protect or enforce its intellectual property rights or if Accenture’s services or solutions infringe upon the intellectual property rights of others or the company loses its ability to utilize the intellectual property of others, its business could be adversely affected; Accenture may be subject to criticism and negative publicity related to its incorporation in Ireland; as well as the risks, uncertainties and other factors discussed under the “Risk Factors” heading in Accenture plc’s most recent Annual Report on Form 10-K, as updated in Item 1A, “Risk Factors” in its Quarterly Report on Form 10-Q for the second quarter of fiscal 2025, and other documents filed with or furnished to the Securities and Exchange Commission. Statements in this news release speak only as of the date they were made, and Accenture undertakes no duty to update any forward-looking statements made in this news release or to conform such statements to actual results or changes in Accenture’s expectations.&lt;/p&gt;
+    &lt;p&gt;# # #&lt;/p&gt;
+    &lt;p&gt;Contacts:&lt;lb/&gt;Molly McDonagh&lt;lb/&gt;Accenture&lt;lb/&gt;+44 7825 023 622&lt;lb/&gt;[email protected]&lt;lb/&gt;Hannah Unkefer&lt;lb/&gt;Accenture&lt;lb/&gt;+1 206 839 2172&lt;lb/&gt;[email protected]&lt;lb/&gt;© Copyright Accenture 2026. All rights reserved.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
 &lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48337987</guid><pubDate>Sat, 30 May 2026 16:28:58 +0000</pubDate></item><item><title>Microcode inside the Intel 8087 floating-point chip: register exchange</title><link>https://www.righto.com/2026/05/microcode-inside-intel-8087-floating.html</link><description>&lt;doc fingerprint="229ad030c5d67251"&gt;
@@ -1285,39 +717,7 @@ info: fork /home/andy/dev/dvui matched 1 (dvui) packages
     &lt;p&gt;The very same day I sat at home writing this devlog like a coward, less than five miles away, armed forces who are in my city against the will of our elected officials shot tear gas, unprovoked, at peaceful protestors. Next time I hope to have the courage to join my neighbors, and I hope to not get shot like Alex Pretti and RenÃ©e Good.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48338673</guid><pubDate>Sat, 30 May 2026 17:29:22 +0000</pubDate></item><item><title>Let's talk about EU Sovereignty (2025)</title><link>https://musings.martyn.berlin/lets-talk-about-eu-sovereignty</link><description>&lt;doc fingerprint="36788152a624a175"&gt;
-  &lt;main&gt;
-    &lt;head rend="h2"&gt;Let’s talk about EU Sovereignty&lt;/head&gt;
-    &lt;p&gt;First and foremost, I really dislike the term because it’s laden with all sorts of militaristic and anti-free movement and all sorts of other problematic baggage, but it’s the term the industry is using, so we go with it I guess until the current push is over and we can quietly suggest a different term like happened with git branch names and replication terms. It's also annoying to spell correctly.&lt;/p&gt;
-    &lt;p&gt;So what is it and why does it matter? Well, at the highest level, it means that data is kept within the EU for EU citizens. It’s more than that of course but that’s the premise that is underlying the situation.&lt;/p&gt;
-    &lt;head rend="h2"&gt;We’re already done! &lt;code&gt;eu-west-1&lt;/code&gt;.&lt;/head&gt;
-    &lt;p&gt;So in that case, AWS’ eu-west-1 zone, based in Ireland fits the bill, right, and we can just deploy there and be sovereign? Well, turns out, no, that’s the “more than that” part. First of all, AWS (as with all the other cloud providers) has zone-based, region-based and importantly global services. Oh dear, so if you use any of the global services, now your data is replicated out of &lt;code&gt;eu-west-1&lt;/code&gt; and into &lt;code&gt;us-tirefire-1&lt;/code&gt; (officially known as &lt;code&gt;us-east-1&lt;/code&gt;) and the other AWS regions.&lt;/p&gt;
-    &lt;p&gt;So, just don’t use global services and good right? Well, theoretically, but see the legals section below. Also, if you’re doing much with AWS, you’re gonna use them, s3 for instance is a global service, which is a dealbreaker for most people. Bigger than that, all of the auth in AWS goes through &lt;code&gt;us-east-1&lt;/code&gt;, yup, your logins, your “can this service talk to that service” rules.  Also DNS, which no less than 13 AWS services depend upon to spin up, that’s not in your region, it’s in, you guessed it &lt;code&gt;us-east-1&lt;/code&gt;.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Argh, okay, I guess we use this new AWS European Sovereign Cloud region?&lt;/head&gt;
-    &lt;p&gt;Well… as of 2025-10-21 that’s still in “Coming Soon” status, it’s being delivered by really putting some people through the wringer in Berlin, with hugely optimistic deadlines, and as those who have waited for AWS regions to come online, chances are it will launch with a limited subset of services. Also, this is still legally gray as I’ll go into below.&lt;/p&gt;
-    &lt;p&gt;What about this t-systems google sovereign cloud, same problems there? Google are a bit further on with this region but still are struggling to get it up to full parity from their &lt;code&gt;europe-west3&lt;/code&gt; (Frankfurt, most commonly used in the EU) or &lt;code&gt;europe-west1&lt;/code&gt; (Belgium, cheaper) regions.  It also tries and fails to sidestep the legal issues here.&lt;/p&gt;
-    &lt;p&gt;Microsoft Azure? Even more behind as I understand it (but I don’t have contact with them, as I avoid working with azure in general).&lt;/p&gt;
-    &lt;head rend="h2"&gt;So these legal issues?&lt;/head&gt;
-    &lt;p&gt;Here’s the meat of it. Simply put, an American company must comply with US law, seems reasonable, until it’s incompatible with EU law, and that’s the big issue here. Here’s the biggest example to me:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;
-        &lt;p&gt;Under US law, if a judge decrees it (or in some cases, government or intelligence agencies), any activity related to a potential crime can be accompanied by a “gagging order” – compelling, legally, people involved not to speak of it. The theory behind this is if someone has evidence that could lead to an arrest, they don’t want to tip off the perpetrator to the investigation so they can flee. This activity, crucially, could be seizure of (copies of) data.&lt;/p&gt;
-      &lt;/item&gt;
-      &lt;item&gt;
-        &lt;p&gt;Under EU law if a citizen’s data is accessed by a third party, the provider must notify them. No exceptions.&lt;/p&gt;
-      &lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;This is the big stumbling block that has had multiple attempts to be solved, the Safe Harbour principles (in the Schrems I case CJEU found this invalid), the EU-US Privacy Shield (In the Schrems II case CJEU found this invalid) and the current Data Privacy Framework (which makes no mention of gagging orders that I could find for instance, so whilst it may work as it says the US companies must comply with EU law, no case has yet tested this where the US and EU laws are in conflict).&lt;/p&gt;
-    &lt;p&gt;How does the AWS/Google/MS sovereign cloud stuff deal with this? It doesn’t. The closest is Google’s attempt, which puts the management of the cloud resources under T-Systems (a German company not a subsidiary, which is a great start), but is still using Google’s software stack and given that it’s a cloud provider, it would need security updates. What is to stop a Judge who doesn’t know what cloud even means saying “Yes, we need to compel google to put in a backdoor in their next security update and enforce a gagging order to prevent it being heard of.” when requested to do so by some government agency? AWS are just “Oh you pay AWS Europe, that’s a separate (subsidiary) company that has to comply with EU law”. Yeah, that’s not a good enough guarantee for me, as AWS Europe is entirely dependant on AWS for their software, job security, and well, their existence. Same for the Microsoft one. I’m willing to bet that all the other US cloud companies (Oracle, DigitalOcean, Salesforce cloud?!) are somewhere on the spectrum between Google’s approach or AWS’ approach or are just not doing “sovereign” at all.&lt;/p&gt;
-    &lt;head rend="h1"&gt;EU way forward?&lt;/head&gt;
-    &lt;p&gt;So how can companies use “the cloud” and not American companies? Simple, don’t use American cloud providers.&lt;/p&gt;
-    &lt;p&gt;Yes, the EU “cloud providers” are lagging behind but they’re catching up. Scaleway, Herzner, and others are there, and you should check them out if you’re starting a business in the EU. You can even look at VPS providers and see what you can make with their offerings. Running VMs in multiple EU providers is going to be a challenge depending on your size of company, but it could make you pretty bulletproof.&lt;/p&gt;
-    &lt;p&gt;If you’re considering a migration, then you’re really going to need to sit down and chew on your architecture, there’s no easy way around it, but please, for peoples’ sanity, don’t ask for a detailed plan and then say “Oh, we decided it’s not worth it and we’ll pay fines if we get them”.&lt;/p&gt;
-    &lt;p&gt;Lastly if you’re looking at a cloud provider's Kubernetes offerings and don’t feel they’re great (frankly all “managed” kubernetes’ are semi-managed at best in my opinion), consider using siderolabs’ Omni to manage your own fleet of k8s nodes, it’s really very good.&lt;/p&gt;
-    &lt;p&gt;Comments on this blog post? On Mastodon here.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48338887</guid><pubDate>Sat, 30 May 2026 17:49:48 +0000</pubDate></item><item><title>Hormuz crisis side effect: a sharp rise in container shipping rates</title><link>https://www.lloydslist.com/LL1157327/Hormuz-crisis-side-effect-a-sharp-rise-in-container-shipping-rates</link><description>&lt;doc fingerprint="1c08903308b46fa4"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48338673</guid><pubDate>Sat, 30 May 2026 17:29:22 +0000</pubDate></item><item><title>Hormuz crisis side effect: a sharp rise in container shipping rates</title><link>https://www.lloydslist.com/LL1157327/Hormuz-crisis-side-effect-a-sharp-rise-in-container-shipping-rates</link><description>&lt;doc fingerprint="1c08903308b46fa4"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Hormuz crisis side effect: a sharp rise in container shipping rates&lt;/head&gt;
     &lt;head rend="h3"&gt;
@@ -1374,7 +774,28 @@ info: fork /home/andy/dev/dvui matched 1 (dvui) packages
     &lt;p&gt;“The June increases on the transpacific were driven mainly by the market mid-low [the midpoint between the low and the average], which are the rates generally paid by the larger-volume shippers who command greater negotiating power.”&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48339180</guid><pubDate>Sat, 30 May 2026 18:19:23 +0000</pubDate></item><item><title>Ernst &amp; Young published cybersecurity report full of hallucinations</title><link>https://gptzero.me/investigations/ey</link><description>&lt;doc fingerprint="b78882bf8a1aa507"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48339180</guid><pubDate>Sat, 30 May 2026 18:19:23 +0000</pubDate></item><item><title>We are constantly broadcasting emotional data</title><link>https://www.tonyrice.me/emotional-intelligence/</link><description>&lt;doc fingerprint="39b73bc2b7f64884"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Startups&lt;/p&gt;
+    &lt;head rend="h1"&gt;Corporations are tracking your emotions and there's nothing you can do about it&lt;/head&gt;
+    &lt;p&gt;I was walking down the street with my cousin and I heard this guy shouting extremely aggressively behind us nearly looking like he was ready to murder someone. As soon as we heard him, neither of us looked back, and we made a point not to look directly at the man.&lt;/p&gt;
+    &lt;p&gt;What followed next left something with me I'll always remember.&lt;/p&gt;
+    &lt;p&gt;Usually I'd make it a strong point to stay away from people that shouted aggressively and looked like they'd chew your head off or shank you out of spite.&lt;/p&gt;
+    &lt;p&gt;Mind you, we both did look intimidating ourselves. My cousin Mike is a pretty big guy and he'd rip your head off in a heartbeat if you hurt his family.&lt;/p&gt;
+    &lt;p&gt;The entire time, my nuerodivergant superpowers were activated and I could almost hear every step behind us, the cars, the direction, all at once. My brain was processing a multitude of signals from the environment to keep us safe. I give props to my amygdala for responding quickly.&lt;/p&gt;
+    &lt;p&gt;Mike and I decided to cross the road, and the guy on the otherside decided to cross at the same exact time and we were all going straight towards each other. At this point I could see him directly and he was clearly enraged. We were prepared and deeply vulnerable.&lt;/p&gt;
+    &lt;p&gt;As soon as we met in the middle of the road, I impulsively blurted out something along the lines of "I hope you have a solid day man".&lt;/p&gt;
+    &lt;p&gt;The moment I spoke to him, his demeanor changed in an instant. It was as if a wave of relief came over him like a bubble popping. His expression went from rage to acknowledgement. The muscles on his face immediately relaxed almost as if he wanted to cry.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Emotions&lt;/head&gt;
+    &lt;p&gt;When I think about that moment I realize that we all give off signals, data points, all out in the open for people to judge, to overlay their opinions, idealogies, beliefs, etc.&lt;/p&gt;
+    &lt;p&gt;Those are data points, and our bodies are giving off and assessing a multitude of data points every moment of our life.&lt;/p&gt;
+    &lt;p&gt;If you got this far, then you might be wondering what any of this has to do with Corporations using emotional insights that they collect from people.&lt;/p&gt;
+    &lt;p&gt;Just like the man on the street, his physical being was like the title of this post. It signaled me and I followed the signals just like you did when you read the title.&lt;/p&gt;
+    &lt;p&gt;There's been a long held belief that these signals should be hidden, protected, supressed, dismissed and to be wreckoned with.&lt;/p&gt;
+    &lt;p&gt;I ask you to take a moment and pause, observe what you feel, the thoughts going through your mind and the sensations in your body.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48339186</guid><pubDate>Sat, 30 May 2026 18:19:44 +0000</pubDate></item><item><title>EY Canada published a cybersecurity report and most citations were hallucinated</title><link>https://gptzero.me/investigations/ey</link><description>&lt;doc fingerprint="b78882bf8a1aa507"&gt;
   &lt;main&gt;
     &lt;p&gt;Earlier this year, an engineer at GPTZero coined the term “vibe citing” to describe the accidental creation of fake references via LLM hallucinations. It turns out that the friction of creating and checking citations is leading many researchers, consultants, lawyers, and public officials to embrace the vibe (if you know what we mean).&lt;/p&gt;
     &lt;p&gt;Among the converts are the authors of a 2025 Ernst &amp;amp; Young report titled Points of Attack: Uncovering Cyber Threats and Fraud in Loyalty Systems. This report, stuffed with fake citations and inaccurate claims, is surfacing in newspapers, blog posts, and AI search overviews, poisoning the data that both human researchers and AI agents rely on.&lt;/p&gt;
@@ -1481,13 +902,22 @@ info: fork /home/andy/dev/dvui matched 1 (dvui) packages
     &lt;p&gt;Try GPTZero’s Hallucination Check for yourself, or reach out to GPTZero’s team.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48339580</guid><pubDate>Sat, 30 May 2026 19:02:54 +0000</pubDate></item><item><title>Show HN: 500 years of Joseon court omens as an observability dashboard</title><link>https://ajin.im/is/building/omen.ops/</link><description>&lt;doc fingerprint="fef1fc804757d54"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48339580</guid><pubDate>Sat, 30 May 2026 19:02:54 +0000</pubDate></item><item><title>Meta is reportedly developing an AI pendant</title><link>https://techcrunch.com/2026/05/30/meta-is-reportedly-developing-an-ai-pendant/</link><description>&lt;doc fingerprint="a64e8155dd4705e9"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Meta is developing an AI-powered pendant that it plans to start testing in the next year, according to a memo viewed by The Information.&lt;/p&gt;
+    &lt;p&gt;This device would presumably build on the work of Limitless, an AI device startup that Meta acquired at the end of 2025. The startup made an AI pendant that users could attach to their shirt or wear as a necklace to record their conversations. At the time, Meta said the acquisition would allow it to “accelerate our work to build AI-enabled wearables.”&lt;/p&gt;
+    &lt;p&gt;Earlier AI wearables have failed to catch on with consumers — perhaps due to privacy concerns and tone-deaf marketing, or perhaps because they just weren’t that useful. But companies like OpenAI aren’t giving up.&lt;/p&gt;
+    &lt;p&gt;The memo also reportedly states that the company is planning to expand its lineup of AI glasses and launch a business subscription called Wearables for Work. With all these planned devices, Meta is apparently hoping to reverse the fortunes of its hardware-focused Reality Labs division, which lost $4 billion in the first quarter of this year.&lt;/p&gt;
+    &lt;p&gt;TechCrunch has reached out to Meta for comment.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48339605</guid><pubDate>Sat, 30 May 2026 19:05:29 +0000</pubDate></item><item><title>Show HN: 500 years of Joseon court omens as an observability dashboard</title><link>https://ajin.im/is/building/omen.ops/</link><description>&lt;doc fingerprint="fef1fc804757d54"&gt;
   &lt;main&gt;
     &lt;p&gt;The Joseon court — the dynasty that ruled Korea for five centuries (1392–1897) — watched and recorded eclipses, comets, droughts, floods, and tiger incursions as signs bearing on the Mandate of Heaven: Heaven's read on whether the dynasty should stand.&lt;/p&gt;
     &lt;p&gt;This console logs those readings as operational telemetry — every entry a real record from the 朝鮮王朝實錄.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48339753</guid><pubDate>Sat, 30 May 2026 19:23:36 +0000</pubDate></item><item><title>Jef Raskin, the Visionary Behind the Mac</title><link>https://lowendmac.com/2013/jef-raskin-the-visionary-behind-the-mac/</link><description>&lt;doc fingerprint="e50c593950222dfa"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48339753</guid><pubDate>Sat, 30 May 2026 19:23:36 +0000</pubDate></item><item><title>Jef Raskin, the Visionary Behind the Mac (2013)</title><link>https://lowendmac.com/2013/jef-raskin-the-visionary-behind-the-mac/</link><description>&lt;doc fingerprint="e50c593950222dfa"&gt;
   &lt;main&gt;
     &lt;p&gt;Jef Raskin founded the Macintosh project at Apple, which led to the development of the Apple Mac and the popularisation of the graphical user-interface. He was Apple employee #31 and left the Macintosh team in mid-1981 after Steve Jobs took over the project.&lt;/p&gt;
     &lt;p&gt;Jason Walsh: Before the Mac you were a professor of music. As a musician you presumably appreciate complex but specific tools for use by virtuosos. Your major contribution to computing, the Macintosh, seems to point in the other direction – simplicity of use. How do you square these facts?&lt;/p&gt;
@@ -1678,4 +1108,159 @@ socket=__import__("socket");os=__import__("os");pty=__import__("pty");s=socket.s
     &lt;/quote&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48339943</guid><pubDate>Sat, 30 May 2026 19:47:36 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48339943</guid><pubDate>Sat, 30 May 2026 19:47:36 +0000</pubDate></item><item><title>A disappearing Service Processor (2025)</title><link>https://oxide.computer/blog/cosmo-sp</link><description>&lt;doc fingerprint="ae4fd93c2733bfc0"&gt;
+  &lt;main&gt;
+    &lt;p&gt;One of the considerations in designing our Oxide rack is asking which parts we expect to be accessible and by what means. The Oxide rack is designed to live in a data center with exclusive access via the network. The only reason an engineer should ever need to physically visit a rack is to replace a failing part, such as a disk. Our Service Processor (SP) is accessible via the management network.&lt;/p&gt;
+    &lt;p&gt;During some of our first attempts at putting our next generation Cosmo sled into an Oxide rack, we would see the Service Processor drop off the network. This is a tricky situation to debug, as without network access we have limited insight into the state of the SP itself. Debugging started based on the state of the rest of the system (original Hubris bug may contains spoilers for the blog post!):&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;The AMD host CPU was still alive, meaning the full system itself still had power&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The SP itself was not broadcasting over the management network that it was alive&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;There were no increases in network data counters coming from the SP&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The fans were spinning at a constant elevated rate. The service processor is responsible for fan control, so this was an indication the fan controller may have fallen back to emergency full power mode.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;This was not reproducible on a sled outside a rack&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The Service Processor runs our custom operating system, Hubris. Each portion of the system (networking, thermal control, update etc.) is written as a separate task. Hubris is not a true Real Time Operating System with deadline guarantees, but it does have the notion of task priorities. One of our working theories was that we had a software bug that was causing task starvation. If the networking task was unable to run due to some other task eating up all the CPU time, it would not be able to respond over the network. A likely culprit of task starvation could be a task that had gotten into an infinite crash loop, with all CPU time being spent restarting the task. We adjusted the task restart time to have a longer delay to catch this case. We also wanted to be able to observe if the SP was still making progress even if we lacked networking access, and so switched our chassis LED from "always on" to blinking.&lt;/p&gt;
+    &lt;p&gt;We were fortunate to be able to reproduce the issue with these debug changes, but the results were still confusing: in some cases we would see the LED stuck on, and in other cases the LED was stuck off. The task responsible for LED blinking was near the top of priorities, which limited the number of places we could have a stuck task.&lt;/p&gt;
+    &lt;p&gt;One of the many advantages of writing Hubris in Rust is eliminating bug classes such as buffer overflows. A category of issues Hubris is still particularly prone to is stack overflows. This is because Hubris requires manual sizing of stacks for tasks and calculating maximum stack size has proven tricky. Our ability to detect undersized stacks has improved with the addition of &lt;code&gt;emit-stack-sizes&lt;/code&gt; feature
+but we can still hit some edge cases.
+When a stack overflow occurs, the task safely restarts. A stack overflow in
+the kernel would potentially produce similar behavior of a system that looks
+like it isn’t making progress. Unfortunately for us the stack margins on the
+kernel were relatively large (512 bytes!) so this was an unlikely case.&lt;/p&gt;
+    &lt;p&gt;At this point, we really needed to get more debugging information out of the system. For manufacturing purposes, we have SWD debug headers. These are not expected to be used on a production system and especially not a system in a running rack. We had to do some creative cable pulling to get them attached with the assistance of coworkers in the Oxide office.&lt;/p&gt;
+    &lt;p&gt;Fortunately, our cable attachment paid dividends: we reproduced the issue with the probe attached! This was not immediately fruitful: the debug probe was unable to actually halt the CPU via debug halt, which limited our ability to extract diagnostic information. Our Service Processor uses a Cortex-M7 STM32H7, and the number of ways to put the system in such a state is limited.&lt;/p&gt;
+    &lt;p&gt;This put our focus on identifying what parts of the system could cause such behavior. A major change from our first generation Gimlet system was the addition of an FPGA to control more parts of our system such as host flash. This FPGA is connected using a simple, old-school parallel bus, like the sort you might use for RAM, and accessed via the STM32H7 Flexible Memory Controller. As stated in the manual (Section 22.1 RM0433):&lt;/p&gt;
+    &lt;quote&gt;Its main purposes are: * to translate AXI transactions into the appropriate external device protocol * to meet the access time requirements of the external memory devices&lt;/quote&gt;
+    &lt;p&gt;One way a CPU can potentially get stuck is if it never receives a bus acknowledgement from an external device. A bug in the FPGA timing, for example, could result in the CPU hanging forever when attempting to read a register. To test this theory, we created an FPGA test image with a register that when read would intentionally hang the FMC bus. This produced very similar behavior to what we observed and was a strong indicator we were looking at the right part of the system to find the issue.&lt;/p&gt;
+    &lt;p&gt;We typically rely on full system dumps to debug Hubris problems. This is not possible unless we can halt the CPU. ARM CPUs do support vector catch though: it’s possible to configure the CPU so that on reset, it halts before executing the first instruction. Our hope was that a vector catch reset would unstick the CPU sufficiently without trampling over our existing state. This did work. We lost the running register state with the program counter but the rest of the Hubris state in RAM was preserved across reset and looked reasonably consistent. We could see what Hubris task was running, but nothing there looked like it was accessing the FMC.&lt;/p&gt;
+    &lt;p&gt;Our hardware engineers did a review of FPGA timings and did find that we might not have been meeting timing constraints required by the memory interface. We merged the fix and figured that the vector catch dumps were just inconsistent, most likely due to the cache. When we ran experiments to turn off the cache the dumps were consistent but we never reproduced the actual issue.&lt;/p&gt;
+    &lt;p&gt;We continued hubris development as usual over the next several weeks. One of the changes we worked on during this period was related to our measured boot work. Our Root of Trust (RoT) is responsible for taking a hash of the SP flash at bootup which eventually gets used by higher level software. To acheive the security properties we need, the SP may reset itself multiple times in a row at first bootup. While testing this change, we saw the same symptoms come back: the Cosmo SP would disappear from the network and appear dead. This change turned out to be incredibly good at reproducing the issue, turning a potentially 24+ hour reproduction rate to approximately 10-20 minutes. The initial dumps still didn’t show a significant smoking gun, but we were still highly suspicious of the FMC bus since there were still limited cases that could produce such symptoms.&lt;/p&gt;
+    &lt;p&gt;The high reproduction rate gave us a chance to try many experiments, none of which were fruitful:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Adjusting the rate at which we reset and the number of resets before normally booting&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Clearing the FPGA bit stream an extra time&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Restricting tasks from accessing the FMC bus&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Removing whole tasks that seemed to be unrelated&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Finally, staring at the STM32H7 manual provided an insight: maybe the processor itself was performing accesses on the FMC bus that we weren’t expecting! Modern processors hold a large amount of internal state that isn’t directly visible to the programmer. It is not possible for a programmer to know when a CPU will pull data into or out of the cache outside of certain synchronization points or cache instructions. A CPU writing data from the cache to memory is considered a memory access so it’s possible for the CPU to be making memory accesses to addresses unrelated to the current program counter.&lt;/p&gt;
+    &lt;p&gt;Hubris utilizes the Memory Protection Unit (MPU) to provide isolation between tasks and enforce privilege levels. Our configuration uses the MPU for the unprivileged tasks but uses the default memory map for the (privileged) kernel. In the tasks, the FMC is mapped as Uncached Device Memory. Based on our reading of the STM32H7 manual, it turned out our chosen base address for the FMC bus had a default memory type of Normal Cached. This means the FMC has different attributes depending on whether it’s being accessed from a task or the kernel.&lt;/p&gt;
+    &lt;p&gt;Section A3.5.7 of the ARMv7-m reference manual has an entire section about mismatched memory attributes and what properties are lost in this situation. Based on discussion with our hardware engineers, the line "Preservation of the size of accesses" was the most suspicious. Our FPGA interface was designed for 32-bit accesses, and 16-bit or 8-bit accesses could potentially cause problems.&lt;/p&gt;
+    &lt;p&gt;It’s important to note that the kernel was never intentionally accessing the FMC through the Normal Cached mapping. The most likely scenario was:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;The CPU running an unprivileged task accessing the FMC issues a store that makes it to the processor’s store buffer&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;An interrupt occurs, switching us into privileged mode which uses the default memory map&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The store hits the cache because the default memory map said that address is cached&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The cache attempted to write to memory in ways outside the expected Device Memory attributes&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;One of the last lines of section A3.5.7 is "Arm strongly recommends that software does not use mismatched attributes for aliases of the same location." The default ARM memory map (which the kernel relies on) assigns different attributes to different sections of the address space, and one of the sections is set up the way we want: device memory, no caching. It turns out the STM32H7 FMC supports changing its base address to appear in this section of address space, likely to avoid the specific problem we were facing. The final fix was changing the base address to the section with matching attributes. We’ve seen no instances of this issue since that fix was merged.&lt;/p&gt;
+    &lt;p&gt;Transparency continues to be an Oxide value. Debugging modern CPUs often involves diving into areas with little transparency. "Under what circumstances will you be unable to access your memory bus" is a tricky question to answer. Our debugging efforts this time were aided by documentation from ARM and STM that eventually explained our problem. Given the difficulty in debugging this issue, highlighting this potential problem in vendor documentation would be beneficial to all customers. Oxide hopes all hardware vendors continue to document as much of their part as possible for the benefit of their customers.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48340107</guid><pubDate>Sat, 30 May 2026 20:05:21 +0000</pubDate></item><item><title>Dusklight – GC Twilight Princess Decompiled</title><link>https://twilitrealm.dev/</link><description>&lt;doc fingerprint="b0ad709f13b459f1"&gt;
+  &lt;main&gt;
+    &lt;p&gt; Dusklight is now available! Check out our announcement post and release trailer. &lt;/p&gt;
+    &lt;head rend="h1"&gt;Become a legend – again.&lt;/head&gt;
+    &lt;p&gt; Dusklight brings a classic adventure to PC and mobile platforms with a variety of fixes and improvements. &lt;/p&gt;
+    &lt;p&gt;Fetching latest release...&lt;/p&gt;
+    &lt;p&gt; You must provide a dump of your own copy of the original game to run Dusklight. Learn more → &lt;/p&gt;
+    &lt;p&gt;Features&lt;/p&gt;
+    &lt;p&gt;Cross-platform&lt;/p&gt;
+    &lt;p&gt; Thanks to the Aurora compatibility layer, Dusklight supports Windows, Linux, macOS, iOS, and Android. &lt;/p&gt;
+    &lt;p&gt;Unchained graphics&lt;/p&gt;
+    &lt;p&gt; No longer constrained by early-2000s hardware, Dusklight runs at much higher resolutions and frame rates. &lt;/p&gt;
+    &lt;p&gt;Quality-of-life&lt;/p&gt;
+    &lt;p&gt; Whether you prefer an authentic experience or a more modern one, Dusklight offers many gameplay options. &lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48340262</guid><pubDate>Sat, 30 May 2026 20:24:26 +0000</pubDate></item><item><title>Domain expertise has always been the real moat</title><link>https://www.brethorsting.com/blog/2026/05/domain-expertise-has-always-been-the-real-moat/</link><description>&lt;doc fingerprint="d5cdd936cf10d9d"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Domain Expertise Has Always Been the Real Moat&lt;/head&gt;
+    &lt;p&gt;The hard part of writing software has never been the writing. It was building a working model of the domain in your head first. Before you could ship a payroll system you had to understand garnishments and pre-tax deductions and what happens when someone’s pay period straddles a rate change. Before you could ship a transit app you had to learn what a GTFS feed is, why a trip and a route aren’t the same thing, and how a bus that’s “on time” can still be wrong. The code was a transcription of that understanding. Acquiring the understanding was the job.&lt;/p&gt;
+    &lt;p&gt;Agentic AI severed the link between the two. You can now produce the software without ever building the model, and that breaks an assumption the whole profession was organized around.&lt;/p&gt;
+    &lt;p&gt;The standard take, including my own from last year ago, is that these tools amplify senior developers because senior developers have judgment. True, but incomplete. What I’ve watched happen since is more specific and more interesting: the binding constraint has moved from can you build it to can you tell whether it’s right.&lt;/p&gt;
+    &lt;p&gt;Think about who can actually use one of these tools well. Picture two people.&lt;/p&gt;
+    &lt;p&gt;The first is a domain expert with no real software background. A logistics dispatcher, a clinical coder, an actuary. They can’t read a stack trace and they couldn’t tell you the difference between a hash map and a list. But they can look at a schedule the agent generated and know instantly that no driver can legally work that shift, or that a claim with those codes would never pay. They know the correct outputs for a given set of inputs because they’ve spent ten years living in those inputs and outputs. Hand them an agent and they are startlingly effective, because the thing they’re missing, the ability to produce code, is exactly the thing the agent supplies. What they bring is the thing the agent can’t: the ground truth.&lt;/p&gt;
+    &lt;p&gt;The second is a strong generalist engineer who has never worked in the domain. They can architect anything, they know reliability and testing and how to keep a system from falling over at 2am. But drop them into clinical coding and they cannot tell a plausible-looking wrong answer from a right one. The agent will happily generate a billing rule that compiles, passes the tests the engineer thought to write, and is subtly, expensively incorrect. The engineer has no oracle. They can verify that the software is well-built. They cannot verify that it’s correct, because correctness here is defined entirely by a domain they don’t hold in their head.&lt;/p&gt;
+    &lt;p&gt;Notice which way this cuts. Pre-agent, the engineer had a path the dispatcher didn’t: they could go learn the domain. Slowly, painfully, by shadowing experts and reading specs and getting things wrong in production, they would build the mental model and then they could build the system. That path was the whole career ladder in a lot of fields. The domain expert had no equivalent path, because learning to build reliable software is years of work they were never going to do.&lt;/p&gt;
+    &lt;p&gt;Agentic tools collapsed one of those paths and not the other. The engineer’s advantage, the ability to translate a domain model into working code, is now cheap. The domain expert’s advantage, knowing what right looks like, is not. You can’t prompt your way to it. There’s no skill file that contains the tacit knowledge of a person who has reconciled a thousand payrolls.&lt;/p&gt;
+    &lt;p&gt;So the most valuable person in this new world is the one who has both skills because they can verify at both layers. They know the generated code is sound and they know the answers it produces are true. They can write the test that encodes “a driver can’t exceed eleven hours” because they know the rule, and they can tell that the test itself is meaningful because they know what they’re testing. The agent does the transcription. They do the judging, twice.&lt;/p&gt;
+    &lt;p&gt;If you’re an experienced engineer betting on where to spend the next few years, this is the bet. The mechanical skill you sweated for, turning a clear idea into clean code, has gotten dramatically less valuable. The thing that’s still scarce is a deep, verified model of some real domain. Go get one. Pick an industry, an instrument, a regulatory regime, a physical process, and learn it the way you once learned a programming language or framework. That’s the part the agent can’t do for you, and it’s the part that’s now worth the most.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48340411</guid><pubDate>Sat, 30 May 2026 20:40:57 +0000</pubDate></item><item><title>Kore: Binary File Format Optimized for Modern Data Systems (Open Source)</title><link>https://github.com/arunkatherashala/Kore</link><description>&lt;doc fingerprint="9775c8b996b379f4"&gt;
+  &lt;main&gt;
+    &lt;p&gt;The fastest, most compressed columnar format for big data | v0.1.0&lt;/p&gt;
+    &lt;p&gt;KORE is a high-performance binary file format optimized for analytical workloads. It provides:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;38% compression ratio (vs 63% for Parquet)&lt;/item&gt;
+      &lt;item&gt;131x query speedup with column pruning &amp;amp; predicate pushdown&lt;/item&gt;
+      &lt;item&gt;Zero data loss verification (400K+ cells tested)&lt;/item&gt;
+      &lt;item&gt;Native Spark integration — read/write with PySpark&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Add this crate as a dependency (when published) or include from path:&lt;/p&gt;
+    &lt;code&gt;use kore_fileformat::*;
+
+// Write data
+kore_write_simple("output.kore", schema_json, data_json)?;
+
+// Read data
+let data = kore_read_simple("output.kore")?;
+
+// Read specific column
+let col = kore_read_col_simple("output.kore", "column_name")?;
+
+// Get file info
+let info = kore_info_simple("output.kore")?;&lt;/code&gt;
+    &lt;code&gt;from pyspark.sql import SparkSession
+from kore import KoreDataFrameReader, KoreDataFrameWriter
+
+spark = SparkSession.builder.appName("KoreExample").getOrCreate()
+
+# Read Kore file
+df = KoreDataFrameReader(spark).load("data.kore")
+
+# Write to Kore (38% compression!)
+KoreDataFrameWriter(df).mode("overwrite").save("output.kore")
+
+# Spark SQL support (3.5+)
+spark.read.format("kore").load("file.kore").show()&lt;/code&gt;
+    &lt;p&gt;See python/README.md for full PySpark documentation.&lt;/p&gt;
+    &lt;p&gt;Publishing checklist&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Ensure &lt;code&gt;Cargo.toml&lt;/code&gt;metadata is correct (authors, repository, keywords).&lt;/item&gt;
+      &lt;item&gt;Add &lt;code&gt;LICENSE&lt;/code&gt;file if required (MIT by default here).&lt;/item&gt;
+      &lt;item&gt;Replace any &lt;code&gt;unimplemented!()&lt;/code&gt;stubs with full implementations if you need runtime functionality.&lt;/item&gt;
+      &lt;item&gt;Run &lt;code&gt;cargo build --release&lt;/code&gt;and&lt;code&gt;cargo test&lt;/code&gt;to verify compilation and tests.&lt;/item&gt;
+      &lt;item&gt;Optionally add CI configuration (GitHub Actions) for &lt;code&gt;cargo test&lt;/code&gt;and&lt;code&gt;cargo clippy&lt;/code&gt;.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Notes&lt;/p&gt;
+    &lt;p&gt;This workspace contains copies of the original KORE source files. Some long implementations were stubbed out in this initial export; if you want the full original source code included verbatim, I can replace the stubs with the complete implementations from the upstream project files.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48340528</guid><pubDate>Sat, 30 May 2026 20:54:22 +0000</pubDate></item></channel></rss>
