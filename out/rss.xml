@@ -1,241 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 03 Jun 2026 19:02:25 +0000</lastBuildDate><item><title>Every Byte Matters</title><link>https://fzakaria.com/2026/06/01/every-byte-matters</link><description>&lt;doc fingerprint="ea7cd901f730395b"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Every byte matters&lt;/head&gt;
-    &lt;p&gt;Published 2026-06-01 on Farid Zakaria's Blog&lt;/p&gt;
-    &lt;p&gt;I have spent a large portion of my career working in Java. In that time, you get used to huge classes. New functionality? Just add a new method and field to the class. The cost of each new field is rarely considered. Performance is often considered from a classic computer science perspective by considering asymptotic analysis of the algorithms and data structures in-use.&lt;/p&gt;
-    &lt;p&gt;Turns out that even within a growth scale for your algorithm, such as a simple for-loop &lt;code&gt;O(N)&lt;/code&gt;, time can vary dramatically if we have a little deeper understanding of the underlying hardware.&lt;/p&gt;
-    &lt;p&gt;First, let’s understand our current machine. Let’s take a peek at our cache line and page sizes.&lt;/p&gt;
-    &lt;code&gt;$ lscpu | grep -i cache
-  L1d cache:    352 KiB (10 instances)
-  L1i cache:    640 KiB (10 instances)
-  L2 cache:     10 MiB (5 instances)
-  L3 cache:     12 MiB (1 instance)
-
-$ getconf LEVEL1_DCACHE_LINESIZE
-  64
-&lt;/code&gt;
-    &lt;p&gt;The instances number is a reflection of how the caches are shared amongst CPUs. If I had 10 CPUs, each one has their own &lt;code&gt;L1d&lt;/code&gt; cache, whereas two of them would share an &lt;code&gt;L2&lt;/code&gt; cache.&lt;/p&gt;
-    &lt;p&gt;Our cache line size is 64 bytes.&lt;/p&gt;
-    &lt;code&gt;┌─────────────────────────────────────────────┐
-│                 64 bytes                    │
-│  byte 0   byte 1   byte 2   ...  byte 63    │
-└─────────────────────────────────────────────┘
-&lt;/code&gt;
-    &lt;p&gt;When you read a single byte from memory, the hardware will fill the surrounding 64 bytes into the cache line. The idea being that data is often temporal and spatially located, meaning data is often accessed near each other and close in time to each other.&lt;/p&gt;
-    &lt;p&gt;We can reference Jeff Dean’s famous “Latency numbers every programmer should know”, however a quick recap with the values from our particular machine is the following:&lt;/p&gt;
-    &lt;code&gt;┌──────────────────────────────────────────────────────────────┐
-│                           CPU Core                           │
-│  ┌───────────┐                                               │
-│  │ Registers │  &amp;lt; 1 ns                                       │
-│  └─────┬─────┘                                               │
-│        ▼                                                     │
-│  ┌───────────┐                                               │
-│  │ L1d Cache │  ~35 KiB/core    ~4-5 cycles    ~1-2 ns       │
-│  │           │  ~560 cache lines                             │
-│  └─────┬─────┘                                               │
-│        ▼                                                     │
-│  ┌───────────┐                                               │
-│  │ L2 Cache  │  ~2 MiB/core-pair  ~12-15 cycles  ~4-5 ns     │
-│  │           │  ~32,000 cache lines                          │
-│  └─────┬─────┘                                               │
-│        ▼                                                     │
-│  ┌───────────┐                                               │
-│  │ L3 Cache  │  12 MiB shared   ~30-40 cycles   ~10-15 ns    │
-│  │           │  ~196,000 cache lines                         │
-│  └─────┬─────┘                                               │
-│        ▼                                                     │
-│  ┌───────────┐                                               │
-│  │   DRAM    │  ~100-200 cycles  ~60-100 ns                  │
-│  │           │                                               │
-│  └───────────┘                                               │
-└──────────────────────────────────────────────────────────────┘
-&lt;/code&gt;
-    &lt;p&gt;The sizes for each cache, is the number returned by &lt;code&gt;lscpu&lt;/code&gt; divided by the number of cores or instances; i.e. 352 KiB ÷ 10 instances = ~35 KiB.
-We then determine the number of cache lines by dividing this number by 64; i.e. 35 KiB ÷ 64 bytes = 560 cache lines.&lt;/p&gt;
-    &lt;p&gt;How does this all matter ? 🤔&lt;/p&gt;
-    &lt;p&gt;Let’s consider an example where we want to iterate over a single struct &lt;code&gt;Monster&lt;/code&gt; and pull out the &lt;code&gt;boolean is_alive&lt;/code&gt; to filter them.
-We create our struct, and in this particular example we need 64 bytes to represent a single Monster.&lt;/p&gt;
-    &lt;code&gt;struct Monster {
-      uint32_t id;          // 4 bytes
-      float    x, y, z;     // 12 bytes
-      float    vx, vy, vz;  // 12 bytes
-      int32_t  hp;          // 4 bytes
-      int32_t  attack;      // 4 bytes
-      int32_t  defense;     // 4 bytes
-      uint8_t  is_alive;    // 1 byte
-      uint8_t  team;        // 1 byte
-      char     name[22];    // 22 bytes
-  };                        // total: 64 bytes
-&lt;/code&gt;
-    &lt;p&gt;If we had an array of Monsters and we iterate over them, the cache line would fill up like so. Each cache line would fill with a single monster, and we would fetch only the &lt;code&gt;is_alive&lt;/code&gt; byte.&lt;/p&gt;
-    &lt;p&gt;This is often referred to as “Array of Structs”.&lt;/p&gt;
-    &lt;code&gt;       cache line 0                          cache line 1
-┌──────────────────────────────┐   ┌──────────────────────────────┐
-│ id0 x0 y0 z0 vx0 vy0 vz0 hp0 │   │ id1 x1 y1 z1 vx1 vy1 vz1 hp1 │
-│ atk0 def0 alive0 team0 name0 │   │ atk1 def1 alive1 team1 name1 │
-│             ▲                │   │            ▲                 │
-└─────────────┼────────────────┘   └────────────┼─────────────────┘
-              │                                 │
-          need this                          need this
-&lt;/code&gt;
-    &lt;p&gt;If we instead normalize the data such that each field is in it’s own list, we can pack the cache lines much tighter.&lt;/p&gt;
-    &lt;code&gt;                        cache line 0
-┌───────────────────────────────────────────────────────────────┐
-│alive0 alive1 alive2 alive3 alive4 alive5 ... alive62 alive63  │
-│  ▲      ▲      ▲      ▲      ▲      ▲          ▲       ▲      │
-└──┼──────┼──────┼──────┼──────┼──────┼──────────┼───────┼──────┘
-   │      │      │      │      │      │          │       │
-   └──────┴──────┴──────┴──────┴──────┴──────────┴───────┘
-                  all 64 in one fetch
-&lt;/code&gt;
-    &lt;code&gt;// SoA layout
-struct Monsters {
-    uint32_t *ids;
-    float    *xs, *ys, *zs;
-    float    *vxs, *vys, *vzs;
-    int32_t  *hps;
-    int32_t  *attacks;
-    int32_t  *defenses;
-    uint8_t  *is_alives;    // packed contiguously
-    uint8_t  *teams;
-    char     (*names)[22];
-};
-&lt;/code&gt;
-    &lt;p&gt;This type of layout is referred to as “Struct of Arrays”.&lt;/p&gt;
-    &lt;p&gt;How much of an impact can this have?&lt;/p&gt;
-    &lt;p&gt;We can observe up to 30x improvements when the Monster struct is 1KiB 🤯&lt;/p&gt;
-    &lt;p&gt;The delta is less observable when the struct is small because multiple Monster structs can still be fetched within a single cache-line.&lt;/p&gt;
-    &lt;p&gt;This data access is incredibly hot though. Your CPU pre-fetcher knows it’s going sequentially and fetches the next cache line before you need it. You never actually have to wait for the memory to be fetched.&lt;/p&gt;
-    &lt;p&gt;What about random access patterns?&lt;/p&gt;
-    &lt;p&gt;Not all access patterns are sequential. Hash maps, trees, graph traversal, and pointer-heavy data structures jump to unpredictable locations. The CPU can’t prefetch what it can’t predict. With random access, the CPU needs the entire array to be present in the cache in order to avoid stalls due to memory lookup.&lt;/p&gt;
-    &lt;p&gt;This means the total size of your collection determines your performance tier.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="5"&gt;
-        &lt;cell role="head"&gt;Monsters&lt;/cell&gt;
-        &lt;cell role="head"&gt;Working Set (64B)&lt;/cell&gt;
-        &lt;cell role="head"&gt;Latency (64B)&lt;/cell&gt;
-        &lt;cell role="head"&gt;Working Set (128B)&lt;/cell&gt;
-        &lt;cell role="head"&gt;Latency (128B)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;512&lt;/cell&gt;
-        &lt;cell&gt;32 KiB&lt;/cell&gt;
-        &lt;cell&gt;~3 ns&lt;/cell&gt;
-        &lt;cell&gt;64 KiB&lt;/cell&gt;
-        &lt;cell&gt;~11 ns&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;4,096&lt;/cell&gt;
-        &lt;cell&gt;256 KiB&lt;/cell&gt;
-        &lt;cell&gt;~11 ns&lt;/cell&gt;
-        &lt;cell&gt;512 KiB&lt;/cell&gt;
-        &lt;cell&gt;~13 ns&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;32,768&lt;/cell&gt;
-        &lt;cell&gt;2 MiB&lt;/cell&gt;
-        &lt;cell&gt;~29 ns&lt;/cell&gt;
-        &lt;cell&gt;4 MiB&lt;/cell&gt;
-        &lt;cell&gt;~43 ns&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="5"&gt;
-        &lt;cell&gt;65,536&lt;/cell&gt;
-        &lt;cell&gt;4 MiB&lt;/cell&gt;
-        &lt;cell&gt;~49 ns&lt;/cell&gt;
-        &lt;cell&gt;8 MiB&lt;/cell&gt;
-        &lt;cell&gt;~65 ns&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;131,072&lt;/cell&gt;
-        &lt;cell&gt;8 MiB&lt;/cell&gt;
-        &lt;cell&gt;~163 ns&lt;/cell&gt;
-        &lt;cell&gt;16 MiB&lt;/cell&gt;
-        &lt;cell&gt;~162 ns&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Doubling the struct from 64B to 128B doubles the working set for the same number of monsters, pushing the data into slower cache levels. At just 512 monsters, a 64B struct fits in L1d at ~3 ns — but a 128B struct has already spilled to L2 at ~11 ns.&lt;/p&gt;
-    &lt;p&gt;We can observe this with a pointer-chasing benchmark. We allocate N monster-sized nodes, wire them into a random order, and chase pointers. Each hop lands at an unpredictable address, defeating the CPU’s prefetcher entirely.&lt;/p&gt;
-    &lt;p&gt;Rather than graph it logarithmically, which I find sometimes is easy to miss, I have included a zoomed in graph. We can see that all struct sizes hit the same staircase like pattern as they go through the various cache levels however the larger struct sizes are shifted left, meaning they hit the increase earlier.&lt;/p&gt;
-    &lt;p&gt;This means for random access patterns, if you can keep tight control on your total working set size, you can drastically affect the time.&lt;/p&gt;
-    &lt;p&gt;Knowing your struct and working set size can make a substantial difference.&lt;/p&gt;
-    &lt;p&gt; Improve this page @ f42923f &lt;lb/&gt; The content for this site is CC-BY-SA. &lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48382382</guid><pubDate>Wed, 03 Jun 2026 11:04:04 +0000</pubDate></item><item><title>Piramidal (YC W24) – Software Engineers – NYC Onsite</title><link>https://news.ycombinator.com/item?id=48382853</link><description>&lt;doc fingerprint="99abd756dc4bbeed"&gt;
-  &lt;main&gt;
-    &lt;div&gt;
-      &lt;p&gt;We're looking for senior software engineers - frontend, backend, and infra - who are excited about solving difficult problems at the boundary of Foundational AI and Neuroscience. Our core backend and infra stack is Python, Go, and Terraform deployed to various cloud and on-prem, while our frontend stack is React and TypeScript. Bonus points for either: standing up and maintaining reliable streaming systems with a production/ops mindset; or building smooth, data-intensive React UIs with modern plotting/visualization libraries. You would take an active role in architecture and design, implementation, and hiring from your early days, and will have the opportunity to have ownership commensurate to your capacity and interests.&lt;/p&gt;
-      &lt;p&gt;Apply here: https://job-boards.greenhouse.io/piramidalinc&lt;/p&gt;
-    &lt;/div&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48382853</guid><pubDate>Wed, 03 Jun 2026 12:00:18 +0000</pubDate></item><item><title>Uber's $1,500/month AI limit is a useful signal for AI tool pricing</title><link>https://simonwillison.net/2026/Jun/3/uber-caps-usage/</link><description>&lt;doc fingerprint="374d54de68f70b75"&gt;
-  &lt;main&gt;
-    &lt;p&gt;3rd June 2026 - Link Blog&lt;/p&gt;
-    &lt;p&gt;Uber Caps Usage of AI Tools Like Claude Code to Manage Costs. I wrote the other day about Uber blowing its 2026 AI budget in four months, and how that wasn't particularly surprising given they would have set that budget in 2025, before anyone could have predicted how popular token-burning coding agents were about to become.&lt;/p&gt;
-    &lt;p&gt;Natalie Lung for Bloomberg:&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;The rideshare giant is limiting all employees to $1,500 in monthly token spending per AI coding tool, an Uber spokesperson said in response to a Bloomberg News inquiry. That means spending on one tool doesn’t have a bearing on the budget for another. The limits, which have been instituted in recent months, only apply to agentic coding software such as Cursor or Anthropic PBC’s Claude Code.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;A $1,500 monthly limit per tool strikes me as a rational policy response to over-spending, and much more sensible than those tokenmaxxing leaderboards encouraging employees to compete for as much AI usage as possible.&lt;/p&gt;
-    &lt;p&gt;It's also interesting in that it hints at a real dollar value for what Uber is getting out of these tools. If we assume two actively used tools per engineer that's $3,000 * 12 = $36,000 cap per engineer per year. Levels.fyi lists the median yearly compensation package for Uber software engineers in the USA at $330,000.&lt;/p&gt;
-    &lt;p&gt;That means each employee's AI spending cap is ~11% of that median compensation package.&lt;/p&gt;
-    &lt;p&gt;I noted that my own token usage comes to about $1,000/month against each of Anthropic and OpenAI - which currently costs me just $100 per provider thanks to their generous subsidized plans for individual subscribers. Those plans are no longer available to larger companies like Uber.&lt;/p&gt;
-    &lt;p&gt;Their new policy means if I were working at Uber I'd still have ~$500/month of tokens to spare for each of those tools, given my current usage patterns.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Recent articles&lt;/head&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Claude Opus 4.8: "a modest but tangible improvement" - 28th May 2026&lt;/item&gt;
-      &lt;item&gt;I think Anthropic and OpenAI have found product-market fit - 27th May 2026&lt;/item&gt;
-      &lt;item&gt;Notes on Pope Leo XIV's encyclical on AI - 25th May 2026&lt;/item&gt;
-    &lt;/list&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48383056</guid><pubDate>Wed, 03 Jun 2026 12:25:14 +0000</pubDate></item><item><title>Meta workers can opt out of being tracked at work up to 30 min</title><link>https://www.bbc.com/news/articles/c93x0k194yno</link><description>&lt;doc fingerprint="64241547a8049be6"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Meta workers can opt out of being tracked at work - but only for half an hour at a time&lt;/head&gt;
-    &lt;p&gt;Meta is scaling back its plan to start tracking its employees' computer activity, according to an internal memo sent on Tuesday.&lt;/p&gt;
-    &lt;p&gt;In April the company received criticism from its own staff after it announced a new tool would log their keystrokes and mouse clicks to train its AI models.&lt;/p&gt;
-    &lt;p&gt;Now, according to Reuters, new controls will allow employees to pause the data collection for "up to 30 minutes at a time" as well as request exemptions from the initiative altogether.&lt;/p&gt;
-    &lt;p&gt;Meta declined to comment on the record.&lt;/p&gt;
-    &lt;p&gt;It follows weeks of backlash from employees, including some who started a petition against the move which now has more than 1,500 signatures.&lt;/p&gt;
-    &lt;p&gt;During the initial announcement of the tool, called the Model Capability Initiative (MCI), Meta told the BBC: "If we're building agents to help people complete everyday tasks using computers, our models need real examples of how people actually use them."&lt;/p&gt;
-    &lt;p&gt;It added that the data was "not used for any other purpose," and the tool had "safeguards in place to protect sensitive content".&lt;/p&gt;
-    &lt;p&gt;But workers were not impressed, with one Meta employee, who asked not to be identified, telling the BBC that having their actions train AI models felt "very dystopian" - as workers expected a slew of additional job cuts.&lt;/p&gt;
-    &lt;p&gt;Meta has laid off around 2,000 employees this year. In April the company told employees it planned to cut 10% of its workforce - roughly 8,000 staff.&lt;/p&gt;
-    &lt;p&gt;Another person who recently left the company told the BBC the tracking tool was "just the latest way they're shoving AI down everyone's throat".&lt;/p&gt;
-    &lt;p&gt;An internal memo - seen by Reuters - was reportedly authored by Stephane Kasriel, a vice president in Meta's Superintelligence Labs unit.&lt;/p&gt;
-    &lt;p&gt;In it, he said the team behind the MCI had introduced "several optimizations" to reduce its impact on laptop battery life.&lt;/p&gt;
-    &lt;p&gt;This change came after reports that employees were finding the tool consumed so much data it was causing their internet usage to surge when working from home.&lt;/p&gt;
-    &lt;p&gt;"While we remain confident in the privacy protections we put in place at launch, which went through several layers of risk review, we have heard your concerns about personal data on work devices, battery life, and wanting more control over when capturing happens," Kasriel said in the memo.&lt;/p&gt;
-    &lt;p&gt;Sign up for our Tech Decoded newsletter to follow the world's top tech stories and trends. Outside the UK? Sign up here.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48383220</guid><pubDate>Wed, 03 Jun 2026 12:42:07 +0000</pubDate></item><item><title>32GB of DDR5 now costs $375 – AI shortage continues to squeeze PC building</title><link>https://www.tomshardware.com/pc-components/ddr5/32gb-of-ddr5-now-costs-usd375-minimum-ai-shortage-continues-to-squeeze-pc-building</link><description>&lt;doc fingerprint="6868d8552986f7de"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;32GB of DDR5 now costs $375 minimum — AI shortage continues to squeeze PC building&lt;/head&gt;
-    &lt;p&gt;Lower-priced kits are disappearing by the day&lt;/p&gt;
-    &lt;p&gt;As the demands of AI continue to consume manufacturing capacity at every level of the PC hardware supply chain, 32GB of DDR5 RAM — broadly understood to be the sweet spot for gaming PCs and enthusiast builds — can no longer be found for less than $375. Well, $374.97 to be precise.&lt;/p&gt;
-    &lt;p&gt;RAM price tracking through 2026 will show you that kits that routinely cost less than $100 just a year ago are now fetching upwards of $240 (16GB). As the AI frenzy has taken hold, retailers far and wide have been pumping up their RAM prices to exorbitant levels. However, there's so much fluctuation and noise that average pricing is now something of a ludicrous fugazi. The going rate for 32GB of DDR5 RAM — the cheapest you can expect to pay — has hovered around $320 for some time, climbing past $350 in recent weeks. Price tracking courtesy of PCPartPicker now reveals the cheapest 32GB DDR5 RAM you can buy is $375. Specifically, four XPOWER kits from Silicon Power will set you back $374.97 thanks to a promo code. You can see the listings yourself below.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Silicon Power Zenith Gaming DDR5 6000MT/s (PC5-48000) CL36 32GB(2x16GB)&lt;/item&gt;
-      &lt;item&gt;Silicon Power Zenith RGB DDR5 6000MT/s (PC5-48000) CL36 32GB(2x16GB)&lt;/item&gt;
-      &lt;item&gt;Silicon Power Pulse Gaming DDR5 6000MT/s (PC5-48000) CL36 32GB(2x16GB)&lt;/item&gt;
-      &lt;item&gt;Silicon Power Zenith RGB DDR5 6000MT/s (PC5-48000) CL36 32GB(2x16GB)&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;As you can imagine, this is enormous pricing pressure for enthusiasts trying to build gaming PCs or upgrade their rigs in 2026. A component that once cost less than $100 and was something of an afterthought now costs almost four times as much, and that's before you've even fired a neuron in consideration of aesthetics, timings, or brand. More popular kits from the likes of Corsair and Crucial, or RGB offerings to match the rest of your build, will easily set you back more than $400.&lt;/p&gt;
-    &lt;p&gt;Of course, 32GB is really the minimum sweet spot you should be aiming for when building a PC in 2026. If you did want more capacity, 64GB will set you back an astonishing $679.99. 16GB of RAM as a compromise can be found for $200 at B&amp;amp;H Photo, but with SK hynix warning that manufacturing constraints will persist through 2030, there's no sign of prices letting up so that you can upgrade capacity any time soon.&lt;/p&gt;
-    &lt;p&gt;The humble RAM combo deals we've been highlighting in recent months are a small source of solace for builders, letting you score RAM for less than the $375 going rate if you pair it with a decent motherboard, a processor, or even an entire set of PC components. A theme of ongoing Computex 2026 announcements remains a lack of pricing clarity on lots of PC hardware, including Nvidia's RTX Spark laptops and PCs, as well as new-build systems and, of course, RAM components themselves. Vendors are likely wary of scaring off potential buyers with higher-than-expected prices ahead of release. Perhaps more likely, the prices haven't been set because they're still going up. Storage isn't much better, with SSD price tracking revealing that drives which once cost as little as $38 are now fetching $200.&lt;/p&gt;
-    &lt;p&gt;AMD is making a noticeable effort to keep PC gaming prices down, this week announcing the return of its Ryzen 7 5800X3D, and the advent of a new Ryzen 7 7700X3D. Intel, which warned this week that "something has to give" when it comes to memory prices, also teased dragging out some of its legacy products to give users more options on older memory technologies, namely Raptor Lake and DDR4.&lt;/p&gt;
-    &lt;p&gt;Get Tom's Hardware's best news and in-depth reviews, straight to your inbox.&lt;/p&gt;
-    &lt;p&gt;Stephen is Tom's Hardware's News Editor with almost a decade of industry experience covering technology, having worked at TechRadar, iMore, and even Apple over the years. He has covered the world of consumer tech from nearly every angle, including supply chain rumors, patents, and litigation, and more. When he's not at work, he loves reading about history and playing video games.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;&lt;header&gt;cknobman&lt;/header&gt;"Vendors are likely wary of scaring off potential buyers with higher-than-expected prices ahead of release."Reply&lt;lb/&gt;What do they think that buyers not finding out the price until release is suddenly going to make want to buy at absurdly high prices?&lt;lb/&gt;I think they dont want to announce pricing because they know that whatever pricing they announce today will likely not be enough come release time and they will raise prices further.&lt;lb/&gt;Either way these vendors better realize they are going to be screwed. People are not buying anymore.&lt;lb/&gt;Pretty telling when I went to Microcenter last week and their shelves were overflowing with RAM, SSD's, and GPU's.&lt;/item&gt;
-      &lt;item&gt;&lt;header&gt;micheal_15&lt;/header&gt;Amazon Alone has over 10 THOUSAND TERABYTES of unsold DDR5 RAM in the UK. But still prices keep being ramped up.Reply&lt;lb/&gt;I can only imagine how many millions of terabytes of unsold DDR5 there is across the rest of the world. The price increase is 100% a scam.&lt;/item&gt;
-    &lt;/list&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48383241</guid><pubDate>Wed, 03 Jun 2026 12:43:43 +0000</pubDate></item><item><title>I was recently diagnosed with anti-NMDA receptor encephalitis</title><link>https://burntsushi.net/encephalitis/</link><description>&lt;doc fingerprint="33028015eda11dd8"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 03 Jun 2026 22:07:22 +0000</lastBuildDate><item><title>I was recently diagnosed with anti-NMDA receptor encephalitis</title><link>https://burntsushi.net/encephalitis/</link><description>&lt;doc fingerprint="33028015eda11dd8"&gt;
   &lt;main&gt;
     &lt;p&gt;I was recently diagnosed with anti-NMDA receptor encephalitis. It is an autoimmune disorder where your body’s normally helpful antibodies start acting strangely. This leads to inflammation in the brain. This short blog briefly discusses some of my experience and prognosis.&lt;/p&gt;
     &lt;p&gt;Target audience: Anyone relying on my work for their own projects.&lt;/p&gt;
@@ -433,12 +197,12 @@ struct Monsters {
     &lt;p&gt;ESP32-S31 will be supported through Espressif's open-source IoT Development Framework ESP-IDF、ESP-Matter (for Matter devices), ESP-BLE-AUDIO and ESP-GMF (for multimedia applications). ESP32-S31 will also work with the ESP Private Agents platform as well as directly with common LLMs to build client devices that run or interact with AI agents to create voice-enabled and intelligent applications.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48385965</guid><pubDate>Wed, 03 Jun 2026 16:10:25 +0000</pubDate></item><item><title>Show HN: Nutrepedia – nutrition info in 29 locales built with Clojure and Htmx</title><link>https://nutrepedia.com/en-us/</link><description>&lt;doc fingerprint="367ad7c436ddd3a0"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48385965</guid><pubDate>Wed, 03 Jun 2026 16:10:25 +0000</pubDate></item><item><title>Show HN: Nutrepedia – Nutrition info in 29 locales built with Clojure and Htmx</title><link>https://nutrepedia.com/en-us/</link><description>&lt;doc fingerprint="367ad7c436ddd3a0"&gt;
   &lt;main&gt;
     &lt;p&gt;Nutrepedia 🇺🇸 EN ▼ 🇺🇸 English US 🇬🇧 English GB 🇨🇦 English CA 🇦🇺 English AU 🇲🇽 Español MX 🇪🇸 Español ES 🇦🇷 Español AR 🇨🇴 Español CO 🇧🇷 Português BR 🇵🇹 Português PT 🇫🇷 Français FR 🇨🇦 Français CA 🇨🇳 中文 (普通话) 🇯🇵 日本語 🇰🇷 한국어 🇷🇺 Русский 🇩🇪 Deutsch 🇮🇹 Italiano 🇳🇱 Nederlands 🇸🇦 العربية 🇵🇱 Polski 🇹🇷 Türkçe 🇮🇩 Bahasa Indonesia 🇮🇳 हिन्दी 🇧🇩 বাংলা 🇮🇳 తెలుగు 🇵🇰 اردو 🇮🇱 עברית 🇮🇷 فارسی Blueberries Fruits Nutrition Highlights Blueberries Raw With Skin Whole Per 1 cup (148g) 1.1g Protein 21.45g Total Carbohydrates 0.49g Total Fat Calories 84.36 kcal Featured Foods Apple Avocado Banana Blueberries Broccoli Chickpeas Cucumber Kale Lentils Oats Peach Pear&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48386129</guid><pubDate>Wed, 03 Jun 2026 16:24:46 +0000</pubDate></item><item><title>MacBook Neo Is So Popular That Apple Doubled Production</title><link>https://www.macrumors.com/2026/06/03/macbook-neo-production-doubled-says-kuo/</link><description>&lt;doc fingerprint="9bc4e96b96a69dd6"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48386129</guid><pubDate>Wed, 03 Jun 2026 16:24:46 +0000</pubDate></item><item><title>New Texas Instruments 5532 chips are not the 5532s we’ve used for decades</title><link>https://groupdiy.com/threads/the-new-ti-5532-chips-are-not-5532s-weve-used-for-decades.93707/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48386133</guid><pubDate>Wed, 03 Jun 2026 16:25:08 +0000</pubDate></item><item><title>MacBook Neo is so popular that Apple doubled production</title><link>https://www.macrumors.com/2026/06/03/macbook-neo-production-doubled-says-kuo/</link><description>&lt;doc fingerprint="9bc4e96b96a699d6"&gt;
   &lt;main&gt;
     &lt;p&gt;On an earnings call in late April, Apple's CEO Tim Cook said that customer response to the MacBook Neo was "off the charts," and the popularity of the laptop has reportedly led the company to significantly boost production.&lt;/p&gt;
     &lt;p&gt;&lt;lb/&gt;Apple supply chain analyst Ming-Chi Kuo this week said he believes that MacBook Neo shipments to Apple were doubled from an initial target of 5 million units to 10 million units in 2026 at some point after the laptop launched in March.&lt;/p&gt;
@@ -446,312 +210,10 @@ struct Monsters {
     &lt;p&gt;New figures from market research firm IDC support Apple's claim that the MacBook Neo is selling well, and the Windows PC industry has taken notice. For example, Dell recently introduced a redesigned XPS 13 laptop from $699 and said it has features "you won't find on a MacBook Neo," such as a touch screen and a backlit keyboard.&lt;/p&gt;
     &lt;p&gt;"Apple's MacBook Neo is a capable machine, and its arrival confirms that there's real appetite for premium quality at accessible prices," admitted Dell.&lt;/p&gt;
     &lt;p&gt;With a starting price of $599 in the U.S., or $499 for college students, the MacBook Neo is Apple's most affordable MacBook ever. Powered by the iPhone's A18 Pro chip, the laptop is available in colorful finishes like Citrus and Blush.&lt;/p&gt;
-    &lt;p&gt;A second-generation MacBook Neo is expected to launch next year with an A19 Pro chip and 12GB of RAM.&lt;/p&gt;
+    &lt;p&gt;A second-generation MacBook Neo is expected to be released next year with an A19 Pro chip and 12GB of RAM.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48386238</guid><pubDate>Wed, 03 Jun 2026 16:33:17 +0000</pubDate></item><item><title>Show HN: Rscrypto, pure-Rust crypto with industry leading public benches</title><link>https://github.com/loadingalias/rscrypto</link><description>&lt;doc fingerprint="ad1938b843d5b4cc"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Pure Rust cryptography: RSA, Ed25519, X25519, AEADs, hashes, KDFs, password hashing, CRCs, &lt;code&gt;no_std&lt;/code&gt;, WASM, and hardware acceleration in one dependency.&lt;/p&gt;
-    &lt;p&gt;&lt;code&gt;rscrypto&lt;/code&gt; is a single primitive stack for projects that care about binary size, deployment control, and speed without a mandatory C, OpenSSL, or system lib story.&lt;/p&gt;
-    &lt;p&gt;Use one leaf feature for one primitive, a group for a subset of primitives, or &lt;code&gt;full&lt;/code&gt; for the whole shebang. The portable Rust backend is always present. SIMD and assembly are only accelerators.&lt;/p&gt;
-    &lt;p&gt;Current benchmark scorecards: Linux CI is &lt;code&gt;1.61x&lt;/code&gt; fastest-external geomean with &lt;code&gt;3,545 / 5,832&lt;/code&gt; wins and &lt;code&gt;5,210 / 5,832&lt;/code&gt; wins-or-ties. Apple Silicon (MBP M1, macOS/aarch64 local full run) is &lt;code&gt;1.25x&lt;/code&gt; fastest-external geomean with &lt;code&gt;235 / 463&lt;/code&gt; wins and &lt;code&gt;450 / 463&lt;/code&gt; wins-or-ties.&lt;/p&gt;
-    &lt;p&gt; Chart: 2026-05-27 Linux CI benchmark pass. Apple Silicon numbers from the 2026-06-01 MBP M1 local full run are listed below. Values above &lt;code&gt;1.00x&lt;/code&gt; mean &lt;code&gt;rscrypto&lt;/code&gt; is faster than the fastest matched Rust baseline.
-&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;RSA is now a first class citizen. Strict DER import/export, RSA-PSS, RSASSA-PKCS1-v1_5, OAEP, RSAES-PKCS1-v1_5, key generation, X.509/JWT/COSE/TLS profile mapping, blinded private operations, and reusable scratch APIs.&lt;/item&gt;
-      &lt;item&gt;One coherent primitive stack. Avoid composing half a dozen crates with different APIs, feature models, and security conventions.&lt;/item&gt;
-      &lt;item&gt;Small builds stay small. Enable &lt;code&gt;sha2&lt;/code&gt;,&lt;code&gt;blake3&lt;/code&gt;,&lt;code&gt;aes-gcm&lt;/code&gt;,&lt;code&gt;chacha20poly1305&lt;/code&gt;,&lt;code&gt;ed25519&lt;/code&gt;,&lt;code&gt;x25519&lt;/code&gt;,&lt;code&gt;argon2&lt;/code&gt;, or any other leaf without pulling in the world.&lt;/item&gt;
-      &lt;item&gt;Portable Rust is the source of truth. SIMD and ASM paths are accelerators; the portable backend remains the reference implementation.&lt;/item&gt;
-      &lt;item&gt;Hardware dispatch is built in. x86/x86_64, Arm/AArch64, Apple Silicon, IBM Z, IBM POWER, RISC-V, and WASM all have portable fallbacks, with optimized kernels where they pay.&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;no_std&lt;/code&gt;is a first-class target. Server, CLI, embedded, bare-metal, and WASM builds use the same crate and feature model.&lt;/item&gt;
-      &lt;item&gt;Audit knobs are explicit. &lt;code&gt;portable-only&lt;/code&gt;forces runtime dispatch to the constant-time portable backend;&lt;code&gt;getrandom&lt;/code&gt;,&lt;code&gt;serde&lt;/code&gt;, and&lt;code&gt;rayon&lt;/code&gt;are opt-in.&lt;/item&gt;
-      &lt;item&gt;Security hygiene is part of the API. Opaque verification errors, constant-time equality, zeroized secret types, strict arithmetic, official vectors, fuzzing, Miri, and cross-CPU CI are built into the project discipline.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;&lt;code&gt;rscrypto&lt;/code&gt; is a primitives crate. It is not a TLS stack, PKI toolkit, protocol implementation, or FIPS 140-3 validated module.&lt;/p&gt;
-    &lt;p&gt;Minimal &lt;code&gt;no_std&lt;/code&gt; SHA-2 build:&lt;/p&gt;
-    &lt;code&gt;[dependencies]
-rscrypto = { version = "0.3.1", default-features = false, features = ["sha2"] }&lt;/code&gt;
-    &lt;p&gt;Full primitive stack with OS randomness enabled:&lt;/p&gt;
-    &lt;code&gt;[dependencies]
-rscrypto = { version = "0.3.1", features = ["full", "getrandom"] }&lt;/code&gt;
-    &lt;p&gt;Use &lt;code&gt;default-features = false&lt;/code&gt; for constrained &lt;code&gt;no_std&lt;/code&gt; builds. Enable &lt;code&gt;getrandom&lt;/code&gt; only when you need APIs that generate salts, keys, or nonces from the operating system.&lt;/p&gt;
-    &lt;code&gt;use rscrypto::{Digest, Sha256};
-
-let one_shot = Sha256::digest(b"hello world");
-
-let mut h = Sha256::new();
-h.update(b"hello ");
-h.update(b"world");
-
-assert_eq!(h.finalize(), one_shot);&lt;/code&gt;
-    &lt;p&gt;The common API shape is deliberately simple/boring: one-shot when convenient, streaming when it's needed.&lt;/p&gt;
-    &lt;code&gt;[dependencies]
-rscrypto = { version = "0.3.1", default-features = false, features = ["rsa"] }&lt;/code&gt;
-    &lt;code&gt;use rscrypto::{RsaPssProfile, RsaPublicKey};
-
-fn verify_release_signature(public_key_der: &amp;amp;[u8], message: &amp;amp;[u8], signature: &amp;amp;[u8]) -&amp;gt; bool {
-  let Ok(key) = RsaPublicKey::from_spki_der(public_key_der) else {
-    return false;
-  };
-
-  key.verify_pss(RsaPssProfile::Sha256, message, signature).is_ok()
-}&lt;/code&gt;
-    &lt;p&gt;For repeated verification with the same key, allocate scratch once:&lt;/p&gt;
-    &lt;code&gt;use rscrypto::{RsaPssProfile, RsaPublicKey, RsaSignatureProfile};
-
-fn verify_batch(public_key_der: &amp;amp;[u8], signed_messages: &amp;amp;[(&amp;amp;[u8], &amp;amp;[u8])]) -&amp;gt; bool {
-  let Ok(key) = RsaPublicKey::from_spki_der(public_key_der) else {
-    return false;
-  };
-  let mut scratch = key.public_scratch();
-
-  signed_messages.iter().all(|(message, signature)| {
-    key
-      .verify_signature_with_scratch(
-        RsaSignatureProfile::pss(RsaPssProfile::Sha256),
-        message,
-        signature,
-        &amp;amp;mut scratch,
-      )
-      .is_ok()
-  })
-}&lt;/code&gt;
-    &lt;p&gt;Enable &lt;code&gt;getrandom&lt;/code&gt; for OS-backed RSA key generation, signing salt/blinding, OAEP encryption randomness, and private-operation blinding:&lt;/p&gt;
-    &lt;code&gt;[dependencies]
-rscrypto = { version = "0.3.1", default-features = false, features = ["rsa", "getrandom"] }&lt;/code&gt;
-    &lt;code&gt;[dependencies]
-rscrypto = { version = "0.3.1", default-features = false, features = ["chacha20poly1305"] }&lt;/code&gt;
-    &lt;code&gt;use rscrypto::{Aead, ChaCha20Poly1305, ChaCha20Poly1305Key, aead::Nonce96};
-
-let key = ChaCha20Poly1305Key::from_bytes([0x11; 32]);
-let nonce = Nonce96::from_bytes([0x22; Nonce96::LENGTH]);
-let cipher = ChaCha20Poly1305::new(&amp;amp;key);
-
-let aad = b"transfer:v1";
-let mut message = *b"pay bob 10";
-
-let tag = cipher
-  .encrypt_in_place(&amp;amp;nonce, aad, &amp;amp;mut message)
-  .expect("encryption succeeds");
-
-cipher
-  .decrypt_in_place(&amp;amp;nonce, aad, &amp;amp;mut message, &amp;amp;tag)
-  .expect("authentication succeeds");
-
-assert_eq!(&amp;amp;message, b"pay bob 10");&lt;/code&gt;
-    &lt;code&gt;[dependencies]
-rscrypto = { version = "0.3.1", default-features = false, features = ["argon2", "phc-strings", "getrandom"] }&lt;/code&gt;
-    &lt;code&gt;use rscrypto::{Argon2Params, Argon2VerifyPolicy, Argon2id};
-
-let password = b"correct horse battery staple";
-let params = Argon2Params::new().build().expect("valid Argon2 params");
-let encoded = Argon2id::hash_string(&amp;amp;params, password).expect("password hash created");
-
-assert!(
-  Argon2id::verify_string_with_policy(
-    password,
-    &amp;amp;encoded,
-    &amp;amp;Argon2VerifyPolicy::default(),
-  )
-  .is_ok()
-);&lt;/code&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;Need&lt;/cell&gt;
-        &lt;cell role="head"&gt;Included&lt;/cell&gt;
-        &lt;cell role="head"&gt;Feature path&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Cryptographic hashes&lt;/cell&gt;
-        &lt;cell&gt;SHA-2, SHA-3, SHAKE, cSHAKE256, BLAKE2, BLAKE3, Ascon-Hash/XOF/CXOF&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;hashes&lt;/code&gt; or leaf features&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;MACs and KDFs&lt;/cell&gt;
-        &lt;cell&gt;HMAC-SHA-2, KMAC256, HKDF-SHA-2, PBKDF2-HMAC-SHA-2&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;auth&lt;/code&gt; or leaf features&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Password hashing&lt;/cell&gt;
-        &lt;cell&gt;Argon2d/i/id, scrypt, PHC string encode/verify&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;auth&lt;/code&gt;, &lt;code&gt;argon2&lt;/code&gt;, &lt;code&gt;scrypt&lt;/code&gt;, &lt;code&gt;phc-strings&lt;/code&gt;&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Public-key primitives&lt;/cell&gt;
-        &lt;cell&gt;Ed25519 signatures, RSA signing/verification/OAEP/RSAES-PKCS1-v1_5/key generation, X25519 key exchange&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;auth&lt;/code&gt;, &lt;code&gt;signatures&lt;/code&gt;, &lt;code&gt;ed25519&lt;/code&gt;, &lt;code&gt;rsa&lt;/code&gt;, &lt;code&gt;x25519&lt;/code&gt;&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;AEAD encryption&lt;/cell&gt;
-        &lt;cell&gt;AES-128/256-GCM, AES-128/256-GCM-SIV, ChaCha20-Poly1305, XChaCha20-Poly1305, AEGIS-256, Ascon-AEAD128&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;aead&lt;/code&gt; or leaf features&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Checksums&lt;/cell&gt;
-        &lt;cell&gt;CRC-16, CRC-24, CRC-32, CRC-32C, CRC-64/XZ, CRC-64/NVMe&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;checksums&lt;/code&gt; or leaf features&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Fast non-crypto hashes&lt;/cell&gt;
-        &lt;cell&gt;XXH3-64/128, RapidHash 64/128&lt;/cell&gt;
-        &lt;cell&gt;&lt;code&gt;xxh3&lt;/code&gt;, &lt;code&gt;rapidhash&lt;/code&gt;&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Fast non-cryptographic hashes and CRCs are for indexing, checksumming, dedup, and integrity plumbing. Do not use them for passwords, signatures, MACs, key derivation, or authentication... it's obviously not safe.&lt;/p&gt;
-    &lt;p&gt;Feature flags are layered deliberately:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Leaf primitives: &lt;code&gt;sha2&lt;/code&gt;,&lt;code&gt;blake3&lt;/code&gt;,&lt;code&gt;aes-gcm&lt;/code&gt;,&lt;code&gt;ed25519&lt;/code&gt;,&lt;code&gt;x25519&lt;/code&gt;,&lt;code&gt;crc32&lt;/code&gt;, etc.&lt;/item&gt;
-      &lt;item&gt;Families/Groups: &lt;code&gt;hashes&lt;/code&gt;,&lt;code&gt;checksums&lt;/code&gt;,&lt;code&gt;macs&lt;/code&gt;,&lt;code&gt;kdfs&lt;/code&gt;,&lt;code&gt;password-hashing&lt;/code&gt;,&lt;code&gt;aead&lt;/code&gt;,&lt;code&gt;signatures&lt;/code&gt;,&lt;code&gt;key-exchange&lt;/code&gt;.&lt;/item&gt;
-      &lt;item&gt;Deployment controls: &lt;code&gt;std&lt;/code&gt;,&lt;code&gt;alloc&lt;/code&gt;,&lt;code&gt;getrandom&lt;/code&gt;,&lt;code&gt;parallel&lt;/code&gt;,&lt;code&gt;serde&lt;/code&gt;,&lt;code&gt;serde-secrets&lt;/code&gt;,&lt;code&gt;portable-only&lt;/code&gt;.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Full feature inventory: &lt;code&gt;docs/features.md&lt;/code&gt;. Public type inventory: &lt;code&gt;docs/types.md&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;Current public benchmark evidence comes from two passes:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Linux CI: 2026-05-27, commit &lt;code&gt;26845c8&lt;/code&gt;, nine Linux runners. This run is filter-based and does not include Argon2, scrypt, or Ascon-AEAD rows.&lt;/item&gt;
-      &lt;item&gt;Apple Silicon: 2026-06-01, commit &lt;code&gt;b06b946&lt;/code&gt;, local MBP M1 macOS/aarch64 full run, including Argon2, scrypt, and Ascon-AEAD rows.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Speedup is &lt;code&gt;external_crate_time / rscrypto_time&lt;/code&gt;; values above &lt;code&gt;1.00x&lt;/code&gt; mean &lt;code&gt;rscrypto&lt;/code&gt; is faster. Do not combine the Linux and Apple Silicon totals as one aggregate because they were collected on different commits and benchmark scopes.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;Area&lt;/cell&gt;
-        &lt;cell role="head"&gt;Compared against&lt;/cell&gt;
-        &lt;cell role="head"&gt;Result&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Linux CI fastest external&lt;/cell&gt;
-        &lt;cell&gt;strongest matched Rust baseline per case&lt;/cell&gt;
-        &lt;cell&gt;1.61x geomean&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Linux CI scorecard&lt;/cell&gt;
-        &lt;cell&gt;fastest external&lt;/cell&gt;
-        &lt;cell&gt;3,545 wins / 5,832 pairs&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Linux CI wins or ties&lt;/cell&gt;
-        &lt;cell&gt;fastest external&lt;/cell&gt;
-        &lt;cell&gt;5,210 / 5,832 pairs&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Apple Silicon fastest external&lt;/cell&gt;
-        &lt;cell&gt;strongest matched Rust baseline per case&lt;/cell&gt;
-        &lt;cell&gt;1.25x geomean&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Apple Silicon scorecard&lt;/cell&gt;
-        &lt;cell&gt;fastest external&lt;/cell&gt;
-        &lt;cell&gt;235 wins / 463 pairs&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Apple Silicon wins or ties&lt;/cell&gt;
-        &lt;cell&gt;fastest external&lt;/cell&gt;
-        &lt;cell&gt;450 / 463 pairs&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Checksums&lt;/cell&gt;
-        &lt;cell&gt;Linux CI / Apple Silicon&lt;/cell&gt;
-        &lt;cell&gt;5.03x / 2.76x geomean&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;SHA-3 / SHAKE&lt;/cell&gt;
-        &lt;cell&gt;Linux CI / Apple Silicon&lt;/cell&gt;
-        &lt;cell&gt;Linux: 2.15x / 1.86x; Apple Silicon: 0.94x / 1.32x geomean (platform-sensitive)&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;BLAKE3, &lt;code&gt;&amp;gt;=64 KiB&lt;/code&gt;&lt;/cell&gt;
-        &lt;cell&gt;Linux CI / Apple Silicon&lt;/cell&gt;
-        &lt;cell&gt;2.31x / 1.80x geomean&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;AEAD&lt;/cell&gt;
-        &lt;cell&gt;Linux CI / Apple Silicon&lt;/cell&gt;
-        &lt;cell&gt;1.57x / 1.47x geomean&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;RSA import + verify&lt;/cell&gt;
-        &lt;cell&gt;Linux CI / Apple Silicon&lt;/cell&gt;
-        &lt;cell&gt;1.32x, 76% wins / 1.45x, 100% wins&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;RSA verify only&lt;/cell&gt;
-        &lt;cell&gt;Linux CI / Apple Silicon&lt;/cell&gt;
-        &lt;cell&gt;0.98x / 1.19x geomean&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;Ed25519 sign / verify&lt;/cell&gt;
-        &lt;cell&gt;Linux CI / Apple Silicon&lt;/cell&gt;
-        &lt;cell&gt;Linux: 1.14x / 1.00x; Apple Silicon: 1.02x / 1.00x geomean&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;X25519&lt;/cell&gt;
-        &lt;cell&gt;Linux CI / Apple Silicon&lt;/cell&gt;
-        &lt;cell&gt;0.95x / 1.00x geomean&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;The honest weak spots right now: Linux CI still shows PBKDF2-SHA256 at &lt;code&gt;iters=1&lt;/code&gt; at 0.81x, X25519 Diffie-Hellman at 0.92x, RSA-4096 verification at 0.94x, and small-message AEAD overhead on plenty of 1-byte and 32-byte rows. Apple Silicon still has BLAKE3 64 KiB losses, HMAC-SHA256 bulk pressure against &lt;code&gt;aws-lc-rs&lt;/code&gt;, empty-message ChaCha20-Poly1305 overhead, and SHA3-256 streaming losses; SHA-3/SHAKE should be described per-platform because the Linux 2.15x SHA-3 result does not carry to the MBP M1 run. See &lt;code&gt;benchmark_results/OVERVIEW.md&lt;/code&gt; for raw runs, methodology, platform scorecards, and loss tables.&lt;/p&gt;
-    &lt;p&gt;&lt;code&gt;rscrypto&lt;/code&gt; keeps the portable Rust path as the byte-for-byte authority. ISA-specific kernels are selected only when the target and runtime CPU support them.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="2"&gt;
-        &lt;cell role="head"&gt;Target family&lt;/cell&gt;
-        &lt;cell role="head"&gt;Acceleration examples&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;x86 / x86_64&lt;/cell&gt;
-        &lt;cell&gt;SSE4.2, AVX2, AVX-512, AES-NI, SHA-NI, VAES, VPCLMULQDQ&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;Arm / AArch64 / Apple Silicon&lt;/cell&gt;
-        &lt;cell&gt;NEON, AES, PMULL, SHA2, SHA3, SVE2-PMULL&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;IBM Z&lt;/cell&gt;
-        &lt;cell&gt;CPACF, MSA, VGFM&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;POWER / ppc64le&lt;/cell&gt;
-        &lt;cell&gt;POWER8/9/10 vector and crypto extensions&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="2"&gt;
-        &lt;cell&gt;RISC-V&lt;/cell&gt;
-        &lt;cell&gt;RVV, Zbc, Zvkned, Zvbc&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;WASM&lt;/cell&gt;
-        &lt;cell&gt;SIMD128 where available, portable fallback everywhere&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Use &lt;code&gt;portable-only&lt;/code&gt; when you need deterministic dispatch, audit-constrained builds, or a portable backend only.&lt;/p&gt;
-    &lt;p&gt;Full platform matrix: &lt;code&gt;docs/platforms.md&lt;/code&gt;. Architecture notes: &lt;code&gt;docs/architecture.md&lt;/code&gt;.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Constant-time MAC, AEAD, and signature verification.&lt;/item&gt;
-      &lt;item&gt;Opaque verification errors that avoid leaking failure details.&lt;/item&gt;
-      &lt;item&gt;Secret-bearing types zeroize on drop and mask &lt;code&gt;Debug&lt;/code&gt;.&lt;/item&gt;
-      &lt;item&gt;Strict arithmetic for counters, lengths, offsets, and indices.&lt;/item&gt;
-      &lt;item&gt;AEAD failed-open paths wipe output buffers.&lt;/item&gt;
-      &lt;item&gt;Portable and accelerated backends are differentially tested for byte-identical output.&lt;/item&gt;
-      &lt;item&gt;Official test vectors, fuzz corpus replay, Miri, &lt;code&gt;cargo deny&lt;/code&gt;, and&lt;code&gt;cargo audit&lt;/code&gt;run in CI.&lt;/item&gt;
-      &lt;item&gt;RSA private-operation release claims require the dedicated RSA Miri and first-order leakage gates.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Read &lt;code&gt;docs/security.md&lt;/code&gt; before shipping cryptographic code. For compliance posture, see &lt;code&gt;docs/compliance.md&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;Vulnerabilities should be reported through GitHub Private Vulnerability Reporting or the process in &lt;code&gt;SECURITY.md&lt;/code&gt;.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;API reference: docs.rs/rscrypto&lt;/item&gt;
-      &lt;item&gt;Examples: &lt;code&gt;examples/&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Feature flags: &lt;code&gt;docs/features.md&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Public type inventory: &lt;code&gt;docs/types.md&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Platform matrix: &lt;code&gt;docs/platforms.md&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Security guidance: &lt;code&gt;docs/security.md&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Migration guides: &lt;code&gt;docs/migration/&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Benchmark methodology: &lt;code&gt;docs/benchmarking.md&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Benchmarks: &lt;code&gt;benchmark_results/OVERVIEW.md&lt;/code&gt;&lt;/item&gt;
-      &lt;item&gt;Release history: &lt;code&gt;CHANGELOG.md&lt;/code&gt;&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Rust 1.91.0.&lt;/p&gt;
-    &lt;p&gt;The pinned nightly in &lt;code&gt;rust-toolchain.toml&lt;/code&gt; is used for Miri, fuzzing, and exotic-architecture checks.&lt;/p&gt;
-    &lt;p&gt;Dual-licensed under Apache-2.0 or MIT, at your option.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48386343</guid><pubDate>Wed, 03 Jun 2026 16:41:14 +0000</pubDate></item><item><title>Angular v22</title><link>https://blog.angular.dev/announcing-angular-v22-c52bb83a4664</link><description>&lt;doc fingerprint="b55c8f19f911a4f8"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48386238</guid><pubDate>Wed, 03 Jun 2026 16:33:17 +0000</pubDate></item><item><title>Angular v22</title><link>https://blog.angular.dev/announcing-angular-v22-c52bb83a4664</link><description>&lt;doc fingerprint="b55c8f19f911a4f8"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Announcing Angular v22&lt;/head&gt;
     &lt;p&gt;Today, we are thrilled to announce the release of Angular v22. We continue to be proud of the work we do with each release. Our goal is to maintain a high quality stream of features and improvements that make the workflows for developers smooth no matter how they build Angular applications.&lt;/p&gt;
@@ -880,7 +342,7 @@ assert!(
     &lt;head rend="h3"&gt;Host Directive de-duplification&lt;/head&gt;
     &lt;p&gt;Angular now automatically de-duplicates host directives that match multiple times on the same element. To ensure clear resolution, if a directive matches both through the template and as a host directive, the template match “wins.” We’ve also streamlined the experience by merging the input and output maps of host directives. Finally, to maintain a clean API, Angular will now throw an error if an input or output is exposed under multiple names, preventing potential naming conflicts.&lt;/p&gt;
     &lt;head rend="h3"&gt;Spread syntax available in templates&lt;/head&gt;
-    &lt;p&gt;Your templates are more expressive with support for spread and rest syntax. This update works with object literals, array liberals and function calls.&lt;/p&gt;
+    &lt;p&gt;Your templates are more expressive with support for spread and rest syntax. This update works with object literals, array literals and function calls.&lt;/p&gt;
     &lt;p&gt;Here’s an example based on a component used in a coffee shop style application:&lt;/p&gt;
     &lt;code&gt;&amp;lt;section&amp;gt;&lt;lb/&gt;  &amp;lt;div [class]="{&lt;lb/&gt;    ...standardCupStyles, &lt;lb/&gt;    'cardboard-sleeve': isHotDrink&lt;lb/&gt;  }"&amp;gt;&lt;lb/&gt;  &amp;lt;/div&amp;gt;&lt;lb/&gt;&lt;lb/&gt;  &amp;lt;app-bakery-cart [pastryOrder]="[...dailyPastryBasics, 'croissant', 'muffin']"/&amp;gt;&lt;lb/&gt;&lt;lb/&gt;  &amp;lt;p&amp;gt;&lt;lb/&gt;    Total Cost: ${{ calculateBill(...baseItemPrices, salesTax, espressoShotPrice, syrupPrice) }}&lt;lb/&gt;  &amp;lt;/p&amp;gt;&lt;lb/&gt;&amp;lt;/section&amp;gt;&lt;/code&gt;
     &lt;head rend="h3"&gt;More robust and less boilerplate with @switch&lt;/head&gt;
@@ -916,28 +378,7 @@ assert!(
     &lt;p&gt;Get out there and build great apps.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48386463</guid><pubDate>Wed, 03 Jun 2026 16:51:49 +0000</pubDate></item><item><title>The Public Should Own Half of the Big A.I. Companies</title><link>https://www.sanders.senate.gov/op-eds/the-public-should-own-half-of-the-big-a-i-companies/</link><description>&lt;doc fingerprint="2b85917f0c05b7e8"&gt;
-  &lt;main&gt;
-    &lt;head rend="h4"&gt;By: Sen. Sanders; New York Times&lt;/head&gt;
-    &lt;p&gt;Artificial intelligence will almost certainly be the most transformational technology in the history of the world. It will profoundly affect the life of every man, woman and child in our country. It will bring — and is already bringing — unimaginable changes to our economy, our democracy, our emotional well-being, our environment and how we educate and raise our children. Further, there is a very real fear that as A.I. becomes smarter than humans it could eventually function independently, with potentially catastrophic consequences.&lt;/p&gt;
-    &lt;p&gt;The question, then, is not whether A.I. will change the world. It will. The question is: Who will own and control that future? Who will benefit from it, and who will be hurt by it? Will A.I. be used to make life better for working families? Will it enrich our quality of life? Will it help us eliminate poverty, extend life expectancies and solve the climate crisis? Or will the future of humanity be determined by a handful of billionaires who have promoted and developed A.I., with virtually no democratic input, who stand to become even richer and more powerful than they are today?&lt;/p&gt;
-    &lt;p&gt;That is the choice before us.&lt;/p&gt;
-    &lt;p&gt;Let us be clear. Artificial intelligence was not created out of thin air. The data and language used by generative A.I. tools didn’t just pop into Sam Altman’s head or Elon Musk’s imagination. A.I. is built on our collective intelligence: our books, songs, artwork, journalism, computer code, scientific research, videos, conversations, images and ideas spanning generations. That is not just the opinion of Bernie Sanders. According to Mr. Altman, the head of OpenAI, A.I. models were trained on our “collective experience, knowledge” and “learnings of humanity.”&lt;/p&gt;
-    &lt;p&gt;For the most part, tech oligarchs have fed this knowledge into their A.I. models without permission, without acknowledgment, without compensation. In other words, the creative work of millions of people — writers, artists, musicians, journalists, teachers, scientists and ordinary citizens — has essentially been stolen by some of the wealthiest people in the world. It’s time for us to reclaim it.&lt;/p&gt;
-    &lt;p&gt;Since A.I. is built on the collective knowledge of humanity, the wealth it generates must benefit humanity. Not just Mr. Musk, Mr. Altman, Dario Amodei and other moguls whose companies are positioned to dominate the industry. Not just venture capitalists in Silicon Valley or money managers on Wall Street who undoubtedly see A.I. as the next great wealth-extracting machine.&lt;/p&gt;
-    &lt;p&gt;That is why I will soon be introducing the American A.I. Sovereign Wealth Fund Act. This legislation would give the public a direct ownership stake in the largest A.I. companies in our country. How? It would create a sovereign wealth fund through a one-time 50 percent tax — not on the profits of OpenAI, Anthropic, xAI and other companies, but paid with something far more valuable than that: the stock.&lt;/p&gt;
-    &lt;p&gt;If passed, this legislation would do two crucial things. First, it would give the public a direct role in determining the future of this technology. No longer would the future of A.I. and the transformation of human life that it will bring be dictated by a handful of Big Tech oligarchs. The federal government would have the power, through its voting shares and an equal representation on each company’s board, to block decisions that hurt our citizens and to push for policies that help them.&lt;/p&gt;
-    &lt;p&gt;Second, this legislation would guarantee that the trillions of dollars potentially generated by A.I. are used to improve the lives of all of us — not simply to make the richest people in the world even richer. If the big A.I. companies continue to grow as rapidly as many analysts expect, then the value of the sovereign wealth fund will grow as well — and the benefits to the American people will grow along with it.&lt;/p&gt;
-    &lt;p&gt;This is not an original idea. It has been proposed by scholars. It has been endorsed by some of the leading A.I. companies in America. OpenAI, for example, recently proposed creating a “public wealth fund that provides every citizen — including those not invested in financial markets — with a stake in A.I.-driven economic growth.” Anthropic, led by Mr. Amodei, similarly proposed the creation of “national sovereign wealth funds with stakes in A.I.” Mr. Musk, who runs xAI, wrote, “Universal HIGH INCOME via checks issued by the Federal government is the best way to deal with unemployment caused by AI.”&lt;/p&gt;
-    &lt;p&gt;Dozens of sovereign wealth funds exist all over the world to ensure that ordinary people benefit from national wealth. Norway’s sovereign wealth fund, one of the largest in the world, was funded from the country’s oil wealth and is now worth more than $2 trillion. Instead of a few oil executives pocketing all the benefits of this national resource, Norway made the decision that this wealth should be used to improve life for all of its people.&lt;/p&gt;
-    &lt;p&gt;This concept has already been put into practice right here at home. Fifty years ago, Alaska created a sovereign wealth fund from the state’s oil revenues. For decades, it has paid annual dividends directly to Alaskans. Moreover, public pension funds in states across the country already hold hundreds of billions of dollars in the stock of companies throughout America. Even President Trump, in an executive order, has proposed establishing an American sovereign wealth fund.&lt;/p&gt;
-    &lt;p&gt;To start, the billions, if not trillions, of dollars generated by this fund would provide direct payments to the American people. And as the fund generates more and more wealth, the proceeds would be used to ensure that every man, woman and child in our country has a decent and dignified standard of living, including health care, education and housing.&lt;/p&gt;
-    &lt;p&gt;Needless to say, I recognize that for the government to have a major stake in a company, particularly one for which A.I. is only part of its business, is complicated. More details — including the specific spending priorities and the mechanics of implementation — will be included in the legislation I unveil in the coming weeks.&lt;/p&gt;
-    &lt;p&gt;But the principle is simple: When a public resource generates wealth, the public should share in that wealth. A.I. is being built on a public resource far more valuable than oil: the accumulated knowledge, creativity and labor of mankind.&lt;/p&gt;
-    &lt;p&gt;The future of A.I. and the fate of humanity must not be decided behind closed doors in Silicon Valley. It must not be dictated by billionaires seeking to maximize their power and profit. It must be decided by workers, parents, teachers, artists, scientists, communities and the American people. It’s our future. We must decide it.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48386551</guid><pubDate>Wed, 03 Jun 2026 16:58:39 +0000</pubDate></item><item><title>Skyvern (YC S23) Is Hiring Open-Source Loving DevRel Engineers</title><link>https://www.ycombinator.com/companies/skyvern/jobs/1qRTlVx-founding-developer-marketing-open-source-ai</link><description>&lt;doc fingerprint="2524c513211cae4c"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48386463</guid><pubDate>Wed, 03 Jun 2026 16:51:49 +0000</pubDate></item><item><title>Skyvern (YC S23) Is Hiring Open-Source Loving DevRel Engineers</title><link>https://www.ycombinator.com/companies/skyvern/jobs/1qRTlVx-founding-developer-marketing-open-source-ai</link><description>&lt;doc fingerprint="2524c513211cae4c"&gt;
   &lt;main&gt;
     &lt;div&gt;
       &lt;p&gt;Skyvern is an open-source AI agent that automates anything in a browser. YC-backed. Growing fast.&lt;/p&gt;
@@ -2813,7 +2254,7 @@ zig build test-valgrind&lt;/code&gt;
     &lt;div&gt;&lt;p&gt;Hey HN, we’re Shalin &amp;amp; Kanyes, best friends who've been hacking together for 10+yrs, and now founders of Hyper (&lt;/p&gt;https://heyhyper.ai/&lt;p&gt;). Hyper is a shared “company brain” that plugs into information flowing inside a company to make AI agents and automations better and ultimately save people time.&lt;/p&gt;&lt;p&gt;Models have gotten good enough that they can (mostly) take on long-horizon, complex tasks. We believe the bottleneck now is that these smart-enough models often lack information about your company, which is scattered in people's heads, Slack threads, stale docs, and in back-and-forth convos with AI.&lt;/p&gt;&lt;p&gt;MCP is useful for getting some info in front of an agent, but there are problems: (1) Once the session dies, so does the insight, so instead of copy-pasting a whole doc each time you're telling the agent to dig through Drive each time - not much of a win; (2) Even when MCP works, what it gathers isn't comprehensive, because people decide things on a whiteboard, brainstorm out loud, post a little in Slack, and scribble the rest in a doc, which leaves the agent working from partial information; (3) And even if it had everything, it doesn't do the meta-reasoning required to do a great job. If you paste in a Notion doc and it won't learn your design taste or your writing style unless you tell it to, and it won't know why a decision was made or when.&lt;/p&gt;&lt;p&gt;As undergrads 5 years ago, we were into the tools-for-thought wave and became power users of Notion, Obsidian, Roam, Anki, real believers in building a second brain. After GPT-3.5 came out we started to realize how much more powerful that second brain could be if an AI could actually read it, because suddenly it would know our backstory, our taste, our preferences, and unlock genuinely new capabilities. That’s why we’re building Hyper.&lt;/p&gt;&lt;p&gt;We know it’s not for everybody! But for people who do want to be on the cutting edge, this is a force multiplier that makes agents faster and better. It increases the number of tasks they can do, and how effectively they do them.&lt;/p&gt;&lt;p&gt;Hyper works by ingesting everything you give it access to, Docs, Slack, Email, Calendar, Granola, and synthesizes it into a knowledge graph of facts and their relationships with embeddings for semantic search. The memory system we’ve built is hybrid, with two modalities. Episodes are the raw source items kept as the source of truth. Facts are the meaning pulled out of each episode, stored as subject-predicate-object records with a plain summary and timestamps for when the fact was introduced and when it was invalidated (subject=person, predicate=works_at, object=company). Facts form a graph with typed edges between them: X is in tension with Y, A is derived from B, J supersedes K. Every time a new fact comes in we update the facts in its neighborhood, so the graph stays current, and that's how we handle stale information. When "we'll ship Friday" is later contradicted by "we're shipping Monday," the new fact supersedes the old one instead of both looking equally true, and we never auto-discard the superseded version, so you can still ask how you landed on Monday.&lt;/p&gt;&lt;p&gt;Every fact carries provenance back to its source and access-control tags for who is allowed to see it. At retrieval we query-expand, then fuse semantic search over embeddings with Postgres full-text search using reciprocal rank fusion, and we only ever evaluate a query against the facts and episodes that person has access to, which means two people on the same team can ask the same question and get different answers. We keep information fresh with webhooks where they exist and polling where they don't, hashing contents to catch changes for sources that don’t handle native dedupe. Agents read and write through two paths: lifecycle hooks in tools like Claude Code, Cowork, Codex, and Cursor, where we inject relevant context on every prompt and pull interesting facts out of every response, and plain MCP tool calls for everything that doesn't expose hooks.&lt;/p&gt;&lt;p&gt;We love it! and so do our early users: one CEO uses Hyper to draft emails in his voice with full company context. What took hours/week now takes minutes and gets sharper each time Hyper learns more how he thinks and how his company is changing. Another YC founder one-shotted a launch video script because Hyper already knew their product, voice, positioning accumulated over months.&lt;/p&gt;&lt;p&gt;We have a 3-day free trial, explained more on our pricing page (https://heyhyper.ai/pricing) and there are more details in our FAQ (https://heyhyper.ai/faq), including things like privacy, compliance, and how we’re different from other “memory” companies..&lt;/p&gt;&lt;p&gt;Give it a spin! break it! and tell us where it falls short: https://heyhyper.ai/. We'd love to build you a 10-star experience :) Comments welcome!&lt;/p&gt;&lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48387095</guid><pubDate>Wed, 03 Jun 2026 17:39:53 +0000</pubDate></item><item><title>Bot vs human traffic</title><link>https://radar.cloudflare.com/traffic#bot-vs-human</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48387144</guid><pubDate>Wed, 03 Jun 2026 17:43:00 +0000</pubDate></item><item><title>Embryos shape their limbs: a key discovery of "genetic brakes"</title><link>https://nouvelles.umontreal.ca/en/article/2026/06/02/how-embryos-shape-their-limbs-a-key-discovery-of-genetic-brakes</link><description>&lt;doc fingerprint="ef74061c3a65c571"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48387095</guid><pubDate>Wed, 03 Jun 2026 17:39:53 +0000</pubDate></item><item><title>Embryos shape their limbs: a key discovery of "genetic brakes"</title><link>https://nouvelles.umontreal.ca/en/article/2026/06/02/how-embryos-shape-their-limbs-a-key-discovery-of-genetic-brakes</link><description>&lt;doc fingerprint="ef74061c3a65c571"&gt;
   &lt;main&gt;
     &lt;p&gt;Canadian scientists have made a significant advance in understanding the mechanisms that enable embryos to properly form their limbs, thanks to new research led by Université de Montréal medical professor Marie Kmita at the Montreal Clinical Research Institute (IRCM).&lt;/p&gt;
     &lt;p&gt;In findings published in the journal PNAS, Kmita and her team highlight the crucial role of certain molecular systems that act as true “genetic brakes,” ensuring that development proceeds correctly.&lt;/p&gt;
@@ -2822,4 +2263,1009 @@ zig build test-valgrind&lt;/code&gt;
     &lt;p&gt;In mice, the researchers demonstrated that altering one of these systems already leads to abnormalities in gene expression. When both systems are disrupted simultaneously, the consequences are major: early genes remain active and normal limb development is severely compromised.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48387251</guid><pubDate>Wed, 03 Jun 2026 17:50:16 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48387251</guid><pubDate>Wed, 03 Jun 2026 17:50:16 +0000</pubDate></item><item><title>Rootshell: A new E2EE email service hosted in Iceland</title><link>https://rootshell.is</link><guid isPermaLink="false">https://news.ycombinator.com/item?id=48388253</guid><pubDate>Wed, 03 Jun 2026 18:58:05 +0000</pubDate></item><item><title>Elixir v1.20: Now a gradually typed language</title><link>https://elixir-lang.org/blog/2026/06/03/elixir-v1-20-0-released/</link><description>&lt;doc fingerprint="a348b8962f1dbf15"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Elixir v1.20 released: now a gradually typed language&lt;/head&gt;
+    &lt;p&gt;In 2022, we announced the effort to add set-theoretic types to Elixir. In June 2023, we published an award winning paper on Elixir’s type system design and said our work was transitioning from research to development.&lt;/p&gt;
+    &lt;p&gt;With Elixir v1.20, we have completed our first development milestone which is to perform type inference and gradually type check every Elixir program, without introducing type annotations. This means Elixir increasingly reports dead code and verified bugs: typing violations that are guaranteed to fail at runtime if executed. Elixir can find verified bugs in existing programs efficiently, without introducing developer overhead, and with an extremely low false positives rate.&lt;/p&gt;
+    &lt;p&gt;In this announcement, we will break down the type system goals, what the &lt;code&gt;dynamic()&lt;/code&gt; type means in Elixir, and how it finds verified bugs. In particular, our implementation performs well in the “If T: Benchmark for Type Narrowing” benchmark. Elixir passes 12 of the 13 categories, showing that it can recover precise type information from ordinary Elixir code, which we use to find verified bugs in dynamically typed programs.&lt;/p&gt;
+    &lt;p&gt;The type system was made possible thanks to a partnership between CNRS and Remote. The development work is currently sponsored by Fresha, and Tidewave.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Types, in my Elixir?&lt;/head&gt;
+    &lt;p&gt;Our goal is to introduce a type system which is:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;sound - the types inferred and assigned by the type system align with the behaviour of the program&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;&lt;p&gt;gradual - Elixir’s type system includes the&lt;/p&gt;&lt;code&gt;dynamic()&lt;/code&gt;type, which can be used when the type of a variable or expression is checked at runtime. In the absence of&lt;code&gt;dynamic()&lt;/code&gt;, Elixir’s type system behaves as a static one&lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;developer friendly - the types are described, implemented, and composed using basic set operations: unions, intersections, and negations (hence it is a set-theoretic type system), with clear error messages&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Introducing a type system into an existing language is a complex change. For this reason, our first milestone was to implement the type system without introducing typing annotations but still have it provide value to developers by finding dead code and verified bugs. This is done through the &lt;code&gt;dynamic()&lt;/code&gt; type, which in Elixir is quite different from other gradually typed languages. Let’s break it down.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The &lt;code&gt;dynamic()&lt;/code&gt; type&lt;/head&gt;
+    &lt;p&gt;Many gradual type systems have the &lt;code&gt;any()&lt;/code&gt; type, which, from the point of view of the type system, often means “anything goes” and no type violations are reported. On the other hand, Elixir’s gradual type is called &lt;code&gt;dynamic()&lt;/code&gt; and it has two important properties: compatibility and narrowing.&lt;/p&gt;
+    &lt;p&gt;In static type systems, when you have a type of shape &lt;code&gt;integer() or binary()&lt;/code&gt; and you invoke a function, said function must accept both types. However, because type systems cannot capture the intention of all of our programs with precision, this may lead to false positives. For example, take the simple code below:&lt;/p&gt;
+    &lt;code&gt;def percentage_or_error(value) when is_integer(value) do
+  value_or_error =
+    if value &amp;gt; 1 do
+      value
+    else
+      "not well"
+    end
+
+  # ... more code ...
+
+  if value &amp;gt; 1 do
+    value_or_error / 100
+  else
+    String.upcase(value_or_error)
+  end
+end
+&lt;/code&gt;
+    &lt;p&gt;Although &lt;code&gt;value_or_error&lt;/code&gt; has type &lt;code&gt;integer() or binary()&lt;/code&gt;, the operator &lt;code&gt;/&lt;/code&gt; accepts only numbers, and &lt;code&gt;String.upcase&lt;/code&gt; accepts only binaries/strings, the program above is valid and emits no exceptions at runtime. However, a type system would still report two violations, because the types supplied to &lt;code&gt;/&lt;/code&gt; and &lt;code&gt;String.upcase&lt;/code&gt; are not a subtype of the accepted types.&lt;/p&gt;
+    &lt;p&gt;While the program above could be better written to have no typing violations, type systems will always reject valid programs, and if Elixir were to introduce too many false positives in existing codebases, it would quickly erode the trust in the type system. Therefore, Elixir’s gradual type system tags the &lt;code&gt;value_or_error&lt;/code&gt; variable above with the type &lt;code&gt;dynamic(integer() or binary())&lt;/code&gt;, which means the type is either &lt;code&gt;integer() or binary()&lt;/code&gt; at runtime.&lt;/p&gt;
+    &lt;p&gt;When calling a function with a &lt;code&gt;dynamic()&lt;/code&gt; type, Elixir will only emit a typing violation if the supplied types and the accepted types are disjoint. In the program above, even though &lt;code&gt;/&lt;/code&gt; expects only numbers, &lt;code&gt;dynamic(integer() or binary())&lt;/code&gt; can be an &lt;code&gt;integer()&lt;/code&gt; and given the accepted and supplied types are not disjoint, there are no typing violations. However, if we were to change the program to this:&lt;/p&gt;
+    &lt;code&gt;value_or_error =
+  if value &amp;gt; 1 do
+    value
+  else
+    "not well"
+  end
+
+Map.fetch!(value_or_error, :some_key)
+&lt;/code&gt;
+    &lt;p&gt;Because &lt;code&gt;Map.fetch!&lt;/code&gt; expects a map data structure, and &lt;code&gt;value_or_error&lt;/code&gt; can only be integer or binary at runtime, the accepted and supplied types are disjoint, which turns into a violation. This is known as the compatibility property and it explains how Elixir reports only verified bugs.&lt;/p&gt;
+    &lt;p&gt;However, reporting only verified bugs would not be useful if we can’t find many bugs in the first place. We addressed this problem by making sure Elixir’s dynamic type can be narrowed. Take this code:&lt;/p&gt;
+    &lt;code&gt;def add_a_and_b(data) do
+  data.a + data.b
+end
+&lt;/code&gt;
+    &lt;p&gt;In the program above, &lt;code&gt;data&lt;/code&gt; starts as a &lt;code&gt;dynamic()&lt;/code&gt; type. We then use it as &lt;code&gt;data.a&lt;/code&gt; and &lt;code&gt;data.b&lt;/code&gt; inside the plus operator, so Elixir will refine the &lt;code&gt;data&lt;/code&gt; variable to have type &lt;code&gt;%{..., a: number(), b: number()}&lt;/code&gt;, which implies it is a map with both &lt;code&gt;a&lt;/code&gt; and &lt;code&gt;b&lt;/code&gt; fields with number values (and potentially any other field, hence the leading &lt;code&gt;...&lt;/code&gt;). Therefore, if you were to forget to select the &lt;code&gt;.b&lt;/code&gt; field and write this:&lt;/p&gt;
+    &lt;code&gt;def add_a_and_b(data) do
+  data.a + data
+end
+&lt;/code&gt;
+    &lt;p&gt;&lt;code&gt;data&lt;/code&gt; would be first narrowed to a map of shape &lt;code&gt;%{..., a: number()}&lt;/code&gt;, then attempted to be used as a &lt;code&gt;number()&lt;/code&gt;, which would emit a violation.&lt;/p&gt;
+    &lt;p&gt;In other words, the &lt;code&gt;dynamic()&lt;/code&gt; type in Elixir effectively works as a range, which can be refined as it is used throughout the program and reports violations whenever type checks fall outside of the range. This is a contrast to other gradual type systems, which use the dynamic type to discard all type information.&lt;/p&gt;
+    &lt;p&gt;Behind the scenes, our type inference and type checking algorithms behave as if we annotated all argument types as &lt;code&gt;dynamic()&lt;/code&gt;. Once we introduce user-supplied type annotations, Elixir’s type system will behave as any statically typed language as long as &lt;code&gt;dynamic()&lt;/code&gt; is not used. And whenever you cross the static-dynamic boundary, we developed new techniques that ensure our gradual typing is sound, without a need for additional runtime checks.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Typing guards, clauses, and more&lt;/head&gt;
+    &lt;p&gt;Most of the work behind this release was to introduce type checking and narrowing to several constructs. Let’s see some of them.&lt;/p&gt;
+    &lt;p&gt;When it comes to guards, we can infer unions, intersections, and negations:&lt;/p&gt;
+    &lt;code&gt;def example(x, y) when is_list(x) and is_integer(y)
+&lt;/code&gt;
+    &lt;p&gt;The code above correctly infers &lt;code&gt;x&lt;/code&gt; is a list and &lt;code&gt;y&lt;/code&gt; is an integer.&lt;/p&gt;
+    &lt;code&gt;def example({:ok, x} = y) when is_binary(x) or is_integer(x)
+&lt;/code&gt;
+    &lt;p&gt;The one above infers x is a binary or an integer, and &lt;code&gt;y&lt;/code&gt; is a two element tuple with &lt;code&gt;:ok&lt;/code&gt; as first element and a binary or integer as second.&lt;/p&gt;
+    &lt;code&gt;def example(x) when is_map_key(x, :foo)
+&lt;/code&gt;
+    &lt;p&gt;The code above infers &lt;code&gt;x&lt;/code&gt; is a map which has the &lt;code&gt;:foo&lt;/code&gt; key, represented as &lt;code&gt;%{..., foo: dynamic()}&lt;/code&gt;. Remember the leading &lt;code&gt;...&lt;/code&gt; indicates the map may have other keys.&lt;/p&gt;
+    &lt;code&gt;def example(x) when not is_map_key(x, :foo)
+&lt;/code&gt;
+    &lt;p&gt;And the code above infers &lt;code&gt;x&lt;/code&gt; is a map that does not have the &lt;code&gt;:foo&lt;/code&gt; key, which has the type: &lt;code&gt;%{..., foo: not_set()}&lt;/code&gt;.  Hence &lt;code&gt;x.foo&lt;/code&gt; within the function body will raise a typing violation.&lt;/p&gt;
+    &lt;p&gt;You can also have expressions that assert on the size of data structures:&lt;/p&gt;
+    &lt;code&gt;def example(x) when tuple_size(x) &amp;lt; 3
+&lt;/code&gt;
+    &lt;p&gt;Elixir will correctly track the tuple has at most two elements, and therefore accessing &lt;code&gt;elem(x, 3)&lt;/code&gt; will emit a typing violation. For maps and lists, we convert size checks into emptiness ones. In other words, Elixir can look at complex guards, infer types, and use this information to find bugs in our code.&lt;/p&gt;
+    &lt;p&gt;When it comes to constructs such as &lt;code&gt;case&lt;/code&gt; and conditionals, Elixir uses information from previous clauses to refine subsequent ones:&lt;/p&gt;
+    &lt;code&gt;case System.get_env("SOME_VAR") do
+  nil -&amp;gt; :not_found
+  value -&amp;gt; {:ok, String.upcase(value)}
+end
+&lt;/code&gt;
+    &lt;p&gt;&lt;code&gt;System.get_env("SOME_VAR")&lt;/code&gt; returns either &lt;code&gt;nil&lt;/code&gt; or a &lt;code&gt;binary()&lt;/code&gt;. Because the first clause matches on &lt;code&gt;nil&lt;/code&gt;, the type system knows &lt;code&gt;value&lt;/code&gt; can no longer be &lt;code&gt;nil&lt;/code&gt;, and therefore it must only be a &lt;code&gt;binary()&lt;/code&gt;, which allows the second clause to also type check without violations. Narrowing across clauses also helps the type system find redundant clauses and dead code in existing codebases.&lt;/p&gt;
+    &lt;p&gt;Furthermore, we have typed many functions in the standard library that work with tuples and maps. You can find more details in the release notes.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Compilation time improvements&lt;/head&gt;
+    &lt;p&gt;Elixir v1.20 also improves compilation times once more, especially on applications running on machines with many cores. Even though BEAM languages are efficient to compile in general, our synthetic benchmarks now place Elixir’s build tool as the fastest among them. If you would like to contribute more examples and scenarios, please start a discussion so we can provide a transparent suite of benchmarks and results.&lt;/p&gt;
+    &lt;p&gt;It also introduces a new compiler option called &lt;code&gt;:module_definition&lt;/code&gt;, which specifies if the module definition should be &lt;code&gt;:compiled&lt;/code&gt; (the default) or &lt;code&gt;:interpreted&lt;/code&gt;. This may improve compilation times in large projects and it does not affect the &lt;code&gt;.beam&lt;/code&gt; files written to disk, only how the contents inside &lt;code&gt;defmodule&lt;/code&gt; are executed. You can enable it by setting &lt;code&gt;elixirc_options: [module_definition: :interpreted]&lt;/code&gt; in your &lt;code&gt;mix.exs&lt;/code&gt;. Read the documentation to learn more.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What is next?&lt;/head&gt;
+    &lt;p&gt;The biggest question ahead of us is: when will Elixir introduce new type signatures that leverage set-theoretic types? As recently discussed in my ElixirConf EU 2026 keynote, we still have both research and development work ahead of us. We will only introduce type signatures:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;if we are satisfied with the type system performance in Elixir v1.20 (and we have done extensive work optimizing it)&lt;/item&gt;
+      &lt;item&gt;if we can implement recursive types efficiently&lt;/item&gt;
+      &lt;item&gt;if we can implement parametric types efficiently&lt;/item&gt;
+      &lt;item&gt;if we can implement traversing key-value pairs of maps as an enumerable efficiently (we are still researching the possible solutions here)&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Once those problems are tackled, we will start to explore and discuss typed struct definitions and finally type signatures. As usual, we will keep the community posted through news and in the Elixir Forum.&lt;/p&gt;
+    &lt;p&gt;We appreciate everyone who tried the release candidates, ran benchmarks, and gave us feedback! Give Elixir v1.20 a try and remember to fix all of the bugs it will find for free!&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48388324</guid><pubDate>Wed, 03 Jun 2026 19:02:26 +0000</pubDate></item><item><title>Brume is a 24-voice multi-timbral desktop synth for the CM5</title><link>https://brume.aftertone.co/</link><description>&lt;doc fingerprint="cec068491bec20ef"&gt;
+  &lt;main&gt;
+    &lt;head rend="h3"&gt;FM&lt;/head&gt;
+    &lt;p&gt;Six operators across twelve algorithm topologies, per-op ratio and level, global feedback, a per-voice FM-index envelope, and a voice-tail state-variable filter with its own envelope — DX-style FM with subtractive shaping on the way out.&lt;/p&gt;
+    &lt;p&gt;A desktop multi-timbral music machine with four synthesis engines, a 10″ touch surface, and one cable to your DAW.&lt;/p&gt;
+    &lt;p&gt;Brume runs four synthesis engines with a shared voice tail (state-variable filter, amp envelope, modulation router), so patches stay coherent across very different sources. Each engine has its own mechanism for continuous spectral change: algorithm routing and per-voice FM-index envelopes in FM, a scanning window in Harmonic, cascaded wavefolding in Timbral, grain scatter in Granular. No samples sit anywhere in the signal path; every voice is generated from live math.&lt;/p&gt;
+    &lt;p&gt;Six operators across twelve algorithm topologies, per-op ratio and level, global feedback, a per-voice FM-index envelope, and a voice-tail state-variable filter with its own envelope — DX-style FM with subtractive shaping on the way out.&lt;/p&gt;
+    &lt;p&gt;Eight harmonics with Gaussian scanning, per-harmonic waveform morph, FM on the fundamental, spectral tilt, and odd/even balance.&lt;/p&gt;
+    &lt;p&gt;Triangle core through a wave-multiplier shaper with linear FM, sub-oscillator, self-modulation feedback, and expanded symmetry.&lt;/p&gt;
+    &lt;p&gt;Pitched clouds of micro-oscillator grains with morphable waveforms. Density, scatter, drift, and FM within grains.&lt;/p&gt;
+    &lt;p&gt;MIDI in, voice allocation, modulation, filter, envelope, mixer. Sends to delay and reverb. A Lua FX slot for custom processing.&lt;/p&gt;
+    &lt;p&gt;One USB cable carries multi-channel audio out, bidirectional MIDI, and clock. Class-compliant — no drivers, no manager app.&lt;/p&gt;
+    &lt;p&gt;4 engines · 24 voices · dry + sends rendered per part.&lt;/p&gt;
+    &lt;p&gt;Class-compliant. One port. Stereo out plus planned per-part stems.&lt;/p&gt;
+    &lt;p&gt;Bitwig, Logic, Ableton, Reaper. Arm a track, point at Brume, record.&lt;/p&gt;
+    &lt;p&gt;Raspberry Pi OS Lite, Rust audio runtime, 10.1-inch capacitive touch. Boots fast. Bridges to your DAW over USB.&lt;/p&gt;
+    &lt;p&gt;Boot and play. The hardware is a deliberate assembly of off-the-shelf parts — the instrument is the software.&lt;/p&gt;
+    &lt;p&gt;Compute Module 5. Quad-core ARM A76, 8 GB RAM, 32 GB eMMC, wireless.&lt;/p&gt;
+    &lt;p&gt;CM5 IO Board with USB OTG for multi-channel audio and MIDI to your DAW. HDMI, GPIO, Ethernet.&lt;/p&gt;
+    &lt;p&gt;Pick the HDMI touchscreen that fits your build. Brume’s UI is designed around a 1024×600 logical layout and auto-scales to whatever panel you connect — tap into the CM5 touchscreen ecosystem. Reference unit: 10.1″ 1920×1200.&lt;/p&gt;
+    &lt;p&gt;Brume installs onto Raspberry Pi OS Lite. The &lt;code&gt;brumectl&lt;/code&gt; CLI adds the runtime packages, labwc/webkitgtk shell, audio config, presets, and systemd service; &lt;code&gt;--update&lt;/code&gt; refreshes the binary and factory presets over SSH.&lt;/p&gt;
+    &lt;p&gt;Korg nanoKONTROL2 is the reference USB-MIDI controller — 8 knobs, 8 faders, transport, and per-strip S/M/R. Brume ships with a default CC-mapping JSON plus a Lua starter script.&lt;/p&gt;
+    &lt;p&gt;Novation Launch Control XL 3 positions as the deeper control option — 24 endless encoders, 8 faders, 16 pads, transport. In development as a first-class surface: dedicated CC-mapping JSON with a per-engine page layout, Lua starter scripts.&lt;/p&gt;
+    &lt;p&gt;Plug in a class-compliant MIDI controller, touch MIDI learn, save the mapping, then shape the behavior in Lua. Map a controller you like, then share the mapping and a starter script so everyone gets it out of the box.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48388870</guid><pubDate>Wed, 03 Jun 2026 19:41:21 +0000</pubDate></item><item><title>Self-hosted dev sandboxes with preview URLs (Docker, Go, no K8s)</title><link>https://github.com/tastyeffectco/sandboxes</link><description>&lt;doc fingerprint="bda6999979a598e0"&gt;
+  &lt;main&gt;
+    &lt;p&gt; The open-source engine for AI app-builder products.&lt;lb/&gt; Give every user an isolated cloud dev environment, a built-in coding agent, and a live preview URL — self-hosted, on one machine, in one command. &lt;/p&gt;
+    &lt;p&gt;Think of the apps where you type "build me a todo app" and seconds later a working website appears at its own link — like Lovable, Bolt, v0, or Replit. sandboxed is the open-source backend that makes that possible, running on your own server.&lt;/p&gt;
+    &lt;p&gt;Here's what it does, in plain terms. You send it one HTTP request, and it:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Creates a sandbox — a private, isolated Linux container (its own filesystem, its own memory limits), so one user's code can never see or break another's.&lt;/item&gt;
+      &lt;item&gt;Runs an AI coding agent inside it — you give it a prompt, and it writes the code into that sandbox. (The OpenCode and Claude Code CLIs come pre-installed.)&lt;/item&gt;
+      &lt;item&gt;Gives the app a live URL — the dev server running inside the sandbox is instantly reachable at a shareable preview link.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;code&gt;POST /sandbox          → a private, isolated container spins up
+POST .../tasks         → an AI agent writes an app inside it
+http://&amp;lt;id&amp;gt;.preview... → that app is live at its own URL
+&lt;/code&gt;
+    &lt;p&gt;It's also cheap to run: a sandbox goes to sleep when nobody's using it (freeing memory) and wakes up the instant someone opens its link again — files are saved on disk the whole time. So one ordinary server can hold many users instead of needing one virtual machine each.&lt;/p&gt;
+    &lt;p&gt;Under the hood it's deliberately small and easy to understand: one Go program that tells Docker what to do, with Traefik handling the URLs and SQLite as the database. No Kubernetes, no separate database server, no message queue — you could read the whole thing in an afternoon.&lt;/p&gt;
+    &lt;code&gt;            ┌──────────────── your host (just needs Docker) ────────────────┐
+ browser ──▶│  Traefik  ──▶  sandbox  (coding agent + dev server :3000)      │
+            │     ▲              ▲   ▲                                        │
+ API/CLI ──▶│  sandboxd ─────────┘   └─ workspace dir (persists)             │
+            │     │  SQLite (source of truth) · idle→stop · request→wake      │
+            └─────┴────────────────────────────────────────────────────────-─┘
+&lt;/code&gt;
+    &lt;p&gt;If you're building an AI app-builder, an agent platform, a coding playground, or a per-user preview product, the hard part isn't the prompt — it's the infrastructure underneath it:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Multi-tenant isolation so one user's code can't touch another's.&lt;/item&gt;
+      &lt;item&gt;Per-user preview URLs with automatic routing and TLS.&lt;/item&gt;
+      &lt;item&gt;Cost control — idle environments must release memory, or your bill explodes.&lt;/item&gt;
+      &lt;item&gt;Agent orchestration — run a coding agent against a workspace, stream its progress, capture the result.&lt;/item&gt;
+      &lt;item&gt;Persistence, wake-on-demand, reconciliation after a crash or reboot.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;That's months of platform work. sandboxed is that platform, distilled to one command:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;⚡ One-command install. &lt;code&gt;./install.sh&lt;/code&gt;and you have a working API + previews.&lt;/item&gt;
+      &lt;item&gt;🧠 Agents included. The OpenCode and Claude Code CLIs ship in every sandbox; hand a sandbox a prompt and it builds.&lt;/item&gt;
+      &lt;item&gt;💸 Dense by design. Stop-on-idle + wake-on-request means dozens of sandboxes share one box instead of one VM each — the difference between a $20 server and a $2,000 cluster.&lt;/item&gt;
+      &lt;item&gt;🔓 Yours. Self-hosted, MIT-licensed, no vendor lock-in. Own your data, your margins, and your roadmap.&lt;/item&gt;
+      &lt;item&gt;🪶 Boring on purpose. SQLite + the &lt;code&gt;docker&lt;/code&gt;CLI + Traefik. A reconciler converges Docker back to the database on every boot. You can read the whole control plane in an afternoon.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Requirements: Docker Engine + the Compose plugin, on Linux. That's it.&lt;/p&gt;
+    &lt;code&gt;git clone https://github.com/tastyeffectco/sandboxes.git
+cd sandboxes
+./install.sh&lt;/code&gt;
+    &lt;p&gt;&lt;code&gt;install.sh&lt;/code&gt; checks Docker, writes a &lt;code&gt;.env&lt;/code&gt;, builds the sandbox base image + the
+control plane, and starts the stack. The API is then live at
+&lt;code&gt;http://127.0.0.1:9090&lt;/code&gt; (verify: &lt;code&gt;curl http://127.0.0.1:9090/healthz&lt;/code&gt; → &lt;code&gt;ok&lt;/code&gt;).&lt;/p&gt;
+    &lt;p&gt;The base image already includes the OpenCode and Claude Code CLIs. Hand a sandbox a prompt and watch it build (OpenCode runs on its free plan out of the box; pass your own provider key via &lt;code&gt;env&lt;/code&gt; to use your account):&lt;/p&gt;
+    &lt;code&gt;API=http://127.0.0.1:9090
+
+# create a sandbox that will serve on port 3000
+ID=$(curl -s -XPOST $API/sandbox -H 'content-type: application/json' \
+       -d '{"ports":[3000]}' | sed -E 's/.*"id":"([^"]+)".*/\1/')
+echo "sandbox: $ID"
+
+# spin a coding agent with a request — it works in ~/workspace/app
+curl -s -XPOST $API/v1/sandboxes/$ID/tasks -H 'content-type: application/json' -d '{
+        "prompt":"create a Vite app that shows a todo list and run it on port 3000",
+        "agent":"opencode"
+     }'
+# -&amp;gt; {"id":"&amp;lt;taskId&amp;gt;","status":"running","events_url":"/v1/sandboxes/&amp;lt;id&amp;gt;/tasks/&amp;lt;taskId&amp;gt;/events"}
+
+# stream the agent's progress (Server-Sent Events)
+curl -N $API/v1/sandboxes/$ID/tasks/&amp;lt;taskId&amp;gt;/events&lt;/code&gt;
+    &lt;p&gt;To use your own model account instead of the free plan, inject a key at create time — it's available to the agent and any shell in the sandbox:&lt;/p&gt;
+    &lt;code&gt;curl -s -XPOST $API/sandbox -d '{"ports":[3000],"env":{"ANTHROPIC_API_KEY":"sk-ant-..."}}'&lt;/code&gt;
+    &lt;p&gt;Once the app serves on port 3000, it's reachable at its preview URL — the sandbox self-registered the route, nothing else to wire:&lt;/p&gt;
+    &lt;code&gt;http://s-&amp;lt;id&amp;gt;-3000.preview.localhost
+&lt;/code&gt;
+    &lt;p&gt;&lt;code&gt;*.localhost&lt;/code&gt; resolves to &lt;code&gt;127.0.0.1&lt;/code&gt; in every modern browser, so it works
+locally with zero DNS and zero certificates (add &lt;code&gt;:$HTTP_PORT&lt;/code&gt; if you changed it
+from 80). The first request to a stopped sandbox wakes it automatically. On a
+real domain you get &lt;code&gt;https://s-&amp;lt;id&amp;gt;-3000.preview.yourdomain.com&lt;/code&gt;
+(see Production / TLS).&lt;/p&gt;
+    &lt;quote&gt;&lt;p&gt;Just want a shell, no agent? Skip step 2 and run anything via the exec API:&lt;/p&gt;&lt;code&gt;curl -XPOST $API/sandbox/$ID/exec -d '{"cmd":["bash","-lc","cd ~/workspace/app &amp;amp;&amp;amp; python3 -m http.server 3000"]}'&lt;/code&gt;then open the same preview URL.&lt;/quote&gt;
+    &lt;p&gt;Base URL = &lt;code&gt;http://127.0.0.1:9090&lt;/code&gt; (set by &lt;code&gt;SANDBOXED_API_BIND&lt;/code&gt;). Auth is off
+by default for local use; with &lt;code&gt;SANDBOXD_API_AUTH_DISABLED=false&lt;/code&gt; +
+&lt;code&gt;SANDBOXD_API_TOKENS&lt;/code&gt;, send &lt;code&gt;-H "Authorization: Bearer &amp;lt;secret&amp;gt;"&lt;/code&gt;.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;Method &amp;amp; path&lt;/cell&gt;
+        &lt;cell role="head"&gt;Body&lt;/cell&gt;
+        &lt;cell role="head"&gt;Purpose&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;POST /sandbox&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;{"ports":[3000],"env":{...}}&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;create — &lt;code&gt;id&lt;/code&gt; optional (ULID auto); &lt;code&gt;env&lt;/code&gt; injects vars (e.g. API keys)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;GET /sandboxes&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;list all sandboxes&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;GET /sandbox/{id}&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;get one (status, ports, container id…)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;POST /sandbox/{id}/exec&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;{"cmd":["bash","-lc","…"]}&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;run a command (non-interactive)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;POST /sandbox/{id}/keepalive&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;postpone the idle reaper&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;POST /v1/sandboxes/{id}/stop&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;stop now to free RAM (wakes on next preview hit)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;DELETE /sandbox/{id}&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;destroy the container, keep the workspace&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;POST /sandbox/{id}/purge&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;destroy and delete the workspace&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;POST /v1/sandboxes/{id}/tasks&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;{"prompt":"…","agent":"opencode"}&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;run a coding agent headlessly&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;GET /v1/sandboxes/{id}/tasks/{taskId}&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;task result&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;GET /v1/sandboxes/{id}/tasks/{taskId}/events&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;live task event stream (SSE)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;GET/PUT /v1/sandboxes/{id}/files&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;{"path","content","append"}&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;list / read / write workspace files&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;&lt;code&gt;GET /healthz&lt;/code&gt;, &lt;code&gt;GET /readyz&lt;/code&gt;&lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;liveness / readiness&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;A complete, copy-pasteable runbook (including driving it from your own agent) is in &lt;code&gt;AGENTS.md&lt;/code&gt;.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="2"&gt;
+        &lt;cell role="head"&gt;Concern&lt;/cell&gt;
+        &lt;cell role="head"&gt;Choice&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;Container runtime&lt;/cell&gt;
+        &lt;cell&gt;Docker + hardened &lt;code&gt;runc&lt;/code&gt; (cap-drop ALL, &lt;code&gt;no-new-privileges&lt;/code&gt;, read-only rootfs)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;Workspace storage&lt;/cell&gt;
+        &lt;cell&gt;one bind-mounted directory per sandbox under the data dir (persists)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;Edge / preview&lt;/cell&gt;
+        &lt;cell&gt;Traefik v3 Docker provider — sandboxes self-register their routes&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;Idle management&lt;/cell&gt;
+        &lt;cell&gt;stop-on-idle (&lt;code&gt;docker stop&lt;/code&gt;) + wake-on-request; no warm pool&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="2"&gt;
+        &lt;cell&gt;State&lt;/cell&gt;
+        &lt;cell&gt;SQLite (WAL); a reconciler converges Docker to the DB on boot&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Control plane&lt;/cell&gt;
+        &lt;cell&gt;one Go binary, shells out to the &lt;code&gt;docker&lt;/code&gt; CLI over the mounted socket&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;The control plane runs in a container with the host Docker socket mounted and launches each sandbox as a sibling container on a shared network so Traefik can route to it. Full design: &lt;code&gt;ARCHITECTURE.md&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;Everything is in &lt;code&gt;.env&lt;/code&gt; (created from &lt;code&gt;.env.example&lt;/code&gt; on install).
+The defaults run a complete local stack. The knobs you'll touch most:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;Variable&lt;/cell&gt;
+        &lt;cell role="head"&gt;Default&lt;/cell&gt;
+        &lt;cell role="head"&gt;What it does&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;PREVIEW_DOMAIN&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;localhost&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;domain preview URLs hang off&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;HTTP_PORT&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;80&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;host port Traefik listens on&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;SANDBOXED_DATA_DIR&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/var/lib/sandboxed&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;where workspaces + state live&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;SANDBOXED_API_BIND&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;127.0.0.1:9090&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;where the control-plane API is published&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;
+          &lt;code&gt;SANDBOXD_API_AUTH_DISABLED&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;true&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;open API for local use; set &lt;code&gt;false&lt;/code&gt; + tokens for prod&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;For a public deployment on a real wildcard domain:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Point &lt;code&gt;*.preview.yourdomain.com&lt;/code&gt;at the host.&lt;/item&gt;
+      &lt;item&gt;In &lt;code&gt;traefik/traefik.yml&lt;/code&gt;, enable the&lt;code&gt;websecure&lt;/code&gt;entrypoint and add a certificate resolver (Let's Encrypt DNS-01 is ideal — one wildcard cert covers every preview host, so you never hit per-host ACME limits).&lt;/item&gt;
+      &lt;item&gt;In &lt;code&gt;.env&lt;/code&gt;:&lt;code&gt;PREVIEW_DOMAIN=yourdomain.com&lt;/code&gt;,&lt;code&gt;PREVIEW_ENTRYPOINT=websecure&lt;/code&gt;,&lt;code&gt;PREVIEW_TLS=true&lt;/code&gt;, and enable auth —&lt;code&gt;SANDBOXD_API_AUTH_DISABLED=false&lt;/code&gt;with&lt;code&gt;SANDBOXD_API_TOKENS=name:secret&lt;/code&gt;.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;docker compose up -d&lt;/code&gt;.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;code&gt;./uninstall.sh            # stop the stack + remove all sandboxes + network (keeps your data)
+./uninstall.sh --images   # also remove the built Docker images
+./uninstall.sh --data     # also DELETE all workspaces + state (asks to confirm)
+./uninstall.sh --all      # full removal: images + data&lt;/code&gt;
+    &lt;p&gt;Safe by default — it removes only what sandboxed created (containers labelled &lt;code&gt;sandboxed.managed=true&lt;/code&gt;, the compose stack, the network) and keeps your
+workspaces unless you pass &lt;code&gt;--data&lt;/code&gt;/&lt;code&gt;--all&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;Yes — that's exactly the point. If you want to ship an AI app-builder or agent SaaS without first spending months building multi-tenant isolation, preview routing, idle/wake cost control, and agent orchestration, sandboxed gives you that core on day one, on a single inexpensive server, with margins you control. It's a strong, honest starting point — beta-quality, MIT-licensed, and built to be read and extended. Launch lean on it; harden as you grow (next section).&lt;/p&gt;
+    &lt;p&gt;sandboxed v1 is tuned for "works anywhere with just Docker, in one command." To keep it that simple, a few things were left basic on purpose. None of them affect the core loop (create → build → preview → sleep → wake → persist) — they're the knobs to tighten once you have real users and real money on the line. Plain version:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;Kept simple on purpose&lt;/cell&gt;
+        &lt;cell role="head"&gt;Fine for&lt;/cell&gt;
+        &lt;cell role="head"&gt;Do this when you're scaling / serious&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Container isolation (hardened Docker), not full VMs&lt;/cell&gt;
+        &lt;cell&gt;your own users running their own code&lt;/cell&gt;
+        &lt;cell&gt;running untrusted strangers' code → put each tenant on its own VM, or use gVisor / Kata / Firecracker&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;API auth is OFF by default&lt;/cell&gt;
+        &lt;cell&gt;local development&lt;/cell&gt;
+        &lt;cell&gt;turn it on (&lt;code&gt;SANDBOXD_API_AUTH_DISABLED=false&lt;/code&gt; + tokens) and never expose the API port unauthenticated&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Preview links are public (anyone with the URL)&lt;/cell&gt;
+        &lt;cell&gt;demos, sharing&lt;/cell&gt;
+        &lt;cell&gt;gate sensitive previews (the private-sandbox forward-auth hook)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Open, unlogged network egress&lt;/cell&gt;
+        &lt;cell&gt;most apps&lt;/cell&gt;
+        &lt;cell&gt;add firewall / egress rules + logging&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Plain-directory workspaces, no disk quota&lt;/cell&gt;
+        &lt;cell&gt;a single server&lt;/cell&gt;
+        &lt;cell&gt;add filesystem/volume quotas; plan multi-host sharding&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;One server, one Docker socket (the control plane is root-equivalent on the host)&lt;/cell&gt;
+        &lt;cell&gt;starting out&lt;/cell&gt;
+        &lt;cell&gt;treat the host as a trust boundary, keep it patched, isolate it, and don't co-locate unrelated secrets&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;The short version for a fast-scaling company: the three that matter most are (1) stronger isolation (VM-per-tenant) if you ever run untrusted code, (2) turn on API auth and lock down the host, and (3) plan for more than one machine. Everything else above is a config change, not a rewrite. Start lean, revisit these as you grow — and PRs are very welcome (&lt;code&gt;CONTRIBUTING.md&lt;/code&gt;).&lt;/p&gt;
+    &lt;p&gt;MIT. Use it, ship it, sell what you build on it.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48388909</guid><pubDate>Wed, 03 Jun 2026 19:43:37 +0000</pubDate></item><item><title>A Man Who Reads Books for a Living (One Every Two Days)</title><link>https://lithub.com/the-man-who-reads-books-for-a-living-one-every-two-days/</link><description>&lt;doc fingerprint="bf82135f6df5acbc"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;The Man Who Reads Books For a Living (One Every Two Days)&lt;/head&gt;
+    &lt;head rend="h2"&gt;You Have Clarke Speicher to Thank (Or Blame) For the &lt;lb/&gt;Recent Train Dreams Adaptation&lt;/head&gt;
+    &lt;p&gt;When Clarke Speicher (spike-er) asked how I liked the screen adaptation of Train Dreams, Denis Johnson’s novella following the solitary logger Robert Granier in the early 20th-century American West, he was actually asking whether it measured up to its source material. That is, after all, the question about adaptations. Still, it felt loaded. If it had been anyone else, I would’ve felt at liberty to prattle without worrying whether I’d arrived at any kind of thesis. That I love the book was beside the point. I felt caught out because it was Clarke doing the asking. But he isn’t an author, screenwriter, director, producer, critic, agent, or editor. He isn’t a journalist or influencer.&lt;/p&gt;
+    &lt;p&gt;Clarke is something much more specific and much rarer: a professional book reader who evaluates literature specifically for screen adaptation. So after a few seconds of mealy-mouthed equivocation about Train Dreams, I came to my senses and flipped the question back on him. A few drinks later, we were talking about his profession, how it works, and what adaptation really means.&lt;/p&gt;
+    &lt;p&gt;In his mid-40s and unassuming, Clarke is the rare interlocutor who seems to listen without waiting to speak, a far cry from people in the biz whose stock-in-trade is summed up by the very word: production. He has glasses, a solid build, a short gray beard. His thoughts tend to outpace his ability to articulate them in a first pass. He smiles a lot. There is something gentle and teddy-bear-ish about him, but it’s tempered by a New Yorker’s world-weariness. I’ve known him a long time, spent many nights talking (and drinking) with him into the small hours about books, movies, love, dreams, life. “The best adaptations take the basic idea and transform it into cinematic terms,” he says. “Which I’m realizing does sound very dumb saying it out loud,” he chuckles at himself.&lt;/p&gt;
+    &lt;p&gt;An executive might walk into a meeting with an author, producer, potential directors, stars, prepared to discuss potential multi-million dollar deals armed only with Clarke’s synopsis.&lt;/p&gt;
+    &lt;p&gt;His work forces a near-daily conversation between two halves of Clarke’s brain: the lifelong reader who devours books and the cinephile who dreams in celluloid. The nuts and bolts are this: an agent, executive, or producer sends Clarke a book or manuscript, blind. He reads it and writes a detailed beat-by-beat synopsis of the core scenes, settings, conflicts, and characters. Here, he quotes essential dialogue and, if any sentence-level writing stands out, includes excerpts. He then steps back to evaluate how the book might actually function on screen, that is, which elements are inherently cinematic, what can and can’t be rendered visually or dramatized, and what kind of movie or series the material wants to be. This is where the tension stretches tightest.&lt;/p&gt;
+    &lt;p&gt;Clarke may love a book but, considering aesthetics, a conceptual budget, the likely target audience, possible star power attached, how similar projects have fared, and basic feasibility, his affection may only have so much bearing on the binary at which he must, finally, land: a recommendation to either pass and go no further, or consider and let it build momentum.&lt;/p&gt;
+    &lt;p&gt;He calls this report “coverage.” It serves as reference for people in rarified air Clarke has never been invited to breathe. But he harbors no ambition to scale Hollywood heights. He is, if the arc of his career is any indication, happy to be something of a brain trust. “Not every executive can read every book,” he explains. “Everybody’s busy and they don’t have time to read everything.” An executive might walk into a meeting with an author, producer, potential directors, stars, prepared to discuss potential multi-million dollar deals armed only with Clarke’s synopsis. The pressure he feels comes from real stakes.&lt;/p&gt;
+    &lt;p&gt;Still, he’s careful not to overstate things. “I don’t want to misconstrue how important I am to this process,” he says. “I actually don’t know.” He gives a good-natured shrug. His involvement begins and ends with his coverage. “I write this report and I email it and it goes into the ether,” he says. “I don’t know if anybody reads it or not… Then someone will tell me ‘your comments were really important to this executive. It was really helpful in explaining why this story works.’”&lt;/p&gt;
+    &lt;p&gt;“I never imagined reading books and turning them into movies was a job.”&lt;/p&gt;
+    &lt;p&gt;Growing up in Delaware, Clarke imagined a different career. He wanted to be an entertainment journalist, to review movies. “I thought I could do that for my local newspaper or something.” He tells me his highest aspiration was to write for Entertainment Weekly. “I never imagined reading books and turning them into movies was a job. I never really knew anything about that kind of job existing before.” In 2001, 20-year-old English major Clarke was reporting on a local film festival for his college newspaper. He met a film executive who offered him an internship. Clarke jumped.&lt;/p&gt;
+    &lt;p&gt;By 2002 he was in New York, reading scripts for one of the big indie studios. Part of every production assistant’s job is to help their boss thin the screenplay slush pile. But “because I can read books fast, I started doing that,” Clarke says. By his own calculation, he could read a hundred pages an hour. “I was always a big reader,” he says. “I loved books but movies are the thing I loved more.” Reading books also paid better than scripts. “At that time it was just a bunch of bad horror novels. Dean Koontz, that kind of thing.” It turned out that speed, a cinephile’s fluency, and an anxious temperament that prohibits laziness made him more valuable than your run-of-the-mill PA. “It just happened that I was suited to it.”&lt;/p&gt;
+    &lt;p&gt;Smash cut to 25 years later.&lt;/p&gt;
+    &lt;p&gt;Clarke is a freelancer staying afloat in the gig economy. He still reads potboilers, YA novels, and the like but capital-L literature remains his wheelhouse. Name the season’s hot novel or some totemic masterwork and he’s probably read it. “Sometimes I’ll get sent a new book by a major author,” he says, adding that it is not unusual to receive a first-draft Word document, typos and all. “I’m probably one of the first people who’s gotten to read [a new major book], and that’s exciting to me.” Solicitations can come from anywhere, including newer power players like Apple and Netflix. “Somebody will contact me who said that I was recommended by somebody I have not spoken to in ten years,” he says. The implication is clear: this is a specific problem to which Clarke is a reliable solution. “That’s part of the reason why I still have a Yahoo email address. Because that’s what I’ve had this whole time.”&lt;/p&gt;
+    &lt;p&gt;To make his nut, Clarke completes about six books a week. He mentions, offhandedly, that he has read “literally thousands of books,” so I do the rough math: even allowing for time off, that works out to roughly 300 books a year, or well over 6,000 across two decades. And that is just the professional tally. One summer a few years ago, for pleasure, he read all of In Search of Lost Time.&lt;/p&gt;
+    &lt;p&gt;Clarke is about as close to a Hollywood insider as someone who never dips a toe into production gets. His name doesn’t appear in credits, but he still feels pride when something that he championed winds up in theaters.&lt;/p&gt;
+    &lt;p&gt;Books will remain books, and movies based on books will keep getting made, but the pipeline between publishing and film has changed almost beyond recognition.&lt;/p&gt;
+    &lt;p&gt;For years, he was the principal reader for a certain EGOT-winning, since-disgraced mega-producer who, it was rumored, kept a cache of cell phones in his desk because he so often threw and broke them. At a social function, someone who worked in development for this producer told Clarke that he was “secretly one of the most powerful men in Hollywood because [this producer’s] opinion mattered the most and [Clarke] was one that was giving him the opinion.” Production partners would approach producer-X enthusiastic about a book, and the producer would ask, “‘But what did Clarke think about it?’ If I didn’t like something, often neither did he. And if he didn’t like something it could be dead in the water. That was why I was, secretly, very powerful and didn’t know it despite being a person who could barely pay his credit card bills.”&lt;/p&gt;
+    &lt;p&gt;Surviving two and a half decades in any industry means being nimble when the ground inevitably shifts. Books will remain books, and movies based on books will keep getting made, but the pipeline between publishing and film has changed almost beyond recognition during Clarke’s tenure. “It used to be that every production company or film studio had a New York office specifically to work with the publishing industry,” he says. Those days are gone. “When I first started I had to go into an office and pick up a physical copy of a book or a manuscript.” Now everything arrives by email, and he hasn’t set foot in an office in about seven years. “I know that every company has somebody who does [this same work],” he says. “I guess a lot of people who do this are based in LA, maybe.”&lt;/p&gt;
+    &lt;p&gt;I ask whether that makes it harder to compare notes with contemporaries. He smiles and very matter-of-factly tells me that, a few years ago, at a brunch hosted by a major production company, “There were two other readers there. That’s the first time I ever met anybody in person.” Shocked, I make him repeat himself, and again he says: “I’ve never met anybody else who does this.”&lt;/p&gt;
+    &lt;p&gt;*&lt;/p&gt;
+    &lt;p&gt;We all have a book or two whose unmade movie plays in our mind at IMAX scale. Every scene is shot on location, the soundtrack is wall-to-wall bangers, and the cast is perfect with a few key roles filled by actors in their bygone prime and maybe one or two from beyond the grave. But, within the constraints of reality, what would actually make that vision work? Where would you even begin?&lt;/p&gt;
+    &lt;p&gt;“If you can’t summarize the basic idea of a book in a sentence, it’s probably gonna be harder to adapt.”&lt;/p&gt;
+    &lt;p&gt;“The kernel—the idea. That’s the first thing that grabs me,” Clarke says. “What’s different and interesting. Is it the setting, the setup?” What he calls a book’s “hook” is the aspect of its central conceit with enough gravity to pull the reader in. He gives Karen Russell’s recent novel The Antidote as an example. “I thought that was very compelling, a really original idea. It’s a detective novel about, like, psychics during the dustbowl. That’s really captivating.”&lt;/p&gt;
+    &lt;p&gt;Another, more pointed example is Hanya Yanagihara’s A Little Life. Clarke says that book “is just a series of terrible things happening to a person… I don’t want to see a movie about that.” Whereas, “Hamnet is a story about grief and something terrible happening to a person but it has the hook: it’s Shakespeare.” And that hook, he says, can’t be added on—it has to be baked-in. “If you can’t summarize the basic idea of a book in a sentence, it’s probably gonna be harder to adapt.”&lt;/p&gt;
+    &lt;p&gt;Within that larger framework, Clarke looks for characters who “are interesting or unique—sympathetic in some interesting way or have unique attributes or a point of view.” But because film is visual, characters cannot merely feel, react, or reflect on the page. They need to do things that push the story along. Clarke puts it plainly: “It’s about [the potential adaptation] being a visual medium.” And characters who serve that medium “aren’t just interesting but doing dynamic things, not just brooding. That could be interesting to read but is harder to make a movie about.”&lt;/p&gt;
+    &lt;p&gt;Outside the demands of his job, Clarke, like the rest of us, can appreciate a piece of writing without having to justify it. Professionally, he cannot. “It sounds stupid but, when you’re adapting something you’re adapting its plot, not necessarily the writing.” That distinction matters. The poeticism and stylistic flourish that give a novel heft and make it singular may also make it harder to translate to the screen. “A book that has wonderful prose and really gives you a great sense of a character in the world and what they’re doing, but it’s all thoughts—that would make it more difficult to make a great movie.”&lt;/p&gt;
+    &lt;p&gt;He cites Mrs. Dalloway. “That was adapted into a movie that nobody really remembers. And Vanessa Redgrave was in that!” He points out that award-winning films are very rarely based on award-winning books. “Honestly, it’s easier to adapt a thriller than some high literary thing.” That is not a judgment of merit. Some of the most beloved films were drawn from books unlikely to appear on a college literature syllabus. Die Hard, Vertigo, The Exorcist. “More people have seen those movies than have read the books, I’d say,” Clarke says and speculates that “a lot of people probably don’t even know that Silence of the Lambs is based on a book. Or The Godfather for that matter.” Still, Clarke’s love of literature and affinity for great prose can assert themselves now and then. “There’s been times when a book reaches a point and maybe I’m not that into it,” he says. “Then something happens that makes me reconsider the whole thing. A sequence that’s so beautiful and amazingly written that maybe [the adaptation] is worth doing.”&lt;/p&gt;
+    &lt;p&gt;The goal is an adaptation that stands on its own. If strict fidelity gets in the way, it can be treated as immaterial.&lt;/p&gt;
+    &lt;p&gt;When Clarke recommends a book for further consideration, he is usually recommending one of two things: either the underlying idea can serve as a foundation for something larger, or the book is adaptable more or less as-is. One route involves interpolation, recontextualization, and refocusing; the other approaches transposition. West Side Story and Baz Luhrmann’s Romeo + Juliet, respectively. For audiences, fidelity is often the real sticking point. But pressure to pay that kind of fan-service seldom makes an adaptation better. “I hate to invoke Harry Potter,” Clarke says. “But the first two films were very faithful. The third does its own thing and many people think that’s the best one.” Alex Garland’s Annihilation based on Jeff VanderMeer’s beloved sci-fi series, for example. “That’s one of those movies that I think a lot of people who didn’t read the book liked because it was so weird.” Indeed: Critics tended to react positively to the film, whereas it was almost universally panned by fans of the series. Clarke liked both the film and books, but he gets it: “if you had read the book and you were expecting [its unique imagery realized onscreen] then you didn’t get it, yeah, you would be disappointed.”&lt;/p&gt;
+    &lt;p&gt;As far as Clarke’s work goes, each book has to be treated on its own terms. The goal is an adaptation that stands on its own. If strict fidelity gets in the way, it can be treated as immaterial. “Sometimes a book has a really good central hook to it and [a successful adaptation would be] expanding upon that rather than going deep into the weeds of all the details of the story… sometimes the best adaptations are the ones that take the most liberties.”&lt;/p&gt;
+    &lt;p&gt;Years ago, he was sent a rambling Thomas Pynchon novel. This was just after P.T. Anderson’s adaptation of Inherent Vice landed with a thud. In his report, Clarke argued that while the plot of this other Pynchon book could technically work without all its “strangeness and digression,” removing those elements would also remove what made the book “an amazing postmodern novel.” He concluded that the book, as written, posed “significant challenges for development.” He tells me that this is one of the rare times when he loved the book but just couldn’t see the adaptation working. He recommended a pass. The book was Vineland. And One Battle After Another, was his favorite movie of 2025. “I wasn’t even sure it was considered an adaptation until I saw the credits.”&lt;/p&gt;
+    &lt;p&gt;The limited series, Clarke says, is where hi-fi book adaptations may have their best chance of flourishing. “It’s great, especially for books… Something like The Corrections or The Amazing Adventures of Kavalier and Clay—these were books that they spent years trying to turn into a movie and they couldn’t do it… now it would be limited series. You couldn’t easily turn these 550-page books that cover years or decades into a movie.”&lt;/p&gt;
+    &lt;p&gt;Sometimes he’s sent stone-cold classics. Those are their own unique problems. “Silas Marner or something—what am I supposed to say? Shakespeare? Am I supposed to say, ‘no, it’s gonna be difficult to adapt A Midsummer Night’s Dream?’ It’s hard to know.” In those cases or others wherein the book in question has obvious value but doesn’t map cleanly onto standard dramatic architecture, Clarke may imagine an arthouse film, something artistically serious but commercially uncertain. “Even if there isn’t a ton of plot getting from A to B and [a book is] more about an experience of life or something, you usually get that through performances and cinematography.” He might give a film like that a “consider” if the project could be helmed by “a visionary director. Somebody who can turn it into something visually interesting but has a real moving plot.” His touchstone is often Terrence Malick, whose tone-poem style has been imitated so often (Train Dreams included) that it nearly forms a genre of its own. But, he says, “I’ve been told ‘stop referring to Malick, you’re scaring people away!’”&lt;/p&gt;
+    &lt;p&gt;When I call Clarke a writer, he demurs. Some of his coverage runs 12, 16, 20 pages. “I’ve had to write a hundred-page synopsis of a book before,” he tells me. I ask if he thinks he’s developed a voice as a writer. He seems apprehensive, and I get the sense that the insinuation that he’s a writer trips him up. But I may be imagining that. “Sometimes I do think about it, whether or not [my writing has] a clear personality,” he says. “Especially nowadays I feel more pressure to be detailed in a way that AI can’t summarize, trying to capture more of the atmosphere and mood than a straightforward Wikipedia summary. I try to capture tone and have quotes and dialogue so [the clients] have a better sense of how the story flows.” The comparison he reaches for is not an author, but tall-tale legend John Henry who, competing against a machine, won, then died from exhaustion—all so a corporation could realize its industrial project.&lt;/p&gt;
+    &lt;p&gt;“I usually have two days to read a book. Sometimes more. Most people I work for now are relaxed.”&lt;/p&gt;
+    &lt;p&gt;Clarke and I met more than a decade ago, when I was a bartender and he was a regular. On learning what he did, I felt a stab of envy. Who wouldn’t want to read and write about books all day? Since getting to know Clarke and his work better, I have revised that feeling. “There have been times when I’m working from eight in the morning until eleven o’clock at night or one o’clock in the morning,“ he says. Last year, he says, there was a stretch when “it was just a nightmare… Every night I was working until 11 and I don’t know why.”&lt;/p&gt;
+    &lt;p&gt;Once, he tells me, at eight in the evening, he was sent a 1,000-plus-page book that had to be finished by start of business the next morning. “[I was] just expected to be on call,” he says.&lt;/p&gt;
+    &lt;p&gt;Clarke waves his hands to dispel the memory: all of that is in the past. Mostly. Episodes like that are less indicative of the industry as a whole than the famously abrasive type it has long yielded and just as long lampooned: the showbiz kingmaker. “He was the only person who was like that.” After ten years of work for Producer X, Clarke’s reliability found him one of that person’s longest-tenured staffers. It is not a big leap to suspect that, alongside dedication to his work and acumen, Clarke was able to absorb that kind of unreasonable demand for so long because of who he is, the way he moves through the world. It’s that unassuming quality that makes him so easy to talk to. A teddy bear can be pummeled without losing its shape.&lt;/p&gt;
+    &lt;p&gt;Producer X is quietly making moves to re-enter the industry. He calls Clarke, but Clarke doesn’t answer. His corner of the industry, Clarke says, is “a lot better now. Most people are concerned for your time… I usually have two days to read a book. Sometimes more. Most people I work for now are relaxed.” That is, most of the time. “Unless it’s a major book or there’s a bidding war or something.”&lt;/p&gt;
+    &lt;p&gt;The 1000-page night sits on the outer limit of Clarke’s professional life, but identifying that margin is illuminating. The work is freelance and deadline-driven, with no salary, benefits, or job security. Once a book is sighted for adaptation, it has to be field-dressed. Some of the visceral mechanisms that gave it life have to be discarded. “The fear I have is that some author will read this and be horrified that something is being read in three hours,” Clarke says. “I do understand that. But I do still have to read it thoroughly and give real consideration.”&lt;/p&gt;
+    &lt;p&gt;In fact, he tells me that he tends to read for work with more intensity than he would for pleasure. Then again, the industry’s machinery demands that books are “being sent to a freelancer. You have to do it as quickly as you can. You have to do as much as you can.” Fortunately for the producers who hire him and the authors whose work he covers, Clarke brings enough sensitivity to bear that writing itself remains part of the equation. That can’t be taken for granted. Anyone who’s seen enough adaptations knows the difference between one that strives to apprehend the source material and one that feels derived from a Wikipedia summary.&lt;/p&gt;
+    &lt;p&gt;As long as humanity is still valuable to the process of adaptation, Clarke will have work. That doesn’t mean he’s whipping around the Hollywood Hills in a convertible or power-lunching. Clarke lives in Gowanus, Brooklyn’s mostly industrial neighborhood. His home office is a narrow two-bedroom near an asphalt processing plant and a superfund site, both of which can be smelled with the windows open on a warm day. “Because of what I do and because I tip well, I think people have an inflated idea of how much money I make,” he says. “It’s volume.” I’ve seen him when things turned dire. When the notoriously fragile film industry’s gears stopped turning for one reason or another, he genuinely lost sleep, confidence, some sense of purpose. How would he pay his rent? Would he have to pack up more than two decades of work and life and move back to Delaware? All I could do at times like that was listen and discount his bar tab. But for right now, at least, the lights are on and the mill is humming.&lt;/p&gt;
+    &lt;p&gt;It’s little wonder producers and executives expect to get what they want when they want it. Their profession alchemizes money and labor into art, then back to money. Failing to find the requisite components in one place, they’ll look another. But they won’t stop anywhere they don’t need to, and they won’t waste time waiting for anyone. That leaves Clarke little latitude to pace his workload. “For ten years I only dated for a year during that whole period of time,” he says. “The person I dated, it was very frustrating for them. You’re never available because you’re always working.”&lt;/p&gt;
+    &lt;p&gt;And this is fundamentally solitary work. Clarke spent much of his 30s exhausted, either from chopping away or dreading that he would never get that chance again. I saw it from behind the bar: Clarke was lonely, frustrated, and disconnected but would nonetheless listen with real generosity to whoever occupied the barstool beside him. At least for a while. He is, after all, a New Yorker.&lt;/p&gt;
+    &lt;p&gt;So when Clarke asked what I thought of Train Dreams, what I didn’t say was that the book had left me moved and heartbroken in a way that resisted explanation, that the feeling stayed with me more than any fully formed thought. The adaptation, which I liked, simply didn’t leave that impression. I hadn’t expected it to. Still, I felt foolish for being unable to articulate exactly what had been lost in the gulf between the two realizations of Robert Granier’s lonely life. And it occurred to me: Clarke rarely has the luxury of uncertainty.&lt;/p&gt;
+    &lt;p&gt;He is now happier than I have ever known him—he’s in a healthy relationship. He tells me that his partner goes out of their way to demonstrate how much they appreciate him. He practically swoons when he tells me that they bought tickets to the 70mm IMAX screening of One Battle After Another. The other day, he posted a photo on social-media showing the two of them playing hooky from work, smiling in the sun-splashed theater lobby. The nature of his work and keeping himself valuable in his industry—that still requires that he pick up the axe and keep swinging. But it seems like now, if only briefly, he can stop and take a breath and just admire the forest around him.&lt;/p&gt;
+    &lt;p&gt;I asked Clarke if he liked Train Dreams and he didn’t hesitate: “I liked it a lot. I love that it was about loneliness. That everybody is alone but there can be a brief period of time when you might love somebody, and that is what makes life worthwhile.”&lt;/p&gt;
+    &lt;p&gt;I paid the tab and walked home, thinking about what he’d said. I watched the movie again. This time, by the end, I was tearing up.&lt;/p&gt;
+    &lt;head rend="h4"&gt;Julien C. Levy&lt;/head&gt;
+    &lt;p&gt;Julien C. Levy is a writer from New York City. His feature journalism has appeared in VICE, Inked Magazine, Thrillist, and CrimeReads.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48389284</guid><pubDate>Wed, 03 Jun 2026 20:08:33 +0000</pubDate></item><item><title>Show HN: Mnemo – local-first AI memory layer for any LLM (Rust, SQLite,petgraph)</title><link>https://github.com/zaydmulani09/mnemo</link><description>&lt;doc fingerprint="fbcb2fd3ed19cfe8"&gt;
+  &lt;main&gt;
+    &lt;quote&gt;
+      &lt;p&gt;Local-first AI memory layer for any LLM. Persistent knowledge graph, entity extraction, semantic retrieval — no cloud required.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Most LLMs forget everything the moment a conversation ends. mnemo fixes that.&lt;/p&gt;
+    &lt;p&gt;mnemo is a sidecar service that watches every conversation you feed it, extracts named entities and relationships using an LLM, builds a persistent knowledge graph in SQLite, and injects relevant context back into future prompts — automatically, in under 50ms. It works with Ollama (fully local, free), OpenAI, Anthropic, or any OpenAI-compatible API. It ships as a single static binary with zero cloud dependency.&lt;/p&gt;
+    &lt;code&gt;  your app
+     │
+     ▼
+  POST /ingest ──► entity extraction (LLM) ──► knowledge graph (SQLite + petgraph)
+                                                        │
+  POST /retrieve ◄── scoring + ranking ◄── graph traversal + full-text search
+     │
+     ▼
+  context_prompt  ──► inject into your LLM prompt
+&lt;/code&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;You POST raw text to &lt;code&gt;/ingest&lt;/code&gt;(a conversation turn, a document, a note).&lt;/item&gt;
+      &lt;item&gt;mnemo sends it to your configured LLM and extracts entities (people, tools, places, concepts) and the relationships between them.&lt;/item&gt;
+      &lt;item&gt;Entities are deduplicated by name+type, aliases are merged, and everything is written to SQLite. The in-memory petgraph is updated atomically.&lt;/item&gt;
+      &lt;item&gt;On POST &lt;code&gt;/retrieve&lt;/code&gt;, mnemo runs a 6-stage pipeline: full-text chunk search → entity name search → graph expansion (BFS over the knowledge graph) → relation filter → score+rank → assemble a&lt;code&gt;context_prompt&lt;/code&gt;string.&lt;/item&gt;
+      &lt;item&gt;You inject &lt;code&gt;context_prompt&lt;/code&gt;into your LLM's system prompt. Done.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;code&gt;git clone https://github.com/zaydmulani09/mnemo
+cd mnemo
+docker compose up -d
+
+# Pull the llama3 model the first time (~4 GB)
+docker exec mnemo-ollama ollama pull llama3
+
+# Verify everything is healthy
+curl http://localhost:8080/health&lt;/code&gt;
+    &lt;code&gt;cargo install --path crates/mnemo-api
+
+# With Ollama
+export MNEMO_LLM_BASE_URL=http://localhost:11434/v1
+mnemo-api
+
+# With OpenAI
+export MNEMO_LLM_BASE_URL=https://api.openai.com/v1
+export MNEMO_LLM_API_KEY=sk-...
+export MNEMO_LLM_MODEL=gpt-4o-mini
+export MNEMO_LLM_PROVIDER=openai
+mnemo-api&lt;/code&gt;
+    &lt;code&gt;pip install mnemo-sdk&lt;/code&gt;
+    &lt;code&gt;from mnemo import MnemoClient
+
+client = MnemoClient()  # server at http://localhost:8080
+
+# Store a memory
+client.ingest("I'm building a Rust vector database called vecdb")
+
+# Get context for injection into your next LLM prompt
+print(client.get_context("what am I working on?"))&lt;/code&gt;
+    &lt;p&gt;All endpoints accept and return &lt;code&gt;application/json&lt;/code&gt;. Base URL: &lt;code&gt;http://localhost:8080&lt;/code&gt;.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="5"&gt;
+        &lt;cell role="head"&gt;Method&lt;/cell&gt;
+        &lt;cell role="head"&gt;Path&lt;/cell&gt;
+        &lt;cell role="head"&gt;Description&lt;/cell&gt;
+        &lt;cell role="head"&gt;Request body&lt;/cell&gt;
+        &lt;cell role="head"&gt;Response&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;GET&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/health&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Server + DB + LLM status&lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;HealthResponse&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;POST&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/ingest&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Store text, extract entities&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;IngestRequest&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;IngestResponse&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;POST&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/retrieve&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Retrieve ranked memory context&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;RetrievalQuery&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;RetrievalResult&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;GET&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/entities&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;List entities (paginated)&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;?limit&amp;amp;offset&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;Entity[]&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;GET&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/entities/:id&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Get entity by UUID&lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;Entity&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;DELETE&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/entities/:id&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Delete entity (cascades)&lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;{"deleted":true}&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;GET&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/entities/:id/neighbors&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Knowledge graph neighbors&lt;/cell&gt;
+        &lt;cell&gt;&lt;code&gt;?depth&lt;/code&gt; (max 5)&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;GraphNode[]&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;GET&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/chunks&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;List memory chunks (paginated)&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;?limit&amp;amp;offset&amp;amp;session_id&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;MemoryChunk[]&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;GET&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/chunks/:id&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Get chunk by UUID&lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;MemoryChunk&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;DELETE&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/chunks/:id&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Delete chunk&lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;{"deleted":true}&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;POST&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/search&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Full-text search entities + chunks&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;{"query","limit"}&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;{"entities","chunks"}&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="5"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;DELETE&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/wipe&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Delete all memory (irreversible)&lt;/cell&gt;
+        &lt;cell&gt;header: &lt;code&gt;X-Confirm-Wipe: true&lt;/code&gt;&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;{"wiped":true}&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;
+          &lt;code&gt;GET&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;/stats&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Entity/chunk/graph counts + uptime&lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;StatsResponse&lt;/code&gt;
+        &lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Key request/response types:&lt;/p&gt;
+    &lt;code&gt;// IngestRequest
+{
+  "content": "string",         // required — text to store
+  "source":  "string",         // required — e.g. "chat", "email", "cli"
+  "session_id": "string|null", // optional — group related chunks
+  "metadata": {}               // optional — arbitrary JSON
+}
+
+// RetrievalQuery
+{
+  "text": "string",            // required — query text
+  "session_id": "string|null", // optional — filter by session
+  "max_chunks": 10,            // default 10
+  "max_entities": 20,          // default 20
+  "min_confidence": 0.5,       // default 0.5
+  "include_graph": true,       // default true — expand via knowledge graph
+  "graph_depth": 2             // default 2 — BFS depth for graph expansion
+}&lt;/code&gt;
+    &lt;p&gt;Full endpoint documentation with curl examples: &lt;code&gt;docs/api.md&lt;/code&gt;&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;Variable&lt;/cell&gt;
+        &lt;cell role="head"&gt;Default&lt;/cell&gt;
+        &lt;cell role="head"&gt;Description&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;MNEMO_DB_PATH&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;mnemo.db&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;SQLite database file path&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;MNEMO_PORT&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;8080&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;API server port&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;MNEMO_LLM_BASE_URL&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;http://localhost:11434/v1&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;OpenAI-compatible LLM base URL&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;MNEMO_LLM_MODEL&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;llama3&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Model name for entity extraction&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;MNEMO_LLM_API_KEY&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;ollama&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;API key (any value works for Ollama)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;
+          &lt;code&gt;MNEMO_LLM_PROVIDER&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;
+          &lt;code&gt;ollama&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;Provider type: &lt;code&gt;ollama&lt;/code&gt;, &lt;code&gt;openai&lt;/code&gt;, &lt;code&gt;anthropic&lt;/code&gt;, &lt;code&gt;custom&lt;/code&gt;&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Pass &lt;code&gt;--config path/to/config.toml&lt;/code&gt; to &lt;code&gt;mnemo-api&lt;/code&gt;. See &lt;code&gt;mnemo.example.toml&lt;/code&gt;:&lt;/p&gt;
+    &lt;code&gt;db_path = "mnemo.db"
+port = 8080
+
+[llm]
+provider = "ollama"
+base_url = "http://localhost:11434/v1"
+model = "llama3"
+api_key = "ollama"
+timeout_secs = 30
+max_retries = 3
+max_tokens = 2048
+temperature = 0.1&lt;/code&gt;
+    &lt;p&gt;Environment variables take precedence over TOML values. The active config source is reported in &lt;code&gt;GET /health&lt;/code&gt; → &lt;code&gt;config_source&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;Install:&lt;/p&gt;
+    &lt;code&gt;cargo install --path crates/mnemo-cli&lt;/code&gt;
+    &lt;p&gt;Usage:&lt;/p&gt;
+    &lt;code&gt;# Store a memory
+mnemo ingest "I use Neovim and prefer dark mode"
+
+# Retrieve relevant context
+mnemo search "what editor do I use?"
+
+# List all extracted entities
+mnemo entities
+
+# Show entity detail + graph neighbors
+mnemo entity &amp;lt;uuid&amp;gt; --neighbors
+
+# List memory chunks
+mnemo chunks
+
+# Server health
+mnemo health
+
+# Memory statistics
+mnemo stats
+
+# Delete everything (prompts for confirmation)
+mnemo wipe
+
+# Skip confirmation prompt
+mnemo wipe --yes
+
+# Point at a non-default server
+mnemo --server http://192.168.1.10:8080 stats&lt;/code&gt;
+    &lt;p&gt;Install:&lt;/p&gt;
+    &lt;code&gt;pip install mnemo-sdk&lt;/code&gt;
+    &lt;p&gt;See &lt;code&gt;sdk/python/README.md&lt;/code&gt; for the full API reference.&lt;/p&gt;
+    &lt;p&gt;Async example:&lt;/p&gt;
+    &lt;code&gt;import asyncio
+from mnemo import AsyncMnemoClient
+
+async def main():
+    async with AsyncMnemoClient() as client:
+        await client.ingest(
+            "Alice is a principal engineer at Stripe working on payment infrastructure.",
+            session_id="session-001",
+        )
+        context = await client.get_context(
+            "what does Alice work on?",
+            session_id="session-001",
+        )
+        print(context)
+
+asyncio.run(main())&lt;/code&gt;
+    &lt;p&gt;A working standalone example: &lt;code&gt;examples/basic_usage.py&lt;/code&gt;&lt;/p&gt;
+    &lt;p&gt;Four Rust crates wired together:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;Crate&lt;/cell&gt;
+        &lt;cell role="head"&gt;Type&lt;/cell&gt;
+        &lt;cell role="head"&gt;Role&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;mnemo-core&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;lib&lt;/cell&gt;
+        &lt;cell&gt;Entity extraction, graph ops, retrieval engine, DB layer&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;mnemo-api&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;bin&lt;/cell&gt;
+        &lt;cell&gt;Axum REST API — thin handler layer over mnemo-core&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;
+          &lt;code&gt;mnemo-cli&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;bin&lt;/cell&gt;
+        &lt;cell&gt;CLI tool using blocking reqwest against the API&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;
+          &lt;code&gt;mnemo-bench&lt;/code&gt;
+        &lt;/cell&gt;
+        &lt;cell&gt;bin&lt;/cell&gt;
+        &lt;cell&gt;Performance benchmarks (12 suites)&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Full architecture documentation: &lt;code&gt;docs/architecture.md&lt;/code&gt;&lt;/p&gt;
+    &lt;p&gt;Benchmarked on Apple M2, SQLite WAL mode, in-memory petgraph. Debug build numbers — release build (&lt;code&gt;--release&lt;/code&gt;) is 3–5× faster.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row span="3"&gt;
+        &lt;cell role="head"&gt;Operation&lt;/cell&gt;
+        &lt;cell role="head"&gt;Avg latency&lt;/cell&gt;
+        &lt;cell role="head"&gt;Throughput&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Entity insert (SQLite)&lt;/cell&gt;
+        &lt;cell&gt;~0.12 ms&lt;/cell&gt;
+        &lt;cell&gt;~8,300 ops/s&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Entity lookup by ID&lt;/cell&gt;
+        &lt;cell&gt;~0.08 ms&lt;/cell&gt;
+        &lt;cell&gt;~12,500 ops/s&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Chunk insert&lt;/cell&gt;
+        &lt;cell&gt;~0.14 ms&lt;/cell&gt;
+        &lt;cell&gt;~7,100 ops/s&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Full-text chunk search&lt;/cell&gt;
+        &lt;cell&gt;~0.28 ms&lt;/cell&gt;
+        &lt;cell&gt;~3,500 ops/s&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Graph neighbor (depth=1)&lt;/cell&gt;
+        &lt;cell&gt;~0.21 ms&lt;/cell&gt;
+        &lt;cell&gt;~4,700 ops/s&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row span="3"&gt;
+        &lt;cell&gt;Graph neighbor (depth=2)&lt;/cell&gt;
+        &lt;cell&gt;~0.89 ms&lt;/cell&gt;
+        &lt;cell&gt;~1,100 ops/s&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Full retrieval pipeline&lt;/cell&gt;
+        &lt;cell&gt;~4.2 ms&lt;/cell&gt;
+        &lt;cell&gt;~238 ops/s&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;Run &lt;code&gt;cargo run -p mnemo-bench&lt;/code&gt; to benchmark on your hardware.&lt;/p&gt;
+    &lt;code&gt;cargo test --workspace          # run all 122 tests
+make coverage                  # HTML coverage report (requires cargo-llvm-cov)
+make coverage-summary          # summary to stdout&lt;/code&gt;
+    &lt;code&gt;cd sdk/python &amp;amp;&amp;amp; pytest tests/ -v&lt;/code&gt;
+    &lt;code&gt;cargo run -p mnemo-bench                    # all 12 benchmarks
+cargo run -p mnemo-bench -- --filter graph  # graph benchmarks only
+cargo run -p mnemo-bench -- --json out.json # save results to JSON&lt;/code&gt;
+    &lt;p&gt;Current test counts: 122 Rust tests · 21 Python tests · 12 benchmarks&lt;/p&gt;
+    &lt;p&gt;PRs welcome. Please run &lt;code&gt;make fmt &amp;amp;&amp;amp; make lint&lt;/code&gt; before submitting.
+Open an issue first for large changes.&lt;/p&gt;
+    &lt;p&gt;See &lt;code&gt;CONTRIBUTING.md&lt;/code&gt; for full setup instructions, code style guide, and how to add a new LLM provider.&lt;/p&gt;
+    &lt;p&gt;MIT — see LICENSE&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48389586</guid><pubDate>Wed, 03 Jun 2026 20:32:10 +0000</pubDate></item><item><title>Ableton Extensions SDK</title><link>https://www.ableton.com/en/live/extensions/</link><description>&lt;doc fingerprint="967f5b880a789808"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Ableton Extensions, introduced in Live 12.4.5, provide a way for users to develop and use their own tools within Ableton Live using the Ableton Extensions SDK.&lt;/p&gt;
+    &lt;p&gt;Extensions can interact with tracks, clips, MIDI, devices, tempo, and other parts of a Live Set to automate tasks, transform musical data, and customize Live’s capabilities.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48389681</guid><pubDate>Wed, 03 Jun 2026 20:39:34 +0000</pubDate></item></channel></rss>
