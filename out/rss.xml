@@ -1,73 +1,10 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Fri, 19 Jun 2026 16:26:33 +0000</lastBuildDate><item><title>DuckDB Internals: Why Is DuckDB Fast? (Part 1)</title><link>https://www.greybeam.ai/blog/duckdb-internals-part-1</link><description>&lt;doc fingerprint="eb18a84145b07ae0"&gt;
-  &lt;main&gt;&lt;p&gt;DuckDB has gone from a research project at CWI Amsterdam in 2019 to one of the most widely adopted databases of the past decade. The list of places it shows up is long: notebooks, ETL pipelines, dashboards, CI test runners, embedded analytics inside SaaS products, even an iPhone running TPC-H at scale factor 100.&lt;/p&gt;&lt;p&gt;Companies have started building real products around it. MotherDuck is wrapping DuckDB into a cloud data warehouse. BI and data app platforms like Hex, Omni, and Evidence use it as an in-app execution engine and cache. Fivetran's Managed Data Lake Service uses DuckDB inside its data-lake writer for merging and compaction. Rill builds an open-source BI tool on top of it. We use it at Greybeam too, powering millions of queries for BI and analytics workloads.&lt;/p&gt;&lt;p&gt;DuckDB is an in-process analytical SQL database. Analytical means it's optimized for the kind of queries that scan millions of rows to filter, aggregate, and join — not the kind that look up a single record by primary key. In-process means there's no server. You don't connect to DuckDB; you load it as a library inside your program, the same way you'd load NumPy or Polars.&lt;/p&gt;&lt;p&gt;DuckDB has received widespread adoption because it's just so damn easy to use. It ships as a single binary under 20 MB with no external dependencies. You install it with &lt;code&gt;pip install duckdb&lt;/code&gt;, &lt;code&gt;brew install duckdb&lt;/code&gt;, or by linking &lt;code&gt;libduckdb&lt;/code&gt; into a C++ project. It opens any directory of Parquet, CSV, or JSON files like they were already a SQL database.&lt;/p&gt;&lt;p&gt;DuckDB also happens to be one of the fastest single-node analytical engines available, regularly holding its own against entire clusters that cost millions of dollars per year.&lt;/p&gt;&lt;p&gt;This is the first post in a three-part deep dive into DuckDB internals. We'll follow a query from the moment it enters the engine to the moment the result is returned, and at each stage we'll look at the design choice that makes it fast.&lt;/p&gt;&lt;p&gt;DuckDB's speed comes from a handful design choices:&lt;/p&gt;&lt;p&gt;This post covers the path from your SQL to the moment the engine is ready to run the query, plus the storage layer the query will read from. By the end you'll have a clear mental model of DuckDB's setup work and storage layout. Query execution is covered in Part 2 so make sure to subscribe!&lt;/p&gt;&lt;p&gt;You point DuckDB at a 6 GB Parquet file on your laptop. The results come back in under a second. No cluster, no setup, no migration, no &lt;code&gt;CREATE TABLE&lt;/code&gt;. How does that work?&lt;/p&gt;&lt;code&gt;SELECT
-  *
-FROM 'orders.parquet';&lt;/code&gt;&lt;p&gt;Most analytical databases are servers. Snowflake, Postgres, BigQuery, Redshift. You open a connection, send SQL over TCP (a protocol to send data over a network), and wait for results to come back. Along the way, every record in the result is serialized into a wire protocol, transmitted across the network, and deserialized on the other end.&lt;/p&gt;&lt;p&gt;Inside a database, a query result lives as typed values at specific memory addresses. A 64-bit integer here, a pointer to a string there. Those addresses only exist in that process. To send the result to a client on another machine, the database has to rewrite every value into an agreed byte format (Postgres has its own, MySQL has another, with ODBC and JDBC as client-side APIs that drivers expose on top) so it can be pushed through a TCP socket. The client then parses those bytes back into its own native types. Every value may be touched multiple times, once to encode and once to decode, and on a large result set, that work often takes longer than the query itself.&lt;/p&gt;&lt;p&gt;DuckDB is not a server. It's a library. There is no DuckDB daemon, no port, no cluster. You load &lt;code&gt;libduckdb&lt;/code&gt; into your program and call functions directly against it.&lt;/p&gt;&lt;p&gt;In 2017, Mark Raasveldt and Hannes Mühleisen published Don't Hold My Data Hostage, a paper measuring what actually happens when you pull a result set out of a warehouse. They found that the client protocol itself — ODBC, JDBC, and similar row-by-row value APIs — was often the slowest single step in the entire query, sometimes dwarfing the time the database spent computing the answer.&lt;/p&gt;&lt;p&gt;Two costs drive this. The first is raw bandwidth: a typical gigabit Ethernet link caps you at around 125 MB/s, and a large result set can take longer to transmit than it took to compute. The second is per-value overhead. ODBC and JDBC hand back results one row and one value at a time, which means the client makes a separate function call for every field in every row. On a 100-million-row result, that's hundreds of millions of function calls, each one doing its own little memory copy, type check, and string allocation.&lt;/p&gt;&lt;quote&gt;ADBC transfers data between systems in columnar Arrow format, which avoids the row-by-row serialization/deserialization that ODBC and JDBC require. Our friends at Columnar are making this commonplace.&lt;/quote&gt;&lt;p&gt;DuckDB sidesteps both bottlenecks by living in the same process as the client.&lt;/p&gt;&lt;p&gt;When a Python script runs &lt;code&gt;con.sql("SELECT ... FROM my_df")&lt;/code&gt; against a pandas dataframe, DuckDB can use a feature called a replacement scan. Instead of copying the dataframe into an internal table first, DuckDB replaces the table reference with a function that reads from the dataframe when the query runs.&lt;/p&gt;&lt;p&gt;In the best case, DuckDB can read the same underlying buffers the Python process already owns, so it avoids materializing a second full copy of the data. This is zero-copy! If NumPy says "here's a buffer (contiguous chunk of memory) of 1 million int64 values," DuckDB can often read that same buffer directly because it understands the same physical layout.&lt;/p&gt;&lt;p&gt;In practice, whether the path is truly zero-copy depends on the dataframe’s physical layout, column types, null representation, and string storage. If the types or layouts do not line up, DuckDB may allocate converted buffers for some columns.&lt;/p&gt;&lt;p&gt;Arrow is the cleanest version of this story because Arrow is already a columnar, typed memory format designed for sharing data between systems. That is why returning DuckDB results as Arrow, or querying Arrow-backed data, can avoid much of the row-by-row conversion overhead that traditional APIs impose.&lt;/p&gt;&lt;p&gt;Once your SQL reaches DuckDB, it goes through the usual stages: parse, bind, plan, optimize.&lt;/p&gt;&lt;p&gt;The first step is to parse SQL into an abstract syntax tree (AST). DuckDB uses a fork of the Postgres parser, which is part of why DuckDB's dialect feels so familiar.&lt;/p&gt;&lt;p&gt;An AST is a tree representation of your query where each node is a syntactic construct: a SELECT statement, a column reference, a function call, a join, a literal. Parsing turns the flat string &lt;code&gt;SELECT sum(l_quantity) FROM lineitem WHERE l_shipdate &amp;gt; '2024-01-01'&lt;/code&gt; into a structured object the engine can actually reason about.&lt;/p&gt;&lt;p&gt;A tree structure is what lets the rest of the engine do its job. The binder walks the nodes to resolve &lt;code&gt;l_quantity&lt;/code&gt; to a specific column in a specific table. The optimizer pattern-matches subtrees to recognize that the &lt;code&gt;WHERE&lt;/code&gt; predicate can be pushed down into the scan. The physical planner maps function call nodes to executable operators. None of these passes can operate on raw SQL. They need to traverse, pattern-match, and rewrite a typed structure. &lt;/p&gt;&lt;p&gt;The next step is binding, which resolves every name in the AST against the catalog. &lt;code&gt;lineitem&lt;/code&gt; becomes a specific table with a known schema. &lt;code&gt;l_quantity&lt;/code&gt; becomes a specific column with a known type. &lt;code&gt;sum&lt;/code&gt; becomes a specific aggregate function whose input type matches that column. Type checking happens here too: comparing &lt;code&gt;l_shipdate&lt;/code&gt; to the string &lt;code&gt;'2024-01-01'&lt;/code&gt; works because the binder coerces the literal to a date.&lt;/p&gt;&lt;p&gt;The output is a bound tree where every node knows what it refers to and what type it produces. Errors like unresolved columns, ambiguous references, and type mismatches surface at this stage.&lt;/p&gt;&lt;p&gt;At this point, DuckDB has turned raw SQL text into a typed tree. The engine no longer sees &lt;code&gt;l_quantity&lt;/code&gt; as just a string in a query; it sees a specific column with a specific type from a specific table.&lt;/p&gt;&lt;p&gt;In DuckDB, the optimizer consists of a sequence of small, focused transformations that you can, in fact, inspect and disable individually.&lt;/p&gt;&lt;code&gt;D SELECT * FROM duckdb_optimizers();
-┌────────────────────────────┐
-│            name            │
-│          varchar           │
-├────────────────────────────┤
-│ expression_rewriter        │
-│ filter_pullup              │
-│ filter_pushdown            │
-│ empty_result_pullup        │
-│ cte_filter_pusher          │
-│ regex_range                │
-│ in_clause                  │
-│ join_order                 │
-│ deliminator                │
-│ unnest_rewriter            │
-│ unused_columns             │
-│ statistics_propagation     │
-│ common_subexpressions      │
-│ common_aggregate           │
-│ column_lifetime            │
-│ limit_pushdown             │
-│ row_group_pruner           │
-│ top_n                      │
-│ top_n_window_elimination   │
-│ build_side_probe_side      │
-│ compressed_materialization │
-│ duplicate_groups           │
-│ reorder_filter             │
-│ sampling_pushdown          │
-│ join_filter_pushdown       │
-│ extension                  │
-│ materialized_cte           │
-│ sum_rewriter               │
-│ late_materialization       │
-│ cte_inlining               │
-│ common_subplan             │
-│ join_elimination           │
-│ window_self_join           │
-└────────────────────────────┘
-           33 rows          &lt;/code&gt;&lt;p&gt;Running &lt;code&gt;SET disabled_optimizers = 'filter_pullup, join_order'&lt;/code&gt; turns specific passes off so you can see what they were doing. &lt;/p&gt;&lt;p&gt;Here are a few interesting optimizers:&lt;/p&gt;&lt;p&gt;This is a classic database optimization: move &lt;code&gt;WHERE&lt;/code&gt; predicates as close to the scan as possible so you prune data as early as possible. DuckDB first pulls filters up to the top of the plan so they can be combined and reorganized, then pushes them back down as far as possible.&lt;/p&gt;&lt;p&gt;Correlated subqueries traditionally force a database to run the inner query once per outer row, which is slow. DuckDB implements techniques from the Unnesting Arbitrary Queries paper to rewrite these as joins, which are dramatically faster.&lt;/p&gt;&lt;p&gt;During a hash join (more on hash joins here), the build side has to be fully read before the probe side starts. DuckDB takes advantage of that ordering: once the build side is in memory, it computes the min and max of the join key values it actually contains, then pushes those bounds back into the probe-side scan as a runtime filter. If the build side turned out to contain values only between 100 and 200, the probe scan can use the table's zonemaps to skip any row groups outside that range before reading them.&lt;/p&gt;&lt;p&gt;When the build side has fewer than 50 distinct join key values, the filter becomes an &lt;code&gt;IN&lt;/code&gt; list instead of a min-max range, which is more precise and skips even more rows.&lt;/p&gt;&lt;p&gt;Join order is the most consequential decision the optimizer makes. The order in which joins run determines how big each intermediate result is. A query joining six tables has 30,240 possible tree shapes, and the difference between best and worst can be orders of magnitude in runtime. Picking well requires estimating how many rows each candidate join will produce, which depends on table sizes, predicate selectivity, and the order of joins that came before.&lt;/p&gt;&lt;p&gt;DuckDB models the query as a graph. Each table is a node, and each join predicate is an edge connecting the tables it references. The optimizer's job is to pick an order to combine the nodes into a single tree, where each combination is a join. For example, if we have a query joining &lt;code&gt;a&lt;/code&gt; to &lt;code&gt;b&lt;/code&gt; , &lt;code&gt;b&lt;/code&gt; to &lt;code&gt;c&lt;/code&gt;, and &lt;code&gt;c&lt;/code&gt; to &lt;code&gt;d&lt;/code&gt;, the graph might look like this:&lt;/p&gt;&lt;code&gt;a ── b ── c ── d&lt;/code&gt;&lt;p&gt;To find the best tree, DuckDB uses dynamic programming, such as DPhyp or DPccp. Dynamic programming is a fancy name for a simple idea: if you've already figured out the best way to join &lt;code&gt;{a, b, c}&lt;/code&gt;, you can reuse that answer when figuring out the best way to join &lt;code&gt;{a, b, c, d}&lt;/code&gt;. You don't need to re-explore all the orderings inside &lt;code&gt;{a, b, c}&lt;/code&gt; . It does this for every connected pair, then triplet, then quadruplet, etc. &lt;/p&gt;&lt;p&gt;There are dozens more optimizations to explore and the entire optimization phase usually finishes in about a millisecond. After optimization, DuckDB has a logical plan. The next step is to translate that plan into something the engine can actually execute.&lt;/p&gt;&lt;p&gt;If you've enjoyed reading this so far, consider subscribing. We'll continue sharing more about the intricacies of DuckDB and many other query engines.&lt;/p&gt;&lt;p&gt;The best content on query engines, optimization, data engineering, and the post-modern data stack. Specially curated with ❤️ by the Greybeam team.&lt;/p&gt;&lt;p&gt;No spam. Unsubscribe anytime.&lt;/p&gt;&lt;p&gt;Imagine the optimizer hands the engine this plan, written in plain English:&lt;/p&gt;&lt;quote&gt;&lt;p&gt;Read&lt;/p&gt;&lt;code&gt;events&lt;/code&gt;from disk. Drop the rows where&lt;code&gt;event_date&lt;/code&gt;is on or before 2026-01-01. Group what's left by&lt;code&gt;customer_id&lt;/code&gt;and add up&lt;code&gt;amount&lt;/code&gt;. Sort the result by total descending. Return the top 10.&lt;/quote&gt;&lt;p&gt;The engine now has to decide how to actually run those steps in a way that uses the CPU well and parallelizes across cores.&lt;/p&gt;&lt;p&gt;The optimizer's output is still a logical plan. It says what each step needs to compute but not which algorithm should do the computing. Most logical steps have several physical implementations.&lt;/p&gt;&lt;p&gt;Take a join. The same logical join can be turned into any of: hash join, index join, piecewise merge join, cartesian join.&lt;/p&gt;&lt;p&gt;DuckDB walks the logical plan and picks a physical operator for each node based on the shape of its inputs and predicates. The output is a physical plan — a tree of physical operators the executor knows how to run.&lt;/p&gt;&lt;p&gt;We will save the details of vectorized execution for Part 2, but one execution concept is useful now: the physical plan is not run as one giant tree walk. DuckDB breaks it into pipelines.&lt;/p&gt;&lt;p&gt;Think of a pipeline as an assembly line. Data enters at one end and passes through a chain of stations. Each station does one thing (drop a row, transform a column, look up a value in a hash table) and hands the result to the next station. As long as each station can decide what to do with a row using only that row, the line keeps moving. Examples of pipelines:&lt;/p&gt;&lt;p&gt;In DuckDB, a connected chain of streaming stations like this is called a pipeline. Pipelines parallelize cleanly since every CPU core can run its own copy of the assembly line on its own slice of the input.&lt;/p&gt;&lt;p&gt;Some operators can't work this way. They need to see the entire input before they can produce an output.&lt;/p&gt;&lt;code&gt;ORDER BY&lt;/code&gt; can't emit a single sorted row until its seen every row because it doesn't know which row belongs first.&lt;code&gt;GROUP BY&lt;/code&gt; can't emit the final sum until it has accounted for every row in a grouping.&lt;p&gt;These operators are called pipeline breakers or sinks. They mark the end of one pipeline and the beginning of the next. The physical plan is effectively a sequence of pipelines stitched together by sinks.&lt;/p&gt;&lt;p&gt;Going back to our original query, the physical plan may look something like this:&lt;/p&gt;&lt;code&gt;GROUP BY&lt;/code&gt; sink:&lt;code&gt;events&lt;/code&gt; → filter &lt;code&gt;event_date &amp;gt; '2026-01-01'&lt;/code&gt; → write into &lt;code&gt;GROUP BY&lt;/code&gt;'s hash table&lt;code&gt;ORDER BY&lt;/code&gt; sink:&lt;p&gt;Each pipeline runs in parallel internally. Multiple threads run the entire assembly line at once, each on its own morsel of input. Pipelines that depend on each other run in sequence, because pipeline 2 can't start reading until pipeline 1's &lt;code&gt;GROUP BY&lt;/code&gt; is done writing.&lt;/p&gt;&lt;p&gt;A sink runs in three phases: sink, combine, and finalize.&lt;/p&gt;&lt;p&gt;Every thread accepts chunks (DuckDB's 2048 row batches) and writes them into its own local state, for example, its own hash table for a &lt;code&gt;HASH_GROUP_BY&lt;/code&gt;, its own sorted run for &lt;code&gt;ORDER_BY&lt;/code&gt;, its own partial aggregate for &lt;code&gt;UNGROUPED_AGGREGATE&lt;/code&gt;, its own hash table for the build side of &lt;code&gt;HASH_JOIN&lt;/code&gt;. Threads do not share state. If every thread wrote into one shared hash table, they'd be fighting for a lock on every insert. Local state lets each thread sink at full speed with no coordination.&lt;/p&gt;&lt;p&gt;Once every thread finishes writing to its local space, the results have to merge into a single global state. For a &lt;code&gt;GROUP BY&lt;/code&gt;, that means combining the partial sums and counts for each group across all the thread-local hash tables. DuckDB designs the sink so the combine step itself runs across all cores, rather than as a single-threaded merge at the end (covered in Part 3).&lt;/p&gt;&lt;p&gt;The merged global state is read out as the input to the next pipeline. For our &lt;code&gt;GROUP BY&lt;/code&gt;, that'll be a stream of &lt;code&gt;customer_id, total)&lt;/code&gt; rows.&lt;/p&gt;&lt;p&gt;A pipeline runs across all cores by giving each thread its own morsel of input. A sink runs across all cores by giving each thread its own local state and merging in parallel. DuckDB does not try to plan global parallelism for the whole query, it parallelizes one pipeline at a time. This is a part of what makes morsel-driven parallelism (covered in Part 3) and vectorized execution (covered in Part 2) work.&lt;/p&gt;&lt;p&gt;The amazing thing about DuckDB is that it can turn most files into a SQL database, and in fact is often used to directly query file formats like Parquet, CSV, JSON, XLSX, etc.&lt;/p&gt;&lt;p&gt;A DuckDB database is a single file, conventionally &lt;code&gt;.duckdb&lt;/code&gt; or &lt;code&gt;.db&lt;/code&gt;. This was inspired by SQLite. One file is easy to move, backup, and share.&lt;/p&gt;&lt;p&gt;Inside the file, data is broken into fixed-size blocks. The default block size is 256 KB, though smaller block sizes (down to 16 KB) can be configured. The headers contain metadata like magic bytes, storage format versions, database headers, etc.&lt;/p&gt;&lt;p&gt;Every block also carries a checksum, a small value computed from the block's contents. When DuckDB reads a block, it recomputes the checksum and compares. If the values don't match, the data has been corrupted somehow, and DuckDB raises an error. Checksums are important because bits occasionally flip in memory or on disk: a cosmic ray hits a cell, a firmware bug drops a byte, a flaky cable corrupts a write, etc. Cloud data warehouses can mitigate this with built-in error correction in memory and redundancy across disks. Consumer hardware like laptops or edge devices generally have less protection, so checksumming is a useful backstop.&lt;/p&gt;&lt;p&gt;Inside the blocks, columns are stored separately from each other. A row store keeps entire records contiguous on disk. For example:&lt;/p&gt;&lt;code&gt;[id_1, name_1, age_1]
-[id_2, name_2, age_2]
-[id_3, name_3, age_3]&lt;/code&gt;&lt;p&gt;This is fast for queries like &lt;code&gt;SELECT * FROM users WHERE id = 42&lt;/code&gt;, because the record's bytes sit close together physically in memory.&lt;/p&gt;&lt;p&gt;Column stores keep columns contiguous on disk.&lt;/p&gt;&lt;code&gt;[id_1, id_2, id_3]
-[name_1, name_2, name_3]
-[age_1, age_2, age_3]&lt;/code&gt;&lt;p&gt;A query that reads 4 columns from a 300 column table only needs to read those 4 columns. On a row store, all 300 columns would be read and 296 of those will need to be discarded. This is why organizations use column stores (Snowflake, BigQuery, ClickHouse, etc.) for analytics: queries tend to be selective, group on, and aggregate a few columns.&lt;/p&gt;&lt;p&gt;Each column is split into row groups of up to 122,880 rows, and within a row group, into column segments that typically map to a single 256 KB block. A row group is a unit of parallelism. A query running on 8 threads should have at least 8 row groups in scope to keep every thread busy.&lt;/p&gt;&lt;p&gt;Each row group also carries a zone map. A zone map contains the min and max values in a row group, plus a null count. When a scan runs with a predicate like &lt;code&gt;WHERE event_date &amp;gt; '2026-01-01'&lt;/code&gt;, DuckDB checks each row group's max value before reading in any of its data. Row groups whose max &lt;code&gt;event_date&lt;/code&gt; is on or before &lt;code&gt;'2026-01-01'&lt;/code&gt; are skipped entirely.&lt;/p&gt;&lt;code&gt;This a similar technique major cloud data warehouses use, just under different names. Snowflake calls it micro-partition pruning, BigQuery calls it block pruning, ClickHouse uses  minmax data skipping indexes.&lt;/code&gt;&lt;p&gt;Zone map effectiveness depends heavily on column ordering. A column that's sorted or naturally ordered by an insert timestamp gives narrow min-max spans per row group. A column whose values are scattered randomly across the table gives spans that cover wide ranges, and the zonemap is much less effective.&lt;/p&gt;&lt;p&gt;Most of the time, practitioners aren't querying DuckDB tables. They're pointing DuckDB at Parquet files. There are two common patterns:&lt;/p&gt;&lt;code&gt;-- Query a parquet file directly
-SELECT
-  customer_id
-  , SUM(amount) as total_amount
-FROM read_parquet('/my/nice/files/*.parquet', union_by_name=TRUE)
-WHERE
-  event_date &amp;gt; '2026-01-01'
-GROUP BY ALL;
-
--- Or load it into a DuckDB table first
-CREATE TABLE events AS
-SELECT * FROM read_parquet('s3://bucket/events/*.parquet');&lt;/code&gt;&lt;p&gt;Why is querying Parquet files so fast? DuckDB hasn't converted the data into its own format. There's no zone map built by DuckDB, no DuckDB-side compression, no &lt;code&gt;.duckdb&lt;/code&gt; file. And yet, some queries run roughly as fast as a native DuckDB table.&lt;/p&gt;&lt;p&gt;Parquet has similar design principles as DuckDB's native format:&lt;/p&gt;&lt;p&gt;When querying Parquet, DuckDB reads the footer to discover the file's schema and row group statistics. It uses those statistics to determine which row groups can satisfy query predicates. For each surviving row group, it reads only the column chunks the query needs, decompresses them, and feeds them into the pipeline-and-sink we described earlier.&lt;/p&gt;&lt;p&gt;When a file is stored remotely, DuckDB doesn't download the whole file. It issues an HTTP request to fetch just the footer, decides which row groups and column chunks it needs, then issues requests to fetch only those bytes. A &lt;code&gt;WHERE&lt;/code&gt; clause that prunes properly can dramatically increase performance over the wire.&lt;/p&gt;&lt;p&gt;CSV is the opposite of Parquet, it's not self-describing. Parquet effectively hands DuckDB a schema, statistics, chunked columns with compressed data. CSVs don't. They're just text. DuckDB needs to figure out what character separates columns, are values quoted, how are quotes escaped, does the first row contain column names, and what type each column should be. DuckDB does this with its CSV sniffer.&lt;/p&gt;&lt;code&gt;SELECT *
-FROM 'events.csv';
-
--- Alternatively
-SELECT *
-FROM read_csv('events.csv');&lt;/code&gt;&lt;p&gt;When DuckDB reads a CSV, it automatically tries to detect three main things: the dialect, the column types, and whether the file has a header row.&lt;/p&gt;&lt;p&gt;The dialect is the file’s parsing grammar: delimiter, quote character, escape character, and newline style. DuckDB tests candidate dialects and chooses the one that produces the most consistent rows and the highest number of columns. For example, a file like this:&lt;/p&gt;&lt;code&gt;Company|Category|City|IsSuperCool
-DuckDB|OLAP database|Amsterdam, Netherlands|True
-Snowflake|data warehouse|Bozeman, MT|True
-BigQuery|data warehouse|Mountain View, CA|N/A
-Greybeam|multi-engine router|San Francisco, CA|True&lt;/code&gt;&lt;p&gt;Should be split on &lt;code&gt;|&lt;/code&gt;, not &lt;code&gt;,&lt;/code&gt;, even though the city names contain commas. The sniffer can figure that out because &lt;code&gt;|&lt;/code&gt; produces a consistent four-column table.&lt;/p&gt;&lt;p&gt;After the dialect is chosen, DuckDB detects column types by trying to convert sampled values in each column to candidate types. If a value cannot be converted to a candidate type, that type is removed from the candidate set for that column. After the samples are processed, DuckDB chooses the remaining candidate type with the highest priority. The documented default candidate types, in priority order, are &lt;code&gt;NULL&lt;/code&gt;, &lt;code&gt;BOOLEAN&lt;/code&gt;, &lt;code&gt;TIME&lt;/code&gt;, &lt;code&gt;DATE&lt;/code&gt;, &lt;code&gt;TIMESTAMP&lt;/code&gt;, &lt;code&gt;TIMESTAMPTZ&lt;/code&gt;, &lt;code&gt;BIGINT&lt;/code&gt;, &lt;code&gt;DOUBLE&lt;/code&gt;, and &lt;code&gt;VARCHAR&lt;/code&gt;. Since every value can be represented as &lt;code&gt;VARCHAR&lt;/code&gt;, it is the fallback type.&lt;/p&gt;&lt;p&gt;Header detection comes next. If the first row looks different from the rows below it, for example, strings like &lt;code&gt;Company&lt;/code&gt; and &lt;code&gt;Category&lt;/code&gt; are treated as the column names. Otherwise it generates default names like &lt;code&gt;column0&lt;/code&gt;, &lt;code&gt;column1&lt;/code&gt;, etc.&lt;/p&gt;&lt;p&gt;The sniffer works from a sample rather than scanning the full file. The default sample size is 20,480 rows. You can increase this, or set &lt;code&gt;sample_size = -1&lt;/code&gt; to inspect the whole file.&lt;/p&gt;&lt;p&gt;Clearly a lot of work happens before a query actually runs. It gets parsed into an AST, bound to the schema, optimized through ~30 passes, and compiled into a physical plan. Even the storage layer does so much work in advance.&lt;/p&gt;&lt;p&gt;Part 2 picks up at execution. Stay tuned!&lt;/p&gt;&lt;p&gt;At Greybeam, this is part of why building a multi-engine router is so exciting for the future of data. It's clear that DuckDB is fast. DuckDB's strengths are real. So are Snowflake's. So are BigQuery's.&lt;/p&gt;&lt;p&gt;We believe in a future where data teams can use the query engine built to run each query the fastest. Come along for the ride.&lt;/p&gt;&lt;p&gt;The best content on query engines, optimization, data engineering, and the post-modern data stack. Specially curated with ❤️ by the Greybeam team.&lt;/p&gt;&lt;p&gt;No spam. Unsubscribe anytime.&lt;/p&gt;&lt;p&gt;Kyle Cheung&lt;/p&gt;&lt;p&gt;Co-founder &amp;amp; CEO, Greybeam optimization for you, you, you, you, and you&lt;/p&gt;&lt;p&gt;Teams like Xometry and Headset have already cut costs by &amp;gt;75%. See what your numbers look like.&lt;/p&gt;&lt;/main&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Fri, 19 Jun 2026 18:13:35 +0000</lastBuildDate><item><title>Show HN: Metiq: a real time 3D globe for 100 public datasets</title><link>https://metiq.space</link><description>&lt;doc fingerprint="fbffffbd6fdd7db7"&gt;
+  &lt;main&gt;
+    &lt;p&gt;loading metiq…&lt;/p&gt;
+  &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48553388</guid><pubDate>Tue, 16 Jun 2026 11:07:08 +0000</pubDate></item><item><title>Reinventing the Renaissance</title><link>https://drb.ie/article/reinventing-the-renaissance/</link><description>&lt;doc fingerprint="b7019955a862a289"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48556082</guid><pubDate>Tue, 16 Jun 2026 14:43:38 +0000</pubDate></item><item><title>Reinventing the Renaissance</title><link>https://drb.ie/article/reinventing-the-renaissance/</link><description>&lt;doc fingerprint="b7019955a862a289"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Reinventing the Renaissance&lt;/head&gt;
     &lt;p&gt;This high-spirited and highly personal approach to writing about the Renaissance is anything but ‘academic’.&lt;/p&gt;
@@ -201,25 +138,7 @@ Greybeam|multi-engine router|San Francisco, CA|True&lt;/code&gt;&lt;p&gt;Should 
     &lt;p&gt;If there is nothing ignoring a file, the &lt;code&gt;git check-ignore -v&lt;/code&gt; command produces no output.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48583356</guid><pubDate>Thu, 18 Jun 2026 10:29:20 +0000</pubDate></item><item><title>Hospitals and universities repurposing drugs at lower cost</title><link>https://www.kcl.ac.uk/news/hospitals-and-universities-repurposing-drugs-at-90-lower-cost</link><description>&lt;doc fingerprint="2c7d70ab320b25c6"&gt;
-  &lt;main&gt;
-    &lt;quote&gt;&lt;p&gt;This alternative research system offers enormous potential to help patients at a fraction of the cost, and governments around the world are starting programmes to formally recognise the research in the system. The drugs are already cheap because they are generic and the programmes will ensure patients have access."&lt;/p&gt;Dr Johnathon Liddicoat, Reader in Law at King’s College London&lt;/quote&gt;
-    &lt;p&gt;17 June 2026&lt;/p&gt;
-    &lt;head rend="h2"&gt;Hospitals and universities repurposing drugs at 90% lower cost&lt;/head&gt;
-    &lt;p&gt;Universities and hospitals are repurposing existing drugs through late-stage trials with funded costs up to 90% lower than those taking place in the pharmaceutical industry.&lt;/p&gt;
-    &lt;p&gt;This “hidden” research system, which operates outside of the patent system, has huge potential to regularly provide society with affordable treatments.&lt;/p&gt;
-    &lt;p&gt;Examples of this have included using a cancer drug to treat a leading cause of blindness, changing a drug from treating breast cancer to preventing it, and using an old anti-inflammatory drug to treat Covid.&lt;/p&gt;
-    &lt;p&gt;The new research led by King’s College London and published in the Cambridge Law Journal explores the parallel drug innovation system taking place outside of pharmaceutical companies.&lt;/p&gt;
-    &lt;p&gt;The research shows that hospitals and universities are conducting substantial numbers of late-stage clinical trials funded at less than 10% of pharmaceutical companies’ reported costs.&lt;/p&gt;
-    &lt;p&gt;This is in part because universities and hospitals are able to carry out these trials with fewer resources than industry.&lt;/p&gt;
-    &lt;p&gt;In drug research and development there are three main barriers to innovation: expertise, risk and capital. These barriers are high for organisations that develop new drugs. However, the barriers are lower when repurposing generic drugs.&lt;/p&gt;
-    &lt;p&gt;The expertise required when repurposing drugs is lower because the drug is well studied and already manufactured, investigators select projects based on their expertise, and the trials are approved by grant and ethics bodies. Risk is lower because no organisation’s financial viability depends on the authorisation and sales of the drug.&lt;/p&gt;
-    &lt;p&gt;The research also explores how clinicians and scientists have different motivations for repurposing generic drugs compared to the incentives that the patent system offers. These include helping patients recover more quickly and publishing studies to progress their careers.&lt;/p&gt;
-    &lt;p&gt;The process of finding new uses for already authorised drugs is commonly known as “repurposing”. Early in a drug’s lifecycle, companies are interested in repurposing, and recent data indicates that, on average, they obtain regulatory authorisations for 32 new uses annually.&lt;/p&gt;
-    &lt;p&gt;These approvals permit the drugs to be marketed for those new uses in addition to the original use. However, once generic drugs enter the market, companies lose interest in repurposing due to competition. Yet, it is also at this moment that the new system flourishes, with hospitals and universities using cheap, generic versions of the drugs in their research.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48583386</guid><pubDate>Thu, 18 Jun 2026 10:33:22 +0000</pubDate></item><item><title>CS 6120: Advanced Compilers: The Self-Guided Online Course (2020)</title><link>https://www.cs.cornell.edu/courses/cs6120/2025fa/self-guided/</link><description>&lt;doc fingerprint="6ec0515d463a0ae8"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48583356</guid><pubDate>Thu, 18 Jun 2026 10:29:20 +0000</pubDate></item><item><title>CS 6120: Advanced Compilers: The Self-Guided Online Course (2020)</title><link>https://www.cs.cornell.edu/courses/cs6120/2025fa/self-guided/</link><description>&lt;doc fingerprint="6ec0515d463a0ae8"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;CS 6120: Advanced Compilers: The Self-Guided Online Course&lt;/head&gt;
     &lt;p&gt;CS 6120 is a PhD-level Cornell CS course by Adrian Sampson on programming language implementation. It covers universal compilers topics like intermediate representations, data flow, and “classic” optimizations as well as more research-flavored topics such as parallelization, just-in-time compilation, and garbage collection. The work consists of reading papers and open-source hacking tasks, which use LLVM and an educational IR invented just for this class.&lt;/p&gt;
@@ -272,40 +191,7 @@ Greybeam|multi-engine router|San Francisco, CA|True&lt;/code&gt;&lt;p&gt;Should 
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48583606</guid><pubDate>Thu, 18 Jun 2026 11:04:31 +0000</pubDate></item><item><title>Modos Color Monitor Pushes E-Paper Displays Further</title><link>https://spectrum.ieee.org/modos-e-paper-monitor</link><description>&lt;doc fingerprint="72f6801103d587d8"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Last fall, Modos debuted the Paper Monitor and Dev Kit, an open-source e-paper display kit that hit a record 75-hertz refresh rate. The project was successful, raising almost double its US $110,000 goal.&lt;lb/&gt;Now the two-person startup is back fundraising for Modos Flow, a 13.3-inch color e-paper monitor with a higher native resolution of 3,200 x 2,400, touch input, and a 60-Hz refresh rate, which is made possible by a new display controller called Enchanter. &lt;lb/&gt;With the Flow’s crowdfunding campaign now live on Crowd Supply, cofounders Alexander Soto and Wenting Zhang spoke with IEEE Spectrum about the engineering behind it and the lessons they’ve learned on their crowdfunding journey.&lt;/p&gt;
-    &lt;p&gt;This conversation has been edited and condensed for clarity.&lt;/p&gt;
-    &lt;p&gt;What is the Modos Flow, and how does it improve on the Paper Monitor Dev Kit?&lt;/p&gt;
-    &lt;p&gt;Wenting Zhang: The previous Paper Dev Kit is a DIY kit. You get the screen and the board, but nothing else. You add your own shell or embed it in another project. A lot of people connect it to a Raspberry Pi, for example. &lt;lb/&gt;The Modos Flow is a complete monitor. The only port is USB Type-C, so you’re supposed to connect it to a laptop or PC.&lt;/p&gt;
-    &lt;p&gt;The Flow’s higher resolution is enabled by a new open-source display controller board called Enchanter. What’s changed?&lt;/p&gt;
-    &lt;p&gt;Zhang: The new board has a larger, newer FPGA [field-programmable gate array], has double the DDR3 memory bandwidth, and a power supply that delivers higher currents for the more power-hungry screen. &lt;lb/&gt;But mostly, it’s about the display input. The input decoder chip is a Chrontel CH7516 DisplayPort-to-LVDS converter. It supports DisplayPort 1.1 rather than 1.0, enabling higher resolutions. &lt;lb/&gt;We want the whole thing open source, so all our parts need to have open documentation with nothing gated behind an NDA [non-disclosure agreement]. This chip wasn’t available when we launched the Paper Dev Kit campaign, so we had no way to support DisplayPort 1.1 while keeping things open. The new chip made DisplayPort 1.1 possible&lt;/p&gt;
-    &lt;p&gt;A common skepticism about e-paper monitors is that faster refresh rates don’t matter if pixel response is still slow. What’s your response?&lt;/p&gt;
-    &lt;p&gt;Zhang: It depends on how you measure it. On LCDs, we measure how long a pixel takes to go from 10 percent to 90 percent of its target brightness. Measured that way, the older E Ink screens on Glider come in around 100 milliseconds. The latest screen, shipping with Enchanter, is more or less 50 milliseconds.&lt;/p&gt;
-    &lt;p&gt;That’s still slower than an LCD, but the first-generation iPad shipped with an IPS screen with a response time around 30 milliseconds. If people were okay with that, 50 isn’t far off.&lt;/p&gt;
-    &lt;p&gt;Also, 10-to-90 percent isn’t a fair perceptual metric. When you move the mouse, what you feel as latency isn’t the pixel fully changing, but when it starts changing. That’s what we optimize for. A higher frame rate shortens time spent buffering, and our controller adds no buffering of its own, so we can minimize the time from user input to onscreen response.&lt;/p&gt;
-    &lt;p&gt;You’ve now taken two products through crowdfunded manufacturing. What were the biggest challenges?&lt;/p&gt;
-    &lt;p&gt;Alexander Soto: The initial plan never goes the way you think. There are always factors outside your control. A chip crisis, tariffs, manufacturing delays. The Flow’s display bezel uses a very specific color-mixing solution, for example, and it took about a month to get that one shade of white just right.&lt;/p&gt;
-    &lt;p&gt;Zhang: Manufacturing, even at a smaller scale, is hard. Factories do exactly what you tell them, and when anything is a tiny bit off, they halt and wait for input.&lt;/p&gt;
-    &lt;p&gt;For example, with the 6-inch model of our prior project, our initial 100 samples were all good, so our instructions for the next batch didn’t include testing the screens. Then we ordered 500 for mass production, and 300 were defective. When we discovered this, we had to tear down 300 assembled units. I tested more than 300 panels myself.&lt;/p&gt;
-    &lt;p&gt;I learned it’s important to be close to the factory or to hire someone local. I used to think it’s as simple as sending an order to the factory online and the parts just get delivered. It never works like that.&lt;/p&gt;
-    &lt;p&gt;Soto: Also, to add to that, reduce your scope and increase your timeline. When we came to doing Enchanter, we thought, “Yeah, we can get this going in a few months.” But it took eight months, even though we already had the prototype. Whatever your gut feeling is on the time it will take, double it.&lt;/p&gt;
-    &lt;p&gt;Why keep going down this path rather than seeking investment?&lt;/p&gt;
-    &lt;p&gt;Soto: I think I’m just stubborn [laughs]. But really, I’m happiest seeing someone hack the dev kit. One community member went from knowing nothing about PCBs [printed circuit boards] or FPGAs [field-programmable gate arrays] to building a board from scratch and retrofitting it into a laptop within a year. We’re seeding a community where each person has their own ideas to build.&lt;/p&gt;
-    &lt;p&gt;Zhang: We discussed both investment and collaborating with established companies, but neither went through. We’re too small to win against a bigger company, and the e-paper monitor market is also just small.&lt;lb/&gt;From an investor’s perspective, there isn’t enough money to be earned. They value our engineering capability but they’d rather direct us to do something else. But that’s not what we want to do.&lt;/p&gt;
-    &lt;p&gt;What’s your advice for engineers considering a crowdfunded project?&lt;/p&gt;
-    &lt;p&gt;Soto: Build community. Before our first campaign, we spent a year attending conferences, writing posts, and sharing our work. It’s good to have people who know you, who’ve shaken your hand and tried the product. You can’t engineer in a silo.&lt;/p&gt;
-    &lt;p&gt;Zhang: If you have the idea and think it could work, just do it. I have way too many prototypes I didn’t continue, and other people turned the same idea into a product, which in many cases seemed worse than my prototype. Yet they were successful. Don’t make yourself regret the things you didn’t do.&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;How E Ink Developed Full-Color e-Paper ›&lt;/item&gt;
-      &lt;item&gt;CES 2026 Preview: E Ink Smartphone, Allergen Detector, and More ›&lt;/item&gt;
-      &lt;item&gt;A Bright New Page in Portable Displays ›&lt;/item&gt;
-      &lt;item&gt;E-Paper Display Reaches the Realm of LCD Screens ›&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Matthew S. Smith is a freelance consumer technology journalist with 17 years of experience and the former Lead Reviews Editor at Digital Trends. An IEEE Spectrum Contributing Editor, he covers consumer tech with a focus on display innovations, artificial intelligence, and augmented reality. A vintage computing enthusiast, Matthew covers retro computers and computer games on his YouTube channel, Computer Gaming Yesterday.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48583897</guid><pubDate>Thu, 18 Jun 2026 11:41:21 +0000</pubDate></item><item><title>I found 10k GitHub repositories distributing Trojan malware</title><link>https://orchidfiles.com/github-repositories-distributing-malware/</link><description>&lt;doc fingerprint="ab0315c70de00bc8"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48583606</guid><pubDate>Thu, 18 Jun 2026 11:04:31 +0000</pubDate></item><item><title>I found 10k GitHub repositories distributing Trojan malware</title><link>https://orchidfiles.com/github-repositories-distributing-malware/</link><description>&lt;doc fingerprint="ab0315c70de00bc8"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;I discovered a large-scale malware distribution campaign on GitHub&lt;/head&gt;
     &lt;p&gt;This is the story of how I found 10,000 repositories on GitHub that distribute Trojan malware. They are all from different contributors, have different names, and are not forks of other repositories. But they share a common pattern, which is what allowed me to write a script to find such repositories.&lt;/p&gt;
@@ -378,187 +264,180 @@ Greybeam|multi-engine router|San Francisco, CA|True&lt;/code&gt;&lt;p&gt;Should 
     &lt;p&gt;I also publish all new essays and notes on Telegram, Bluesky and X.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48583928</guid><pubDate>Thu, 18 Jun 2026 11:45:43 +0000</pubDate></item><item><title>The Korean telecom giant at the center of Anthropic's Mythos controversy</title><link>https://www.wired.com/story/sk-telecom-anthropic-mythos-export-controls/</link><description>&lt;doc fingerprint="3ecbdf15e58f9bc9"&gt;
-  &lt;main&gt;
-    &lt;p&gt;The Trump administration’s move to impose export controls on Anthropic’s most powerful AI technology followed a spat over the company granting South Korean telecom giant SK Telecom access to its Claude Mythos model, according to people familiar with the matter. US officials were concerned about what they alleged were SK Telecom’s ties to China, those people said.&lt;/p&gt;
-    &lt;p&gt;Those concerns appear to have compounded when Amazon later flagged vulnerabilities it identified in Fable 5 to the White House. Fable 5 is a highly safeguarded version of Mythos that Anthropic released to the public on June 9. The Amazon researchers claimed that it was possible to circumvent some of Fable 5’s guardrails and access Mythos’ formidable cybercapabilities, though Anthropic and outside cybersecurity experts have argued these risks are not unique to Claude.&lt;/p&gt;
-    &lt;p&gt;The confluence of events is what ultimately led the White House to determine that it could not trust Anthropic to safeguard its most advanced AI technology, according to a person close to the Trump administration. On Friday, it ordered Anthropic to revoke access to Mythos and Fable 5 for all foreign nationals, including immigrants inside the US.&lt;/p&gt;
-    &lt;p&gt;Rather than gate access to its technology based on nationality, a process that would be difficult to implement while also preserving privacy, Anthropic decided it was better to disable access to the models entirely. The White House and Anthropic remain at odds after days of negotiations about bringing Claude Mythos and Fable 5 back online.&lt;/p&gt;
-    &lt;p&gt;Because Claude Mythos is exceptionally skilled at identifying software vulnerabilities, Anthropic restricted early access to a small group of trusted organizations through a program called Project Glasswing. Earlier this month, SK Telecom, South Korea’s largest wireless carrier, became one of roughly 150 companies to receive access to Mythos as Anthropic expanded the program “following several weeks of close collaboration” with outside experts and the US government.&lt;/p&gt;
-    &lt;p&gt;Anthropic declined to comment. The White House and SK Telecom did not immediately respond to a request for comment. The Washington Post previously reported that Trump administration officials were alarmed to learn that the Mythos recipients included a “South Korean telecommunications company” they believed had links to China, though the article did not name the firm. In response to that reporting, SK Telecom told a Korean newspaper that the “anonymous insider’s remarks in foreign media lack verified facts, and our company has no ties to China.”&lt;/p&gt;
-    &lt;p&gt;A person close to Anthropic said the company viewed SK Telecom’s access to Mythos and the vulnerabilities that Amazon identified as separate issues. They noted that the letter the US government sent to Anthropic demanding that it restrict access to Claude Mythos and Fable 5 solely to US nationals doesn’t reference the Korean company or China.&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row&gt;
-        &lt;cell role="head"&gt;Got a Tip?&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Are you a current or former Anthropic or US government employee who wants to talk about what’s happening? We’d like to hear from you. Using a nonwork phone or computer, contact the reporters securely on Signal at louise_matsakis.83 and mzeff.88&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Earlier this month, shortly after Anthropic announced Project Glasswing’s latest expansion, the White House asked Anthropic to revoke SK Telecom’s access to Mythos, according to a person close to the AI lab. The company immediately complied, sources tell WIRED, and the US government did not threaten to put export controls on the model at the time.&lt;/p&gt;
-    &lt;p&gt;SK Telecom has poured capital into Anthropic several times, including a $100 million investment in 2023 that coincided with the formation of a commercial partnership to develop an AI model tailored to the telecommunications industry. It was one of several Korean organizations to participate in Project Glasswing, along with Samsung Electronics and the Korea Internet and Security Agency.&lt;/p&gt;
-    &lt;p&gt;While SK Telecom itself does not appear to have large operations in China, it’s part of a much bigger conglomerate called SK Group, whose affiliates maintain extensive business interests in the country spanning semiconductors, energy, and other industries.&lt;/p&gt;
-    &lt;p&gt;In 2024, SK Telecom generated only about $1.9 million in revenue from China, primarily from investment-related activities, and employed just seven people there, according to its annual report.&lt;/p&gt;
-    &lt;p&gt;But its involvement in China's telecom industry stretches back more than 20 years. In 2004, SK Telecom and China Unicom, a state-owned telecommunications operator, formed a joint venture called UNISK to provide wireless internet and mobile content services in China. It was one of the first joint ventures between a foreign company and a Chinese carrier.&lt;/p&gt;
-    &lt;p&gt;In 2006, SK Telecom invested $1 billion in convertible bonds issued by China Unicom's Hong Kong–listed unit, which were eventually converted into a roughly 6.6 percent equity stake. But the partnership began unwinding several years later. SK Telecom sold its stake in China Unicom back to the Chinese carrier in 2009 for approximately $1.3 billion, though it has continued to maintain a small financial interest connected to the venture. In its 2025 annual filing with the US Securities and Exchange Commission, SK Telecom listed an investment in UNISK valued at roughly $17 million.&lt;/p&gt;
-    &lt;p&gt;In 2021, the first Trump administration restricted US investment in China Unicom as part of a broader effort targeting Chinese firms Washington said were linked to the country's military and intelligence sectors. In April of this year, citing national security concerns, the US Federal Communications Commission proposed barring US telecom firms from interconnecting with China Unicom and other Chinese carriers, a move that China Unicom recently warned could disrupt global communications.&lt;/p&gt;
-    &lt;p&gt;Hugo Lowell and Zeyi Yang contributed reporting.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48584484</guid><pubDate>Thu, 18 Jun 2026 12:44:09 +0000</pubDate></item><item><title>W Social, public institutions and the theater of European digital sovereignty</title><link>https://blog.elenarossini.com/w-social-public-institutions-and-the-theater-of-european-digital-sovereignty/</link><description>&lt;doc fingerprint="ad08970b98c3054f"&gt;
-  &lt;main&gt;
-    &lt;p&gt;In the past few months I have unwittingly become an expert on all things W Social: the microblogging platform that is a fork of Bluesky and bills itself as Europe’s alternative to X, with identity verification “to fight bots and misinformation” and data hosted in Europe “to promote European digital sovereignty”. Why am I fascinated by this topic? I find the discrepancies between their public image and the reality behind the scenes truly striking.&lt;/p&gt;
-    &lt;p&gt;Over the course of the past few days I have received sensational information that no media organization has so far reported. So here we go, with another article about W Social on their big week, as they are set to open their public beta to their waiting list later today.&lt;/p&gt;
-    &lt;p&gt;But first: if you missed my previous articles on the topic, you can find them here:&lt;/p&gt;
-    &lt;p&gt;This article represents my personal opinions, commentary, and conclusions formed through independent research using publicly available sources. Any characterizations, interpretations, or inferences are presented as opinion, not as statements of objective fact. Readers are encouraged to review the referenced materials and draw their own conclusions.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Prominent Institutions and Government Officials Move their Accounts to W Social&lt;/head&gt;
-    &lt;p&gt;On Friday June 12th I received a tip: that the ATproto accounts of the European Commission, its president Ursula von der Leyen, the European Central Bank and its president Christine Lagarde had been migrated from Bluesky PBC to W Social’s servers.&lt;/p&gt;
-    &lt;p&gt;I immediately double-checked the information on the website clearsky.app (which indexes information about ATproto) and saw this for myself:&lt;/p&gt;
-    &lt;p&gt;I was incredibly surprised by this move: W Social is a private, for-profit enterprise controlled by Swedish entrepreneurs which had a really spotty launch and isn’t forthcoming with communications about their tech stack.&lt;/p&gt;
-    &lt;p&gt;Europe already has an ATproto social network - Eurosky - run by a non-profit foundation - Modal - that is building everything in the open, with full transparency, sharing all the steps in their development roadmap:&lt;/p&gt;
-    &lt;p&gt;Last week Eurosky shared news about their strides in attaining greater independence from Bluesky PBC’s infrastructure: they are now mirroring the did:plc directory and set up their own firehose running on European infrastructure; they even launched a new platform/webapp - mu.social - that is a full replacement of the Bluesky app.&lt;/p&gt;
-    &lt;p&gt;If these concepts sound foreign to you, let me attempt to explain things in plain terms. Social networks powered by ATproto are built on composable, modular services that can be independently hosted. To be fully sovereign you need:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;your own Personal Data Server (PDS), which stores user accounts, posts, likes, follows, profile data and also handles identity and signing keys;&lt;/item&gt;
-      &lt;item&gt;a relay, which aggregates messages from PDS instances and makes them available to AppViews as a data stream;&lt;/item&gt;
-      &lt;item&gt;an AppView, which indexes data from relays and provides a search engine;&lt;/item&gt;
-      &lt;item&gt;a moderation service, which manages labels, blocks and mutes;&lt;/item&gt;
-      &lt;item&gt;a PLC (Public Key Infrastructure), which maps usernames to public identities.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;While self-hosting an ATproto Personal Data Server is now relatively easy and affordable, running the other components requires great resources and technical expertise.&lt;/p&gt;
-    &lt;p&gt;W Social has made promises of hosting their users’ data in Europe but they haven’t been forthcoming about their roadmap and whether or not they are relying on Bluesky PBC’s infrastructure for the other services.&lt;/p&gt;
-    &lt;p&gt;Thus my surprise when I heard about the migration of such prominent institutional accounts. Had they done due diligence, I wondered?&lt;/p&gt;
-    &lt;head rend="h2"&gt;Exclusive: W Social may have quietly become closed-source&lt;/head&gt;
-    &lt;p&gt;Then on Saturday I received another tip. Someone wrote to me:&lt;/p&gt;
-    &lt;quote&gt;W Social have taken down the public repo of their app: https://github.com/w-social-eu. You can still look at the last state from early March in the archive, but right now it's no longer public. That means that the European Commission has factually migrated their data from an open source platform (Bluesky) into a closed source platform (W Social).&lt;/quote&gt;
-    &lt;p&gt;I immediately checked GitHub as well as Codeberg and other Git platforms and could not find any traces of W Social (even after trying alternate spellings).&lt;/p&gt;
-    &lt;p&gt;This was another surprising piece of news in the context of the recent unveiling of the Tech Sovereignty Package by the European Commission.&lt;/p&gt;
-    &lt;p&gt;In their announcement on June 3 (only a week before the account move to W Social), the European Commission had expressed the desire to “[strengthen] Europe’s tech sovereignty” via a European technological sovereignty package that focused on four core areas. The third area is:&lt;/p&gt;
-    &lt;quote&gt;Strengthening digital autonomy through open source – the open source strategy will scale up open source alternatives in priority areas, invest in skills, start-ups and digital infrastructure, and support greater use of open source in public administrations.&lt;/quote&gt;
-    &lt;p&gt;I wonder if the person in charge of the European Commission’s ATproto account migrations knew that W Social has quietly gone closed-source?&lt;/p&gt;
-    &lt;head rend="h2"&gt;European Big Tech?&lt;/head&gt;
-    &lt;p&gt;I contacted Aral Balkan, the co-founder of the Small Technology Foundation, asking him to help me unpack this news.&lt;/p&gt;
-    &lt;p&gt;According to Balkan, the move by the W Social developers - deleting their code from GitHub - is highly unusual:&lt;/p&gt;
-    &lt;quote&gt;The standard practice is to deprecate the old repo and put up a message telling people where the new one is. Not delete it.&lt;/quote&gt;
-    &lt;p&gt;Balkan continued:&lt;/p&gt;
-    &lt;quote&gt;It’s very concerning if the removal of their public repository signals that W Social is taking their implementation closed source. Furthermore, I couldn’t find the source of their web client and mobile apps on their GitHub either. There have been so many red flags with W Social since its hastily cobbled-together announcement at Davos that they might as well make a red flag their logo.&lt;/quote&gt;
-    &lt;p&gt;For context, the repositories of Bluesky and its forks Eurosky and Blacksky are all publicly available on GitHub... and W Social's repository was as well, until some time in March.&lt;/p&gt;
-    &lt;p&gt;It was simply removed without any notice.&lt;/p&gt;
-    &lt;p&gt;Balkan then addressed the issue of identity verification - which is required by W Social:&lt;/p&gt;
-    &lt;quote&gt;It’s very concerning – but again, not surprising – to see folks from the European Commission jumping on this particular bandwagon. Especially given the commission’s push for identity verification (under the guise of age verification – as lobbied for by Meta) and W Social’s plans to make identity verification a core part of their system. My fear is that W Social is just another for-profit Big Tech startup that happens to be based in the EU. We don’t need that. We don’t need more European surveillance capitalists and people farmers. We need ethical alternatives working for the common good.&lt;/quote&gt;
-    &lt;p&gt;Indeed, there is plenty of evidence showing how leaders from the world of Big Tech are connected to W Social.&lt;/p&gt;
-    &lt;p&gt;In my previous article about the company I had only mentioned one person who is on their Board of Advisors: Yariv Adan, a former AI lead at Alphabet (Google). But the full picture of their advisory board is very telling, as it comprises prominent people from the world of European politics as well as Big Tech executives.&lt;/p&gt;
-    &lt;p&gt;Marc Placzek in particular is an interesting choice: he was a Chief Privacy Officer at Paypal (a company co-founded by tech oligarch Peter Thiel), and he currently serves this role at Tools for Humanity (a company co-founded by another tech oligarch: OpenAI CEO Sam Altman). What is Tools for Humanity's mission? To “create a global ID, a global currency, and an app enabling payment with World's own digital token” with irises scanned to verify one’s identity.&lt;/p&gt;
-    &lt;p&gt;For more information on Tools for Humanity and World(coin):&lt;/p&gt;
-    &lt;head rend="h2"&gt;Questions for European public institutions on W Social&lt;/head&gt;
-    &lt;p&gt;I have so many questions that I wish I could address to people working at European public institutions who now have ATproto accounts on W Social.&lt;/p&gt;
-    &lt;p&gt;Here are my top 3:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Are you aware that the W Social network may have become closed-source?&lt;/item&gt;
-      &lt;item&gt;Do you know if all the components in W Social’s ATproto stack are self-hosted in Europe (not just their PDS, but also their relay, AppView and moderation)?&lt;/item&gt;
-      &lt;item&gt;Why didn’t you move to Eurosky instead?&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;I am curious to see how the beta launch of W Social will go today. And which other prominent accounts will join them.&lt;/p&gt;
-    &lt;p&gt;Elena&lt;/p&gt;
-    &lt;p&gt;💓 Did you enjoy this post? Share it with a friend!&lt;lb/&gt;👫 Follow me on Mastodon. All my other links are available here: elena.social&lt;lb/&gt;💌 If you'd like to say hi, my contact information is here&lt;lb/&gt;✏️ If this post resonated with you, leave a comment!&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48584497</guid><pubDate>Thu, 18 Jun 2026 12:46:04 +0000</pubDate></item><item><title>Show HN: Talos – Open-source WASM interpreter for Lean</title><link>https://github.com/cajal-technologies/talos</link><description>&lt;doc fingerprint="ed26265f6eedbecd"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Talos is a WebAssembly interpreter written in Lean 4, named after the bronze giant of Greek mythology who guarded Crete — a mechanical guardian, built to enforce rules.&lt;/p&gt;
-    &lt;p&gt;The same definitions that execute a Wasm program are the ones you reason about. There is no separate spec interpreter to keep in sync: evaluation and proof share a single codebase.&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;Work in progress. Talos is under active development. APIs and proof interfaces may change.&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;The goal is a feature-complete, executable semantics for WebAssembly that doubles as a formal object. You can:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Run programs on concrete inputs.&lt;/item&gt;
-      &lt;item&gt;State and prove theorems about their behavior — correctness against a spec, equivalence between programs, properties that hold for all inputs — using Lean's proof tooling.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;The interpreter is deliberately optimized for clarity of reasoning over execution speed. Talos aims for full Wasm coverage, but the immediate focus is on the subset of features that arise naturally from non-optimized, higher-level source code (Rust, C, etc.) — the semantics that actually matter when you want to verify what a program does, not how fast it does it.&lt;/p&gt;
-    &lt;p&gt;Proof is the north star. Performance work belongs behind a separately proven-equivalent implementation.&lt;/p&gt;
-    &lt;p&gt;Proofs in Talos are built on weakest precondition (WP) calculus — a predicate transformer semantics that lets you reason backwards from postconditions to the preconditions that guarantee them. This gives structured, compositional proofs for loops, branches, and function calls without re-unfolding the interpreter at every step.&lt;/p&gt;
-    &lt;p&gt;Run a &lt;code&gt;.wat&lt;/code&gt; module:&lt;/p&gt;
-    &lt;code&gt;cd interpreter
-lake exe runner samples/factorial.wat fact 5
-&lt;/code&gt;
-    &lt;p&gt;Output: &lt;code&gt;120&lt;/code&gt;&lt;/p&gt;
-    &lt;p&gt;Run with a fuel cap (default 1 000 000 steps):&lt;/p&gt;
-    &lt;code&gt;lake exe runner --fuel 10000 samples/factorial.wat fact 5
-&lt;/code&gt;
-    &lt;p&gt;See &lt;code&gt;interpreter/samples/factorial.wat&lt;/code&gt; for a minimal example module.&lt;/p&gt;
-    &lt;p&gt;Prove something about it:&lt;/p&gt;
-    &lt;p&gt;&lt;code&gt;interpreter/Interpreter/Wasm/Examples/Factorial.lean&lt;/code&gt; shows a complete correctness proof using the WP tactic layer.&lt;/p&gt;
-    &lt;p&gt;Three Lake packages in a monorepo, forming a strict dependency chain:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row span="3"&gt;
-        &lt;cell role="head"&gt;Package&lt;/cell&gt;
-        &lt;cell role="head"&gt;Path&lt;/cell&gt;
-        &lt;cell role="head"&gt;Purpose&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;Interpreter&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;interpreter/&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Wasm AST, semantics, WP tactic layer&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row span="3"&gt;
-        &lt;cell&gt;
-          &lt;code&gt;CodeLib&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;codelib/&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Lifting lemmas and program-reasoning helpers&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;Programs&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;programs/&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;Concrete Rust-to-Wasm verification tasks&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;Depend on the interpreter only (Wasm semantics + WP calculus):&lt;/p&gt;
-    &lt;code&gt;# lakefile.toml
-[[require]]
-name = "WasmInterpreterLean"
-scope = "your-org"           # if published, or use path/git
-path = "path/to/repo/interpreter"&lt;/code&gt;
-    &lt;p&gt;Depend on CodeLib (adds lifting lemmas and reasoning helpers on top):&lt;/p&gt;
-    &lt;code&gt;[[require]]
-name = "CodeLib"
-path = "path/to/repo/codelib"&lt;/code&gt;
-    &lt;p&gt;Code that imports &lt;code&gt;CodeLib&lt;/code&gt; never needs to import the interpreter directly —
-&lt;code&gt;CodeLib&lt;/code&gt; re-exports the parts of the interpreter that downstream proofs need.&lt;/p&gt;
-    &lt;code&gt;just build   # builds interpreter → codelib → programs in order&lt;/code&gt;
-    &lt;p&gt;Or build a single package:&lt;/p&gt;
-    &lt;code&gt;cd interpreter &amp;amp;&amp;amp; lake build
-cd codelib     &amp;amp;&amp;amp; lake build
-cd programs    &amp;amp;&amp;amp; lake build&lt;/code&gt;
-    &lt;p&gt;Dependencies:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Lean 4 — toolchain pinned in &lt;code&gt;interpreter/lean-toolchain&lt;/code&gt;, fetched automatically by&lt;code&gt;elan&lt;/code&gt;.&lt;/item&gt;
-      &lt;item&gt;&lt;code&gt;wasm-tools&lt;/code&gt;— needed to decode&lt;code&gt;.wasm&lt;/code&gt;binaries and to run the Wasm testsuite.&lt;code&gt;brew install wasm-tools&lt;/code&gt;or&lt;code&gt;cargo install wasm-tools&lt;/code&gt;.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;code&gt;just testsuite&lt;/code&gt;
-    &lt;p&gt;Filter to a specific file by name:&lt;/p&gt;
-    &lt;code&gt;just testsuite i32&lt;/code&gt;
-    &lt;p&gt;See CONTRIBUTING.md.&lt;/p&gt;
-    &lt;p&gt;GNU Affero General Public License v3.0 — see LICENSE.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48584761</guid><pubDate>Thu, 18 Jun 2026 13:10:44 +0000</pubDate></item><item><title>Ubiquiti: Enterprise NAS, Built on ZFS</title><link>https://blog.ui.com/article/introducing-enterprise-nas</link><description>&lt;doc fingerprint="6fff587e4dda8302"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48583928</guid><pubDate>Thu, 18 Jun 2026 11:45:43 +0000</pubDate></item><item><title>Ubiquiti: Enterprise NAS, Built on ZFS</title><link>https://blog.ui.com/article/introducing-enterprise-nas</link><description>&lt;doc fingerprint="6fff587e4dda8302"&gt;
   &lt;main&gt;
     &lt;p&gt;Enterprise storage has traditionally required costly licensing, proprietary hardware, and complex management. ENAS changes that by delivering a private, local storage platform designed for performance, scalability, and simplicity, all without the overhead typically associated with enterprise infrastructure.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48585866</guid><pubDate>Thu, 18 Jun 2026 14:24:30 +0000</pubDate></item><item><title>Zero-Touch OAuth for MCP</title><link>https://blog.modelcontextprotocol.io/posts/enterprise-managed-auth/</link><description>&lt;doc fingerprint="9fd186813c036a9e"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48585866</guid><pubDate>Thu, 18 Jun 2026 14:24:30 +0000</pubDate></item><item><title>Show HN: Pagecast – Publish Markdown/HTML Reports to Cloudflare Pages</title><link>https://github.com/Amal-David/pagecast</link><description>&lt;doc fingerprint="e2507313522efd26"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Preview local HTML reports, Markdown docs, and static mini apps, then publish them to shareable Cloudflare Pages URLs from the terminal or your coding agent.&lt;/p&gt;
+    &lt;p&gt;Live app: https://pagecasthq.pages.dev/&lt;/p&gt;
+    &lt;p&gt;Pagecast is a local-first publishing tool for agent-generated reports and small static web projects. It gives you a local admin UI for previewing files, managing published versions, renaming links, re-syncing updates, and revoking old URLs. For automation, it exposes headless &lt;code&gt;pagecast publish&lt;/code&gt; commands, a small
+Cloudflare Pages CLI abstraction, and Codex / Claude agent skills.&lt;/p&gt;
+    &lt;p&gt;Good fits:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;HTML reports, dashboards, coverage output, Playwright or Lighthouse reports.&lt;/item&gt;
+      &lt;item&gt;Markdown plans, proposals, release notes, docs, and summaries.&lt;/item&gt;
+      &lt;item&gt;Static mini apps from build folders such as &lt;code&gt;dist&lt;/code&gt;,&lt;code&gt;build&lt;/code&gt;,&lt;code&gt;out&lt;/code&gt;, or&lt;code&gt;public&lt;/code&gt;.&lt;/item&gt;
+      &lt;item&gt;Coding-agent workflows that should ask before publishing a finished artifact.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Not a fit:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Private drafts or scratch notes.&lt;/item&gt;
+      &lt;item&gt;Server-rendered apps that need a running backend.&lt;/item&gt;
+      &lt;item&gt;Python/Ruby/Node services unless they first export static assets.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Node.js 20 or newer.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;npx&lt;/code&gt;for one-command use.&lt;/item&gt;
+      &lt;item&gt;A Cloudflare account for public publishing.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;pnpm&lt;/code&gt;only when rebuilding the web UI from&lt;code&gt;web/&lt;/code&gt;.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The root CLI/server has no runtime npm dependencies. The React admin UI is built from &lt;code&gt;web/&lt;/code&gt; into &lt;code&gt;public/&lt;/code&gt; and is already included in the package.&lt;/p&gt;
+    &lt;p&gt;Use Pagecast without installing it globally:&lt;/p&gt;
+    &lt;code&gt;npx pagecast&lt;/code&gt;
+    &lt;p&gt;This starts the local app and opens the admin UI.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Admin UI: &lt;code&gt;http://127.0.0.1:4173&lt;/code&gt;&lt;/item&gt;
+      &lt;item&gt;Local published-page server: &lt;code&gt;http://127.0.0.1:4174&lt;/code&gt;&lt;/item&gt;
+      &lt;item&gt;Local data/config: &lt;code&gt;.pagecast/&lt;/code&gt;in your current working directory&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Use the admin UI on &lt;code&gt;4173&lt;/code&gt; for normal work. The &lt;code&gt;4174&lt;/code&gt; server is intentionally
+separate: it serves local published-page routes such as &lt;code&gt;/p/&amp;lt;slug&amp;gt;/&lt;/code&gt; so Pagecast
+can preview the same URL shape it deploys to Cloudflare Pages. Its root path is
+not an app and returns &lt;code&gt;404&lt;/code&gt;; use &lt;code&gt;/healthz&lt;/code&gt; only to check that it is running.&lt;/p&gt;
+    &lt;p&gt;From a clone:&lt;/p&gt;
+    &lt;code&gt;git clone https://github.com/Amal-David/pagecast.git
+cd pagecast
+npm start&lt;/code&gt;
+    &lt;p&gt;Run the app once:&lt;/p&gt;
+    &lt;code&gt;npx pagecast&lt;/code&gt;
+    &lt;p&gt;Open the Cloudflare Pages panel and click Connect Cloudflare. Pagecast uses scoped Wrangler OAuth (&lt;code&gt;account:read&lt;/code&gt;, &lt;code&gt;user:read&lt;/code&gt;, &lt;code&gt;pages:write&lt;/code&gt;), detects your
+account, and creates the Pages project if needed.&lt;/p&gt;
+    &lt;p&gt;Or do the same setup from the terminal:&lt;/p&gt;
+    &lt;code&gt;npx pagecast pages setup --project pagecast&lt;/code&gt;
+    &lt;p&gt;If you prefer a token for automation, create a scoped Cloudflare API token with Account &amp;gt; Cloudflare Pages &amp;gt; Edit permission, then run:&lt;/p&gt;
+    &lt;code&gt;CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... npx pagecast pages status --json&lt;/code&gt;
+    &lt;p&gt;If more than one Cloudflare account is available, Pagecast asks you to choose the account once in the admin UI, or you can pass it directly:&lt;/p&gt;
+    &lt;code&gt;npx pagecast pages setup --account 90e4c638bea527f464ec6fa7caebfd4e --project pagecast&lt;/code&gt;
+    &lt;p&gt;Publish an HTML file:&lt;/p&gt;
+    &lt;code&gt;npx pagecast publish "/absolute/path/report.html" --json
+# -&amp;gt; {"ok":true,"url":"https://&amp;lt;project&amp;gt;.pages.dev/p/&amp;lt;token&amp;gt;/", ...}&lt;/code&gt;
+    &lt;p&gt;Publish Markdown:&lt;/p&gt;
+    &lt;code&gt;npx pagecast publish "/absolute/path/report.md" --json&lt;/code&gt;
+    &lt;p&gt;Publish a static web project as a shareable snapshot by building first, then publishing the generated entry file:&lt;/p&gt;
+    &lt;code&gt;npm run build
+npx pagecast publish "$(pwd)/dist/index.html" --json&lt;/code&gt;
+    &lt;p&gt;This creates a &lt;code&gt;/p/&amp;lt;token&amp;gt;/&lt;/code&gt; link and stages sibling assets from the build
+folder.&lt;/p&gt;
+    &lt;p&gt;Deploy a whole static folder directly to a named Cloudflare Pages project:&lt;/p&gt;
+    &lt;code&gt;npx pagecast publish site "$(pwd)/dist" --project pagecasthq --branch main --json&lt;/code&gt;
+    &lt;p&gt;&lt;code&gt;--branch&lt;/code&gt; is optional. If you omit it, Pagecast deploys to &lt;code&gt;main&lt;/code&gt;:&lt;/p&gt;
+    &lt;code&gt;npx pagecast pages deploy "$(pwd)/dist" --project pagecasthq --json&lt;/code&gt;
+    &lt;p&gt;That command is the Pagecast abstraction over raw Wrangler deploys. It replaces:&lt;/p&gt;
+    &lt;code&gt;CLOUDFLARE_ACCOUNT_ID=90e4c638bea527f464ec6fa7caebfd4e npx wrangler pages deploy /private/tmp/pagecasthq-deploy --project-name pagecasthq --branch main&lt;/code&gt;
+    &lt;p&gt;with:&lt;/p&gt;
+    &lt;code&gt;npx pagecast pages deploy /private/tmp/pagecasthq-deploy --project pagecasthq --branch main --json&lt;/code&gt;
+    &lt;p&gt;Direct site deploys replace the target Pages project contents. For source-folder build settings, link renaming, re-sync, and revoke controls, use the app:&lt;/p&gt;
+    &lt;code&gt;npx pagecast&lt;/code&gt;
+    &lt;p&gt;Common headless errors:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;&lt;code&gt;{"ok":false,"statusCode":401}&lt;/code&gt;: run&lt;code&gt;npx pagecast pages setup&lt;/code&gt;once, or run&lt;code&gt;npx pagecast&lt;/code&gt;and connect Cloudflare.&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;{"ok":false,"statusCode":409}&lt;/code&gt;: pass&lt;code&gt;--account &amp;lt;account-id&amp;gt;&lt;/code&gt;, or run&lt;code&gt;npx pagecast&lt;/code&gt;once and choose the Cloudflare account.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Pagecast wraps the Wrangler commands needed for normal Pages publishing:&lt;/p&gt;
+    &lt;code&gt;npx pagecast pages setup --project pagecast --json
+npx pagecast pages status --json
+npx pagecast pages projects list --json
+npx pagecast pages deploy "/absolute/path/dist" --project pagecasthq --branch main --json
+npx pagecast pages deploy "/absolute/path/dist" --project pagecasthq --json&lt;/code&gt;
+    &lt;p&gt;Agents and CI should prefer &lt;code&gt;--json&lt;/code&gt;. Human terminal output stays concise by
+default. Direct deploys use &lt;code&gt;main&lt;/code&gt; when &lt;code&gt;--branch&lt;/code&gt; is not provided.&lt;/p&gt;
+    &lt;p&gt;When an agent writes an HTML file and opens it as &lt;code&gt;file:///…/report.html&lt;/code&gt;, the
+bundled Chrome extension adds a one-click Publish to Pagecast button. It
+publishes the local file through your running Pagecast server and returns a public
+link; re-publishing the same file updates the same URL.&lt;/p&gt;
+    &lt;p&gt;Install (load unpacked):&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;&lt;code&gt;chrome://extensions&lt;/code&gt;→ enable Developer mode → Load unpacked → select the&lt;code&gt;extension/&lt;/code&gt;folder.&lt;/item&gt;
+      &lt;item&gt;Open the extension's Details and enable "Allow access to file URLs".&lt;/item&gt;
+      &lt;item&gt;Run &lt;code&gt;npx pagecast&lt;/code&gt;(connected to Cloudflare), open a local&lt;code&gt;.html&lt;/code&gt;/&lt;code&gt;.md&lt;/code&gt;file, click the toolbar icon → Publish.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The server must be running (a browser extension can't start it). The admin server exposes a &lt;code&gt;POST /api/publish-local { path }&lt;/code&gt; endpoint and reflects CORS only for
+&lt;code&gt;chrome-extension://&lt;/code&gt; origins. See &lt;code&gt;extension/README.md&lt;/code&gt; for details.&lt;/p&gt;
+    &lt;p&gt;Pagecast includes a Codex-native skill and a portable Agent-Skills file. The skill tells the agent to offer once for finished, shareable HTML/Markdown/static artifacts and to publish only after explicit confirmation.&lt;/p&gt;
+    &lt;p&gt;From a clone of this repo:&lt;/p&gt;
+    &lt;code&gt;mkdir -p ~/.codex/skills
+cp -R .codex/skills/publish-report ~/.codex/skills/&lt;/code&gt;
+    &lt;p&gt;Start a new Codex session, then ask:&lt;/p&gt;
+    &lt;code&gt;Use $publish-report to publish /absolute/path/report.md with Pagecast.
+&lt;/code&gt;
+    &lt;p&gt;For a web project:&lt;/p&gt;
+    &lt;code&gt;Use $publish-report to build this project and publish dist/index.html with Pagecast.
+&lt;/code&gt;
+    &lt;code&gt;/plugin marketplace add Amal-David/pagecast
+/plugin install pagecast@pagecast&lt;/code&gt;
+    &lt;p&gt;This installs the portable &lt;code&gt;publish-report&lt;/code&gt; skill and the Claude Code
+report-detection hook.&lt;/p&gt;
+    &lt;p&gt;Copy the portable skill into your agent's skills folder:&lt;/p&gt;
+    &lt;code&gt;cp plugin/skills/publish-report/SKILL.md /path/to/your-agent/skills/publish-report/SKILL.md&lt;/code&gt;
+    &lt;p&gt;More detail is in plugin/README.md.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Add &lt;code&gt;.html&lt;/code&gt;,&lt;code&gt;.htm&lt;/code&gt;,&lt;code&gt;.md&lt;/code&gt;, and&lt;code&gt;.markdown&lt;/code&gt;files by absolute path or&lt;code&gt;file:///...&lt;/code&gt;URL.&lt;/item&gt;
+      &lt;item&gt;Add deployable static folders.&lt;/item&gt;
+      &lt;item&gt;Add source folders with an explicit build command and output directory.&lt;/item&gt;
+      &lt;item&gt;Drop or choose HTML/Markdown files and browser-supported folder uploads.&lt;/item&gt;
+      &lt;item&gt;Drag to reorder reports.&lt;/item&gt;
+      &lt;item&gt;Publish a shareable URL, revoke one version, or revoke all versions for a report.&lt;/item&gt;
+      &lt;item&gt;Rename a published URL. Old links redirect to the new path.&lt;/item&gt;
+      &lt;item&gt;Re-sync a published page in place at the same URL.&lt;/item&gt;
+      &lt;item&gt;Enable auto-sync for path-backed reports.&lt;/item&gt;
+      &lt;item&gt;Edit HTML in the app without overwriting the original source file.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Run the packaged app from source:&lt;/p&gt;
+    &lt;code&gt;npm start&lt;/code&gt;
+    &lt;p&gt;Run the verification suite:&lt;/p&gt;
+    &lt;code&gt;npm run check
+npm test&lt;/code&gt;
+    &lt;p&gt;Rebuild the React admin UI into &lt;code&gt;public/&lt;/code&gt;:&lt;/p&gt;
+    &lt;code&gt;npm run build&lt;/code&gt;
+    &lt;p&gt;Work on the React UI with Vite:&lt;/p&gt;
+    &lt;code&gt;pnpm -C web install --frozen-lockfile --ignore-scripts
+npm start
+pnpm -C web run dev&lt;/code&gt;
+    &lt;p&gt;Vite runs on &lt;code&gt;http://127.0.0.1:5173&lt;/code&gt; and proxies &lt;code&gt;/api&lt;/code&gt;, &lt;code&gt;/preview&lt;/code&gt;, and &lt;code&gt;/p&lt;/code&gt; to
+the local Pagecast server on &lt;code&gt;http://127.0.0.1:4173&lt;/code&gt;.&lt;/p&gt;
+    &lt;code&gt;src/                         Node CLI, server, Cloudflare Pages publisher
+public/                      Built admin UI served by the package
+web/                         Vite + React source for the admin UI
+plugin/                      Claude/portable Agent-Skills integration
+.codex/skills/publish-report/ Codex-native Pagecast skill
+llms.txt                     Agent-readable command and workflow map
+test/                        Node test suite
+&lt;/code&gt;
+    &lt;p&gt;Before publishing a package:&lt;/p&gt;
+    &lt;code&gt;npm run build
+npm run check
+npm test
+npm pack --dry-run&lt;/code&gt;
+    &lt;p&gt;The npm package includes &lt;code&gt;src/&lt;/code&gt;, &lt;code&gt;public/&lt;/code&gt;, &lt;code&gt;plugin/&lt;/code&gt;, &lt;code&gt;llms.txt&lt;/code&gt;, and the Codex
+skill under &lt;code&gt;.codex/skills/publish-report/&lt;/code&gt;.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;The admin UI binds to &lt;code&gt;127.0.0.1&lt;/code&gt;.&lt;/item&gt;
+      &lt;item&gt;Draft previews are admin-only local routes.&lt;/item&gt;
+      &lt;item&gt;Public access works only through active &lt;code&gt;/p/&amp;lt;token&amp;gt;/&lt;/code&gt;publication links.&lt;/item&gt;
+      &lt;item&gt;Revoked publication tokens return 404 after the Pages redeploy finishes.&lt;/item&gt;
+      &lt;item&gt;Public report routes reject parent-directory traversal and hidden-file paths.&lt;/item&gt;
+      &lt;item&gt;Path-based reports and snapshots include non-hidden sibling assets from the report folder, so anything in that folder can become public if referenced or guessed.&lt;/item&gt;
+      &lt;item&gt;The Pages root does not publish a report listing.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Pagecast is released under the MIT License. See LICENSE.&lt;/p&gt;
+    &lt;p&gt;Issues and pull requests are welcome. Keep changes focused, run the verification commands above, and rebuild &lt;code&gt;public/&lt;/code&gt; with &lt;code&gt;npm run build&lt;/code&gt; whenever you change
+files under &lt;code&gt;web/&lt;/code&gt;.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48590505</guid><pubDate>Thu, 18 Jun 2026 19:42:54 +0000</pubDate></item><item><title>Zero-Touch OAuth for MCP</title><link>https://blog.modelcontextprotocol.io/posts/enterprise-managed-auth/</link><description>&lt;doc fingerprint="9fd186813c036a9e"&gt;
   &lt;main&gt;
     &lt;p&gt;The Enterprise-Managed Authorization extension is now stable. Organizations can centrally manage authorization for MCP servers and end-users can access all connected MCP servers through a single log in. The extension is being adopted by Anthropic, Microsoft, Okta and a growing number of MCP servers.&lt;/p&gt;
     &lt;p&gt;The Enterprise-Managed Authorization (EMA) extension is now stable. We’ve heard from the community that authorization and repeated consent prompts from connected MCP servers is one of the biggest pain points when it comes to managing connectivity in enterprise environments. This extension helps address this.&lt;/p&gt;
@@ -718,116 +597,7 @@ cd programs    &amp;amp;&amp;amp; lake build&lt;/code&gt;
     &lt;p&gt;Why search for updates when we can send them to you?&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48593694</guid><pubDate>Fri, 19 Jun 2026 01:01:13 +0000</pubDate></item><item><title>Datasette Apps: Host custom HTML applications inside Datasette</title><link>https://simonwillison.net/2026/Jun/18/datasette-apps/</link><description>&lt;doc fingerprint="14581d721f95a7a1"&gt;
-  &lt;main&gt;
-    &lt;head rend="h2"&gt;Datasette Apps: Host custom HTML applications inside Datasette&lt;/head&gt;
-    &lt;p&gt;18th June 2026&lt;/p&gt;
-    &lt;p&gt;Today we launched a new plugin for Datasette, datasette-apps, with this launch announcement post on the Datasette project blog. That post has the what, but I’m going to expand on that a little bit here to provide the why.&lt;/p&gt;
-    &lt;head rend="h4"&gt;The TL;DR&lt;/head&gt;
-    &lt;p&gt;Datasette Apps are self-contained HTML+JavaScript applications that run in a tightly constrained &lt;code&gt;&amp;lt;iframe&amp;gt;&lt;/code&gt; sandbox hosted on your Datasette application. They can use JavaScript to run read-only SQL queries against data in Datasette, and can run write queries too if you configure them with some stored queries.&lt;/p&gt;
-    &lt;p&gt;Here’s a very simple example and a more complex custom timeline example—the latter looks like this:&lt;/p&gt;
-    &lt;p&gt;Apps are allowed to run JavaScript and render HTML and CSS. They are limited in terms of access—the &lt;code&gt;&amp;lt;iframe sandbox="allow-scripts allow-forms"&amp;gt;&lt;/code&gt; they run in prevents them from accessing cookies or localStorage and they also have an injected CSP header (thanks to this research) which prevents them from making HTTP requests to outside hosts, preventing a malicious or buggy app from exfiltrating private data.&lt;/p&gt;
-    &lt;p&gt;Datasette Apps started out as my attempt at building a Claude Artifacts mechanism for Datasette Agent, but I quickly realised that the sandboxed pattern is interesting for way more than just adding custom apps to the interface surface and promoted it to its own top-level concept within the Datasette ecosystem.&lt;/p&gt;
-    &lt;p&gt;They’re also a fun way to turn my multi-year experiment in vibe-coded HTML tools into a core feature of my main project!&lt;/p&gt;
-    &lt;p&gt;You can try out Datasette Apps by signing in with GitHub to the agent.datasette.io demo instance.&lt;/p&gt;
-    &lt;head rend="h4"&gt;Why build this?&lt;/head&gt;
-    &lt;p&gt;Since the very first release, Datasette has offered a flexible backend for creating custom HTML apps via its JSON API.&lt;/p&gt;
-    &lt;p&gt;One of my earliest Datasette projects was an internal search engine for documentation when I worked at Eventbrite—it worked by importing documents from different systems into SQLite on a cron and then serving them through a Datasette instance with a custom HTML+JavaScript search interface that directly queried the Datasette API.&lt;/p&gt;
-    &lt;p&gt;I had client-side JavaScript constructing SQL queries, which originally was intended as an engineering joke but turned out to be a really productive way of iterating on the app!&lt;/p&gt;
-    &lt;p&gt;That project, combined with my experience building my HTML tools collection and my experiments with Claude Artifacts, has convinced me that adding a Datasette-style backend to a self-contained HTML frontend is an astonishingly powerful combination.&lt;/p&gt;
-    &lt;p&gt;Imagine how much more useful Claude Artifacts could be if they had access to a persistent relational database. That’s what I’m building with Datasette Apps!&lt;/p&gt;
-    &lt;head rend="h4"&gt;Neat ideas in Datasette Apps&lt;/head&gt;
-    &lt;p&gt;Here are a few of the ideas and patterns I’ve figured out building this which I think have staying power.&lt;/p&gt;
-    &lt;head rend="h5"&gt;&lt;code&gt;&amp;lt;iframe sandbox="allow-scripts" srcdoc="..."&amp;gt;&lt;/code&gt; + &lt;code&gt;&amp;lt;meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:;"&amp;gt;&lt;/code&gt;
-&lt;/head&gt;
-    &lt;p&gt;This is the magic combination that makes Datasette Apps feasible in the first place. I need to run untrusted HTML and JavaScript on a highly sensitive domain—an authenticated Datasette instance can contain all sorts of private data. The &lt;code&gt;sandbox=&lt;/code&gt; attribute lets me run that untrusted code in a way that cannot interact with the parent application—it can’t read the DOM, or access cookies, or steal secrets from &lt;code&gt;localStorage&lt;/code&gt;. It can however use &lt;code&gt;fetch()&lt;/code&gt; and friends to load content (or exfiltrate data) from other domains. But... it turns out if you start an HTML page with a &lt;code&gt;&amp;lt;meta http-equiv="Content-Security-Policy"&amp;gt;&lt;/code&gt; header you can set additional policies that lock down access to other domains. I was worried that malicious JavaScript would be able to update or remove that header but it turns out that doesn’t work—once set, the CSP policy is immutable for the content of that frame.&lt;/p&gt;
-    &lt;head rend="h5"&gt;Locked down APIs with &lt;code&gt;postMessage()&lt;/code&gt; and &lt;code&gt;MessageChannel()&lt;/code&gt;
-&lt;/head&gt;
-    &lt;p&gt;Having locked down those iframes to the point that they couldn’t do anything interesting at all, the challenge was to open them back again such that they could run an allow-list of operations, starting with read-only SQL queries against specified databases.&lt;/p&gt;
-    &lt;p&gt;I built the first version of this with &lt;code&gt;postMessage()&lt;/code&gt;, which allows a child iframe to send messages to the parent window. I created a simple protocol for requesting that the parent run a SQL query—the parent could then verify it was against an allow-listed database before executing it.&lt;/p&gt;
-    &lt;p&gt;One of the LLM tools, I think it was GPT-5.5, suggested that &lt;code&gt;postMessage()&lt;/code&gt; on its own can be exploited if the iframe somehow loads additional code from an untrusted domain. I don’t think that applies to Datasette Apps, but I also believe in defense in depth, so I had GPT-5.5 help me port to a MessageChannel() based transport instead.&lt;/p&gt;
-    &lt;p&gt;&lt;code&gt;MessageChannel()&lt;/code&gt; has the advantage that if a page navigates to somewhere else the channel closes automatically, removing any chance of executing commands sent from an untrusted external page.&lt;/p&gt;
-    &lt;head rend="h5"&gt;Visible logs, for queries and errors&lt;/head&gt;
-    &lt;p&gt;If you navigate to the timeline demo and search for the string &lt;code&gt;usercontent&lt;/code&gt; you’ll pull in some search results that embed images from the &lt;code&gt;user-images.githubusercontent.com&lt;/code&gt; domain. This domain is not in the CSP allow-list, so it trips an error.&lt;/p&gt;
-    &lt;p&gt;Those errors are captured and transmitted back to the parent frame, where they can be displayed in a useful error log. This is meant to make hacking on apps more productive by surfacing otherwise-invisible problems.&lt;/p&gt;
-    &lt;p&gt;I built an experiment demonstrating that you can even turn this into a one-click-to-allow mechanism for building the CSP allow-list based on what breaks, but I haven’t integrated that idea into &lt;code&gt;datasette-apps&lt;/code&gt; just yet.&lt;/p&gt;
-    &lt;p&gt;SQL queries are also visibly logged—scroll to the bottom of the timeline page to see that in action.&lt;/p&gt;
-    &lt;head rend="h5"&gt;Stored queries for write operations&lt;/head&gt;
-    &lt;p&gt;I want apps to be able to conditionally write to the database, but this is an even more dangerous proposition than SQL reads!&lt;/p&gt;
-    &lt;p&gt;My solution involves Datasette’s stored queries feature, rebranded from “canned queries” and given a major upgrade in the recent Datasette 1.0a31—work that was directly inspired by Datasette Apps.&lt;/p&gt;
-    &lt;p&gt;Users can create a stored write query that performs an insert or update, then allow-list that specific query for an app to use. Usage from code inside an app looks like this:&lt;/p&gt;
-    &lt;code&gt;const result = await datasette.storedQuery("todos", "add_todo", {
-  title: "Buy milk",
-  due_date: "2026-06-20",
-  priority: "high",
-  completed: false
-});&lt;/code&gt;
-    &lt;p&gt;I’m only just beginning to explore the possibilities this unlocks myself, but my goal is to support full read-write applications built safely as Datasette Apps.&lt;/p&gt;
-    &lt;head rend="h5"&gt;Copy and paste a prompt to build an app&lt;/head&gt;
-    &lt;p&gt;The Datasette Apps plugin has no dependency on LLMs at all, but these self-contained apps are the perfect shape to be written by a modern LLM.&lt;/p&gt;
-    &lt;p&gt;The create app form includes a copyable prompt at the end. This prompt has everything a model needs to know to build a new app, including the schema of any selected databases.&lt;/p&gt;
-    &lt;p&gt;This means you can click “copy”, paste it into ChatGPT or Claude or Gemini, tell it what you need, and there’s a good chance the model will spit out the code necessary to build the app.&lt;/p&gt;
-    &lt;p&gt;If you have Datasette Agent installed your AI assistant will also gain tools to both create new apps and edit existing ones, Claude Artifacts style.&lt;/p&gt;
-    &lt;head rend="h4"&gt;Built with so much AI assistance&lt;/head&gt;
-    &lt;p&gt;Datasette Apps started life back in April as datasette-agent-artifacts, a plugin I have since renamed to &lt;code&gt;datasette-agent-edit&lt;/code&gt; keeping only its editing tools. I built that as one of the first plugins for Datasette Agent, to help get the plugin hooks into the right shape. That first prototype was mainly built using Claude Opus 4.6 in Claude Code.&lt;/p&gt;
-    &lt;p&gt;When I switched track to Datasette Apps I started with a plan constructed using Codex Desktop and GPT-5.5 xhigh, based on extensive dialog and feeding in both &lt;code&gt;datasette-agent-artifacts&lt;/code&gt; and other prototypes I had built.&lt;/p&gt;
-    &lt;p&gt;Most of the work that followed stuck with Codex, but in the few short days that we had access to Claude Fable 5 I had it run a security evaluation of the product (an ability that would get it banned by the US government shortly afterwards) and it found a very real problem.&lt;/p&gt;
-    &lt;p&gt;I was allowing users to allow-list CSP hosts for their apps, but Fable pointed out the following attack:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;A less privileged user with &lt;code&gt;create-app&lt;/code&gt;permission creates an app that queries SQLite for all available tables and selects and exfiltrates all of the data to a host they had allow-listed via CSP.&lt;/item&gt;
-      &lt;item&gt;They then trick an administrator user with access to private data into visiting their app.&lt;/item&gt;
-      &lt;item&gt;... and the app can now run queries as that user and steal their private data!&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;That’s clearly unacceptable. I fixed it by restricting the ability to allow-list any domain to a new &lt;code&gt;apps-set-csp&lt;/code&gt; permission, which is intended just for trusted staff. Site administrators can also configure Datasette with a list of &lt;code&gt;allowed_csp_origins&lt;/code&gt;, which regular users can then select. This means you can do things like allow &lt;code&gt;cdnjs.cloudflare.com&lt;/code&gt; and your users will be able to build apps that load extra JavaScript libraries from the cdnjs CDN.&lt;/p&gt;
-    &lt;p&gt;I’ve reviewed Datasette Apps extremely closely, especially the security-adjacent parts of it. The critical sandbox and CSP configuration are based on multiple AI-assisted prototypes and tests.&lt;/p&gt;
-    &lt;head rend="h4"&gt;It’s looking good so far&lt;/head&gt;
-    &lt;p&gt;I’m really pleased with this initial release.&lt;/p&gt;
-    &lt;p&gt;Datasette is growing beyond its origins as an application for serving read-only data into a much richer ecosystem of tools for doing useful things with that data once it has been collected.&lt;/p&gt;
-    &lt;p&gt;Datasette’s roots are in data journalism. I’ve always been interested in the question of what comes next after a journalist gets their hands on a giant dump of data about the world. Datasette supports exploring and publishing it. Datasette Agent adds interrogating it with AI assistance. Now Datasette Apps expands that to building custom interfaces and visualizations to help unlock the stories that are hidden within.&lt;/p&gt;
-    &lt;head rend="h2"&gt;More recent articles&lt;/head&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;GLM-5.2 is probably the most powerful text-only open weights LLM - 17th June 2026&lt;/item&gt;
-      &lt;item&gt;Publishing WASM wheels to PyPI for use with Pyodide - 13th June 2026&lt;/item&gt;
-    &lt;/list&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48593731</guid><pubDate>Fri, 19 Jun 2026 01:06:27 +0000</pubDate></item><item><title>So You Want to Define a Well-Known URI</title><link>https://mnot.net/blog/2026/well_known_uris</link><description>&lt;doc fingerprint="7b2d995e29936f91"&gt;
-  &lt;main&gt;
-    &lt;head rend="h2"&gt;So You Want To Define a Well-Known URI&lt;/head&gt;
-    &lt;p&gt;Friday, 19 June 2026&lt;/p&gt;
-    &lt;p&gt;As one of the authors of the Well-Known URI specification and current Designated Expert for the registry, I field a lot of questions about how they should be used, and end up coaching a lot of folks on how to best use them. Below, I’ve summarised how I think about them. Note that these aren’t all requirements for registration – just what I consider good practice.&lt;/p&gt;
-    &lt;head rend="h3"&gt;What Well-Known Locations are Good For&lt;/head&gt;
-    &lt;p&gt;Well-known locations work best when the client – whether it’s a browser, bot, or other software – knows the site1 and needs to discover something about the whole site in an efficient way.&lt;/p&gt;
-    &lt;p&gt;robots.txt is the perfect example – it pre-dated the RFC so it doesn’t use a well-known location, but was a major part of the reason we reserved a space for them. A crawler needs to know what the access policies for the site are, and putting it in one central place for the site avoids the need to check headers and content on every response (which would defeat many of the purposes of having such a policy).&lt;/p&gt;
-    &lt;p&gt;A well-known location doesn’t have to contain policy, though. Any mechanism where the client already knows the site but needs to learn something about or interact with it as a whole is a candidate for becoming a well-known location. For example, the &lt;code&gt;change-password&lt;/code&gt; well-known location allows clients to change their password for a site.&lt;/p&gt;
-    &lt;head rend="h3"&gt;When They’re the Wrong Tool&lt;/head&gt;
-    &lt;p&gt;While well-known locations solve real problems for some protocols, in other cases it seems like designers are specifying a well-known location because it seems like the thing to do. Some proposals register one expecting it to confer legitimacy, or boost adoption — as though a slot in the registry were a credential. It isn’t. Well-known locations solves a specific problem (the client knows the site, and needs something site-wide); if your protocol doesn’t have that problem, a registration may only create new ones — and won’t bring the adoption you’re hoping for.&lt;/p&gt;
-    &lt;p&gt;Similarly, some proposals for well-known locations are effectively using them as a URL shortener. Instead of conveying a full URL in a protocol, they only need to convey the relevant site – the well-known location fills in the rest.&lt;/p&gt;
-    &lt;p&gt;The problem is that this pattern locks you into a 1:1 relationship between services and sites. If a deployment ever needs more than one service, they’ll need to create a different site, and find a way to direct users to the appropriate one.&lt;/p&gt;
-    &lt;p&gt;Using a well-known location is reasonable if your protocol can genuinely only carry a hostname. Often, though, it’s done just for convenience — and maybe to make the protocol feel more “official” — causing unnecessary rigidity in deployments. If your protocol can use a real URL, don’t bother with a well-known location.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Common Pitfalls and Tradeoffs&lt;/head&gt;
-    &lt;p&gt;Even when well-known locations are the right tool, the assumptions we make about sites don’t always hold true, and can create significant complications. If you’re defining a well-known location for your protocol, you should be aware of the issues below.&lt;/p&gt;
-    &lt;head rend="h4"&gt;Discovery Mechanisms&lt;/head&gt;
-    &lt;p&gt;Many protocols try to use a well-known location as a discovery mechanism, with the idea that “the user already knows the site.”&lt;/p&gt;
-    &lt;p&gt;The problem is that the reality is fuzzier than it sounds at first – there may be a mismatch between the scope of the user’s current interaction and where discovery happens. For example, if the client starts with “login.example.com”, should they look up the well-known location on that site, or on “example.com”? Should they follow redirects from one to the other? What site(s) should the publisher make a well-known location on available to assure interoperability?&lt;/p&gt;
-    &lt;p&gt;This especially matters in cases where the protocol isn’t really about Web sites, but instead it’s just leveraging HTTP to get something else done. For example, it may be tempting to specify that a well-known location for a registrable domain name be located at the apex, but that can be operationally difficult for some.&lt;/p&gt;
-    &lt;p&gt;If your protocol falls into this category, consider both what’s being discovered and what your users start with, then work out how they reliably find the right hostname without assuming too much about their architecture.&lt;/p&gt;
-    &lt;head rend="h4"&gt;Content Metadata&lt;/head&gt;
-    &lt;p&gt;Some protocols try to use a well-known location as a way to learn about the content on the site. After all, that’s how &lt;code&gt;/robots.txt&lt;/code&gt; works.&lt;/p&gt;
-    &lt;p&gt;While that pattern works for some kinds of metadata, many sites represent multiple publishers (for example, the old &lt;code&gt;/~username/&lt;/code&gt; convention). Putting content metadata in a central location either puts that mechanism off-limits to those users, or requires the administrator to develop complex infrastructure to support and oversee their control of it.&lt;/p&gt;
-    &lt;p&gt;These kinds of deployments surface a tradeoff between convenience and granularity, and often necessitate creation of a parallel metadata mechanism – for example, in HTTP response headers or in the content itself – along with the rationalisation of the different metadata attachment mechanisms.&lt;/p&gt;
-    &lt;p&gt;That’s not to say that Well-Known locations can’t be used for content metadata; just that they’re a lot more work than you might think. So if your protocol is using well-known locations for resource metadata, make sure you consider these tradeoffs carefully. Not all sites are like the ones you’re used to – the Web is a big place.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Other Considerations&lt;/head&gt;
-    &lt;p&gt;A few other things regularly come up.&lt;/p&gt;
-    &lt;p&gt;First, some proposals have already defined a fixed location at the root (like &lt;code&gt;/robots.txt&lt;/code&gt; – usually because they only learned about Well-Known locations later). If so, they should have a transition plan for existing deployments. Generally, proponents over-focus on their current deployed footprint; with a good transition plan over a reasonable amount of time, moving over to a Well-known location is manageable.&lt;/p&gt;
-    &lt;p&gt;Many proposals assume &lt;code&gt;http&lt;/code&gt; and &lt;code&gt;https&lt;/code&gt; URLs implicitly. Well-known locations apply to other URL schemes too, so the relevant schemes should be enumerated explicitly.&lt;/p&gt;
-    &lt;p&gt;Finally, make sure you register your well-known location. That link contains guidance about when to register and how to choose a name; unlike the advice here, it does affect your chances of successful registration.&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;&lt;p&gt;Technically, what’s referred to as a site here is an origin – the tuple of&lt;/p&gt;&lt;code&gt;(scheme, host, port)&lt;/code&gt;. ↩&lt;/item&gt;
-    &lt;/list&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48595331</guid><pubDate>Fri, 19 Jun 2026 06:05:01 +0000</pubDate></item><item><title>Project Valhalla, Explained: How a Decade of Work Arrives in JDK 28</title><link>https://www.jvm-weekly.com/p/project-valhalla-explained-how-a</link><description>&lt;doc fingerprint="279d913acb10e18"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48593694</guid><pubDate>Fri, 19 Jun 2026 01:01:13 +0000</pubDate></item><item><title>Project Valhalla, Explained: How a Decade of Work Arrives in JDK 28</title><link>https://www.jvm-weekly.com/p/project-valhalla-explained-how-a</link><description>&lt;doc fingerprint="279d913acb10e18"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Project Valhalla, Explained: How a Decade of Work Arrives in JDK 28 - JVM Weekly vol. 180&lt;/head&gt;
     &lt;head rend="h3"&gt;The new JVM Weekly is here... and Ragnarok seems to come, as we finally have Valhalla in the JDK. However, situation is a bit... nuanced.&lt;/head&gt;
@@ -968,4 +738,212 @@ Point[] points = new Point[1_000_000];&lt;/code&gt;
     &lt;p&gt;After conflicting reports about the economic feasibility of building the tunnel during the 2000s, it was finally included in Norway’s National Transport Plan in 2013. Debates continued about whether to press ahead with the project until 2021 when the Norwegian Ministry of Transport and Communications finally gave approval for preparations to begin. It is expected to be open to boat traffic from 2031.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48596910</guid><pubDate>Fri, 19 Jun 2026 10:16:10 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48596910</guid><pubDate>Fri, 19 Jun 2026 10:16:10 +0000</pubDate></item><item><title>There Are No Instances in ATProto</title><link>https://overreacted.io/there-are-no-instances-in-atproto/</link><description>&lt;doc fingerprint="ad3acd37d19e67fe"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;There Are No Instances in atproto&lt;/head&gt;
+    &lt;p&gt;June 19, 2026&lt;/p&gt;
+    &lt;p&gt;Every single time a post about atproto hits Hacker News, somebody asks in the comments: “But where are all the Bluesky instances?”. The problem is, there are no instances in atproto! The question is a category error. Instances are a Mastodon-brained concept, and I wanted something I can link to that explains this clearly.&lt;/p&gt;
+    &lt;p&gt;So this is that post.&lt;/p&gt;
+    &lt;head rend="h2"&gt;RSS and Google Reader&lt;/head&gt;
+    &lt;p&gt;I know RSS is still being used somewhere (podcasts?!) but its heyday is arguably behind. Which is a shame. For a few years, which some of us might fondly remember as the golden age of the web, it felt like blogging was a cool thing.&lt;/p&gt;
+    &lt;p&gt;Now look at this picture because it’s going to be important:&lt;/p&gt;
+    &lt;p&gt;As a reminder, you publish stuff on your own blog, which you can either self-host or host on a popular blogging platform. But then everyone’s stuff gets aggregated into apps like Google Reader and Feedly, or collective blogs like Monologue (RIP).&lt;/p&gt;
+    &lt;p&gt;Note that hosting and aggregation are two separate things. Your posts don’t “live” in an app like Google Reader. Apps are mere projections of the Blogosphere.&lt;/p&gt;
+    &lt;p&gt;Seriously, make sure this thought sears into your brain; it’s going to be essential.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Facebook and Such&lt;/head&gt;
+    &lt;p&gt;Here’s what you could call an evolution of this concept.&lt;/p&gt;
+    &lt;p&gt;We put a box around the whole thing so that everyone is enclosed in the same space so we can show ads and stuff. Also, let’s leave only one app (we can let alternative apps live for a while, but not for long). That’s traditional social media.&lt;/p&gt;
+    &lt;p&gt;Oh no, now we have centralization!&lt;/p&gt;
+    &lt;p&gt;Oh no, runaway network effects!&lt;/p&gt;
+    &lt;p&gt;Oh no, bla bla bla.&lt;/p&gt;
+    &lt;p&gt;What do we do?&lt;/p&gt;
+    &lt;p&gt;We need to decentralize this somehow.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Mastodon and Its Instances&lt;/head&gt;
+    &lt;p&gt;I say “Mastodon” here because if I say “ActivityPub” instead, a crowd of people will show up and say that actually what I’m describing is how Mastodon chose to implement ActivityPub. Whereas ActivityPub by itself does not really specify how to actually use it in practice. I’m sure this is all very interesting—but I digress.&lt;/p&gt;
+    &lt;p&gt;How do we decentralize a social network?&lt;/p&gt;
+    &lt;p&gt;Let’s build a version of what we saw earlier, but make it self-hostable. Then every community can have their own “little Facebook” or “little Twitter”. We’ll call them instances. They’re kind of like countries—because you live “inside” one of them:&lt;/p&gt;
+    &lt;p&gt;But wait, this opens a bunch of questions.&lt;/p&gt;
+    &lt;p&gt;How do you choose which instance to join? Maybe you’re a member of a few overlapping communities. Well, I guess you’re just gonna have to pick which community’s admins you trust the most with handling your identity and data.&lt;/p&gt;
+    &lt;p&gt;Okay, now another problem—what if my friend’s on a different instance? How will they see my posts? Since each instance is basically its own little Facebook, they have no shared source of truth. So they have to send messages to each other:&lt;/p&gt;
+    &lt;p&gt;This network topology might remind you of warring fiefdoms in Ancient China.&lt;/p&gt;
+    &lt;p&gt;If Alice-from-instance-#1 follows Bree-from-instance-#2, the two instances make an agreement: Bree’s posts will be forwarded to instance #1 so that Alice can see them. That’s called “federation”. You post on your instance, and then it gets forwarded to other instances whose users wanted to hear from you.&lt;/p&gt;
+    &lt;p&gt;This picture has a few interesting implications:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;You “belong” to your instance. You’re not Alice, you are Alice-from-instance-#1. That’s why your Mastodon login is literally &lt;code&gt;[email protected]&lt;/code&gt;. “Where you’re from” is an immutable part of your identity. (Somehow, this manages to be even more restrictive than countries and nationalities.)&lt;/item&gt;
+      &lt;item&gt;If your instance’s admins pick a fight with another instance’s admins, they may choose to “stop federating”, and no longer forward any posts between them. That could be a surprising reason why you’re no longer seeing posts from your friends.&lt;/item&gt;
+      &lt;item&gt;If your instance goes down, your identity ceases to exist. People who followed you followed you-from-that-instance, not some abstract platonic “actual you”.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Oh, and the arrows between instances scale as O(n²). This might not matter much now, but it could matter if this approach to social networking becomes popular.&lt;/p&gt;
+    &lt;head rend="h2"&gt;atproto&lt;/head&gt;
+    &lt;p&gt;Now forget all of that—full reset.&lt;/p&gt;
+    &lt;p&gt;The mistake was when we drew this box:&lt;/p&gt;
+    &lt;p&gt;Erase the box.&lt;/p&gt;
+    &lt;p&gt;Go back to this:&lt;/p&gt;
+    &lt;p&gt;We have hosting where things actually “live”, and apps aggregate from them. This worked for blogs just fine, so why wouldn’t it work for literally everything else?&lt;/p&gt;
+    &lt;p&gt;Like RSS, but for all kinds of stuff.&lt;/p&gt;
+    &lt;p&gt;That’s atproto.&lt;/p&gt;
+    &lt;head rend="h2"&gt;So Where Are All the Bluesky Instances?&lt;/head&gt;
+    &lt;p&gt;Now you know! There are no instances in atproto.&lt;/p&gt;
+    &lt;p&gt;Instances are these Mastodon-brained things:&lt;/p&gt;
+    &lt;p&gt;They’re those isolated bundled hosting+app fiefdoms that send stuff to each other.&lt;/p&gt;
+    &lt;p&gt;Compare this picture to atproto.&lt;/p&gt;
+    &lt;p&gt;In atproto, we cut hosting apart from the aggregation at the network level:&lt;/p&gt;
+    &lt;p&gt;There are no instances at all! There’s hosting you can swap, and there are apps that aggregate from everyone’s hosting. It’s very much like RSS and Google Reader.&lt;/p&gt;
+    &lt;p&gt;The decentralization of atproto is richer in structure than “many copies of one app”:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;If you want to swap your hosting, you can. I literally did this today. Aside from three or four UX snags, it was all automatic. My atproto stuff is at Eurosky now. If I were more adventurous, I could host all my data myself too for free on Cloudflare.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;If you want to try new apps or make new apps, you can do that too! Check out Tangled and Semble, which have nothing to do with Bluesky. I’ve made my own app recently (and it’s open source). I recommend you to try your hand at it too.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;You care about decentralization? You have full agency here. Decentralize away.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Free Yourself from the Instance Brain&lt;/head&gt;
+    &lt;p&gt;Now you see why every decentralized social media discussion is derailed by this.&lt;/p&gt;
+    &lt;p&gt;Mastodon users measure decentralization by the number of instances because that’s the only thing you can do in Mastodon. If there’s only one type of “box”, and each box is “an app coupled with hosting”, the only thing you can do is to host more of these boxes and get them to talk to each other. They’re isolated by default.&lt;/p&gt;
+    &lt;p&gt;In atproto, every app is a projection of the whole Atmosphere, just like Feedly and Google Reader are projections of the entire Blogosphere. You mostly “decentralize” by swapping your hosting, and/or by making and trying new apps. Running many full copies of the Bluesky database server is possible, but it’s not any more useful than running many copies of Google Reader. People do set them up (cue Blacksky), but they arise to meet someone’s specific needs (like a different moderation philosophy). There are other approaches too: this Bluesky client has no dedicated database at all, and it just hits a free community-run cache of everyone’s hosting. Shared network infrastructure like Relays has been cheap to run for a year now.&lt;/p&gt;
+    &lt;p&gt;This is why “counting Bluesky instances” is so misleading. What matters is:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Are people migrating to alternative hosting?&lt;/item&gt;
+      &lt;item&gt;Are people trying and making new apps?&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Separating hosting and apps fixes broken incentives in closed and in federated social. Coupling hosting and apps was the original sin, and the fix is simple.&lt;/p&gt;
+    &lt;p&gt;Keep our stuff outside the apps; let the apps aggregate over it.&lt;/p&gt;
+    &lt;p&gt;Like RSS and Google Reader.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48599515</guid><pubDate>Fri, 19 Jun 2026 15:10:02 +0000</pubDate></item><item><title>Amateur may have cracked Linear A, a 120-year-old puzzle</title><link>https://aiclambake.com/clamtakes/linear-a/</link><description>&lt;doc fingerprint="b7ad02178f787dd4"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;AI Engineer Claims to Have Cracked Linear A&lt;/head&gt;
+    &lt;p&gt;Tom Di Mino, a self-taught AI engineer and an amateur linguist, claims to have accomplished a feat that has eluded linguistics experts for over a century: deciphering a Bronze-age Minoan writing system known as Linear A.&lt;/p&gt;
+    &lt;p&gt;His claims are currently being reviewed by linguistics experts at Rutgers and Cambridge. While I’m caveating, I will also mention that I know Tom socially.&lt;/p&gt;
+    &lt;p&gt;Di Mino, who is based in the Hudson Valley, began to work on the problem in January this year, and says the major insight came to him on May 22.&lt;/p&gt;
+    &lt;p&gt;If Tom Di Mino has deciphered Linear A, it would be an earthquake in the field of linguistics. When a related Minoan script, Linear B, was deciphered in 1952, it made the front page of the New York Times.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Linear A maps to an extinct Semitic language&lt;/head&gt;
+    &lt;p&gt;Di Mino believes that Linear A belongs to an extinct Semitic language that was a precursor to biblical Hebrew, the way that Latin is a precursor to Italian.&lt;/p&gt;
+    &lt;p&gt;Di Mino is not the first to argue that Linear A was Semitic. Prior attempts to prove it, however, including a 1957 article published by Cyrus Gordon in the journal Antiquity, did not unlock translations the way that Di Mino’s solution appears to, and Gordon’s work did not gain widespread acceptance in the field.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Some background on Linear A and Linear B&lt;/head&gt;
+    &lt;p&gt;Linear A is a Minoan script that appeared sometime around 1800 BC and was used until 1450 BC, when Crete was conquered by Mycenaean Greeks. The Mycenaeans adopted the Minoan symbols as their own, with some minor revisions. The Mycenaean-Greek version of the symbols are known as Linear B. Both scripts were found on various tablets, vases, and other artifacts from the era.&lt;/p&gt;
+    &lt;p&gt;Both scripts use syllables, not letters, as their core elements. The syllables are generally consonant-vowel pairs.&lt;/p&gt;
+    &lt;p&gt;The two systems have 60 core syllables in common, and they both also use logograms – symbols that represent a whole word (“cow”), not just a syllable.&lt;/p&gt;
+    &lt;p&gt;Linear B was deciphered and identified as Greek in 1952 by Michael Ventris, a British architect, cryptographer, and amateur linguist, like Di Mino. Ventris’s breakthrough may not have happened without prior work on Linear B by Alice Kober, a professor at Brooklyn College.&lt;/p&gt;
+    &lt;p&gt;Kober and Ventris used grammatical and statistical analyses to look for patterns in the location of the symbols (e.g. the first syllable was more likely to be a vowel) and how the symbols shifted.&lt;/p&gt;
+    &lt;p&gt;There are many more inscriptions associated with Linear B than Linear A, however, which made it easier to decipher. Also, many Linear A inscriptions are inventories cataloging the trade of different commodities, so they don’t tell us much about the language.&lt;/p&gt;
+    &lt;p&gt;Because Linear A and Linear B have 60 symbols in common, and because Linear B has been deciphered, experts could guess what the overlapping Linear A symbols sounded like but didn’t know what the sounds meant. And there were 13 additional symbols in Linear A that did not appear in Linear B. For those, no sound values have been accepted.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The key that unlocked Linear A&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;On May 22, Di Mino was analyzing a series of Linear A prayer inscriptions that adhered to a formula. (Don’t worry, you don’t have to understand the formula, but I’m including it for the nerds.)&lt;/p&gt;
+        &lt;p&gt;IOZa2 (Iouktas): A-TA-I-*301-WA-JA · JA-DI-KI-TU · JA-SA-SA-RA-ME · U-NA-KA-NA-SI · I-PI-NA-MA · SI-RU-TE · TA-NA-RA-TE-U-TI-NU · I&lt;/p&gt;
+        &lt;p&gt;(Also see Figure 1 below.)&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;In the formula all of the words in each line of the inscription were known (based on their overlap with Linear B syllables) except for the first word.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The first word was the same verb, but with different conjugations.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The verb contained 5 known Linear B signs and “*301”, which appeared to be a Linear A-only sign, “na,” which Di Mino used to unlock the root “nawaya,” which means “to dwell.” In Hebrew, Akkadian and other Semitic languages there is a 3 syllable consonant system. N-W-Y is used for verbs and nouns meaning “to dwell or build a pasture”.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Once deciphered, Di Mino saw that the prayer was similar to subsequent Hebrew prayers but was addressed to a Goddess.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;While Cyrus Gordon had previously proposed links between dedication tablets in Linear A and similar tablets in Akkadian and Phoenician that he had translated, Di Mino claims to be the first person to identify the links between the Linear A inscriptions and Hebrew prayers.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;This insight not only unlocked the verb in the prayer inscriptions, but it may also shed a broader light on the use of logograms in Linear A.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Di Mino claims that his insights into logograms in Linear A additionally help to resolve problems with some translations of Linear B, which validates his findings.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;Di Mino used Claude Code to build an engine and methodology to systematically organize and categorize symbols, and to test hypotheses. He believes that he might not have been able to do the work without Claude and thinks the techniques he used may unlock other undeciphered writing systems.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;Artifacts&lt;/head&gt;
+    &lt;p&gt;Di Mino’s research has led to:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;
+        &lt;p&gt;Proposed readings for 37 of the script’s 102 signs, including all 13 symbols unique to Linear A that have no counterpart in Linear B. He also resolved the sound values for 3 Linear B signs which were unknown to this day.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;A lexicon of 383 Linear A terms translated into English&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;A 9-page draft of a manuscript titled Ya Diktu: Grammar of the Minoan Peak Sanctuary Libation Formula, which may form the foundation for a submission to a peer-reviewed scientific journal&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Figure 1. A summary of the symbols in line 1 of the Minoan prayer inscription. Credit: Tom Di Mino, Ya Diktu: Grammar of the Minoan Peak Sanctuary, June 2026.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48600107</guid><pubDate>Fri, 19 Jun 2026 16:04:42 +0000</pubDate></item><item><title>Spotify Killed the Thrill of the Hunt</title><link>https://erildrun.bearblog.dev/spotify-killed-the-thrill-of-the-hunt/</link><description>&lt;doc fingerprint="30679350d1ee6db9"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Spotify killed the thrill of the hunt&lt;/head&gt;
+    &lt;p&gt;So I was reading a post from another user about canceling their Spotify, and it caught my attention because it came entirely from a fan’s perspective.1 As a small artist, I’ve got my own issues with Spotify. The way they operate just isn’t great for anyone involved, but this was different. It made me stop and consider how someone who isn’t making music experiences all of this.&lt;/p&gt;
+    &lt;p&gt;When I think about Spotify, my reactions are almost entirely shaped by being an artist. As a listener, I don’t even really like streaming services. I’ve always preferred owning my music. That’s just how I’ve always been.&lt;/p&gt;
+    &lt;p&gt;What stood out in that post was the idea that Spotify’s algorithm wasn’t serving them well, and more importantly, that the sheer over-availability of music was actually reducing their appreciation for it. That stuck with me.&lt;/p&gt;
+    &lt;p&gt;I started thinking back to coming up in the metal scene in the late ’90s and early 2000s, when finding music actually took effort. There were no streaming platforms. You had to dig. You had to seek out small, specialized record stores or spend time on shady forums. You’d track down obscure distros just to order releases you couldn’t get any other way.&lt;/p&gt;
+    &lt;p&gt;Sometimes that meant sending a money order, or "well hidden cash" and just waiting, hoping something would come back. And yeah, I get why that sounds ridiculous now, maybe even stressful. But it created something that’s hard to replicate: a real sense of accomplishment, and a sense of community around the music.&lt;/p&gt;
+    &lt;p&gt;You’d uncover these incredibly obscure bands, and chances are you didn’t know anyone else who had even heard of them. There was something powerful about that. It felt like you had discovered something genuinely hidden.&lt;/p&gt;
+    &lt;p&gt;Now, it’s completely different. The moment some obscure demo drops, it’s everywhere, Bandcamp, Spotify, Apple Music, Instagram, whatever. Everyone knows about it instantly. That sense of discovery, of finding a truly underground gem, just isn’t the same anymore. It’s too easy now.&lt;/p&gt;
+    &lt;p&gt;You can go on YouTube right now, search for any niche genre, and instantly access thousands of artists. And while that’s undeniably convenient, I do think it cheapens the experience. I haven’t discovered a band in a long time that’s stuck with me the way those older discoveries did.&lt;/p&gt;
+    &lt;p&gt;I still have these obscure shirts from bands that only did a single run 25 years ago. That was it, no reprints, no restocks. And those artifacts carry weight in a way that’s hard to recreate today.&lt;/p&gt;
+    &lt;p&gt;It’s just… not the same anymore. And I’m not entirely sure how to explain that feeling, but it’s there. &lt;lb/&gt;-Wræcca&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48600236</guid><pubDate>Fri, 19 Jun 2026 16:19:55 +0000</pubDate></item><item><title>Hyundai buys Boston Dynamics, Atlas humanoid to be used at vehicle plant by 2028</title><link>https://startupfortune.com/hyundai-takes-full-control-of-boston-dynamics-as-softbank-exits-for-325-million/</link><description>&lt;doc fingerprint="a78011d9fce041eb"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Hyundai's move to buy SoftBank's remaining 9.65% stake in Boston Dynamics for $325 million is not just cleanup from an old deal. It gives Hyundai full control of one of the few humanoid robotics companies with real factory work in sight.&lt;/p&gt;
+    &lt;p&gt;Hyundai Motor Group is expected to approve the purchase on June 22, closing out SoftBank's last piece of Boston Dynamics and turning the Waltham, Massachusetts robotics company into a wholly owned Hyundai business. The price is $325 million for the remaining stake, according to the deal terms, and it follows the put option SoftBank retained when Hyundai bought control of Boston Dynamics in 2021.&lt;/p&gt;
+    &lt;p&gt;You should read that as a signal, not a footnote. Hyundai paid about $880 million for an 80% stake in Boston Dynamics in the 2021 transaction, valuing the company at roughly $1.1 billion at the time. SoftBank had bought Boston Dynamics from Alphabet in 2017, after Google had acquired the robotics lab in 2013. It was a strange ownership path for a company whose robots became famous on YouTube long before they became obvious commercial products.&lt;/p&gt;
+    &lt;p&gt;That part is changing. At CES in Las Vegas on January 5, 2026, Hyundai and Boston Dynamics showed the electric Atlas humanoid robot in public, with the Associated Press reporting that the life-sized robot stood up, walked around the stage and was remotely piloted for the demonstration. The useful detail was not the stagecraft. It was the deployment plan. A production version of Atlas is expected to begin work at Hyundai's electric vehicle plant near Savannah, Georgia, by 2028.&lt;/p&gt;
+    &lt;p&gt;Boston Dynamics has spent years making robots that looked too good to be businesses. Spot, its four-legged robot, became the first obvious commercial success. Atlas is the harder test because humanoid robots have to justify themselves in places where traditional automation already exists. Business Insider reported in January that Boston Dynamics CEO Robert Playter said Atlas would need to learn new factory tasks in a day or two and reach 99.9% reliability before it could be truly useful on the floor. That's a high bar. It's also the right one.&lt;/p&gt;
+    &lt;p&gt;Hyundai's advantage is that it doesn't have to imagine the first customer. It owns the factories, the vehicle programs and now the whole robotics company. The Verge reported from CES that Hyundai plans to start Atlas with parts sequencing at its Metaplant in Georgia, then move toward heavier and more complex operations by 2030. If you're building robots for the physical world, that kind of controlled deployment matters more than a perfect demo video.&lt;/p&gt;
+    &lt;p&gt;The supply chain is part of the story too. Hyundai Mobis, the group's components arm, has been tied to actuator production for Atlas, which keeps one of the robot's most important hardware systems closer to Hyundai's own industrial base. Frankly, that is the difference between treating robotics as a side bet and treating it as a manufacturing capability. A humanoid robot is only as useful as the parts, service network and production discipline behind it.&lt;/p&gt;
+    &lt;p&gt;The field around Boston Dynamics is no longer sleepy. Tesla has shifted part of its Fremont factory story toward Optimus after ending Model S and Model X production, a move reported by Axios and The Verge earlier this year. Figure AI has pushed humanoid robots into BMW factory trials. Unitree has made lower-cost humanoids impossible to ignore. None of those companies has Boston Dynamics' long record in locomotion, but they don't need to. They need to make robots cheap enough, useful enough and reliable enough to win specific jobs.&lt;/p&gt;
+    &lt;p&gt;That is why full ownership matters for Hyundai. Boston Dynamics doesn't have to beat every humanoid rival in every market. It has to make Atlas work inside Hyundai plants first, where the tasks are known, the layout is controlled and the payoff can be measured in production uptime rather than conference applause. If it works there, Hyundai gets a robotics platform and a proof point at the same time.&lt;/p&gt;
+    &lt;head rend="h2"&gt;SoftBank has moved on to a bigger AI bet&lt;/head&gt;
+    &lt;p&gt;For Masayoshi Son, the Boston Dynamics exit looks small beside SoftBank's current AI infrastructure campaign. The Wall Street Journal reported in April that SoftBank is forming Roze AI, a new venture meant to use artificial intelligence and robotics to build physical infrastructure, including data centers. Tom's Hardware, citing the Financial Times, reported that Son is aiming for a $100 billion valuation for Roze and a public listing as soon as this year.&lt;/p&gt;
+    &lt;p&gt;That puts the $325 million Boston Dynamics proceeds in perspective. SoftBank is not walking away from robotics as an idea. It is moving toward robots as part of the AI buildout, tied to data centers, energy, land and construction. Boston Dynamics is a product company with hard engineering problems and a slower revenue curve. Son now wants the infrastructure layer.&lt;/p&gt;
+    &lt;p&gt;Hyundai wants the robot on the factory floor. That is a narrower bet, but it is easier to judge. By 2028, Atlas is supposed to be doing real work in Georgia, not just walking across a stage in Las Vegas. If Hyundai can turn that into repeatable manufacturing value, the SoftBank exit will look less like a tidy cleanup and more like the moment Hyundai stopped borrowing a robotics future and decided to own it outright.&lt;/p&gt;
+    &lt;p&gt;Also read: Texas just rewrote the rules for connecting AI data centers to its power grid • Elastic's $85 million bet on DeductiveAI is a signal that AI-native ops tooling is now acquisition currency • The U.S. government just told ASML one of its most restricted machines may be inside China&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48600312</guid><pubDate>Fri, 19 Jun 2026 16:28:20 +0000</pubDate></item><item><title>Google workspace threatening to block Firefox access</title><link>https://tales.fromprod.com/2026/169/google-workspace-threatening-to-block-firefox.html</link><description>&lt;doc fingerprint="1d62549019ef3b6d"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Google workspace threatening to block firefox&lt;/head&gt;
+    &lt;p&gt;At the time of writing (2026-06-18), Google Workspace appears to be starting to warn users from Firefox that they must use Chrome. This was for a &lt;code&gt;Google Workspace Business Plus&lt;/code&gt; account and workspace, from an up to date browser and OS.&lt;/p&gt;
+    &lt;p&gt;At this time, Firefox access still seems to work but I’ve no idea for how long.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Specific warning&lt;/head&gt;
+    &lt;code&gt;
+Icon indicating that the user may soon lose their access to their account.
+Secure your device for safe app access
+To help keep your data secure, make sure that your device meets your organisation's security requirements
+Next steps
+
+    Download Chrome Browser and sign in with your work account
+
+&lt;/code&gt;
+    &lt;p&gt;This was from a webpage with url &lt;code&gt;https://access.workspace.google.com/remediate?urlparams=REDACTED&lt;/code&gt;&lt;/p&gt;
+    &lt;p&gt;Screenshot below&lt;/p&gt;
+    &lt;head rend="h2"&gt;Response from Google support&lt;/head&gt;
+    &lt;p&gt;Absolutely nothing useful, repeatedly transferred around and took ages.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Why do I care?&lt;/head&gt;
+    &lt;p&gt;My team need to make sure that their software works in multiple browsers, and I personally prefer using firefox and don’t want to be forced to use Chrome for no discernable benefit.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48600345</guid><pubDate>Fri, 19 Jun 2026 16:30:49 +0000</pubDate></item><item><title>A New Bill Takes Aim at Government Pressure to Silence Lawful Online Speech</title><link>https://www.eff.org/deeplinks/2026/06/new-bill-takes-aim-government-pressure-silence-lawful-online-speech</link><description>&lt;doc fingerprint="f7b282b09801537c"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Last week, Senators Ted Cruz and Ron Wyden introduced the Justice Against Weaponized Bureaucratic Overreach to Networked Expression, or JAWBONE Act. The bipartisan legislation creates a federal cause of action against government officials who coerce or attempt to coerce broadcasters, interactive computer services, or AI providers into taking actions against lawful, First-Amendment-protected speech, and establishes a transparency system for government communications with those intermediaries about user expression.&lt;/p&gt;
+    &lt;p&gt;We thank the Senators for their leadership on this important issue. Jawboning occurs when the government pressures private companies to censor speech protected by the First Amendment, and it’s not always obvious to the public or to the victims what has actually happened. Deleting posts or cancelling accounts because a government official or agency demanded it or even made threats in making those demands—just like spying on people’s communications on behalf of the government—raises serious free speech concerns. Among other things, this bill would provide a new legal right to bring claims against the government in federal court, in addition to what the First Amendment provides.&lt;/p&gt;
+    &lt;p&gt;At EFF, we’re continuing to fight back on behalf of those censored by government coercion. One recent example: we represent the creator of ICEBlock, an app that allows the public to report immigration enforcement activity in their communities. In June 2025, high-ranking federal officials began threatening to investigate and prosecute the creator of ICEBlock, Joshua Aaron. In October 2025, the U.S. Attorney General demanded Apple remove ICEBlock from the App Store, and the company complied. The government’s coercion violated Aaron’s First Amendment rights.&lt;/p&gt;
+    &lt;p&gt;We’ve also filed a Freedom of Information Act lawsuit against the same government agencies that threatened Aaron and other services that provided forums to report ICE activity. The lawsuit seeks the disclosure of the government’s communications with Apple, Google, and Meta that forced the services to remove lawful speech.&lt;/p&gt;
+    &lt;p&gt;When federal officials pressure private companies into censoring protected speech, it can violate the First Amendment. But, not every communication from a government agency to a platform is unconstitutionally coercive. Treating legitimate communication and information-sharing between the government and private actors as though it were always unconstitutional would chill the valuable, good-faith engagement that supports a healthier and safer internet and nation for all Americans. This is a complex issue, and one that is important for Congress and the courts to get right.&lt;/p&gt;
+    &lt;p&gt;Finally, contrary to what many in Congress have been saying, social media platforms and other internet intermediaries have their own First Amendment rights to decide how they moderate users’ speech. They are not “state actors” and do not have an obligation under the First Amendment to allow all user speech on their platforms. EFF filed an amicus brief setting out our position in 2018, and we’ve said it in many cases since. The Supreme Court recognized again in the Netchoice cases that these services have a right to curate and edit their users’ speech, whether or not it aligns with the government’s position. And, it’s important to defend that First Amendment right so that governments cannot dictate how to edit a company’s site according to the government’s wishes and desires. To prevent jawboning by default, companies must be free to curate their platforms as they wish.&lt;/p&gt;
+    &lt;p&gt;EFF applauds Senators Cruz and Wyden for taking this critical issue seriously, and we look forward to working with Congress on this bipartisan bill as it moves through the process. We hope it lands on the right balance to provide additional protections for everyday users around freedom of expression.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=48600950</guid><pubDate>Fri, 19 Jun 2026 17:34:28 +0000</pubDate></item></channel></rss>
