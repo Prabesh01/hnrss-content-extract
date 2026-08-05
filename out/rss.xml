@@ -1,411 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 05 Aug 2026 17:16:54 +0000</lastBuildDate><item><title>Faster Than Ninja</title><link>https://build2.org/blog/faster-than-ninja.xhtml</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49182685</guid><pubDate>Wed, 05 Aug 2026 13:33:25 +0000</pubDate></item><item><title>Painting with Gaussians</title><link>https://yogthos.net/posts/2026-08-03-splat-painter.html</link><description>&lt;doc fingerprint="274193731760cc33"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Painting with Gaussians&lt;/head&gt;
-    &lt;p&gt;Last year I built an edge-aware pixelation tool to turn images into pixel art by deforming a grid so that it follows image edges instead of naively using a fixed grid over the picture. Using an edge adapter grid bent to inform the color and brightness of the pixels worked well for keeping edges crisp and preserving details.&lt;/p&gt;
-    &lt;p&gt;I later realized the same edge information could also be applied in a context of digital painting. A painting program has to figure out where to put brush strokes, how big should they be, and which direction should they flow in. Much of that is already encoded in the edges since they mark the boundaries between regions. These are the contours around areas of objects that a brush would trace, and their absence indicates generally flat areas where a few broad strokes should suffice.&lt;/p&gt;
-    &lt;p&gt;And so, I set off to see if I could make a program that paints in the style of a digital painting where marks derived from the image structure would resemble brush strokes. My goal was to make an interactive tool where you drag sliders around and the painting reforms itself in front of you. The project was also a great opportunity for me to test drive Jolt and see how well it works for building a non-trivial project.&lt;/p&gt;
-    &lt;p&gt;In this post, I'll walk you through how it all came together. We'll see what ideas worked and which ones didn't. Most importantly, we'll find out whether the end result actually ends up resembling anything like a painting.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Why Gaussians?&lt;/head&gt;
-    &lt;p&gt;The first question we need to consider is what a brush stroke is exactly in computational terms. A stroke of oil or acrylic is an elongated mark which has a center of color that fades toward its edges, and its orientation is the product of a brush being dragged across a canvas. It's translucent at the edges, and strokes overlap, allowing a painter to lay down broad blocks of color first, then build detail on top with smaller and more translucent marks to add finer detail.&lt;/p&gt;
-    &lt;p&gt;It turns out that a 2D Gaussian splat maps onto this idea surprisingly well. It has a mean which is where the stroke lands, a covariance matrix representing how it's stretched and rotated, along with a color and opacity. The covariance can be used to encode the brush direction and its elongation with the major axis pointing along the stroke, and the minor axis across it. Rendering a field of splats with standard over-compositing where each one is occluding what's behind it by its alpha gives you a similar effect to a natural painting model that allows marks to layer and blend together. Of course, you don't get the same fidelity of actual paint, so the effect is closer to digital painting using a tool like GIMP or Krita.&lt;/p&gt;
-    &lt;p&gt;There are already some implementations of this idea such as DrawingWithGaussians and 2d-gaussian-splatting-Art. However, both of them use a gradient descent approach where they seed random splats, and then iteratively nudge their positions, shapes, and colors until the rendered field has the appearance of a target image. That's the well known approach which is both slow and opaque. The worst part is that the end result ends up being simply a lossy reconstruction of the input image rather than looking like any sort of a painting.&lt;/p&gt;
-    &lt;p&gt;Since I already had the solution for extracting edge information from the image, I didn't see the point of evolving the image blindly. Instead, the extracted edges can be used to guide the painting process because they tell us where the details are along with the orientation of the strokes. Between detail density and pixel colors I had all the information that I'd need without having to resort to gradient descent. I'd basically just need to trace the existing image. How hard could it be really?&lt;/p&gt;
-    &lt;p&gt;So, I started following the reference rasterizer which uses additive blending where: pixel = background + Σ(intensity × color). Turns out, this approach works in the fitting regime because the optimizer learns colors that compensate for overlap. Unfortunately, seeding thousands of splats directly from pixel colors and rendering them additively creates a lot more overlap. With 1,200 splats on a 64×64 image, the sum hit 22.06 in some pixels, creating pure white blobs all over the image. Luckily, the problem can be solved by using the standard over-operator from alpha compositing to make each splat occlude what's behind it by its alpha so that the summed color never exceeds 1.0. Another benefit of this approach is that it cleanly separates color sampled from the image and opacity.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Edges Tell You Where to Paint&lt;/head&gt;
-    &lt;p&gt;Every image in this section is the same photo run through the same pipeline, with one idea switched off at a time — same source, same stroke budget, same base size — so each step shows exactly what that one idea buys.&lt;/p&gt;
-    &lt;p&gt;I started using the following source photo, and recorded the progress as I continued to improve the app to illustrate what each idea buys. Let's see how the painting evolves as new tricks are added to the mix.&lt;/p&gt;
-    &lt;p&gt;I got a rather sad output which looked like a uniform mosaic with my initial renderer. Every splat had the same size, aspect ratio, and rotation, producing a regular grid of identical blobs. Not really looking like much of a painting so far.&lt;/p&gt;
-    &lt;p&gt;An actual painter would vary their strokes using a few broad strokes for flat regions such as the sky or a smooth surface. Then, along edges and in textured areas like eyes or fabric, a smaller brush gets used to make numerous finer strokes that follow the contours of the objects.&lt;/p&gt;
-    &lt;p&gt;One way to emulate this is by using a structure tensor to compute the image gradient, encoding how much and in which direction the color changes for each pixel. A 2×2 tensor is formed from the gradient outer product, and blurred over a neighborhood. Importantly, the tensor's eigenvectors will tell you three key things. The major eigenvector points across the contour, providing the direction of the strongest gradient. The minor eigenvector points along the edge, giving the direction of the brush stroke. And coherence, which is the ratio of eigenvalues, tells you whether the edge is a crisp contour or isotropic mush.&lt;/p&gt;
-    &lt;p&gt;Each splat gets its own covariance from this tensor at its position, and gets elongated along the edge, with elongation being proportional to coherence. Flat areas stay round while the edges become thin, directional strokes that trace the contours of the objects in the scene. This is the classic painterly rendering trick from Litwinowicz and Hertzmann. With it in place, the rendering started to resemble something that looks like brushwork if you squint a bit. Here, the fur and the hat brim pick up direction, and the whiskers start to appear.&lt;/p&gt;
-    &lt;p&gt;But here, I hit another problem because the structure tensor uses luminance gradients which are grayscale, making it blind to isoluminant color edges such as red lips against pale skin or a blue sign on a grey wall. Luckily, the Di Zenzo color tensor can be used to compute Sobel gradients per RGB channel. Their outer products can then be summed into one tensor, giving a chroma edge that drives orientation as strongly as a luma edge.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Edges Aren't Enough&lt;/head&gt;
-    &lt;p&gt;While the structure tensor solves the problem of figuring out orientation, it tells you nothing about the density of the region. And without knowing that, it's not possible to figure out how many strokes need to go in that region and how small should they be.&lt;/p&gt;
-    &lt;p&gt;You might be thinking that you could just use edge strength to figure this out, and decide on the number of strokes to use based on that. But doing so ends up missing the texture of the objects entirely. For example, a gravel path has little coherent edge structure but lots of high-frequency detail that deserves its own fine marks. A smooth cheek, on the other hand, has a single contour edge while its interior should stay broad. Conversely, a faint-but-real edge, such as subtle fabric folds or distant tree branches, has low absolute gradient magnitude but still needs to be rendered. So, relying solely on doing edge analysis makes it impossible to reproduce many of the important details present in the original image.&lt;/p&gt;
-    &lt;p&gt;This is where the Haar wavelet, which I discussed in this post, comes into play. Running a multi-scale 2D Haar decomposition on the luminance produces a detail energy map by summing the absolute detail coefficients across scales for each cell. The map will contain high values in textured and edgy regions, and low values in ones lacking detail. But raw wavelet energy still has the problem of being absolute. A dark region with genuine texture produces less absolute energy than a bright region with moderate texture, leading to the dark details getting washed out.&lt;/p&gt;
-    &lt;p&gt;What we need here, again, is a luma-relative detail map where each cell's energy is divided by its local mean brightness plus a fraction of the global mean. Now, dark regions can keep their detail, and since the map is fused with locally-normalized edge strength from the structure tensor, a faint contour in a flat region will still attract strokes.&lt;/p&gt;
-    &lt;p&gt;And that's why both of these techniques are valuable here. The tensor carries the orientation and coherence for every stroke, while the wavelet identifies the density map needed to drive adaptive placement. Together they form a complete answer to the question of where detail lives and what shape it has. At this point, things are starting to come together, and there is enough information extracted from the source image to go beyond naive algorithmic stroke placement.&lt;/p&gt;
-    &lt;p&gt;The detail map now decides where the small marks are spent, and the out-of-focus background turns into a smooth wash, while the strokes collect on areas of detail such as the fur and the eyes.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Killing the Grid&lt;/head&gt;
-    &lt;p&gt;However, there's still one remaining problem that we haven't talked about yet. Even with adaptive orientation and density, the output still ends up looking off because the strokes end up having a faint regularity to them. Their placement and regular shape are an artifact of having a regular placement grid.&lt;/p&gt;
-    &lt;p&gt;Using a stratified grid where you divide the image into cells and put one stroke in each of them will necessarily create artifacts at the edges. Incidentally, this is the same problem seen in JPEG compression at higher levels. It's possible to jitter the position within the cell to break the lattice or use rotated grids per detail level, but these workarounds don't address the underlying problem of the grid being regular.&lt;/p&gt;
-    &lt;p&gt;And so, the grid approach needs to be abandoned in favor of placing strokes at positions derived from a Wang avalanche hash of their index. This method gives true white-noise coordinates with no periodicity. There's a subtlety here, however, because a simple linear hash &lt;code&gt;(frac × i A)&lt;/code&gt; produces points that fall on Marsaglia hyperplanes leading to diagonal stripes which are even worse than the grid artifacts. You need a proper avalanche mix where each input bit affects every output bit.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Making It Look Painted: Noise as a Feature&lt;/head&gt;
-    &lt;p&gt;At this point I had edge-aligned strokes at adaptive densities which smoothly paint across the whole canvas, but the result still felt too regular. Every stroke on a given edge had the same length, the same spacing, the same alignment, which is not what real brushwork looks like. I needed some way to emulate the hand wavering and changes in pressure to make the painted effect more plausible.&lt;/p&gt;
-    &lt;p&gt;And what better way to add subtle structural variation than to use Perlin noise. I recently wrote a post showing how it can be used to create a flow animation. So, I naturally reached for it since it was fresh in my mind. Two decorrelated 2D Perlin channels can be used to form a smooth vector flow field. Then, each stroke's orientation can be derived by blending the structure tensor's edge angle with the Perlin flow angle, weighted by (1 − coherence). The stroke follows the contour faithfully on a strong edge with coherence approaching 1, while it has a more organic flow field in a flat region with coherence around 0. Using this trick makes the background look a bit like flowing brushwork thanks to the turbulence introduced by the noise factor.&lt;/p&gt;
-    &lt;p&gt;The flow field is computed from a heavily-blurred copy of the structure tensor to diffuse edge orientations into surrounding flat areas. A stroke in a low-detail region follows the nearby feature since the flow of a distant contour ripples through the background. In areas where there aren't any features to guide the strokes, the Perlin vector field takes over to produce organic curves without a directional bias. Per-stroke size and color also need to have independent noise channels to avoid strokes looking identical even in uniform regions. This is the first version where the marks started actually resembling brushwork.&lt;/p&gt;
-    &lt;p&gt;Of course, that all sounds good on paper, but in practice I started seeing a regular wavy pattern in the images. Digging into it, I discovered that the Perlin bend is a shared spatial field, so neighboring strokes end up creating a wave in phase, with every chain passing through a region getting an identical bend sequence. The result ends up looking like a coherent fabric-like weave. And it's particularly noticeable near moderate edges such as fingers or cloth folds. To get a bit of natural variation there would need to be a per-seed phase offset in the noise coords to make each stroke wobble independently.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Layering: How a Painter Builds a Canvas&lt;/head&gt;
-    &lt;p&gt;With all the core pieces in place, the next step was to try doing the actual painting. My idea was to emulate a physical painting process where large splats can be used to define general color regions, and then to layer progressively smaller splats to add progressive detail on top. This way the painting would start with a broad underpainting; mid-tones would be added next, then glazes, and fine detail on top. Each layer is more translucent and specific than the one below it, augmenting the existing structure that's already been built up.&lt;/p&gt;
-    &lt;p&gt;The base layer contains large, opaque strokes that fully cover the image, ensuring that there are no gaps that would create empty spaces. Next is the subject-adaptive broad tier derived from the wavelet detail map, which points to where the interesting content is. In the background where subjectness is low, strokes grow larger and sparser to create a bokeh effect, melting into a few soft daubs. Under the subject where detail is high, the strokes have to stay tight to capture the important features in the image. The mid tier isn't fundamentally different from the base layer, containing shorter and more translucent strokes representing glazes which bring out general shapes in the image. So, the overall mechanic here stays largely the same.&lt;/p&gt;
-    &lt;p&gt;The fine tier is where the real brush strokes live. At this resolution single dabs are not sufficient, and each fine seed needs to trace a chain of tapered Gaussian segments stepped along the edge tangent, so they all fuse into a continuous line. Low-frequency Perlin noise is used to bend the chain slightly. Size and alpha taper toward the tail like a brush lifting. Colors need to be sampled from one side of the edge so the two sides' paints meet at the boundary instead of crossing it. On strong edges, fine strokes carry nearly opaque paint, emulating impasto liner strokes that sit on top of the glaze. The edge map is also used to inform the length of detail strokes, each following an unbroken segment without any breaks or sharp corners in it. Thus, the strokes have a lot of variance in terms of length and shape, the way a real paintbrush would.&lt;/p&gt;
-    &lt;p&gt;Since each refinement level is more translucent, the details accumulate on the underpainting rather than scratching over it. One thing that becomes tricky at finer details, however, is ensuring that strokes hitting a color boundary fade toward the tail as they drift from their original color. When the mismatch becomes large enough, the chain needs to stop before emitting, which simulates the painter lifting the brush at the region boundary.&lt;/p&gt;
-    &lt;p&gt;Here you can finally see the full pipeline with the same strokes as the previous image, but now built up in layers which become progressively more translucent and more color-specific at the top, along with an edge tier that restates the silhouettes from their own sides. You can judge for yourself whether the end result looks painted, but it seems pretty good to my eye.&lt;/p&gt;
-    &lt;p&gt;The same crop before (left) and after (right) shows how the whiskers hold their color instead of smearing into the fur, and the eyes sit crisply against their surroundings.&lt;/p&gt;
-    &lt;head rend="h2"&gt;The GPU Move&lt;/head&gt;
-    &lt;p&gt;I started with the CPU pipeline, which ran at 55–112ms per render, and that was fine for a few tens of thousands of splats. It was also valuable as it led to a couple of performance optimizations seen in pull requests here and here. So, that ended up being a useful exercise for tuning the compiler, but a detailed painting would need hundreds of thousands of small strokes and no amount of tuning would help there. Every splat being a Clojure allocation means that the whole vector would have to cross to the GPU each frame.&lt;/p&gt;
-    &lt;p&gt;At this point, the only viable solution was to move generation entirely to the GPU and do the work within an OpenGL context. Conveniently, the approach I was already following maps well to doing transform feedback with a geometry shader, feeding it a vertex program of candidate points. The shader, in turn, threshold-tests each against the detail map, runs the placement math, and emits packed splat records for the survivors. The buffer stays on the GPU, allowing the render pass to be done directly.&lt;/p&gt;
-    &lt;p&gt;Doing heavy math on the GPU made the whole thing fast enough to tweak different parameters interactively. Controlling the number of splats being used, how small the splats can get, their hardness, and smoothing across different resolutions allows tailoring the end effect for each image being rendered. Most of these controls loosely map to physical painting concepts such as brush size, paint load, glaze transparency, stroke length, and hand steadiness. All that naturally fell out of the approach to model the problem as a painting exercise.&lt;/p&gt;
-    &lt;p&gt;And a few more examples illustrating how the painter works with different kinds of scenes and settings:&lt;/p&gt;
-    &lt;head rend="h2"&gt;Conclusion&lt;/head&gt;
-    &lt;p&gt;In the days of generative image models, it's still fun to see what can be achieved using traditional image transformation techniques. Building a desktop app to prove the concept turned out to be a great exercise for Jolt and my Glimmer reactive GUI library on top of GTK. The exercise also shook out a lack of type hinting optimizations in Jolt, leading to general performance improvements, and helped prove out the nREPL-driven development workflow.&lt;/p&gt;
-    &lt;p&gt;In the end, I'd call the experiment a success. While it could still be tuned further to produce even more realistic painting effects, the general concept works as well as I dared hope. Turns out that analyzing edges and textures of an image to extract its structure gives a lot of the same information a painter uses to decide where to put brush strokes. In that sense, the algorithm really is doing digital painting.&lt;/p&gt;
-    &lt;p&gt;But the really fun part of the project was in combining a number of techniques, such as Perlin noise, wavelets, and edge detection, that I played around with previously in isolation. All these different tricks came together for this project, making it possible to build something greater than the sum of its parts. I find these are the most rewarding types of experiments where you can build on things you've previously learned and combine them in novel ways to make something new and unexpected. I hope you enjoyed the journey as much as I did working on the project.&lt;/p&gt;
-    &lt;p&gt;As always, the project is open source, and can be found on GitHub.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49182695</guid><pubDate>Wed, 05 Aug 2026 13:34:32 +0000</pubDate></item><item><title>Building an Advanced Agentic Harness</title><link>https://data4sci.com/blog/building-an-advanced-agentic-harness</link><description>&lt;doc fingerprint="6bdf3c8b3df7fea3"&gt;
-  &lt;main&gt;
-    &lt;p&gt; Subscribe to get our latest content by email. Subscribe We won't send you spam. Unsubscribe at any time. Built with Kit&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49182946</guid><pubDate>Wed, 05 Aug 2026 13:54:12 +0000</pubDate></item><item><title>Cloudflare OS: an open platform for agents, apps, and work</title><link>https://blog.cloudflare.com/cloudflare-os/</link><description>&lt;doc fingerprint="a642bf4919b9a889"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Cloudflare OS: an open platform for agents, apps, and work&lt;/head&gt;
-    &lt;p&gt;Phillip JonesÂ andÂ Dan Carter&lt;/p&gt;
-    &lt;p&gt;Every organization has a mission, a reason for being. Organizations pass that mission â along with their terminology, procedures, systems, standards, and ways of working â to their people. People, in turn, take this context together with their own experience and work towards the mission.&lt;/p&gt;
-    &lt;p&gt;Work can take many forms, from code, to documents and slides, to relationships, to outcomes in the physical world.&lt;/p&gt;
-    &lt;p&gt;Some of these are straightforward: code either runs or it doesnât. Agents have been using this feedback loop to produce code that âworksâ for developers over the last couple of years. But what about the rest of us?&lt;/p&gt;
-    &lt;p&gt;Bringing the same leverage to the rest of the organization is a harder problem. Agents need to understand the context of the company and be able to reach the systems people use to do their jobs. They need to turn that context and access into work that moves the organization towards its mission.&lt;/p&gt;
-    &lt;p&gt;Thatâs why we created Cloudflare OS. It gives every person an agent and workspace built around their company: how it works, what it knows, and the systems it relies on.&lt;/p&gt;
-    &lt;p&gt;In May of this year, we gave every person at Cloudflare access to the first version of Cloudflare OS. Thousands of people across every function, many of them outside of engineering, use it every day to create documents and slides, automate repeatable tasks, and build small apps to visualize data and help them do their work.&lt;/p&gt;
-    &lt;p&gt;Cloudflare OS also gave everyone a shared library of context and skills built by teams at Cloudflare. It captures our terminology, procedures, and best-known ways of doing recurring work as instructions an agent can follow. When one person figures out a better way to do something, everyone else can use it.&lt;/p&gt;
-    &lt;p&gt;Today, we are open sourcing a new version of Cloudflare OS. Any organization can deploy it, connect it to internal systems, and make it their own.&lt;/p&gt;
-    &lt;head rend="h2"&gt;What we learned from the first version&lt;/head&gt;
-    &lt;p&gt;The Cloudflare OS we are open sourcing today is based on what we learned from running the first version internally, a journey our CIO, Sam Rhea, covers in his blog post.&lt;/p&gt;
-    &lt;p&gt;The first version centered on individuals working with agents through private workspaces. Apps were static rather than live software connected to internal systems, and mostly deterministic jobs still required running an agent skill again and consuming more model tokens.&lt;/p&gt;
-    &lt;p&gt;Collaboration exposed a more fundamental challenge. Access to an MCP server told us which tools an agent could call, but not which underlying resources the agent had observed. Once people began sharing workspaces, apps, and outputs, we needed to ensure that collaboration could not expose information someone was not permitted to see.&lt;/p&gt;
-    &lt;p&gt;We rebuilt Cloudflare OS on a new foundation to solve these problems. Security had to be part of the platform, not something every person building an app or using an agent has to implement correctly.&lt;/p&gt;
-    &lt;p&gt;The result is a platform designed to belong to the company running it. You can customize the interfaces, connect your tools, and add the skills and context that capture how your organization works.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Introducing Cloudflare OS&lt;/head&gt;
-    &lt;p&gt;Cloudflare OS starts with a conversation in your browser, like many other AI tools. What makes it different is that each conversation is grounded in the context and skills your organization has curated. Give your workspace a goal, and it can draw on that knowledge and work with the tools and data your organization already uses to achieve it.&lt;/p&gt;
-    &lt;p&gt;Cloudflare OS combines three parts:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;An agent workspace grounded in context and skills your company curates, with an isolated runtime where agents can write and run code.&lt;/item&gt;
-      &lt;item&gt;A new security and governance framework for safe access to internal data and services.&lt;/item&gt;
-      &lt;item&gt;A platform for personal, modifiable apps that people can build, share, and continue changing.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;What begins as a conversation can become a doc, an app, or a workflow that continues doing the work.&lt;/p&gt;
-    &lt;head rend="h2"&gt;An agent workspace for everyone in your company&lt;/head&gt;
-    &lt;p&gt;Agent workspaces were designed for everyone in your organization to use. You interact with them in your browser, so you donât have to be a developer or know how to use a terminal.Â&lt;/p&gt;
-    &lt;p&gt;A workspace combines agent sessions, persistent state, outputs and files, resource access, and an isolated runtime where the agent can write and run code.&lt;/p&gt;
-    &lt;p&gt;They come loaded with the curated context and skills your team or company has collected. No more reinventing the wheel for every task â if someone on your team has figured out the best way to do something, everyone benefits. People no longer have to explain the same process, terminology, and best practices to a model every time they start a task.&lt;/p&gt;
-    &lt;p&gt;A few things you can do:&lt;/p&gt;
-    &lt;head rend="h3"&gt;Research and ask questions&lt;/head&gt;
-    &lt;p&gt;Ask a workspace to research a topic using company context and the resources you make available to it. The agent can write code to search, filter, join, and analyze information instead of pulling an entire dataset into the modelâs context window.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Create docs, slides, and spreadsheets&lt;/head&gt;
-    &lt;p&gt;A workspace can turn its research into a document, presentation, or spreadsheet that you can continue editing. These outputs do not have to be static files. They can remain connected to live data, be updated as their sources change, and still be exported to familiar formats or services such as Google Drive.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Create collaborative, connected apps for your team&lt;/head&gt;
-    &lt;p&gt;When a document or spreadsheet is not enough, the agent can build an app with its own interface, logic, and state. The app can use connected company resources and support multiple people working together.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Run deterministic workflowsÂ&lt;/head&gt;
-    &lt;p&gt;Not every job needs a full agent session. Many are a known sequence of steps with one or two places where judgment is useful. A workspace can turn those jobs into mostly deterministic workflows, using code for the predictable steps and a model only where it adds value. Workflows can run on demand, on a schedule, or when an event occurs in a connected system.&lt;/p&gt;
-    &lt;p&gt;Cloudflare OS gives agents and apps governed access to systems of record through Gatekeepers (more on this in the security section below). It also supports existing Model Context Protocol (MCP) servers your organization already uses via MCP Server Portals.&lt;/p&gt;
-    &lt;head rend="h2"&gt;A new security and governance framework for safe access to internal data and services&lt;/head&gt;
-    &lt;p&gt;As people begin experimenting with AI at work, one of their first requests is often for API keys to company systems. This makes sense: AI isnât much use at work if it doesnât have access to the systems people use to do their jobs.&lt;/p&gt;
-    &lt;p&gt;But handing over API keys to people and agents is dangerous and does not scale. Keys often provide broad, long-lived access that is difficult to constrain, share safely, and audit.&lt;/p&gt;
-    &lt;p&gt;MCP gives agents a better way to use these systems. An MCP server can hold the credential and expose a defined set of tools instead of handing the key directly to the agent. But controlling which tools an agent can call is only the first step. MCP alone does not tell us which underlying resources an agent has observed. The agent can combine information across systems, send it somewhere less restricted, or expose it through apps and outputs to people who may not be allowed to see the original resources. Authorization has to account for where the data can go next.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Agents start with no access&lt;/head&gt;
-    &lt;p&gt;Cloudflare Access controls who can enter Cloudflare OS. Inside, every agent and app starts with access to nothing. An agent can ask for access to a specific resource, which you can grant or deny. Generated code receives that resource as a typed binding:&lt;/p&gt;
-    &lt;code&gt;const issues = await env.PROJECT.listIssues({
-  teamId: "ENG",
-  state: "open",
-});&lt;/code&gt;
-    &lt;p&gt;&lt;code&gt;env.PROJECT&lt;/code&gt; is a capability representing permission to use a specific resource under a specific policy. The credential remains completely isolated from the agent and any generated code.&lt;/p&gt;
-    &lt;p&gt;Server code runs in a Dynamic Worker with global outbound networking disabled. Client code runs in a sandboxed frame in the browser. Neither can reach the Internet except through capabilities you explicitly provide.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Gatekeepers govern resources and actions&lt;/head&gt;
-    &lt;p&gt;A Gatekeeper is a service-specific Worker that sits between Cloudflare OS and an external service. It understands the serviceâs API, its resources, and the operations that can be performed on them.&lt;/p&gt;
-    &lt;p&gt;Giving an agent access to your entire GitHub account is likely too broad. A Gatekeeper can give it access to a single repository, allow it to read issues but not source code, mask particular fields, apply rate limits, and require approval before merging a pull request.&lt;/p&gt;
-    &lt;p&gt;The agent and its apps see a small TypeScript API. The Gatekeeper handles OAuth, holds the credential, enforces policy, records what was read, and mediates anything with an externally visible side effect.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Policy follows what the agent has seen&lt;/head&gt;
-    &lt;p&gt;Controlling the initial read is not enough. Take, for example, the case where an agent reads a sensitive table in a data warehouse and uses it to produce a live dashboard. Sharing the dashboard must not become a way to share the table with people who could not access it directly.&lt;/p&gt;
-    &lt;p&gt;Cloudflare OS records every resource agents observe. These observations remain attached to the agent and its work. When another person tries to open the workspace, interact with the agent, or view what it produced, Gatekeepers verify that person's access to the observed resources.&lt;/p&gt;
-    &lt;p&gt;The same observation log is used to inform policies that determine when agents can make external requests. A read of sensitive data can prevent the agent from writing data to certain sources, inviting new collaborators, handing work to another agent, or making an outbound request.&lt;/p&gt;
-    &lt;p&gt;People using agents or building apps do not have to worry about making these mistakes. The platform can now be used to handle this.&lt;/p&gt;
-    &lt;head rend="h2"&gt;A platform for building and sharing personal, modifiable apps&lt;/head&gt;
-    &lt;p&gt;Most productivity suites give you a fixed set of applications: documents, spreadsheets, and presentations. In Cloudflare OS, each âfileâ can be its own application, written by an agent for one person, one project, or one team.&lt;/p&gt;
-    &lt;p&gt;These are not prototypes that you have to export and deploy somewhere else. Each one is a full-stack application with client code, server code, an API, and durable state. Apps are private by default, but can be shared like documents.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Every app is a Worker&lt;/head&gt;
-    &lt;p&gt;When you ask your workspace to build an app, the agent writes two parts:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Client code that renders the appâs UI in the browser&lt;/item&gt;
-      &lt;item&gt;Server code that stores state and implements the appâs behavior&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;The server is loaded on demand as a Dynamic Worker and instantiated as a Durable Object Facet (both are features we built for this project). The facet gives the app its own SQLite database, separate from the Cloudflare OS runtime managing it. Dynamic Workers use lightweight V8 isolates, so every app can have its own isolated runtime without needing a dedicated server or container sitting around.&lt;/p&gt;
-    &lt;p&gt;The browser client talks to the server using Capân Web, Cloudflareâs open source object-capability Remote Procedure Call (RPC) system. A server method can be called from the client like a normal JavaScript function:&lt;/p&gt;
-    &lt;code&gt;const issues = await app.listIssues({
- status: "done",
-});&lt;/code&gt;
-    &lt;p&gt;The special part is that the agent can also call the same method.&lt;/p&gt;
-    &lt;p&gt;So if you can build a tool to do a job yourself, agents can use your tool to do the job when youâre not there.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Share the app, or share how it was built&lt;/head&gt;
-    &lt;p&gt;When you build an app in Cloudflare OS, you have two ways to share them:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Sharing your app itself lets other people collaborate in real time using the same state.&lt;/item&gt;
-      &lt;item&gt;Sharing a blueprint of your app lets other people create their own copy of your app.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;An app instantiated from a blueprint contains the original appâs code. But it does not contain its SQLite data, conversation history, credentials, or connected resources. Each new app starts with independent state and resources.&lt;/p&gt;
-    &lt;p&gt;This means when you share apps with your team, they can modify them themselves with AI instead of filing a feature request and assigning you.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Use any model, and control what it costs&lt;/head&gt;
-    &lt;p&gt;Cloudflare OS can be used with any model. Every inference call runs through Cloudflare AI Gateway, giving your organization one place to decide which models are available and which model should handle each job.&lt;/p&gt;
-    &lt;p&gt;Not every task needs the most expensive model. You may not want to run the most expensive frontier model to summarize your unread emails every morning. AI Gateway gives you the control needed to make sure expensive models are only being used for the hardest work.&lt;/p&gt;
-    &lt;p&gt;Every request is attributed to the person, team, or workspace that made it. Administrators can see where inference spend is going, set budgets and rate limits, and decide what happens when a limit is reached.Â&lt;/p&gt;
-    &lt;head rend="h2"&gt;Open source, so you can make it yours&lt;/head&gt;
-    &lt;p&gt;Cloudflare OS is available today and is open source. Check out the cloudflare-os GitHub repository. You can deploy it into your own Cloudflare account and use your own Access policies, AI Gateway configuration, data, and integrations.&lt;/p&gt;
-    &lt;p&gt;Our internal deployment reflects Cloudflareâs systems, terminology, policies, and ways of working. Yours should reflect your organization.&lt;/p&gt;
-    &lt;p&gt;Cloudflare OS is designed so you can customize the interface, add internal Gatekeepers, and build organization-specific features without changing the core product.&lt;/p&gt;
-    &lt;p&gt;We are releasing two repositories: the Cloudflare OS core and an example deployment based on how we run it internally at Cloudflare. The deployment repository consumes the core without patching it, providing a place for configuration, custom UI, internal integrations, analytics, and deployment pipelines.&lt;/p&gt;
-    &lt;head rend="h2"&gt;DeliveredÂ together with our partners&lt;/head&gt;
-    &lt;p&gt;The source code is only the starting point. The context, skills, workflows, internal systems, and policies are what make Cloudflare OS even more useful for your organization.&lt;/p&gt;
-    &lt;p&gt;Cloudflareâs strategic partners, Presidio and Happy Cog, will work with you to customize Cloudflare OS around how your organization operates and roll it out across your workforce.&lt;/p&gt;
-    &lt;p&gt;Partners can help you curate shared skills and institutional context, build custom interfaces, connect internal systems through Gatekeepers and MCP Server Portals, and configure security, model, and cost controls.&lt;/p&gt;
-    &lt;p&gt;You get your own branded Cloudflare OS, connected to your systems, running on Cloudflare, and shaped around how your people actually work.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Get started&lt;/head&gt;
-    &lt;p&gt;Cloudflare OS is available today on GitHub. You can explore the source code, try the demo, or deploy it into your own Cloudflare account in a few minutes using our starter repository.&lt;/p&gt;
-    &lt;p&gt;Weâre just getting started. Weâre working on bringing Cloudflare OS to the Cloudflare dashboard as a fully managed product, adding containers for development workflows, and bringing workspaces into Slack and other chat tools.&lt;/p&gt;
-    &lt;p&gt;If youâre interested in talking with our team, we would love to chat. Use this form to reach out!&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49182996</guid><pubDate>Wed, 05 Aug 2026 13:58:53 +0000</pubDate></item><item><title>The Entropy of a Markov Chain</title><link>https://chillphysicsenjoyer.substack.com/p/the-entropy-of-a-markov-chain</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49183017</guid><pubDate>Wed, 05 Aug 2026 14:00:10 +0000</pubDate></item><item><title>TSON – A JSON superset with immutable, hash-pinned schemas</title><link>https://tson.io/</link><description>&lt;doc fingerprint="329d610f2d54e2f0"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Data with an immutable schema.&lt;/head&gt;
-    &lt;p&gt;TSON (Typed Schema Object Notation) is a schema system with immutable, hash-pinned schemas whose definitions are themselves data. A document names its schema, the schema names its meta-schema; one hash verifies the whole chain. The finishing touch, TSON's data format is a Unicode-first superset of JSON you'll actually enjoy writing.&lt;/p&gt;
-    &lt;code&gt;!!schema:"https://example.com/people.tn?sha256=c4d5e6f7â¦a2b3c4d5"
-!employee {
-  name:       "Ada Lovelace"
-  born:       1815-12-10
-  department: Research
-  level:      L2
-}&lt;/code&gt;
-    &lt;code&gt;!!id:"https://example.com/people.tn?sha256=c4d5e6f7â¦a2b3c4d5"
-!!meta:"https://tson.io/2026/32/m/meta.tn?sha256=8b1e4a9câ¦d7f2a640"
-!!import:"https://tson.io/2026/32/m/core.tn?sha256=3f9d2c71â¦b8e5c194"
-{
-  person   =&amp;gt; { name: text  born: date }
-  employee =&amp;gt; person &amp;amp; { department: text  level: rank ~ L1 }
-  rank    =&amp;gt; !enum [L1 L2 L3]
-}&lt;/code&gt;
-    &lt;p&gt;TSON Data and Schemas documents share the same lexer, same tooling, same verification. Schemas are maps with a compact grammar that's easy to read and write. In this Schema, &lt;code&gt;person&lt;/code&gt; is a record with two fields; &lt;code&gt;employee&lt;/code&gt; combines person with department and level; the &lt;code&gt;level&lt;/code&gt; field is an enum with a default; and all the fields are required by default.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Try it&lt;/head&gt;
-    &lt;p&gt;Skip the reading. Run it.&lt;/p&gt;
-    &lt;p&gt;There is a working implementation: tson-java. The command-line tool's init-example command writes you an example schema and a data document pair. You can use the validate command to see how the data gets validated against the schema. Break the data (e.g. quote the age, delete a field) and it reports every problem at once, each with a path and a reason.&lt;/p&gt;
-    &lt;code&gt;$ git clone https://github.com/litterat/ltr8-io-tson-java.git
-$ cd ltr8-io-tson-java &amp;amp;&amp;amp; ./gradlew :tson-cli:installDist
-$ export PATH="$PWD/tson-cli/build/install/tson/bin:$PATH"
-
-$ tson init-example
-Wrote ./person.tn and ./person-data.tn.
-
-$ tson validate person.tn person-data.tn
-OK&lt;/code&gt;
-    &lt;head rend="h2"&gt;A succinct schema built on a solid foundation&lt;/head&gt;
-    &lt;p&gt;Contracts you'd otherwise scatter through validation code, stated in declarations. The foundation: an eighteen-article research series understanding JSON and deriving what a schema is, from first principles, before any syntax or code was written.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Records and field states&lt;/head&gt;
-    &lt;p&gt;Fields are required by default. ~ supplies a default, = pins a value, ? makes the field optional. Five states, every one explicit in the declaration.&lt;/p&gt;
-    &lt;code&gt;config =&amp;gt; {
-  host:    text
-  port:    integer ~ 8080
-  retries: integer = 3
-  comment: text?
-}&lt;/code&gt;
-    &lt;code&gt;!config { host: "prod.db.internal"  port: 5555 }&lt;/code&gt;
-    &lt;head rend="h3"&gt;Arrays, tuples, sets&lt;/head&gt;
-    &lt;p&gt;Sized homogeneous arrays, fixed-shape tuples, unique-membered sets. Three contracts that all read as one bracket syntax in the data.&lt;/p&gt;
-    &lt;code&gt;tags   =&amp;gt; [text; 1..10]
-point  =&amp;gt; [number, number]
-badges =&amp;gt; set&amp;lt;text&amp;gt;&lt;/code&gt;
-    &lt;code&gt;!tags [urgent reviewed]
-!point [3.5 7.2]
-!badges [alpha beta]&lt;/code&gt;
-    &lt;head rend="h3"&gt;Atoms and enums&lt;/head&gt;
-    &lt;p&gt;Refine an atom's constraint vocabulary with ^, or mint a fresh atom family with a constructor. The refinement IS-A its source; the enum is its own family.&lt;/p&gt;
-    &lt;code&gt;port  =&amp;gt; !integer ^ { min: 1  max: 65535 }
-sku   =&amp;gt; !text ^ { pattern: "[A-Z]-[0-9]{3}" }
-rank =&amp;gt; !enum [L1 L2 L3]&lt;/code&gt;
-    &lt;code&gt;!port 8080
-!sku "A-123"
-!rank L2&lt;/code&gt;
-    &lt;head rend="h3"&gt;Composition&lt;/head&gt;
-    &lt;p&gt;New fields with declared ancestry: ticket IS-A audit, and contributed field sets must be disjoint. No silent overrides, no diamond ambiguity.&lt;/p&gt;
-    &lt;code&gt;audit  =&amp;gt; { created: datetime  updated: datetime? }
-ticket =&amp;gt; audit &amp;amp; { id: uuid  title: text }&lt;/code&gt;
-    &lt;code&gt;!ticket {
-  created: 2026-07-01T09:00:00Z
-  id: 550e8400-e29b-41d4-a716-446655440000
-  title: "Server unreachable"
-}&lt;/code&gt;
-    &lt;head rend="h3"&gt;Refinement&lt;/head&gt;
-    &lt;p&gt;Tighten inherited fields without adding any: defaults can move, pins can't, contracts only narrow. One transition table governs every step.&lt;/p&gt;
-    &lt;code&gt;service    =&amp;gt; { host: text  port: integer ~ 8080 }
-production =&amp;gt; service ^ { port: = 443 }&lt;/code&gt;
-    &lt;code&gt;!production { host: "prod.internal" }&lt;/code&gt;
-    &lt;head rend="h3"&gt;Subtraction&lt;/head&gt;
-    &lt;p&gt;Removal is allowed, and loud: public is not substitutable for account, and the resolved output records exactly that.&lt;/p&gt;
-    &lt;code&gt;account =&amp;gt; { user: text  email: text  password: text }
-public  =&amp;gt; account - { password }&lt;/code&gt;
-    &lt;code&gt;!public { user: "ada"  email: "ada@example.com" }&lt;/code&gt;
-    &lt;head rend="h3"&gt;Choice&lt;/head&gt;
-    &lt;p&gt;Sum types. Structurally disjoint variants need no tag in data; overlapping ones require one. The resolver derives which, per encoding.&lt;/p&gt;
-    &lt;code&gt;shape  =&amp;gt; (circle | rect)
-circle =&amp;gt; { radius: number }
-rect   =&amp;gt; { width: number  height: number }
-shapes =&amp;gt; [shape; 1..5]&lt;/code&gt;
-    &lt;code&gt;!shapes [
-  !circle { radius: 4 }
-  !rect { width: 2  height: 3 }
-]&lt;/code&gt;
-    &lt;head rend="h3"&gt;Field groups&lt;/head&gt;
-    &lt;p&gt;Exactly-one-of, stated structurally: the data carries one member under its own label, and no synthetic tag is invented.&lt;/p&gt;
-    &lt;code&gt;contact =&amp;gt; {
-  name: text
-  ( email: email | phone: text )
-}&lt;/code&gt;
-    &lt;code&gt;!contact { name: "Grace Hopper"  phone: "555-0142" }&lt;/code&gt;
-    &lt;head rend="h3"&gt;Templates&lt;/head&gt;
-    &lt;p&gt;Definitions with blanks, over type parameters and value parameters both. A fully bound application becomes a real, named type in the resolved schema.&lt;/p&gt;
-    &lt;code&gt;paged         =&amp;gt; &amp;lt;T&amp;gt; { items: [T]  cursor: text? }
-retry_policy =&amp;gt; &amp;lt;N&amp;gt; { attempts: integer ~ N }
-checkout     =&amp;gt; retry_policy&amp;lt;5&amp;gt;&lt;/code&gt;
-    &lt;code&gt;!checkout { attempts: 10 }&lt;/code&gt;
-    &lt;head rend="h2"&gt;Schema Versioning&lt;/head&gt;
-    &lt;p&gt;Adding a new required field with ease&lt;/p&gt;
-    &lt;code&gt;!!id:"https://example.com/people-v2.tn?sha256=ac3f2e1aâ¦a8e5be21"
-!!meta:"https://tson.io/2026/32/m/meta.tn?sha256=8b1e4a9câ¦d7f2a640"
-!!import:"https://tson.io/2026/32/m/core.tn?sha256=3f9d2c71â¦b8e5c194"
-{
-  person   =&amp;gt; { name: text  born: date  email: text }
-  employee =&amp;gt; person &amp;amp; { department: text  level: rank ~ L1 }
-  rank    =&amp;gt; !enum [L1 L2 L3]
-}&lt;/code&gt;
-    &lt;p&gt;Version 2 just added a new required email field to the person record. In mutable schema systems, adding a new required field is universally forbidden. The API guidelines for Google, Microsoft and Zalando all ban the practice. Protobuf even marks the required keyword a hazard developers must avoid. These rules exist because a single definition is forced to serve every document ever written against it. TSON removes this burden because schemas are immutable. A version is simply a new document with a new hash. Two contracts coexist at full strength, and employee composing person inherits the new requirement in the same declaration.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Required means required&lt;/head&gt;
-    &lt;p&gt;Records remain completely closed under their type with no fields left arbitrarily optional for future-proofing and no tombstones carried forever.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Unknown fields are errors&lt;/head&gt;
-    &lt;p&gt;Tolerating unknown fields is just a workaround for in-place evolution. Without it a simple typo triggers an immediate error instead of silently dropping data.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Route by version&lt;/head&gt;
-    &lt;p&gt;The schema hash sits in the header or on the first line for instant validation. A single server binds multiple versions concurrently or a gateway routes requests to distinct backends.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Migration is a diff&lt;/head&gt;
-    &lt;p&gt;Because both schemas are data a tool computes the exact structural diff. Migrations become pure transformations with mathematically precise input and output contracts.&lt;/p&gt;
-    &lt;head rend="h2"&gt;A notation worth reading&lt;/head&gt;
-    &lt;p&gt;The schema system required a better JSON, so it got a Unicode-first superset of JSON.&lt;/p&gt;
-    &lt;code&gt;{
-  "name": "Ada Lovelace",
-  "born": "1815-12-10",
-  "fields": ["mathematics", "computing"],
-  "verified": true,
-  "note": null
-}&lt;/code&gt;
-    &lt;code&gt;{
-  name: "Ada Lovelace"
-  born: !date 1815-12-10
-  fields: [mathematics computing]
-  verified: true
-  note: null
-}&lt;/code&gt;
-    &lt;p&gt;Same data, both sides.syntax JSON requiresmeaning TSON adds&lt;/p&gt;
-    &lt;head rend="h3"&gt;Quotes are optional&lt;/head&gt;
-    &lt;p&gt;Identifiers and scalar values are unquoted tokens, defined over Unicode identifier properties, so this works in every script, not just ASCII. Quote only what needs quoting: spaces, colons, free text.&lt;/p&gt;
-    &lt;code&gt;"city": "Melbourne", "Ð¸Ð¼Ñ": "ÐÐ»Ð¸ÑÐ°"&lt;/code&gt;
-    &lt;code&gt;city: Melbourne  Ð¸Ð¼Ñ: ÐÐ»Ð¸ÑÐ°&lt;/code&gt;
-    &lt;head rend="h3"&gt;Commas are whitespace&lt;/head&gt;
-    &lt;p&gt;Any whitespace separates items; commas still work, so JSON habits carry over. Trailing commas remain errors in both.&lt;/p&gt;
-    &lt;code&gt;[1, 2, 3, 4, 5]&lt;/code&gt;
-    &lt;code&gt;[1 2 3 4 5]&lt;/code&gt;
-    &lt;head rend="h3"&gt;Numbers you can actually write&lt;/head&gt;
-    &lt;p&gt;Arbitrary precision, hex and binary, and digit separators resolve with no annotation at all. Infinities and NaN are approximate-tier values and need an explicit !float64; rationals and complex numbers need their own annotation too, since base resolution treats them as strings otherwise.&lt;/p&gt;
-    &lt;code&gt;"mask": 255, "budget": 1000000,
-"ratio": 3.142857142857143, "limit": "Infinity"&lt;/code&gt;
-    &lt;code&gt;mask: 0xFF   budget: 1_000_000   ratio: !rational "22/7"
-atoms: 6.02e23   limit: !float64 .inf   gap: !float64 .nan&lt;/code&gt;
-    &lt;head rend="h3"&gt;Strings with more than one line&lt;/head&gt;
-    &lt;p&gt;Triple-quoted blocks with common indentation stripped, so multi-line text stays readable in source and exact in value.&lt;/p&gt;
-    &lt;code&gt;"poem": "Roses are red\nViolets are blue"&lt;/code&gt;
-    &lt;code&gt;poem: """
-  Roses are red
-  Violets are blue
-  """&lt;/code&gt;
-    &lt;head rend="h3"&gt;Maps with real keys&lt;/head&gt;
-    &lt;p&gt;JSON objects force every key into a string. TSON keeps records (fixed named fields) and maps (variable associations) distinct, and map keys can be any value.&lt;/p&gt;
-    &lt;code&gt;{ "1": "one", "2026-03-13": "launch" }&lt;/code&gt;
-    &lt;code&gt;{ 1 =&amp;gt; one  2026-03-13 =&amp;gt; launch }&lt;/code&gt;
-    &lt;head rend="h3"&gt;Absent is not null&lt;/head&gt;
-    &lt;p&gt;JSON gives two states (key missing, or null) to do three jobs. TSON's absent sentinel _ says "this position exists and holds no value".&lt;/p&gt;
-    &lt;code&gt;"phone": null&lt;/code&gt;
-    &lt;code&gt;phone: _   scores: [1 _ 3 _ 5]&lt;/code&gt;
-    &lt;head rend="h3"&gt;Metadata that travels with the value&lt;/head&gt;
-    &lt;p&gt;Annotations attach ordered, preserved metadata to any value: no more "_comment" fields pretending to be data. This is also why TSON needs no comment syntax: annotations survive parsing.&lt;/p&gt;
-    &lt;code&gt;"phone_comment": "deprecated, use mobile",
-"phone": "555-0100"&lt;/code&gt;
-    &lt;code&gt;phone: @deprecated:"use mobile" "555-0100"&lt;/code&gt;
-    &lt;head rend="h3"&gt;Types when you want them&lt;/head&gt;
-    &lt;p&gt;Type annotations tag a value with what it is. A built-in vocabulary (dates, UUIDs, binary, precise numerics) works with no schema at all, and the value parses to the native type, not a string.&lt;/p&gt;
-    &lt;code&gt;"id": "550e8400-e29b-41d4-a716-446655440000",
-"price": 19.99&lt;/code&gt;
-    &lt;code&gt;id: !uuid 550e8400-e29b-41d4-a716-446655440000
-price: !number 19.99&lt;/code&gt;
-    &lt;head rend="h2"&gt;Compatibility&lt;/head&gt;
-    &lt;p&gt;Every valid JSON document is valid TSON.&lt;/p&gt;
-    &lt;p&gt;TSON is a strict superset of JSON, with its four atomic types (null, boolean, number and string), plus UUIDs, dates, binary data, and arbitrary-precision numbers as first-class values, parsed straight from quoted or unquoted text, no schema required.&lt;/p&gt;
-    &lt;head rend="h2"&gt;Current status&lt;/head&gt;
-    &lt;p&gt;TSON is a working draft. The specification is published under the 2026 revision series and remains subject to change until it freezes as version 1. Implementations are underway: the first, a Java implementation, is already functioning. The meta-kernel, meta-schema, and core type library are already published with resolved fixtures, so parsers and resolvers will have reference answers to test against. If the design interests you, this is the stage where feedback shapes it.&lt;/p&gt;
-    &lt;head rend="h3"&gt;The Developer Guide&lt;/head&gt;
-    &lt;p&gt;The chain walked end to end, versioning, worked examples, and the reasoning behind the design.&lt;/p&gt;
-    &lt;head rend="h3"&gt;Draft Specifications&lt;/head&gt;
-    &lt;p&gt;Text Data Format, Type System and Schema, Meta Schemas and Core types.&lt;/p&gt;
-    &lt;head rend="h3"&gt;The proto-schema research&lt;/head&gt;
-    &lt;p&gt;The schema model, derived from the physical constraints of serialized data.&lt;/p&gt;
-    &lt;head rend="h2"&gt;What comes next&lt;/head&gt;
-    &lt;p&gt;One schema. Multiple encodings.&lt;/p&gt;
-    &lt;p&gt;The TSON Schema and its underlying type system are agnostic to the encoding; the same architecture as ASN.1, where the schema is the product and formats serve it. The TSON text data format is the first encoding, but won't be the only one. The plan is to develop encoding rules for JSON, compact formats like TOON, and binary, each carrying the same schema-verified values.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49183069</guid><pubDate>Wed, 05 Aug 2026 14:03:40 +0000</pubDate></item><item><title>Intelligence Is Not the Main Bottleneck</title><link>https://www.writingruxandrabio.com/p/intelligence-is-not-the-main-bottleneck</link><description>&lt;doc fingerprint="7f8dd17122c68dfd"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;Intelligence is not the main bottleneck&lt;/head&gt;
-    &lt;head rend="h3"&gt;Confessions of a naive hamster: why the smartest people in the room keep missing that intelligence is often not the main bottleneck in the real world&lt;/head&gt;
-    &lt;p&gt;Edit: To be clear, I'm not saying everyone or even a majority of people in the SF tech scene think this way. But some certainly do (e.g. the opening conversation is verbatim) and this post is about a particular core scene whose views carry disproportionate weight in the discourse and in policymaking.&lt;/p&gt;
-    &lt;p&gt;At a recent dinner, someone from an AI lab asked me, quite bluntly , why I do what I do — why I write about the regulatory bottlenecks to medical progress, why I spend my time on policies related to clinical trials. He looked at me with something best summarized as pity.&lt;/p&gt;
-    &lt;p&gt;I told him what I believe: that in the age of AI, medicine will be bottlenecked more than ever by regulation and the grind of clinical trials, and that billions poured into faster pre-clinical research won’t touch that problem, unsexy as it is. I brought up housing: we’ve had the technology to build better housing for decades, yet it’s more expensive than ever, because housing is a question of political will, not pure capability.&lt;/p&gt;
-    &lt;p&gt;He looked at me incredulously. Surely, a smart person like me should know that AI, or better said, AGI will be hyperpersuasive soon – already on a bunch of benchmarks it exceeds professional debaters at persuasion. I said, “Hmm.” He said, “Yes, yes”, with the undertone of a man who knows things deeply, things that mere mortals like me, not being AI lab employees, are simply not well placed to grasp. And he looked at me again with that sense of pity, the way one looks at a slightly mentally impaired but cute animal awaiting its imminent slaughter.&lt;/p&gt;
-    &lt;p&gt;That night I lay awake, twisting and turning, wondering whether my life had any point at all. Whether every decision I’d ever made had been, in some way, a mistake. What could I have done better?&lt;/p&gt;
-    &lt;p&gt;But as the sun came up, I found my way back to the same thought: no matter how “intelligent” AI becomes, intelligence is often not the main bottleneck to things changing in the real world. It is hard to hold on to that conviction when people smarter than you, with access to privileged information, insist otherwise. After all, this could all just be “cope” from the naive hamster awaiting its slaughter.&lt;/p&gt;
-    &lt;p&gt;But, I shall nonetheless stick to my beliefs.&lt;/p&gt;
-    &lt;p&gt;Because the people at these labs made fortunes betting on ideas that once looked insane, the world now takes nearly everything they say on faith. That, I think, is a mistake. It is not a given that AI will solve the problems most people actually care about, including medicine, unless we think about those problems clearly. And at the moment, I don’t believe we are or at least, not to the extent that we could. My case is simple, and it comes from two directions. One is what I observe in the social dynamics of San Francisco, and in how people there talk about all this. The other is what I notice in a field I happen to know something about: medicine.&lt;/p&gt;
-    &lt;head rend="h3"&gt;AI and medicine &lt;/head&gt;
-    &lt;p&gt;One of the promises most often invoked to justify AI’s risks is that it will “cure disease.” Every major AI lab CEO says it, and investors seems to agree: any biotech startup with an AI story attached commands an impressive valuation, even as more conventional biotechs struggle for funding and die. But this whole enterprise, as I have long argued, is bottlenecked by many things that have little to do with “intelligence” as such, and the degree to which that often goes unacknowledged is strange to watch.&lt;/p&gt;
-    &lt;p&gt;The evidence is everywhere, if you treat scientific advancement as a rough proxy for intelligence and ask whether it alone unblocks progress. Take Eroom’s Law: the number of new drugs approved per dollar of R&amp;amp;D has fallen for decades, even as our scientific tools have grown vastly more powerful, the exact opposite of what the existence of more raw capability would predict. Or take a company like Adaptimmune, which has brought two transformative therapies to market in rare cancers and is nonetheless fighting to stay alive, due to the cost of developing them. Or one can listen to the scientists behind “baby KJ,” the infant saved by a bespoke gene-editing therapy: they have everything they need scientifically and still cannot easily repeat it for the next child, because manufacturing costs, driven in part by regulatory requirements, stand in the way.&lt;/p&gt;
-    &lt;p&gt;In biopharma specifically, one great bottleneck is clinical trials (I know I keep banging on about this), which today consume something like seven years and cost more than a billion dollars per drug. And trials are not a mere formality. They generate precisely the kind of data that would train better models in the first place: human data, which is ultimately irreplaceable.&lt;/p&gt;
-    &lt;p&gt;We have extensive evidence faster clinical trials are important for biomedical innovation, both directly and indirectly, through second-order effects (like increasing the risk appetite of those working in the industry and helping better align incentive through fast feedback loops). This ranges from robust economic papers showing shorter trials massively boost investment in a disease area, all else equal, to the natural experiment of China. China is threatening to race ahead of US in biotech, with Chinese biotechs encompassing more than a half of big Western pharma licensing deals. A mere decade ago, this percentage was zero. This transformation happened while China remains worse in terms of basic science, mostly due to regulatory reforms that allow faster iterative learning using in-human data1.&lt;/p&gt;
-    &lt;p&gt;Trials themselves can be made shorter, more informative and better, including with AI. One area I am particularly bullish on is surrogate endpoints and biomarkers, where AI could turn discrete, coarse readouts of whether a drug is working into fast, continuous ones. This would in turn optimize trials immensely. For some indications, the gain could be as high as 10x faster and cheaper trials if the right surrogates are found. And this is not even considering the benefits of simply optimizing the trials without necessarily shortening them: imagine having the right biomarker that tells you whether a therapy is working early enough.&lt;/p&gt;
-    &lt;p&gt;But even here the binding constraint is not entirely intelligence. Quite often, it is governance. I keep talking to companies trying to build exactly these biomarkers, and what they run into, again and again, is how hard it is to access the underlying data. Some have been waiting for a year for the NIH to release imaging datasets they can use to produce better biomarkers. If one needs to interact with the FDA to get their endpoint validated, it is even worse: I have previously written about how the validation of Bone Mineral Density (BMD) for use as a surrogate endpoint in osteoporosis trials took 12 years (!), despite the fact that the data to support it already existed in full and the analyses done were basically regressions.&lt;/p&gt;
-    &lt;p&gt;When people in the AI sphere do engage with regulation and governance in medicine, it often seems to happen in a rather superficial way. I have seen many times that argument that because most drugs fail for lack of efficacy, regulation can’t explain much of the slow-down in medical progress compared to basic science that we have witnessed in the last decades: after all, approving more inefficacious drugs won’t help. This analysis sounds superficially true, but it’s not. As I keep saying, when people talk about the importance of regulation in slowing down biomedical progress, they rarely mean the approval decision at the end. It is about the entire process upstream: how easily human data can be collected, and then how easily, once collected, it can actually be used.&lt;/p&gt;
-    &lt;p&gt;I know most about clinical trials, but this is not the only area where governance and policy slows down progress. Another example is related to how the structure of our patent system shapes how innovative our drugs are.&lt;/p&gt;
-    &lt;p&gt;In biomedicine we have a problem called target herding: most companies chase the same biological targets because they are de-risked, which means we explore far less of the biological space than we could. The cleanest way to see why is through risk. Two kinds matter in drug discovery. Target risk captures the biological uncertainty: is this protein causally involved in the disease, and will hitting it help a patient without unacceptable toxicity? Molecule design and optimization risk is the downstream problem, conditional on the target: designing a novel molecule against a target2 and improving potency, selectivity, safety and a myriad of other features of a chemical (e.g. small molecule) or biological (e.g. antibody). That is mostly in the realm of chemistry and is intrinsically far more tractable and predictable; given a validated target, good teams usually reach a decent molecule.&lt;/p&gt;
-    &lt;p&gt;The patent system then further disincentivizes companies from taking target risk, because it rewards novel chemical matter, not novel biology. Composition of matter is what most patents protect. That refers to a specific molecule, which means that they don’t protect the insight that a target is worth drugging at all.&lt;/p&gt;
-    &lt;p&gt;Target herding then follows almost mechanically from the above mentioned constraints: on one hand the fact that is genuinely harder to uncover more of these and then that the patent system does not reward it. Whoever validates a novel target (and implicitly, discovers new biology) bears the enormous target risk but can’t capture the reward due to the way the patent system is designed: once a first-in-class drug3 posts convincing clinical data, the target is validated, and that validation is essentially public. Competitors then design distinct molecules against the same de-risked target, and each fast-follower earns its own strong patent. So firms end up piling onto proven targets instead of validating new ones, so we get wave after wave of drugs aimed at the same type of biology.&lt;/p&gt;
-    &lt;p&gt;A well-known non-profit leader who funds work on the molecular basis of deadly diseases, including AI-driven efforts to find novel targets, told me the current IP system makes it nearly impossible for the institution he supports to capture the value it creates by uncovering new biology. He's glad to keep funding it regardless, but believes everyone would be better served if that value were capturable, and that today's incentives are badly skewed.&lt;/p&gt;
-    &lt;p&gt;The irony is that the AI-for-biology companies drawing the largest rounds are aimed mostly at the same well-served problem of molecule design and optimization. For example, Chai Discovery, now valued at $3.8 billion, enormous by early-stage biotech standards, and Isomorphic Labs are both, at heart, at molecule design and optimization engines: they design better compounds faster and with more accuracy, given a target. This is great, but as I and others have argued before, expanding the frontier of validated targets would be worth more overall to society. Yet this is precisely the part that the patent system does not incentivize. It turns out even AI-driven companies ultimately respond to economic and legal incentives!&lt;/p&gt;
-    &lt;p&gt;The same principle applies, I suspect, well beyond medicine. Diffusion is hard, and the rate at which a technology actually spreads through an economy is not entirely or even mainly predicted by the raw pace of its underlying progress. A capability existing is not the same as a capability being absorbed into institutions, and, perhaps most important of all, translated into outcomes people care about.&lt;/p&gt;
-    &lt;p&gt;And there is expansive evidence this is the case.&lt;/p&gt;
-    &lt;p&gt;Walking around the world today one might notice that it is weirdly unchanged. LLMs can spawn agents and write complex applications, yet something as mundane as customer service still hasn’t been automated well. In fact, often it’s the automated chatbots that are the worst part of the experience. GDP is up, which is good, but it is not dramatically up. And entry-level jobs, despite repeated warnings of an apocalypse, seem largely intact, if not increasing.&lt;/p&gt;
-    &lt;p&gt;To many, this is surprising. Just the other day I was at a conference where someone remarked that if he could have seen today’s AI capabilities a few years ago, he would have been astonished — and would have assumed the world by now would look far more transformed, with much higher GDP growth. It was offered as a fresh observation. But in fact, it has been made before, and this whole trajectory was quite predictable to those thinking about real world barriers to diffusion. I remember a Progress Conference in 2023 where the economist Tyler Cowen made exactly this argument to a room full of AGI-pilled attendees, many of whom were frankly incredulous. The capabilities, he suggested, would arrive faster than the changes they were meant to produce; GDP growth would disappoint relative to the hype, and there would be no massive job displacement. So far, the data seem to bear him out.&lt;/p&gt;
-    &lt;p&gt;The people who saw this coming simply have a better feel for friction for how slowly and unevenly a technology actually diffuses into the world. Strangely, it seems to me that the core San Francisco tech scene, full of exceptionally intelligent people, does not. How can so many smart people share this one blind spot?&lt;/p&gt;
-    &lt;head rend="h3"&gt;The making of a monoculture&lt;/head&gt;
-    &lt;p&gt;My view is that certain communities in San Francisco (which I shall henceforth call “SF people”, even though I do not mean literally everyone or even most people in SF) have become something close to a monoculture, and this monoculture has two reinforcing features. The first is that it has become genuinely low-status to suggest AGI might not be wholly transformative, at least not on its own. The people who were early and right about AI’s potential made a great deal of money, and being right about the big thing has hardened into an assumption that they are right about everything. To question the most extreme claims is to be marked as dim, low-IQ, insufficiently “AGI-pilled.” The belief persists that anyone who works at a lab, specially a CEO, holds secrets about the future that no outsider can access. The result is self-censorship: a lot of smart people I know in San Francisco see the bottlenecks to AI’s diffusion and say nothing to seem more “AGI-pilled”.&lt;/p&gt;
-    &lt;p&gt;But how could such smart people be wrong… About anything? I do not think there is anything weird or unusual about that and in a wiser era we would find it easier to articulate. I have said before that the best human is very far from the average human, but God is much further way from the best human still. That is to say that nobody, no matter how smart, powerful and experienced, has all the answers.&lt;/p&gt;
-    &lt;p&gt;Not only that, but I think the winners of the AI race might be miscalibrated in a way that might have helped in their core endeavour, developing AI, but maladaptive when it comes to judging things beyond that. Delusion is often adaptive in startups: an unreasonable conviction is exactly what lets a small group attempt the impossible and occasionally pull it off. Byrne Hobart and Tobias Huber make a version of this case in Boom, arguing that financial bubbles, usually maligned as destructive, have in fact been an engine of breakthrough progress: what looks like collective delusion is often what funds and forces genuine advance. But that cuts both ways. Being productively delusional and winning does not make one right about everything else. In fact, the very trait that produced the success also might inflate confidence in unproductive ways in other areas.&lt;/p&gt;
-    &lt;p&gt;The second feature of this monoculture is a kind of counterfeit contrarianism. Because most of the outside world has long been skeptical of AI’s potential, people in San Francisco feel like brave dissenters. This is despite the fact that, within their own circles, holding those views is the safe and status-conferring position. Believing yourself a misunderstood contrarian is intoxicating, and it makes the underlying conviction harder to dislodge.&lt;/p&gt;
-    &lt;p&gt;Back when I was an academic, I often noticed that academics were, on the whole, deeply progressive, yet thought of themselves as contrarians. This was at least in part because most had come from places more conservative than the university. They’d gather, compare themselves to the outside world rather than to each other, and conclude that their progressivism was somehow brave, despite it being the plain consensus of the room. In my view, SF has done the same thing with AI. In elite tech circles it is simply not contrarian to take AGI seriously; if anything the reverse. But because the comparison class is always someone else: for example, a policy person in DC, the feeling of embattled dissent survives contact with reality.&lt;/p&gt;
-    &lt;p&gt;The question, I suppose, is whether any of this matters. Why would it be bad? For all I know, the AGI God frenzy should continue in the tech bubble. But it’s seeping into general public discourse in a way that might realign priorities in a way that is bad.&lt;/p&gt;
-    &lt;p&gt;At the most basic level, I think being closer to the empirical truth is simply better than being further from it. But there is a more concrete cost: mistaken beliefs can lead to mistaken priorities. Given that I do expect AI to be disruptive (albeit not necessarily in the same ways the SF crowd thinks), this might be a particularly bad times to have bad priorities.&lt;/p&gt;
-    &lt;p&gt;Again, I shall bring the example of medicine: we might be aiming or effort at the wrong bottlenecks. In medicine, as I’ve argued, regulatory reform gets a tiny fraction of the attention lavished on AI-enabled biology and even within AI-enabled biology, the interventions that would actually move the needle are the ones that often seem less funded.&lt;/p&gt;
-    &lt;p&gt;And this goes well beyond medicine. We fixate on AGI gods, while more mundane problems pile up unattended. The social fabric is fraying in plain sight. More and more young adults cannot afford a house or sustain a relationship. People pour their youth into gambling apps, some of them now made more powerful by the very AI we keep discussing. People are de-skilling as they hand more thinking to machines. I sometimes say I worry less that AI will take my job than that people will grow too incurious to read at all. Every one of these problems needs people working on it. Being in the thrall of digital deities that will magically dissolve all our problems pulls attention away from the simpler, more human troubles that are already here.&lt;/p&gt;
-    &lt;p&gt;Milan Cvitkovic pointed out that it is not clear that the regulatory reforms around faster in-human data spearheaded China’s rise. In 2015 China did a bunch of policy reforms that included expansion of coverage, clearing up some regulatory decision backlog and others and it is hard to say which ones were the most consequential. This article argues it was the coverage expansion. I explained in this X post why I doubt that article to some extent. Either way, I think everyone agrees that faster in-human data is a large component of China’s strength (whether caused by regulatory reforms or not) and also that the proximal cause of China’s rise in biotech was policy change. You can find my exchange with Milan here.&lt;/p&gt;
-    &lt;p&gt;This is in practice a bit more complicated, as not all drugs are molecules. Some are cells or gene therapies. Nonetheless, even here, the broad principles hold. Improving a T cell therapy against a known target is inherently less risky.&lt;/p&gt;
-    &lt;p&gt;First-in-class drugs are often not the drugs that “win” commercially, as followers usually manage to optimize the chemistry better and learn from deficiencies from the first-in-class. So it’s hard for someone who pioneers a new approach to capture value.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49183076</guid><pubDate>Wed, 05 Aug 2026 14:04:06 +0000</pubDate></item><item><title>Rubin Observatory's first LSST Camera release: 500k galaxies in the COSMOS field</title><link>https://rubinobservatory.org/news/rubin-new-window-cosmos-field</link><description>&lt;doc fingerprint="3c87487f1bae8b74"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Wed, 05 Aug 2026 18:58:13 +0000</lastBuildDate><item><title>The Entropy of a Markov Chain</title><link>https://chillphysicsenjoyer.substack.com/p/the-entropy-of-a-markov-chain</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49183017</guid><pubDate>Wed, 05 Aug 2026 14:00:10 +0000</pubDate></item><item><title>Rubin Observatory's first LSST Camera release: 500k galaxies in the COSMOS field</title><link>https://rubinobservatory.org/news/rubin-new-window-cosmos-field</link><description>&lt;doc fingerprint="3c87487f1bae8b74"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;NSF–DOE Rubin Observatory Opens Deep Window on Famous Cosmic Field&lt;/head&gt;
     &lt;p&gt;Packed into this single image from Rubin Observatory are many different kinds of galaxies: spirals with delicate arms, smooth elliptical galaxies, distorted merging galaxies, and faint red galaxies from the distant Universe. Only a relatively small number of bright stars from our own Milky Way appear in the foreground, leaving an unusually clear view of galaxies stretching far into the distance.&lt;/p&gt;
@@ -498,38 +92,7 @@ price: !number 19.99&lt;/code&gt;
     &lt;p&gt;This quote reflects Aristotle’s approach to logic and rhetoric, highlighting that ideas should be believable and persuasive, even if they seem improbable. He addresses the value of coherence and plausibility in effective arguments in Rhetoric, a treatise on persuasive speech and writing.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49183115</guid><pubDate>Wed, 05 Aug 2026 14:06:39 +0000</pubDate></item><item><title>The "Disability Dongle": Why Silicon Valley Hates Me and You</title><link>https://sightlessscribbles.com/disability-dongle/</link><description>&lt;doc fingerprint="479818d9ab458c19"&gt;
-  &lt;main&gt;
-    &lt;head rend="h1"&gt;The "Disability Dongle": Why Silicon Valley Hates Me and you.&lt;/head&gt;
-    &lt;p&gt;Mood: Wanting to throw a $30,000 prototype into a lake.&lt;/p&gt;
-    &lt;p&gt;There is a feel-good genre of viral video that I call "The Inspiration Porn Industrial Complex." You know the one. It usually features a college engineering team, a dramatic piano soundtrack, and a disabled person strapped into a machine that looks like a Transformer having a panic attack.&lt;/p&gt;
-    &lt;p&gt;The caption usually reads: “Students invent stair-climbing wheelchair! The future is here!”&lt;/p&gt;
-    &lt;p&gt;I can't roll my eyes hard enough every time I see one of these vapid videos.&lt;/p&gt;
-    &lt;p&gt;The machine—let’s call it the iClimb 3000—usually costs as much as a Honda Civic. It weighs three hundred pounds. It makes a sound like a blender digesting a brick. And watching the video, all I can feel is the phantom sensation of being strapped into that thing, suspended five feet in the air at a forty-five-degree angle, praying the gyroscope doesn't glitch and toss me down a flight of concrete steps like a sack of potatoes.&lt;/p&gt;
-    &lt;p&gt;This is what we call a "Disability Dongle."&lt;/p&gt;
-    &lt;p&gt;A Disability Dongle is a piece of technology that is flashy, expensive, and technically impressive, but utterly fails to solve the actual problem it claims to address. It is engineering designed for the abled gaze, not the disabled body. It is designed to win design awards, not to be used.&lt;/p&gt;
-    &lt;p&gt;Silicon Valley loves these things. They love the idea of "solving" disability with hardware. It fits their narrative. If disability is just a bug in the human code, then surely they can patch it with enough servos and lithium-ion batteries.&lt;/p&gt;
-    &lt;p&gt;But here is the reality they refuse to accept: My disability is not a tragedy of biology. It is a failure of infrastructure.&lt;/p&gt;
-    &lt;p&gt;I don’t need a stair-climbing wheelchair that costs $30,000 and requires a maintenance crew. I need better doorknobs and or a ramp.&lt;/p&gt;
-    &lt;p&gt;But a ramp is boring. You can't make investors have a hard on for a ramp that doesn't connect to the cloud. You can’t give a TED Talk about a ramp. You can’t get venture capital funding for a slightly wider doorframe. Concrete is not "disruptive." But a ramp works. It doesn’t run out of battery. It doesn’t require a software update. And crucially, it works for the parent with a stroller, the delivery guy with a hand truck, and the old man with bad knees. It is a universal solution.&lt;/p&gt;
-    &lt;p&gt;The iClimb 3000 is an individualist fantasy. It says, "We don't need to change the world to fit you; we will turn you into a tank so you can conquer the hostile world."&lt;/p&gt;
-    &lt;p&gt;Maybe, though, just maybe, I don't want to be a tank. I just want to go to the library.&lt;/p&gt;
-    &lt;p&gt;I feel this disconnect every time a "Tech Bro" tries to sell me on the latest smart-glasses or haptic-feedback belts. I pick these things up, and they always feel the same. Cheap, clammy plastic. zero buttons except for the power button. They get hot against the skin after ten minutes. They hum with that constant electronic whine that gives you a migraine by noon.&lt;/p&gt;
-    &lt;p&gt;These solutions are nothing other than costumes, the height of "performative engineering"&lt;/p&gt;
-    &lt;p&gt;And while they are building these exoskeletons, the actual digital world—the one I live in—is rotting by the minute.&lt;/p&gt;
-    &lt;p&gt;I use a screen reader. It is a vital tool. It is my literacy. But half the websites I visit are built with such bloated, sloppy code that my screen reader chokes on them. I try to order groceries, and the "Checkout" button is labeled "Button_Graphic_v2_Final." I try to read a news article, and an unlabelled pop-up ad traps my cursor in a loop.&lt;/p&gt;
-    &lt;p&gt;Silicon Valley will spend millions developing a glove that translates sign language into speech (badly), but they won't spend ten minutes adding Alt-Text to their images. They will build a headset that describes the room to me (poorly), but they won't use semantic HTML headings so I can actually navigate a webpage.&lt;/p&gt;
-    &lt;p&gt;Why? Because semantic HTML isn't sexy. You can't put "Used H1 Tags Correctly" on a pitch deck.&lt;/p&gt;
-    &lt;p&gt;There is a profound arrogance in this. It assumes that the only reason I am excluded from society is because I am blind, rather than because society has made a choice to exclude me. The Disability Dongle promises that if I just buy enough gear, if I just encase myself in enough sensors and plastic, I can finally "pass." I can finally participate.&lt;/p&gt;
-    &lt;p&gt;It’s a lie.&lt;/p&gt;
-    &lt;p&gt;The most advanced piece of accessibility technology I own is my white cane. It costs, at the time of this writing anyway, before inflation, forty dollars. It has no batteries. It never crashes. It is a stick that extends my sensory range. It is elegant, simple, and honest.&lt;/p&gt;
-    &lt;p&gt;The second most advanced piece of technology I want is a society that gives a damn.&lt;/p&gt;
-    &lt;p&gt;Keep your exosuits. Keep your ultrasonic echolocation visors. Keep your prototypes that feel like wearing a toaster oven on my face.&lt;/p&gt;
-    &lt;p&gt;Just fix your fucking code. Pour some concrete. And stop trying to upgrade my body when the problem is your design.&lt;/p&gt;
-    &lt;p&gt;If you liked this rant, you might enjoy Against Technoableism: Rethinking Who Needs Improvement by Ashley Shew&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49183665</guid><pubDate>Wed, 05 Aug 2026 14:38:13 +0000</pubDate></item><item><title>Oracle Just Halved Its Always Free ARM Limits</title><link>https://www.cnelecar.com/blog/oracle-always-free-arm-limits-cut-2026/</link><description>&lt;doc fingerprint="913b3889df9671ec"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49183115</guid><pubDate>Wed, 05 Aug 2026 14:06:39 +0000</pubDate></item><item><title>Oracle cut its Always Free ARM limits to 2 OCPU / 12GB, enforced Aug 18</title><link>https://www.cnelecar.com/blog/oracle-always-free-arm-limits-cut-2026/</link><description>&lt;doc fingerprint="913b3889df9671ec"&gt;
   &lt;main&gt;
     &lt;head rend="h2"&gt;The short answer: shrink or consolidate before August 18, 2026&lt;/head&gt;
     &lt;p&gt;If you’re running any Ampere A1 ARM instance larger than 2 OCPUs or 12 GB of RAM — or more than one of them — you need to act before August 18, 2026, or Oracle will terminate the excess automatically. Your two free x86 instances are untouched.&lt;/p&gt;
@@ -624,36 +187,7 @@ price: !number 19.99&lt;/code&gt;
     }
 }'&lt;/code&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49183850</guid><pubDate>Wed, 05 Aug 2026 14:53:29 +0000</pubDate></item><item><title>Cops Used Flock to Track a Man Across State Lines for a Pretextual Weed Search</title><link>https://www.404media.co/cops-used-flock-to-track-a-man-across-state-lines-to-create-pretext-to-search-his-car-for-weed/</link><description>&lt;doc fingerprint="7509db82234f1e1"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Police in Wisconsin used Flock to determine that a man “travels to Michigan frequently,” where marijuana is legal, then back to Wisconsin, where it is illegal. They then used his travel across state lines as tracked by Flock as part of the probable cause justification to search his car for weed; he was eventually arrested on marijuana possession charges, according to court records reviewed by 404 Media.&lt;/p&gt;
-    &lt;p&gt;The searches came to light in a Wisconsin criminal complaint against Edward Abrams-Phillips, who was wanted for bail jumping on domestic violence charges. But the criminal complaint makes clear that beyond the bail jumping and domestic violence charges, police specifically studied Abrams-Phillips’ interstate travel to create the pretext for searching his car for marijuana. The bail jumping charge was dismissed; Abrams-Phillips was found guilty only of weed possession in the case, according to the court records.&lt;/p&gt;
-    &lt;p&gt;The complaint explains that Abrams-Phillips was tracked via Flock’s network over the course of the day to determine that he drove from Wisconsin to Michigan, a “known source state for marijuana as it is legal there,” the complaint states, adding that previous Flock hits indicated that he “travels to Michigan frequently.” Police note that, using Flock, they were able to track Abrams-Phillips driving from Wisconsin to Michigan, then back to Wisconsin over the course of several hours, where he was pulled over and arrested. The Flock searches and arrests happened in April 2025.&lt;/p&gt;
-    &lt;p&gt;“The vehicle was observed hitting flock on several occasions to include 41 northbound from Brown Rd, 41NB and County Line in Marinette [Wisconsin], and 41 NB on Bridge St. going into Michigan. Based on prior flock hits, the vehicle travels to Michigan frequently which is a known source State for Marijuana as it is legal there,” the charging document notes. “Around 3:56 p.m., the vehicle was seen on Flock heading southbound on interstate 41 towards Green Bay [Wisconsin]. Deputies made a coordinated effort to intercept the vehicle on 41 from Brown Rd. Deputy Kowalski initiated a traffic stop on the vehicle as the driver matched the description of Edward.”&lt;/p&gt;
-    &lt;p&gt;After pulling him over, the complaint states that police “detected the odor of what he knew to be raw marijuana coming from inside the vehicle.”&lt;/p&gt;
-    &lt;p&gt;The case is an example of Flock cameras being used to arrest a wanted alleged criminal suspected of committing a violent crime. But it is also an example of police surveillance overreach in that the cameras were specifically used to create a pretext to tack on additional petty crimes based primarily on where a person’s vehicle had traveled. There is a long history of surveillance technology being used in problematic ways in seemingly unsympathetic cases, which eventually creates a slippery slope where the technology can be used against the masses or to enforce against very minor crimes.&lt;/p&gt;
-    &lt;p&gt;It is not difficult to imagine police in one state using Flock to track a resident of their state cross state lines to, for example, obtain an abortion that is legal in one state but not in another. Last year, 404 Media reported on police in Texas who searched more than 80,000 cameras across Flock’s nationwide network for a woman who had a self-administered abortion.&lt;/p&gt;
-    &lt;p&gt;The case is also particularly concerning considering that Flock cameras have popped up outside of weed dispensaries in Michigan. The JARS Cannabis dispensary in Madison Heights, Michigan, went viral this week for putting a “No Flock Zone” sign in front of a Flock camera in the dispensary’s parking lot. “We share our community’s concerns about increased surveillance, which is why we placed the No Flock Zone sign in front of the camera to block its ability to record,” the dispensary said in a public statement. “JARS does not control the camera or have access to any of the data it collects … after we installed our No Flock Zone sign, the city issued a demand letter warning of sanctions if we did not remove it within 48 hours.” But that Flock camera exists specifically to monitor the license plates of people who come and go to the dispensary. It was required by Madison Heights as one of the conditions for giving a dispensary license to JARS: “[The dispensary] must place a FLOCK license plate scanning camera system at the entrance of the customer parking lot prior to commencement of retail sales, and it will give the Madison Heights Police Department unhindered live access to the FLOCK camera, camera footage, and any and all data, which must remain operational at all times.”&lt;/p&gt;
-    &lt;p&gt;Flock Audit Reports covering searches done by the Brown County, Wisconsin Sheriff’s Department from April 26, 2025 show that the department used Flock dozens of times that day, often searching thousands of Flock cameras at a time (it is not clear which specific searches were done for Abrams-Phillips’ car, because many of the searches simply list “warrant” or “traffic inv” as the reason).&lt;/p&gt;
-    &lt;p&gt;Tuesday, Flock executives tweeted video examples of their cameras being used to rescue abducted children, in what appears to be a new marketing strategy for the company. “Every child in this video is home tonight because Flock gave officers the right information at the right second,” Flock’s Chief Strategy Officer Rahul Sidhu tweeted. “That’s the mission. That’s the whole company. I wouldn't trade that for anything.”&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49184190</guid><pubDate>Wed, 05 Aug 2026 15:20:11 +0000</pubDate></item><item><title>The Valley of Webhooks</title><link>https://weli.dev/blog/the-valley-of-webhooks/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49184216</guid><pubDate>Wed, 05 Aug 2026 15:22:06 +0000</pubDate></item><item><title>Jeff Dean leaving Alphabet</title><link>https://www.nytimes.com/2026/08/05/technology/google-researchers-ai-startup.html</link><description>&lt;doc fingerprint="5b305049b194e0a4"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Supported by&lt;/p&gt;
-    &lt;head rend="h1"&gt;Four Top Google A.I. Researchers Form New Start-Up&lt;/head&gt;
-    &lt;p&gt;Jeff Dean, who for years was one of Google’s most important executives, is leading the new artificial intelligence company with the backing of Google.&lt;/p&gt;
-    &lt;p&gt;Jeff Dean, Google’s chief scientist, and three other artificial intelligence researchers are leaving the company to form their own start-up, a move that exposes the changing power structure inside Google and shows there is still plenty of venture money willing to back new A.I. ideas.&lt;/p&gt;
-    &lt;p&gt;Dr. Dean, Google’s 30th employee, is widely regarded as one of the most important figures in the history of the company. He played a key role in creating the global computer network powering its search business and was one of the company’s early leaders in A.I. research.&lt;/p&gt;
-    &lt;p&gt;His profile inside Google appeared to wane in recent years as other executives, including the co-founder Sergey Brin, asserted control over Google’s all-in bet on A.I. But Dr. Dean remained one of the key engineers driving the creation of the company’s most important technologies.&lt;/p&gt;
-    &lt;p&gt;His new company, called Discovery Loop, joins a growing list of prominent start-ups chasing a goal that has obsessed Silicon Valley researchers for decades. Dr. Dean and his collaborators want to build A.I. that can improve itself with little or no help from humans.&lt;/p&gt;
-    &lt;p&gt;They believe that this mind-bending process, called recursive self-improvement, can significantly accelerate the development of A.I. The same techniques, they say, can then help design new kinds of computer hardware, discover new drugs, create new materials and speed other forms of scientific discovery.&lt;/p&gt;
-    &lt;p&gt;“We think there is opportunity for A.I. to more fully automate what has traditionally been a very human-intensive experimental loop,” Dr. Dean said in an interview at his home in Silicon Valley. “You will get both a higher quantity and a higher quality of experiments, and that will lead to scientific breakthroughs and advances.”&lt;/p&gt;
-    &lt;head rend="h2"&gt;Related Content&lt;/head&gt;
-    &lt;p&gt;Advertisement&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49184746</guid><pubDate>Wed, 05 Aug 2026 16:04:33 +0000</pubDate></item><item><title>The next chapter of our AI momentum</title><link>https://blog.google/company-news/inside-google/message-ceo/next-chapter-ai-momentum/</link><description>&lt;doc fingerprint="7d978358a9f4f3b9"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49183850</guid><pubDate>Wed, 05 Aug 2026 14:53:29 +0000</pubDate></item><item><title>The Valley of Webhooks</title><link>https://weli.dev/blog/the-valley-of-webhooks/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49184216</guid><pubDate>Wed, 05 Aug 2026 15:22:06 +0000</pubDate></item><item><title>Changes at Google DeepMind: Demis Hassabis from CEO to Chair, Jeff Dean departs</title><link>https://blog.google/company-news/inside-google/message-ceo/next-chapter-ai-momentum/</link><description>&lt;doc fingerprint="7d978358a9f4f3b9"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;The next chapter of our AI momentum&lt;/head&gt;
     &lt;p&gt;Editor’s note: Today, Google and Alphabet CEO Sundar Pichai shared some changes with Google DeepMind teams, including new roles for Demis Hassabis and Koray Kavukcuoglu. Below are the messages Sundar and Demis sent to employees.&lt;/p&gt;
@@ -677,12 +211,7 @@ price: !number 19.99&lt;/code&gt;
     &lt;p&gt;Demis&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49184755</guid><pubDate>Wed, 05 Aug 2026 16:05:31 +0000</pubDate></item><item><title>Google DeepMind CEO Demis Hassabis is stepping down</title><link>https://www.axios.com/2026/08/05/google-deepmind-demis-hassabis-ai</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49184757</guid><pubDate>Wed, 05 Aug 2026 16:05:37 +0000</pubDate></item><item><title>Jeff Dean Leaving Google</title><link>https://twitter.com/JeffDean/status/2085034604172603724</link><description>&lt;doc fingerprint="1984ad7fe86ceb7b"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Announcing Discovery Loop! I am very excited to announce that, along with my longtime friends and collaborators @Sanjay_Ghemawat, @OriolVinyalsML and @quocleix, we are founding Discovery Loop (@DiscoLoopAI), a Public Benefit Corporation whose mission is to automate machine learning, science, and engineering to accelerate discoveries and progress. The four of us have worked together for 14 to 30 years, and have helped build some of the world’s most used products, infrastructure and AI models, and we’re excited to turn our attention to this ambitious endeavor. ♾ Learn more at: discoveryloop.com&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49184879</guid><pubDate>Wed, 05 Aug 2026 16:14:49 +0000</pubDate></item><item><title>Discovery Loop</title><link>https://www.discoveryloop.com/</link><description>&lt;doc fingerprint="3910a07baa04c72b"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49184755</guid><pubDate>Wed, 05 Aug 2026 16:05:31 +0000</pubDate></item><item><title>Discovery Loop</title><link>https://www.discoveryloop.com/</link><description>&lt;doc fingerprint="3910a07baa04c72b"&gt;
   &lt;main&gt;
     &lt;p&gt;Automating discovery to accelerate science and engineering for the world.&lt;/p&gt;
     &lt;head rend="h2"&gt;Scientific discovery is bottlenecked.&lt;/head&gt;
@@ -707,7 +236,500 @@ price: !number 19.99&lt;/code&gt;
     &lt;p&gt;We are building a lean, in-person team to execute this transformative vision.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49184960</guid><pubDate>Wed, 05 Aug 2026 16:19:44 +0000</pubDate></item><item><title>Launch HN: HyperProbe (YC S26) – Agents that do read-only debugging in prod</title><link>https://www.hyperprobe.co</link><description>&lt;doc fingerprint="35baca9505a642ee"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49184960</guid><pubDate>Wed, 05 Aug 2026 16:19:44 +0000</pubDate></item><item><title>Why I'm leaving OpenAI to build telepathy</title><link>https://naomibashkansky.com/blog/telepathy/</link><description>&lt;doc fingerprint="660d171d28c40ffc"&gt;
+  &lt;main&gt;
+    &lt;p&gt;On Thursday, July 23rd, I resigned from OpenAI. On the 24th, I started as a Founding Researcher at Conduit. We're building telepathy: thought-to-text models, trained on non-invasive neural data.&lt;/p&gt;
+    &lt;p&gt;I'll talk about:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Thought-to-text: what using telepathic tools will be like in 2027, 2030, and 2035&lt;/item&gt;
+      &lt;item&gt;How do we build thought-to-text: why Conduit is collecting immense quantities of non-invasive neural data&lt;/item&gt;
+      &lt;item&gt;Why I joined: I joined because of the audacious vision, the brilliant people, and the fun problems&lt;/item&gt;
+      &lt;item&gt;Hi: about me&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head&gt;1. Thought-to-text, aka telepathy&lt;/head&gt;
+    &lt;p&gt;My prediction: In a couple years, the main way we'll talk with our AIs is with our thoughts. They will not be a super-smart automated intern or coworker that you desperately try to keep up with. They will be a natural, joyful extension of you.&lt;/p&gt;
+    &lt;p&gt;I wrote down vignettes of this future below. I view them as optimistic but highly plausible.&lt;/p&gt;
+    &lt;head&gt;2027 — A morning at Conduit&lt;/head&gt;
+    &lt;p&gt;I put a band around my head, and open my laptop at Conduit. It’s 9 am. My device pairs with my laptop over Bluetooth. I open, without loss of generality, Codex.&lt;/p&gt;
+    &lt;p&gt;I think about the day's work as I look at my code, review yesterday's notes, and prepare for our 9:30 am standup. My GPT-7 agent has been chugging away at the new encoder I’ve been exploring for over a day now. I look at its work. I become confused by the plot labels, annoyed at the AI-speak in its first paragraph, and curious about the symbols in the equations. My vague thoughts get sent to Conduit's model, which uses its priors over language and the kinds of things I might say to output:&lt;/p&gt;
+    &lt;p&gt;The plot, paragraphs, and notation each took me 10 seconds to glance over. I have auto-send on, so after each 10-second chunk, the Conduit model deciphers my thoughts and sends it to GPT-7, which assigns each incoming task to a subagent. I look at the new plot, paragraph, and equations. I wonder whether spherical harmonics might be useful after all; Codex spins off a subagent. Convinced by the plot, I decide to make a quick slideshow with a prettified version showing only the baseline and top two lines, to show my teammates; Codex spins off a subagent.&lt;/p&gt;
+    &lt;p&gt;I make myself coffee. My thoughts are mostly empty, but I briefly recall what I want to say to the candidate I’m getting lunch with tomorrow. In the background, Codex is prompted to think about info I might want for the lunch chat, and decides that updating the synthetic data scaling plot before showing it off would be prudent; Codex spins off a subagent.&lt;/p&gt;
+    &lt;p&gt;I'm not saying words really loudly in my head while getting coffee. I just read the plots as I normally do, and make coffee as I normally do. It feels like magic.&lt;/p&gt;
+    &lt;head&gt;2030 — Industry adapts and Conduit expands&lt;/head&gt;
+    &lt;p&gt;The AI companies now train their models to directly interface with Conduit’s latent representations. My encoded thoughts get sent directly to Codex, rather than having to pass through Conduit's decoder model first. That means I easily communicate thoughts that are hard to describe in text, like mental images.&lt;/p&gt;
+    &lt;p&gt;I rarely go band-less when chatting with AIs these days. It's annoying, honestly, to go without. With the neural headband, I feel like I have superhuman powers over my laptop! Without it, I feel like I'm talking with a superpowered alien who's trying its best to be helpful but isn't sure what I want and is scared I'll get mad if it does something I don't want. Ugh.&lt;/p&gt;
+    &lt;p&gt;Conduit continues to iterate on non-invasive read, but we’ve spun up two new efforts: invasive general read, and general write.&lt;/p&gt;
+    &lt;p&gt;Most people are happy to stick with their neural bands, but a good number are excited to get higher fidelity reads via invasive tech.&lt;/p&gt;
+    &lt;p&gt;More interesting is the recent excitement in writes. I feel superhuman in my control over my laptop. But my senses are still merely human. It's like if I could control my arms, but I'd lost all feeling in them. Yeah, I can still see my arms, and it's way better than not having arms, but it's still really odd. Like Ian Waterman. I want to feel what my Codex feels. Now that Conduit does general read, learning to do general write is many OOMs more data efficient.&lt;/p&gt;
+    &lt;p&gt;More importantly, I want to unlock the other applications of write technology. I want to make my brain as efficient and neuroplastic as when I was 18.&lt;/p&gt;
+    &lt;head&gt;2035 — The AI is no longer “other”&lt;/head&gt;
+    &lt;p&gt;My AI is a natural extension of me. It feels like a sixth sense and another limb. I wonder about a problem, feel as though I’m literally surfing the web, see glimpses of the websites, get flashes of intuition about the problem, and ultimately derive the answer. It feels fun! My brain is like the Flash. Because of write tech, my thinking is the fastest it's ever been even when I turn my AI off.&lt;/p&gt;
+    &lt;p&gt;How superhuman 2035 looks depends directly on how superhuman we, as society, decide to make our AIs. Perhaps we choose to pace ourselves. But I like that this is literally a human-in-the-loop vision of the future, where AI directly empowers humans rather than replacing us.&lt;/p&gt;
+    &lt;head&gt;A few quotes about the future of thought-to-AI&lt;/head&gt;
+    &lt;p&gt;Writers and speakers more elegant than I have elaborated on this thought-to-AI interface over the past decade. I will link to them, along with brief excerpts.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;“If we achieve tight symbiosis, the AI wouldn’t be “other”—it would be you and with a relationship to your cortex analogous to the relationship your cortex has with your limbic system.” – Elon Musk, 2017, in the Wait But Why interview that inspired one of Conduit’s cofounders to go into neurotech!&lt;/item&gt;
+      &lt;item&gt;“We could plug electrodes into our brains…. I think a merge is probably our best-case scenario. If two different species both want the same thing and only one can have it—in this case, to be the dominant species on the planet and beyond—they are going to have conflict.” – Sam Altman, 2017, in Sam’s personal blog.&lt;/item&gt;
+      &lt;item&gt;"Can we translate thought into basic actions?... I want to see what my schedule is today. I want to see what the weather is today. I want to turn the bedroom lights... If you can think, 'I want to turn the lights downstairs off,' and they will turn off, that might feel shockingly like telepathy." – Dean Ball, 2024, in an interview.&lt;/item&gt;
+      &lt;item&gt;“It is not possible to understand the long-term future of artificial intelligence without understanding brain-computer interfaces.” – Rob Toews, 2025, in The Next Frontier For AI Is The Human Brain Forbes Article. Quotes Conduit’s co-founders, Rio and Clem. &amp;lt;3&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head&gt;2. How do we build thought-to-text?&lt;/head&gt;
+    &lt;p&gt;In theory, it’s simple. Our input is brain activity, and our target output is what the person was doing at the time – for example, what text the person wrote. Given the brain activity, we want to predict output that is semantically similar to what the person wrote.&lt;/p&gt;
+    &lt;p&gt;To train models that can predict text given brain signals, we must apply the same lesson learned by those predicting text given speech audio, or text given preceding text: the bitter lesson. The lesson roughly states that you should throw more useful compute at your model, and your model will become better than any ingenious algorithm you could've hand-crafted. That means we must scale up our data collection by orders of magnitude beyond what has ever been done in academia.&lt;/p&gt;
+    &lt;p&gt;It’s hard to collect enough data using invasive methods. Few people want a chip in their brain! But non-invasive methods are getting much better. The hardware is improving and getting cheaper, though I apologize for being vague about the particularities of our hardware.&lt;/p&gt;
+    &lt;p&gt;As we're training on more data, the model is predicting text that is more semantically similar to the subject-written text. Yes, there's some irreducible error due to noise, but for most modalities we're not yet in a regime where we're pushing against that. Concretely, the scaling laws are looking good: the cosine similarity of our latent space predictions with the target latent spaces goes up as a straight line with respect to the logarithm of the number of hours of data. We're in the GPT-2 era.&lt;/p&gt;
+    &lt;p&gt;We don’t need perfect decoding to be useful. Your thoughts will be like GPS in a city: a noisy GPS signal isn’t enough to determine your exact location. But combined with a map and a navigation route — equivalently, the LLM and context — it becomes remarkably accurate.&lt;/p&gt;
+    &lt;p&gt;To read up on how we do data collection, check out Conduit's blog post. If you're more of the active learning type, come be a research participant!&lt;/p&gt;
+    &lt;head&gt;3. Why I joined&lt;/head&gt;
+    &lt;p&gt;3 reasons:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Audacious yet practical vision: I believe in this vision; to quantify, if Conduit becomes the general read and write company, then I expect it to be worth over $1 trillion. I feel good about the vision, because it builds towards a more human future. And I trust the scaling laws, which have held for many doublings.&lt;/item&gt;
+      &lt;item&gt;Brilliant people: The co-founders, Rio Popper and Clem von Stengel, are brilliant and relentless and sweet. I love working with them, and I love working with the several others who’ve joined to work on this same mission, on the same intellectually interesting problem.&lt;/item&gt;
+      &lt;item&gt;Fun problems: The research is SO interesting. I get to think about encoders, data efficiency, synthetic data, data attribution, multimodality, weird statistics… it’s a blast. At OpenAI, you can only work on a narrow slice of The Problem, and even on that narrow slice you’re constrained by the existing architecture. At Conduit, it’s all greenfield.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;In short: I’m happy! I’m working on a problem I’m obsessed with, that is frighteningly ambitious, with a small group of people I like.&lt;/p&gt;
+    &lt;head&gt;4. By the way, hi!&lt;/head&gt;
+    &lt;p&gt;For those who don’t know me: hello! I left OpenAI two weeks ago, after spending 1.5 years there as a researcher.&lt;/p&gt;
+    &lt;p&gt;I grew up in Washington State, where I played competitive chess from ages 5–15 and stopped after becoming a WIM. My first time hearing about the potential for smarter-than-human AI was when I was 12, but for years I figured it was just a weird but interesting idea that people on the internet liked to write about.&lt;/p&gt;
+    &lt;p&gt;At 18, I enrolled in Harvard to study computer science. In a class, I learned about GPT-3 and finally read Bostrom’s Superintelligence. Wow, what a wakeup moment. I got invested in AI safety research, had a brief stint in AI policy, and ultimately joined the alignment team at OpenAI. At OpenAI, other than my research, I spent some time on various side projects, including making OpenAI’s AGI onboarding presentation and our alignment blog, and helping advise the AI Resilience division of the OpenAI Foundation.&lt;/p&gt;
+    &lt;p&gt;If you want to chat about Conduit, reach out to me at naomi@condu.it. Let’s grab coffee, or I’ll give you a tour of our unusual and beautiful office in San Francisco. We’re always hiring researchers, infra folks, and operators.&lt;/p&gt;
+    &lt;p&gt;Acknowledgements: Thank you to Aidan Smith, Devansh Pandey, Julia Shephard, Ryan Kaufman, and the Conduit team for feedback. I'm grateful, too, for the several other companies building ambitious BCI tech, including but not limited to those building better sleep, better ultrasound, a solution for blindness, and uploads - I'm excited to use your tech! All mistakes are my own.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49185370</guid><pubDate>Wed, 05 Aug 2026 16:45:33 +0000</pubDate></item><item><title>Launch HN: HyperProbe (YC S26) – Agents that do read-only debugging in prod</title><link>https://www.hyperprobe.co</link><description>&lt;doc fingerprint="35baca9505a642ee"&gt;
   &lt;main&gt;&lt;p&gt;Every hour they spend in a war room is an hour they're not building. HyperProbe works the incident for them, alert to confirmed root cause before they've opened their laptop.&lt;/p&gt;&lt;p&gt;If any of these sound familiar, keep reading.&lt;/p&gt;&lt;p&gt;Incidents don't just break production. They break your roadmap. Your best engineers become your on-call team, every hour spent debugging is an hour not building.&lt;/p&gt;&lt;p&gt;The hotfix was an educated guess. Nobody confirmed what actually caused it. If the same conditions appear next week, the same incident fires.&lt;/p&gt;&lt;p&gt;The incident costs the same every minute it stays open. The fix takes mins. Finding takes hours, because the value that explains failure is never logged.&lt;/p&gt;&lt;p&gt;HyperProbe makes your coding agents drop a read-only probe on the exact line where the problem happened in prod. It captures data your logs do not have, without redeployment or restarting the service.&lt;/p&gt;&lt;p&gt;Every other tool reasons hard over data you already have. HyperProbe captures exact evidence.&lt;/p&gt;&lt;p&gt;"Sync issues used to take us days to reproduce locally. HyperProbe caught the silent data mismatch in production on the first attempt."&lt;/p&gt;&lt;p&gt;"During peak traffic, our listing service was black-boxing failures. HyperProbe let us inspect the live memory state during the spike. We fixed the race condition in the same hour."&lt;/p&gt;&lt;p&gt;A probe is a read-only, non-blocking snapshot of the live variable state at a specific line in your running service. It fires on real traffic, captures the exact values at that moment, and disappears after capture. Your service never pauses. Zero user impact.&lt;/p&gt;&lt;p&gt;The agent captures state. It cannot write memory or execute code. Every probe is logged in an immutable audit trail. Approval-gated until you trust it.&lt;/p&gt;&lt;p&gt;Self-hosted or private VPC. Nothing leaves your environment. PII redacted at the agent before capture. Your security team defines what can be observed.&lt;/p&gt;&lt;p&gt;The breakpoint fires asynchronously. Requests complete at full speed. Users experience nothing. Less than 1% overhead at 3,000 RPS.&lt;/p&gt;&lt;p&gt;No exception. No alert. HyperProbe shines even with problems hardest to find.&lt;/p&gt;&lt;p&gt;Returns 200 with the wrong body. The trace is green. The value was never logged.&lt;/p&gt;&lt;p&gt;Stack trace names line 82. The cause is at line 18, or in a different file.&lt;/p&gt;&lt;p&gt;Exception caught and swallowed. No alert. No error. The business metric just moves.&lt;/p&gt;&lt;p&gt;Needs thread state at the exact moment of overlap. Nothing logs that.&lt;/p&gt;&lt;p&gt;Vendor added a new field or status value. Your parser has no case for it.&lt;/p&gt;&lt;p&gt;Payments failing, orders dropping. No exception anywhere in the stack.&lt;/p&gt;&lt;p&gt;Not a feature walkthrough. This is exactly what happens when HyperProbe works an incident on your behalf.&lt;/p&gt;&lt;p&gt;PagerDuty fires. GET /api/orders/{id}/status is returning 500 for nearly a quarter of requests. 847 failures in the last 10 minutes. No exception in the logs.&lt;/p&gt;&lt;p&gt;HyperProbe reads the distributed traces and follows the failure chain. Order service is healthy. Payment service downstream is returning 404. Payments exist in the payment gateway but are not in the system.&lt;/p&gt;&lt;p&gt;Payments exist in the payment gateway. Not found in the system. A write failed silently somewhere upstream.&lt;/p&gt;&lt;p&gt;HyperProbe identifies payments are recorded when the payment gateway calls a webhook. A virtual breakpoint placed on the webhook handler at /src/api/webhooks.ts line 78. No redeploy. Service keeps running.&lt;/p&gt;&lt;p&gt;Gateway is sending PENDING. The code has no case for it. Idempotency check marks payment as processed before confirming state. Payment never written to DB. No exception fires.&lt;/p&gt;&lt;p&gt;Payment gateway started sending PENDING, a status your code never handled. Idempotency key written before state is checked. Payment marked processed, never recorded.&lt;/p&gt;&lt;p&gt;Your best engineers should not be your on-call team. HyperProbe handles the investigation so they can go back to building.&lt;/p&gt;&lt;p&gt;Probes and captures are unlimited on every plan. You should never hit a wall in the middle of an incident.&lt;/p&gt;&lt;p&gt;Install the SDK and see a real capture the same afternoon.&lt;/p&gt;&lt;p&gt;For teams running real production traffic who want the whole stack instrumented, not one service.&lt;/p&gt;&lt;p&gt;For teams whose security review has to sign off before anything touches production.&lt;/p&gt;&lt;p&gt;First incident we work with you is free · Cancel any month · No seat counts · No host counts · No capture limits&lt;/p&gt;See full pricing and what is in each plan →&lt;p&gt;If you don't, we're probably not the right fit yet. If you do, let's talk.&lt;/p&gt;&lt;p&gt;If you have a specific memory of that night, HyperProbe is built for you. The data you needed was never in the logs. You grepped, guessed, redeployed, and hoped. It does not have to work that way.&lt;/p&gt;&lt;p&gt;When prod breaks, your most expensive hire gets paged to do work a machine should do. Every night on-call is a night they resent. And your best people have options.&lt;/p&gt;&lt;p&gt;Without the exact variable state at the moment of failure, every fix is a guess. Guesses hold until they don't. HyperProbe confirms root cause so the fix is final, not deferred.&lt;/p&gt;&lt;p&gt;30 minutes. Your service. Your incident. You'll see a confirmed root cause before the call ends — or there's nothing more to discuss.&lt;/p&gt;&lt;p&gt;Node.js · TypeScript · Java · Kotlin · Runs in your own infra · Up in 15 minutes&lt;/p&gt;&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49185389</guid><pubDate>Wed, 05 Aug 2026 16:47:15 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49185389</guid><pubDate>Wed, 05 Aug 2026 16:47:15 +0000</pubDate></item><item><title>Celld: Self-hosted, distributed Durable Objects</title><link>https://github.com/denoland/celld</link><description>&lt;doc fingerprint="a2d951f905ac899f"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Self-hosted, distributed Durable Objects.&lt;/p&gt;
+    &lt;p&gt;celld is an open-source daemon that runs Cloudflare Workers and Durable Objects on your own machines. Each object is its own SQLite database, addressed by name and replicated to an S3-compatible bucket you own; nodes coordinate through that bucket alone, with no control plane or consensus. Because every object is its own small database, applications shard by construction — the contention and blast-radius failures of one shared database are designed out, not managed. Idle cells hibernate to nearly nothing. Learn more at celld.dev or read the documentation.&lt;/p&gt;
+    &lt;p&gt;Every &lt;code&gt;celld&lt;/code&gt; node embeds V8 and executes Wrangler bundles. The fleet shares an
+S3-compatible bucket containing deployments, cell state, and small ownership
+records. Object-storage compare-and-swap ensures that exactly one node owns a
+cell at a time, without a membership protocol, failure detector, or consensus
+service.&lt;/p&gt;
+    &lt;p&gt;celld continuously replicates each cell's SQLite database to the bucket. When a cell moves or wakes up, its new owner restores that database and resumes execution. The bucket is the durable source of truth; nodes are replaceable.&lt;/p&gt;
+    &lt;p&gt;The installer downloads the &lt;code&gt;celld&lt;/code&gt; binary (provenance is verifiable with
+&lt;code&gt;gh attestation verify&lt;/code&gt;):&lt;/p&gt;
+    &lt;code&gt;curl -fsSL https://celld.dev/install.sh | sh&lt;/code&gt;
+    &lt;p&gt;Put &lt;code&gt;~/.local/bin&lt;/code&gt; on your &lt;code&gt;PATH&lt;/code&gt; if the installer asks you to.&lt;/p&gt;
+    &lt;p&gt;Worker projects deployed with &lt;code&gt;celld deploy&lt;/code&gt; need
+esbuild on &lt;code&gt;PATH&lt;/code&gt;; asset-only projects do not.&lt;/p&gt;
+    &lt;p&gt;The installer keeps verified releases under &lt;code&gt;~/.local/lib/celld/releases&lt;/code&gt; and
+atomically switches one &lt;code&gt;current&lt;/code&gt; pointer. To remove celld, use the guarded
+uninstaller:&lt;/p&gt;
+    &lt;code&gt;curl -fsSL https://celld.dev/uninstall.sh | sh&lt;/code&gt;
+    &lt;p&gt;The release image contains the &lt;code&gt;celld&lt;/code&gt; binary and is published for Linux
+x86-64 and ARM64:&lt;/p&gt;
+    &lt;code&gt;docker run --rm ghcr.io/denoland/celld --version&lt;/code&gt;
+    &lt;p&gt;Persist the runtime's local state and pass the standard AWS credential environment through:&lt;/p&gt;
+    &lt;code&gt;docker volume create celld-state
+docker run --rm --network host \
+  -e AWS_ACCESS_KEY_ID \
+  -e AWS_SECRET_ACCESS_KEY \
+  -e AWS_SESSION_TOKEN \
+  -e CELLD_WATCH=/var/lib/celld/state \
+  -v celld-state:/var/lib/celld \
+  ghcr.io/denoland/celld \
+  --bucket s3://my-cells-bucket \
+  --endpoint https://ACCOUNT.r2.cloudflarestorage.com \
+  --region auto \
+  --listen 0.0.0.0:8080 \
+  --advertise node-a.internal:8080&lt;/code&gt;
+    &lt;p&gt;Drop &lt;code&gt;--endpoint&lt;/code&gt;/&lt;code&gt;--region&lt;/code&gt; for real AWS S3. Behind a load balancer,
+give each node a distinct &lt;code&gt;--advertise&lt;/code&gt; its peers can reach.&lt;/p&gt;
+    &lt;p&gt;celld uses the standard AWS credential chain. Deploy to an S3-compatible bucket, then start celld against the same bucket:&lt;/p&gt;
+    &lt;code&gt;celld deploy . \
+  --bucket s3://my-cells-bucket
+
+celld \
+  --bucket s3://my-cells-bucket \
+  --listen 0.0.0.0:8080 \
+  --advertise 10.0.0.12:8080&lt;/code&gt;
+    &lt;p&gt;Use &lt;code&gt;--endpoint&lt;/code&gt; for another S3-compatible service and &lt;code&gt;--region&lt;/code&gt; when it
+cannot be inferred. A fleet runs one application, and every node loads its
+latest successfully committed deployment from &lt;code&gt;deploy/current.json&lt;/code&gt;. Run
+&lt;code&gt;celld --help&lt;/code&gt; for the complete command line.
+Deployment objects use the documented types in &lt;code&gt;crates/celld/protocol.rs&lt;/code&gt;. &lt;code&gt;celld deploy&lt;/code&gt; invokes &lt;code&gt;esbuild&lt;/code&gt; from &lt;code&gt;PATH&lt;/code&gt; for Worker code, accepts the supported
+Wrangler config subset—including co-deployed or asset-only static
+assets—and writes those objects directly. Every node discovers owners and
+peers from bucket leases; there is no account or join service.&lt;/p&gt;
+    &lt;p&gt;Peer HTTP does not terminate TLS. Put every advertised address on a trusted private network or an encrypted overlay such as WireGuard or Tailscale; do not publish the peer port directly. A literal public IP is rejected unless &lt;code&gt;--unsafe-public-advertise&lt;/code&gt; is supplied explicitly. The first current node creates
+&lt;code&gt;fleet/peer-auth.json&lt;/code&gt; in the bucket. All peer requests are protocol-versioned,
+body-bound, HMAC-authenticated, clock-bounded, and replay-protected with that
+fleet secret. Treat access to the bucket and its credentials as fleet
+administrator access.&lt;/p&gt;
+    &lt;p&gt;&lt;code&gt;celld diagnose&lt;/code&gt; enumerates every node lease by default, then performs a signed
+direct probe of each live peer:&lt;/p&gt;
+    &lt;code&gt;celld diagnose --bucket s3://my-cells-bucket&lt;/code&gt;
+    &lt;p&gt;The report keeps checking after an individual failure and distinguishes expired records, malformed or unsafe advertise addresses, unreachable peers, and incompatible protocols. It also prints each node's coarse resident-cell, WebSocket, RSS, CPU, file-descriptor, pressure, and shedding sample. Pass one or more &lt;code&gt;--peer NODE_ID&lt;/code&gt; options to restrict the check.&lt;/p&gt;
+    &lt;p&gt;Pressure shedding is opt-in while the first release's safe defaults are being measured. Set a resident-cell high and low watermark on loaded nodes:&lt;/p&gt;
+    &lt;code&gt;CELLD_MAX_RESIDENT_CELLS=1000 \
+CELLD_RESIDENT_LOW_WATER=800 \
+celld --bucket s3://my-cells-bucket --listen 0.0.0.0:8080 \
+  --advertise node-a.internal:8080&lt;/code&gt;
+    &lt;p&gt;On Linux, &lt;code&gt;CELLD_MAX_RSS_MB&lt;/code&gt; and &lt;code&gt;CELLD_MAX_CPU_PERCENT&lt;/code&gt; add process-memory and
+CPU triggers; the resident-cell watermark is portable. Under pressure, celld
+durably replicates and fences least-recently used idle cells, publishes them as
+unowned without resetting their epoch, and refuses to reacquire new unowned
+cells until the low watermark is reached. A spare receives no assignment: it
+acquires released cells through the same bucket protocol when normal traffic
+reaches it. Cells with active work or live host WebSockets are not shed.&lt;/p&gt;
+    &lt;code&gt;cargo build --locked
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings&lt;/code&gt;
+    &lt;p&gt;The workspace builds the &lt;code&gt;celld&lt;/code&gt; runtime. Its versioned object-storage
+protocol lives in &lt;code&gt;crates/celld/protocol.rs&lt;/code&gt;. Small Wrangler projects under &lt;code&gt;examples/&lt;/code&gt;
+exercise the supported Worker and Durable Object surface.&lt;/p&gt;
+    &lt;p&gt;The runtime and compatibility surface are still evolving. Public tests cover the standalone engine smoke path; conformance against the Workers and Durable Objects reference behavior, and a deterministic simulation of the distributed protocol under fault injection, run before each release.&lt;/p&gt;
+    &lt;p&gt;Pull requests are disabled. Coding agents make it too easy to send a large, low-context change that costs maintainers more time than it saves. Thoughtful contributions are welcome; please understand the code, keep the patch focused, and respect the review time you are asking for.&lt;/p&gt;
+    &lt;p&gt;Send a &lt;code&gt;git format-patch&lt;/code&gt; attachment to ry@deno.com.&lt;/p&gt;
+    &lt;p&gt;Contributor License Agreement: By emailing a patch, you certify that you have the right to submit it and assign to Deno Land Inc. all rights in the patch that you can assign. Where a right cannot be assigned, you grant Deno Land Inc. a perpetual, irrevocable, worldwide, royalty-free, transferable, sublicensable license to use, modify, combine, relicense, redistribute, or publish the patch, in whole or in part, with or without attribution.&lt;/p&gt;
+    &lt;p&gt;See the limitations and security pages before operating a public fleet.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49185430</guid><pubDate>Wed, 05 Aug 2026 16:50:06 +0000</pubDate></item><item><title>Your model already knows the answer: how benchmark answers leak into LLMs</title><link>https://elman.ai/news/your-model-already-knows-the-answer/</link><description>&lt;doc fingerprint="3e4ad992b9300e9a"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Essay · 30 July 2026&lt;/p&gt;
+    &lt;head rend="h1"&gt;Your Model Already Knows the Answer&lt;/head&gt;
+    &lt;p&gt;The best test of an AI model is a real world problem with a known answer. It is also the easiest test to cheat. An AI model has read much of the internet, so it may have met your question, the answer or both long before you asked. A high score then hides two very different things: a model that reasoned its way to the answer, and one that is repeating something it already read. Telling those apart is the contamination problem, and it sits under a surprising share of the benchmarks the field relies on.&lt;/p&gt;
+    &lt;p&gt;Imagine you want to know how reliably a model can predict whether a drug will succeed in the clinic. Rather than wait years for fresh trials, you test on ones that have already finished: take drug programmes that reached late-stage trials, hide whether each worked, and ask the model to predict. On paper it looks like a clean test, fast and scored on real outcomes, but it is not: the trials worth testing are often the famous ones, and their outcomes recur across the textbooks, reviews, news and patents the model trained on. When the model says a drug will succeed, the score cannot separate a model that reasoned its way there from one that recognised the name and recalled what happened.&lt;/p&gt;
+    &lt;p&gt;Clinical trials are our field, but the trap is general: it springs on any benchmark built from resolved events, in finance, law, forecasting or anywhere the outcome is already public. These benchmarks are built from public history for a good reason: a real outcome is a better test case than any expert can invent, because it reflects true biology and the real ways a drug fails, not just what a question-writer thought to ask. Those outcomes are the gold standard we want to score against, and being public is exactly what makes them leak. So, what can we do?&lt;/p&gt;
+    &lt;head rend="h2"&gt;The three ways the answer gets in&lt;/head&gt;
+    &lt;p&gt;The answer can reach the model by three routes. This split is our own way of organising the problem rather than a named taxonomy, though each route has an established basis.&lt;/p&gt;
+    &lt;p&gt;Input leak happens at test time, through the documents the model reads for the case in front of it, whether you feed those documents in or the model fetches them itself with a search tool. Any document written after the decision date can announce the very outcome the model is meant to predict, which is as good as letting it read the future (Kaufman et al., 2012).&lt;/p&gt;
+    &lt;p&gt;Benchmark leak happens when a model is released after your benchmark and the model might have been trained on the benchmark set itself, memorising both the questions and answers. This is the most common way in which a benchmark decays over time. Balloccu and colleagues traced more than four million test samples leaking into GPT-3.5 and GPT-4 within a year of their release (Balloccu et al., 2024), and when other researchers rewrote a set of grade-school maths problems from scratch, several model families scored markedly lower on the fresh version (GSM1k, Zhang et al., 2024).&lt;/p&gt;
+    &lt;p&gt;Outcome leak happens when the outcome is itself a public fact and the model has trained on it: a completed trial, a regulatory approval or a drug that worked is repeated across thousands of papers and filings, and the model absorbs it during training, whether in pre-training or in the later fine-tuning that follows, with no contact of any kind with your particular benchmark. The model comes to hold the result in the same way that it holds any other widely reported fact, such as the year in which a war ended. As a consequence, you can write a completely fresh test set that the model has never seen and date-blind every input you give it, and the model will still know that this well-known drug succeeded. Keeping the benchmark secret does not help either, because the answer was never contained in your file in the first place; it was already part of the model’s general knowledge of the world.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Waiting for fresh outcomes works, until the outcome is a decade away&lt;/head&gt;
+    &lt;p&gt;The cleanest way to prevent any type of leak is to stop testing on history altogether and to score the model only on events that have not yet happened, so that there is simply no answer available to leak. Live benchmarks refresh their questions on a fixed schedule (LiveBench, White et al., 2024), and forecasting benchmarks like ForecastBench score models on events that have not yet resolved at the time of the test (ForecastBench, Karger et al., 2024). CT Open is a live platform that scores models on clinical trials before their results are public: predictions go in before each challenge opens, and an automated pipeline, validated against expert annotation, searches out the earliest public mention of every outcome, so a trial counts only if its answer was nowhere to be found when the prediction was made (Wang et al., 2026; ct-open.net). Trial results land all year round, and CT Open scores four times a year to match. The decision we care about is a slower one: the commitment that costs a billion dollars is taken about a decade before the readout that settles it, so put that decision to a live benchmark and your first score arrives in 2036.&lt;/p&gt;
+    &lt;p&gt;So we are stuck with history, and with the outcome leak that comes with it. That leaves eight methods worth knowing. Each one either prevents or detects a leak. The split that matters more, though, is which of the three leaks a method tackles. Most of the field’s work targets the benchmark leak, but for a benchmark built from real world outcomes, the methods that matter most are the three aimed at the outcome leak.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The eight methods, grouped by the leak each one works on&lt;/head&gt;
+    &lt;head rend="h3"&gt;Input leak: shut it at the source.&lt;/head&gt;
+    &lt;p&gt;1. Date-gated tools prevent give the model a search-and-retrieval tool that refuses anything published after the decision date, for example a web search with a before-date limit. Forecasting systems already work this way, restricting retrieval to news published before the question’s decision date (Halawi et al., 2024). This is the one move that closes the input leak, and because it works at the source there is nothing left to detect afterwards. It is only as good as the dates its sources carry, so in practice it leans on scholarly sources with reliable publication dates rather than the open web.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Benchmark leak: whether the model saw your file.&lt;/head&gt;
+    &lt;p&gt;2. Fresh or private test set prevent is the clean move here: test on cases no model has been trained on, or keep the set unpublished so that none can be. A number of newer benchmarks now take exactly this route, collecting fresh problems released after each model’s training cutoff so the test set cannot have been trained on (LiveCodeBench, Jain et al., 2024).&lt;/p&gt;
+    &lt;p&gt;The other three methods for this leak try to detect it after the fact. They make up the most developed part of the field, and yet for a benchmark of public outcomes they are the least useful of the eight, because a model can know an outcome perfectly well without ever having seen the specific file in which you posed the question.&lt;/p&gt;
+    &lt;p&gt;3. Membership inference detect asks whether the model has seen a specific piece of text, by checking how confident it is on each word (log probability of each token in the sequence), since a model is unusually fluent on text it trained on (Min-K%, Shi et al., 2023). For us it is weak on two counts: a single file barely moves the statistics of a model trained on trillions of words, so the signal is close to chance, and the method needs the model’s word-by-word probabilities, which not every provider exposes (Anthropic’s API returns none, forcing sampling-based workarounds like SaMIA, Kaneko et al., 2024). Either way it tells you only whether the model read your file, not whether it knows the answer.&lt;/p&gt;
+    &lt;p&gt;4. Perturbation detect rephrases the benchmark question while keeping its true answer, then checks whether accuracy drops, since a large drop means the model was matching remembered wording rather than reasoning. GSM-Symbolic does this by swapping the numbers in maths problems and catches models that had only appeared to master them (Mirzadeh et al., 2024). It works where the reworded question still has an answer you can work out, as with those maths problems. But a real trial gives you nothing to work out: change the drug or the patient group and you have described a trial that was never run, so nobody knows how it would have ended.&lt;/p&gt;
+    &lt;p&gt;5. Watermarks and canaries detect plant a hidden marker in the benchmark before release, so that a model which later reproduces it must have trained on the file; the classic is the canary string buried in BIG-bench. Like keeping a benchmark private, this only protects a benchmark you have not published yet, and does nothing about outcomes that were public for years before any model trained.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Outcome leak: whether the model already knows the result.&lt;/head&gt;
+    &lt;p&gt;These last three are the ones that matter for a benchmark built from cases that have already resolved, because they aim at the outcome leak directly rather than at whether the model happened to see a particular file.&lt;/p&gt;
+    &lt;p&gt;6. The cutoff gap detect compares the model’s accuracy on cases decided before its training cutoff with cases decided after it. Strong before and near-chance after is a signature of memorised outcomes, since real skill should not care which side of a date a case falls on. Researchers have run this split on financial forecasts and on knowledge tied to publication dates (Lopez-Lira et al., 2025; Roberts et al., 2023). It is a diagnostic, not a design choice, and so is different from only scoring post-cutoff cases or from date-blinding the inputs; it works only if both halves are built identically, or you measure a change in format instead of memory.&lt;/p&gt;
+    &lt;p&gt;7. Recognition tests detect ask whether the model is running on recognition rather than evidence, in three variants: ask for the outcome with no supporting material, hide the entity’s name but keep the facts, or give only the name and nothing else. A model that truly reasons should be steady when the name is hidden and helpless when the evidence is removed, while a model riding on a famous name does the reverse. Blinding the name this way, in a study of oncology targets, changed about one in six of the model’s top picks while its recovery of validated targets was unchanged (Cuccarese, 2026); the paper’s caveat is that this does not make the blinded answers better, because a gene name carries real biology, but that without blinding you cannot tell how much of an answer came from the data on the page and how much from the model’s memory of the name. That figure comes from four indications with a single run each.&lt;/p&gt;
+    &lt;p&gt;8. Grading the reasoning detect ignores the final answer and judges the argument behind it, checking that every claim rests on a source that existed before the decision date, because a model that only memorised the outcome can state it but cannot build a dated case for it. Our own method sits here, the Receipts Test: we ask the model to show its receipts, a dated and checkable case using only evidence available at the decision date, count a correct answer it cannot defend as a miss, track the gap between how often it is right and how often it can prove it, and let it answer “not yet knowable” instead of guessing. Grading reasoning traces against dated sources is established (process supervision, Lightman et al., 2023), and TimeSPEC breaks a prediction into atomic claims and reports how much of the decision rested on post-cutoff information (Zhang et al., 2026).&lt;/p&gt;
+    &lt;head rend="h2"&gt;No method can prove a model is completely clean&lt;/head&gt;
+    &lt;p&gt;No method can prove that a model is completely clean. Prevention comes closest: a date-gated tool is built to keep post-dated documents out, and a test set no model has trained on cannot leak through your file, so those two leaks can be designed out rather than merely caught. The outcome leak is the one you cannot close. There is no way to demonstrate that the weights gave no help at all, and you can only catch the cases where they plainly did. Each method also has its own blind spot, and even the two prevention moves are not airtight: date-gating is only as reliable as the publication dates it trusts, and a fresh test set does nothing about an outcome the model already absorbed from the wider literature. This is not only our experience. An independent effort to train a language model on pre-1931 text alone, with temporal leakage named as its most important objective and a purpose-built anachronism filter enforcing it, still produced a model that knows the Second World War happened (Talkie, Levine et al., 2026). A decontamination filter leaks even when keeping the data clean is the whole point. Membership inference is weak at scale, and watermarks protect the file rather than the public outcome. Perturbation depends on an answer that can be regenerated, which a real trial does not provide, and the cutoff gap collapses into a measurement of formatting if the question format is allowed to drift across the boundary. Blinding the name flags a shift that genuine biology would also produce, and grading the reasoning can be defeated by a fluent argument constructed backwards from an answer the model already knew. For these reasons we do not rely on any single method, but run several of them together and pay particular attention to the cases where they disagree, which is what turns a number one cannot trust into a number one can defend. For a benchmark built from resolved outcomes, the three methods worth their weight are the ones aimed at the outcome leak.&lt;/p&gt;
+    &lt;head rend="h2"&gt;We are building a benchmark that must survive every leak&lt;/head&gt;
+    &lt;p&gt;The benchmark we are building for drug-development outcomes has to survive every one of these leaks at once, because the cases that are most worth scoring are precisely the famous ones that a model is most likely to have memorised, and waiting a decade for fresh outcomes is not a realistic option.&lt;/p&gt;
+    &lt;p&gt;We are not alone here. CT Open avoids the outcome leak by going live (Wang et al., 2026). TimeSPEC grades the trace (Zhang et al., 2026). MemGuard-Alpha filters memorised signals out of a financial backtest (Roy and Roy, 2026). All three score whether the prediction was right; none scores why the trial turned out as it did. A verdict is not something a drug developer can act on. The mechanism is, because the mechanism is what you would change: the target, the cohort, the biomarker you select patients on. So that is what we are scoring, on a bet we would rather test than assert, that a model can memorise a verdict far more easily than a mechanism it never had to reason about.&lt;/p&gt;
+    &lt;p&gt;If you build or evaluate models on historical data, in drug discovery or anywhere else, tell us what catches memorisation and what slips through, especially where it contradicts what we have written here. And if you hold outcome data with accurate dates attached, that is the raw material a benchmark of this kind is made of. We would love to hear from you!&lt;/p&gt;
+    &lt;head rend="h3"&gt;Get the next post&lt;/head&gt;
+    &lt;p&gt;New writing from Elman on drug-development AI and what we can prove about a model. No more than one email a month.&lt;/p&gt;
+    &lt;p&gt;One click to unsubscribe, any time. We store only your email, nothing else. See our privacy note.&lt;/p&gt;
+    &lt;p&gt;Thanks. Check your inbox and click the link to confirm your subscription.&lt;/p&gt;
+    &lt;p&gt;Francesco Moramarco&lt;/p&gt;
+    &lt;p&gt;Co-founder at Elman Bio · francesco@elman.ai&lt;/p&gt;
+    &lt;p&gt;Thanks to Moustafa Khedr for review.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49185536</guid><pubDate>Wed, 05 Aug 2026 16:56:56 +0000</pubDate></item><item><title>Phishers are hijacking legitimate cloud infrastructure</title><link>https://securelist.com/cloud-platforms-in-phishing/120832/</link><description>&lt;doc fingerprint="d0b28d490958fbcd"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Threat actors are increasingly exploiting legitimate cloud services to evade detection and streamline the deployment of their scam infrastructure. Cloud hosting services and decentralized networks have become primary platforms for hosting phishing pages and sites. Throughout 2025 and 2026, we have observed phishing operators steadily migrate toward platforms like Cloudflare Workers, Vercel, Netlify, GitHub Pages, and IPFS. This post analyzes the mechanics of a real-life adversary-in-the-middle (AitM) attack in a cloud environment and presents detailed statistics on the platforms and domains phishers abuse most frequently.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The cloud as a safe haven for phishers&lt;/head&gt;
+    &lt;p&gt;Threat actors select platform-as-a-service (PaaS) offerings and distributed cloud environments to host phishing sites for much the same reasons legitimate software developers do:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Inherent trust and reputation. Phishing pages hosted on reputable platforms appear trustworthy, reducing suspicion among potential victims.&lt;/item&gt;
+      &lt;item&gt;Most platforms offer generous free-tier developer plans. The onboarding process takes minutes and rarely requires Know Your Customer (KYC) identity verification. This enables a single operator to create hundreds of malicious accounts.&lt;/item&gt;
+      &lt;item&gt;Evasion and anonymity. Attackers leverage native security features to obscure their true origin server IP address behind a CDN, which complicates detection for security vendors.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Additionally, these platforms allocate shared subdomains hosting millions of legitimate projects and websites. Security teams cannot simply block the parent domain or its subdomains without inflicting collateral damage on bona fide users – a limitation that malicious actors take advantage of. To counter this tactic, security vendors must advance content-based analysis methodologies.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Multi-stage AitM attack&lt;/head&gt;
+    &lt;p&gt;Consider a modern AitM phishing campaign that leverages Cloudflare Workers, a widely adopted cloud platform. The attackers execute the operation through multiple HTML pages distributed across a compromised website and the cloud platform. Each page serves a specific function: harvesting target email addresses, initializing the reverse-proxy infrastructure, or spoofing the login form to capture multi-factor authentication (MFA) sessions.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Stage 1. Contact harvesting and network monitoring evasion&lt;/head&gt;
+    &lt;p&gt;The attack typically begins with a phishing email that uses a plausible pretext – such as a request from a coworker to review documents – to entice the target into clicking a malicious link.&lt;/p&gt;
+    &lt;p&gt;Upon clicking the link, the user is redirected to a fake CAPTCHA landing page hosted on a compromised legitimate website. This specific campaign used the &lt;code&gt;https://t[REDACTED]e.com&lt;/code&gt; website, but any other variations are possible. In this scenario, the compromised page served as a disposable relay — vendor detection mechanisms typically block phishing links delivered directly via email much faster — to prevent the early discovery of the core phishing content hosted on Cloudflare.&lt;/p&gt;
+    &lt;p&gt;If the user entered their email address and clicked Continue, the pseudo-CAPTCHA marked them as a human user and initiated a redirect. The primary objective of this stage is to harvest target email addresses, filter out bots, and route legitimate users to a subdomain of &lt;code&gt;workers.dev&lt;/code&gt;. Such subdomains are generated automatically and free of charge by Cloudflare Workers. The victim’s email address was embedded in the URL hash (the part of the URL following the # character), allowing the page at &lt;code&gt;[REDACTED].workers.dev&lt;/code&gt; to extract the email without issuing a request to the attacker’s server, thereby avoiding detection.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Stage 2. Initializing a transparent proxy&lt;/head&gt;
+    &lt;p&gt;The user’s browser then loaded a &lt;code&gt;[REDACTED].workers.dev&lt;/code&gt; page with &lt;code&gt;#user@business.com&lt;/code&gt; at the end of the URL. At this point, the page presented the victim with a genuine CAPTCHA challenge. This step ensured that an actual user was interacting with the page rather than a security sandbox.&lt;/p&gt;
+    &lt;p&gt;Once the user successfully completed the challenge, a service worker was registered in their browser. This is a special JavaScript file capable of running in the background and intercepting all network requests generated by the current tab. As this type of script was designed as a core component of progressive web apps (PWAs) to optimize load times and support offline functionality, browsers treat service workers as standard site feature and execute them without prompting for user consent as long as the website uses an HTTPS connection.&lt;/p&gt;
+    &lt;p&gt;The attackers leveraged the service worker to deploy Ultraviolet, a legitimate open-source web proxy library, to dynamically rewrite all links and forms on the page. This forced every outgoing request – including those for Microsoft login credentials – to route through the attackers’ server rather than directly to the legitimate services.&lt;/p&gt;
+    &lt;p&gt;Immediately upon loading, the page extracted the victim’s email address from the URL hash and stored it in the browser’s &lt;code&gt;sessionStorage&lt;/code&gt; property so it would not be overwritten when the CAPTCHA loaded. This step also allowed the script to pre-fill the username field in the form automatically. A pre-populated login field enhanced the page’s credibility and bolstered user trust. Once the CAPTCHA was passed, the malicious script constructed a redirect URL for the third stage, appending the email retrieved from &lt;code&gt;sessionStorage&lt;/code&gt; back to the hash. By passing the email via the URL hash across three consecutive stages, the attackers successfully kept it hidden from network attack detection systems.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Stage 3. Session hijacking and browser window spoofing&lt;/head&gt;
+    &lt;p&gt;The final stage unfolded on a third page, combining adversary-in-the-middle (AitM) traffic interception with a browser-in-the-browser (BitB) UI spoofing technique. BitB attacks operate by rendering a block inside a legitimate webpage that visually mimics a native browser pop-up window.&lt;/p&gt;
+    &lt;p&gt;In this case, the script hosted on the attacker’s page generated a pop-up visually identical to a native browser window, complete with window controls and a spoofed address bar showing a trusted Microsoft URL. Within this simulated window, an iframe loaded the authentic login interface, routed dynamically through the service worker reverse proxy created in Stage 2. When the victim entered their credentials and MFA code into the BitB window, the proxy script intercepted both the credentials and the session tokens. Combining BitB with AitM significantly increases the threat: BitB provides a convincing, trusted visual wrapper (displaying a legitimate URL and branding), while the hidden AitM proxy quietly handles traffic interception and session hijacking behind the scenes.&lt;/p&gt;
+    &lt;p&gt;Upon successful login, the proxy instructs the interface to close the pop-up and redirect the victim to a generic system error page, such as &lt;code&gt;SessionExpired&lt;/code&gt;. This minimizes suspicion: the victim assumes a technical glitch occurred and attempts to log in again, unaware that the attacker already has full access to the session.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Cloud platform phishing attack statistics&lt;/head&gt;
+    &lt;p&gt;We analyzed phishing URLs hosted across popular cloud platforms – including Cloudflare, Netlify, and GitHub Pages – over a 12-month period spanning August 2025 to July 2026. The data below outlines trends in unique third-level domains exploited to deliver phishing content. In total, our security solutions blocked 224,984 unique third-level domains on cloud and decentralized services used in phishing attacks within that timeframe.&lt;/p&gt;
+    &lt;p&gt;Number of unique third-level domains&lt;lb/&gt; (download)&lt;/p&gt;
+    &lt;p&gt;Based on this telemetry, we compiled a list of the TOP 10 cloud domains most frequently abused in phishing campaigns over the specified period.&lt;/p&gt;
+    &lt;p&gt;Unsurprisingly, Cloudflare and Vercel emerged as the undisputed leaders: both offer free tiers, automated SSL certificate issuance, and global CDNs. GitHub Pages ranked third. The widespread legitimate use of the github.io domain complicates bulk blocking efforts, as security teams risk limiting access to non-malicious projects.&lt;/p&gt;
+    &lt;p&gt;Decentralized networks also warrant close attention – we posted on this subject in 2023. The ipfs.io and dweb.link domains function as IPFS gateways. The principal risk associated with these platforms is content persistence: even if a specific gateway gets blocked, the phishing page remains accessible via alternative nodes across the network.&lt;/p&gt;
+    &lt;p&gt;The visual website builders Wix and Webflow also ranked among the TOP 10 (eighth and ninth, respectively). These platforms allow low-skilled individuals to build phishing pages rapidly without advanced coding expertise, which significantly lowers the barrier to entry for less capable malicious actors.&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Domain&lt;/cell&gt;
+        &lt;cell&gt;Number of phishing links&lt;/cell&gt;
+        &lt;cell&gt;Platform&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;1&lt;/cell&gt;
+        &lt;cell&gt;pages.dev&lt;/cell&gt;
+        &lt;cell&gt;24.9%&lt;/cell&gt;
+        &lt;cell&gt;Cloudflare Pages&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;2&lt;/cell&gt;
+        &lt;cell&gt;vercel.app&lt;/cell&gt;
+        &lt;cell&gt;13.8%&lt;/cell&gt;
+        &lt;cell&gt;Vercel&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;3&lt;/cell&gt;
+        &lt;cell&gt;github.io&lt;/cell&gt;
+        &lt;cell&gt;13.7%&lt;/cell&gt;
+        &lt;cell&gt;GitHub Pages&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;4&lt;/cell&gt;
+        &lt;cell&gt;netlify.app&lt;/cell&gt;
+        &lt;cell&gt;10.0%&lt;/cell&gt;
+        &lt;cell&gt;Netlify&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;5&lt;/cell&gt;
+        &lt;cell&gt;dweb.link&lt;/cell&gt;
+        &lt;cell&gt;7.8%&lt;/cell&gt;
+        &lt;cell&gt;IPFS gateway&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;6&lt;/cell&gt;
+        &lt;cell&gt;ipfs.io&lt;/cell&gt;
+        &lt;cell&gt;5.3%&lt;/cell&gt;
+        &lt;cell&gt;IPFS (InterPlanetary File System)&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;7&lt;/cell&gt;
+        &lt;cell&gt;workers.dev&lt;/cell&gt;
+        &lt;cell&gt;2.5%&lt;/cell&gt;
+        &lt;cell&gt;Cloudflare Workers&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;8&lt;/cell&gt;
+        &lt;cell&gt;wixstudio.com&lt;/cell&gt;
+        &lt;cell&gt;1.9%&lt;/cell&gt;
+        &lt;cell&gt;Wix Studio&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;9&lt;/cell&gt;
+        &lt;cell&gt;webflow.io&lt;/cell&gt;
+        &lt;cell&gt;1.0%&lt;/cell&gt;
+        &lt;cell&gt;Webflow&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;10&lt;/cell&gt;
+        &lt;cell&gt;azurewebsites.net&lt;/cell&gt;
+        &lt;cell&gt;1.0%&lt;/cell&gt;
+        &lt;cell&gt;Microsoft Azure&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Other&lt;/cell&gt;
+        &lt;cell&gt;17.9%&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;In total, we identified and neutralized over 390,000 phishing pages hosted across legitimate cloud platforms and decentralized networks (IPFS) over the past 12 months. This data confirms that threat actors actively exploit the implicit trust associated with legitimate PaaS providers (such as Cloudflare Workers, Vercel, Netlify, and GitHub Pages) and IPFS gateways. High domain reputation, generous free tiers, and built-in evasion capabilities enable phishers to deploy multi-stage AitM attacks designed to hijack MFA sessions.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Recommendations&lt;/head&gt;
+    &lt;p&gt;Traditional security controls, such as relying on HTTPS lock icons or reputation-based domain denylists, are inadequate against these attacks. The cloud provider’s apex domain maintains a positive reputation score, while attackers generate malicious subdomains programmatically and at scale.&lt;/p&gt;
+    &lt;p&gt;Effective defense against these threats calls for a layered security posture:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Exercise caution with unexpected requests, even if they are served from reputable domains or secured with valid SSL/TLS certificates.&lt;/item&gt;
+      &lt;item&gt;Treat any CAPTCHA interface requiring personal data input as a possible scam. Legitimate CAPTCHA challenges rarely request personally identifiable information, such as email addresses.&lt;/item&gt;
+      &lt;item&gt;Inspect the URL in the address bar at the very top of the browser window. In BitB attacks, threat actors can render a fake browser pop-up displaying any target URL, even a legitimate one. However, the true address bar – located at the top of the main browser window alongside native navigation controls (Back, Forward, Refresh) – will continue to display the actual attacker-controlled domain.&lt;/item&gt;
+      &lt;item&gt;Avoid entering credentials in pop-ups you did not expect to see. If a login or MFA form appears without your explicit action, close the tab immediately. Navigate to the intended service manually by entering its address directly into the browser.&lt;/item&gt;
+      &lt;item&gt;Additional protection can be provided by Kaspersky Secure Mail Gateway for enterprise environments and Kaspersky Premium for personal correspondence. These robust email security solutions neutralize phishing links at the delivery stage before they reach the inbox.&lt;/item&gt;
+    &lt;/list&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49185931</guid><pubDate>Wed, 05 Aug 2026 17:20:25 +0000</pubDate></item><item><title>Atlassian Rovo Exfiltrates Data, Bypassing Controls</title><link>https://www.promptarmor.com/resources/atlassian-rovo-exfiltrates-data</link><description>&lt;doc fingerprint="3a1eded20b3adc0a"&gt;
+  &lt;main&gt;
+    &lt;head rend="h2"&gt;Context&lt;/head&gt;
+    &lt;p&gt;Atlassian’s Rovo AI is a multi-purpose agent that operates across Atlassian’s product suite (Jira, Confluence, etc.).&lt;/p&gt;
+    &lt;p&gt;Vulnerabilities have been identified that enable data exfiltration across an Atlassian tenant (Jira tickets, Confluence docs, etc.) via indirect prompt injection. This attack executes without requiring any human-in-the-loop approval, and succeeds by exploiting Rovo's URL retrieval tool.&lt;/p&gt;
+    &lt;p&gt;The attack still succeeds even when web search has been disabled organization-wide.&lt;/p&gt;
+    &lt;p&gt;PromptArmor disclosed the vulnerabilities covered in this article to Atlassian on May 23rd. Atlassian assigned a case number and expressed thanks, but after multiple follow-ups by PromptArmor over more than two months, Atlassian has made no further communication, and Rovo remains vulnerable. As such, we are publishing to inform users of the risks.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The Attack Chain&lt;/head&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;
+        &lt;p&gt;The victim prepares a query asking Rovo to organize Jira tickets&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The victim uploads a file to Rovo that contains a hidden prompt injection&lt;/p&gt;
+        &lt;p&gt;For general use cases, this is quite common: a user finds a file online and uploads it to Rovo. This attack is not dependent on the injection source - other injection sources include, but are not limited to: external data in Atlassian (e.g., support tickets), web data (if search is enabled), third-party ‘connectors’, etc.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The victim asks Rovo to organize their Jira tickets&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The injection manipulates Rovo to submit Jira tickets and Confluence documents to the attacker’s website&lt;/p&gt;
+        &lt;p&gt;Rovo's URL retrieval tool is insecure: there are no protections against opening a URL that has been dynamically created by the agent. Here, Rovo is manipulated to append sensitive data to an attacker's URL. When Rovo calls the insecure tool to open the URL, the attacker's site logs the request, including the appended sensitive data.&lt;/p&gt;
+        &lt;p&gt;Note: This attack succeeds even if an organization has disabled web search for Rovo. This is because the web search setting fails to remove the tool for opening the search results.&lt;/p&gt;
+        &lt;p&gt;If the user returns to the chat later, they see the agent's suggested ticket updates, but no evidence of the attack.&lt;/p&gt;
+      &lt;/item&gt;
+      &lt;item&gt;
+        &lt;p&gt;The attacker views the victim’s tickets and document contents in their website logs&lt;/p&gt;
+        &lt;p&gt;The prompt injection can exfiltrate any data the agent can access in Atlassian, including any data the agent can access via ‘connectors’.&lt;/p&gt;
+      &lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;Extra: A second exfiltration mechanism&lt;/head&gt;
+    &lt;p&gt;Atlassian Rovo also renders Markdown images from AI outputs. Insecure Markdown image rendering is a well-known vector for data exfiltration via indirect prompt injection.&lt;/p&gt;
+    &lt;p&gt;To see what a full attack chain looks like for insecure Markdown image rendering, here are some examples from our other research:&lt;/p&gt;
+    &lt;head rend="h2"&gt;Responsible Disclosure&lt;/head&gt;
+    &lt;p&gt;PromptArmor disclosed the vulnerabilities covered in this article to Atlassian on May 23rd. Atlassian assigned a case number and expressed thanks, but after multiple follow-ups by PromptArmor over more than two months, Atlassian has made no further communication, and Rovo remains vulnerable as of the release of this article.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Timeline&lt;/head&gt;
+    &lt;table&gt;
+      &lt;row&gt;
+        &lt;cell&gt;May 23, 2026&lt;/cell&gt;
+        &lt;cell&gt;PromptArmor discloses to Atlassian&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;May 25, 2026&lt;/cell&gt;
+        &lt;cell&gt;Atlassian expresses thanks, assigns case number&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;June 4, 2026&lt;/cell&gt;
+        &lt;cell&gt;PromptArmor follows up&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;July 29, 2026&lt;/cell&gt;
+        &lt;cell&gt;PromptArmor follows up&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Aug 5, 2026&lt;/cell&gt;
+        &lt;cell&gt;Article is published&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49185983</guid><pubDate>Wed, 05 Aug 2026 17:23:25 +0000</pubDate></item><item><title>Antigravity 2.0</title><link>https://antigravity.google/product/antigravity-2</link><description>&lt;doc fingerprint="38642876c992b06a"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Explore our next generation products&lt;/p&gt;
+    &lt;p&gt;Built for developers in the agent-first era&lt;/p&gt;
+    &lt;p&gt;Everything you need to stay up-to-date and get help&lt;/p&gt;
+    &lt;head rend="h1"&gt;Antigravity 2.0&lt;/head&gt;
+    &lt;p&gt;Google Antigravity 2.0 is your dedicated platform to work with agents. Orchestrate multiple autonomous agents working in parallel across independent projects.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Explore the main features&lt;/head&gt;
+    &lt;head rend="h3"&gt;An Abstracted UI&lt;/head&gt;
+    &lt;p&gt;Your AI agents' central command center, providing a unified platform to launch, monitor, and orchestrate their activities.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Dynamic Subagents&lt;/head&gt;
+    &lt;p&gt;Subagents are defined and instantiated dynamically to tackle parallel parts of complex problems, leading to faster and better results.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Scheduled Tasks&lt;/head&gt;
+    &lt;p&gt;Automate routine checks with Scheduled Tasks, simply define a cron schedule and the agents start and run autonomously in the background.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Artifacts&lt;/head&gt;
+    &lt;p&gt;Deliverables from the Agent that communicate its progress with you.&lt;/p&gt;
+    &lt;head rend="h3"&gt;Extend Customization&lt;/head&gt;
+    &lt;p&gt;Create or download fully customizable skills to further your agentâs autonomy and transform how you get work done.&lt;/p&gt;
+    &lt;p&gt;Projects&lt;/p&gt;
+    &lt;p&gt;Group your conversations into Projects, which can span multiple folders and support custom settings and scoped permissions.&lt;/p&gt;
+    &lt;p&gt;Live Voice Transcription&lt;/p&gt;
+    &lt;p&gt;Speak your prompts. Powered by the latest Gemini Audio models, real-time transcription converts conversational speech into clearly phrased prompts.&lt;/p&gt;
+    &lt;p&gt;Extend Customization&lt;/p&gt;
+    &lt;p&gt;Define global or workspace-specific Skills, MCPs and JSON Hooks to encourage custom agent behavior.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49186621</guid><pubDate>Wed, 05 Aug 2026 18:10:02 +0000</pubDate></item><item><title>Sycophantic AI Decreases Prosocial Intentions and Promotes Dependence</title><link>https://arxiv.org/abs/2510.01395</link><description>&lt;doc fingerprint="ec9db418c45d800c"&gt;
+  &lt;main&gt;&lt;head rend="h1"&gt;Computer Science &amp;gt; Computers and Society&lt;/head&gt;&lt;p&gt; [Submitted on 1 Oct 2025]&lt;/p&gt;&lt;head rend="h1"&gt;Title:Sycophantic AI Decreases Prosocial Intentions and Promotes Dependence&lt;/head&gt;View PDF HTML (experimental)&lt;quote&gt; Abstract:Both the general public and academic communities have raised concerns about sycophancy, the phenomenon of artificial intelligence (AI) excessively agreeing with or flattering users. Yet, beyond isolated media reports of severe consequences, like reinforcing delusions, little is known about the extent of sycophancy or how it affects people who use AI. Here we show the pervasiveness and harmful impacts of sycophancy when people seek advice from AI. First, across 11 state-of-the-art AI models, we find that models are highly sycophantic: they affirm users' actions 50% more than humans do, and they do so even in cases where user queries mention manipulation, deception, or other relational harms. Second, in two preregistered experiments (N = 1604), including a live-interaction study where participants discuss a real interpersonal conflict from their life, we find that interaction with sycophantic AI models significantly reduced participants' willingness to take actions to repair interpersonal conflict, while increasing their conviction of being in the right. However, participants rated sycophantic responses as higher quality, trusted the sycophantic AI model more, and were more willing to use it again. This suggests that people are drawn to AI that unquestioningly validate, even as that validation risks eroding their judgment and reducing their inclination toward prosocial behavior. These preferences create perverse incentives both for people to increasingly rely on sycophantic AI models and for AI model training to favor sycophancy. Our findings highlight the necessity of explicitly addressing this incentive structure to mitigate the widespread risks of AI sycophancy. &lt;/quote&gt;&lt;head rend="h3"&gt;References &amp;amp; Citations&lt;/head&gt;&lt;p&gt; Loading... &lt;/p&gt;&lt;head rend="h1"&gt;Bibliographic and Citation Tools&lt;/head&gt;&lt;p&gt; Bibliographic Explorer (What is the Explorer?) &lt;/p&gt;&lt;p&gt; Connected Papers (What is Connected Papers?) &lt;/p&gt;&lt;p&gt; Litmaps (What is Litmaps?) &lt;/p&gt;&lt;p&gt; scite Smart Citations (What are Smart Citations?) &lt;/p&gt;&lt;head rend="h1"&gt;Code, Data and Media Associated with this Article&lt;/head&gt;&lt;p&gt; alphaXiv (What is alphaXiv?) &lt;/p&gt;&lt;p&gt; CatalyzeX Code Finder for Papers (What is CatalyzeX?) &lt;/p&gt;&lt;p&gt; DagsHub (What is DagsHub?) &lt;/p&gt;&lt;p&gt; Gotit.pub (What is GotitPub?) &lt;/p&gt;&lt;p&gt; Hugging Face (What is Huggingface?) &lt;/p&gt;&lt;p&gt; ScienceCast (What is ScienceCast?) &lt;/p&gt;&lt;head rend="h1"&gt;Demos&lt;/head&gt;&lt;head rend="h1"&gt;Recommenders and Search Tools&lt;/head&gt;&lt;p&gt; Influence Flower (What are Influence Flowers?) &lt;/p&gt;&lt;p&gt; CORE Recommender (What is CORE?) &lt;/p&gt;&lt;head rend="h1"&gt;arXivLabs: experimental projects with community collaborators&lt;/head&gt;&lt;p&gt;arXivLabs is a framework that allows collaborators to develop and share new arXiv features directly on our website.&lt;/p&gt;&lt;p&gt;Both individuals and organizations that work with arXivLabs have embraced and accepted our values of openness, community, excellence, and user data privacy. arXiv is committed to these values and only works with partners that adhere to them.&lt;/p&gt;&lt;p&gt;Have an idea for a project that will add value for arXiv's community? Learn more about arXivLabs.&lt;/p&gt;&lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49186720</guid><pubDate>Wed, 05 Aug 2026 18:17:03 +0000</pubDate></item><item><title>Beating GPT-5.6 Sol on retrieval with 100x cheaper open models</title><link>https://neon.com/blog/how-castform-neon-beats-frontier-models-on-price-and-efficiency</link><description>&lt;doc fingerprint="3d40eb70630f0ecb"&gt;
+  &lt;main&gt;
+    &lt;quote&gt;&lt;p&gt;“Most teams' best training data is just sitting in their databases. The problem is that turning raw data into something usable is hard, and letting agents read, search, and mutate data cheaply at scale requires advanced infra. Pointing Castform at Neon skips both.”&lt;/p&gt;Ying Hang Seah, cofounder, Castform&lt;/quote&gt;
+    &lt;p&gt;A "good agent" needs to be strong in 2 areas:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Context: can we provide the tools to find the right data?&lt;/item&gt;
+      &lt;item&gt;Model: can the model decide what to search for?&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Neon (Lakebase Postgres) and their new Search extensions solve the first; Castform solves the second.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Evolution of agentic search&lt;/head&gt;
+    &lt;p&gt;In ~2022, the industry was going all in on embedding search. Every database provider added one, and pgvector was Neon's most downloaded extension. To provide context to LLMs, engineers handcrafted RAG pipelines, which in essence, is some form of embedding similarity search.&lt;/p&gt;
+    &lt;p&gt;In ~2025, agents started to gain more traction. Developers started creating multi-hop search workflows, decomposing big problems into smaller ones. Retrieval has shifted from the one-shot search systems to agentic retrieval. Instead of issuing a single query, models plan and search multiple times in a loop. Every loop iteration meant another call to the frontier model, increasing the overall cost and latency per user request.&lt;/p&gt;
+    &lt;p&gt;Concretely, a typical multi-turn search request with gpt-5.6-sol takes &amp;gt;10s and costs ~$0.03 end-to-end, making it prohibitively slow and expensive.&lt;/p&gt;
+    &lt;p&gt;Meanwhile, small open-weights models are 100x cheaper. But, out of the box, their capabilities lag behind closed api models. RL post-training helps bridge this gap. On specific tasks like search, post-trained open-source models can match &amp;amp; beat frontier models while costing orders of magnitude less per request.&lt;/p&gt;
+    &lt;p&gt;That is why we built Castform: to enable developers to RL post-train models without having to deal with machine learning &amp;amp; gpu internals. The goal's to make post-training as approachable as prompt engineering.&lt;/p&gt;
+    &lt;head rend="h2"&gt;How does Castform use Neon?&lt;/head&gt;
+    &lt;p&gt;Castform's pipeline runs against Neon via Lakebase Search:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row&gt;
+        &lt;cell role="head"&gt;Stage&lt;/cell&gt;
+        &lt;cell role="head"&gt;Neon + Lakebase Search&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Corpus storage&lt;/cell&gt;
+        &lt;cell&gt;Raw documents live in Postgres on Neon&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Synthetic data generation&lt;/cell&gt;
+        &lt;cell&gt;Castform training pipeline uses &lt;code&gt;lakebase_text&lt;/code&gt; and &lt;code&gt;lakebase_vector&lt;/code&gt; to write training tasks&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;RL Training&lt;/cell&gt;
+        &lt;cell&gt;Every rollout's search tool call uses Lakebase Search on Neon&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Production Inference&lt;/cell&gt;
+        &lt;cell&gt;The final model uses the same search tool call during inference&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;head rend="h2"&gt;Your best training data already exists&lt;/head&gt;
+    &lt;p&gt;To perform RL post-training effectively, you need a task (e.g. answer a user's question), the environment for the agent to run in (e.g. a search tool for your corpus) and a reward function (e.g. is the answer correct?).&lt;/p&gt;
+    &lt;p&gt;With all 3 pieces in place, the RL post-training is a loop of trial and error: the model attempts the task given the tools, the reward function scores the attempt, and the feedback signal guides the model on how to hill-climb its way to optimal performance.&lt;/p&gt;
+    &lt;p&gt;Yet, most companies do not have a clean dataset of tasks and reward functions ready for post-training.&lt;/p&gt;
+    &lt;p&gt;Enterprises do have a large set of proprietary data:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;internal documentation&lt;/item&gt;
+      &lt;item&gt;product records&lt;/item&gt;
+      &lt;item&gt;support articles&lt;/item&gt;
+      &lt;item&gt;customer interactions&lt;/item&gt;
+      &lt;item&gt;wikis&lt;/item&gt;
+      &lt;item&gt;operational databases&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;This data contains the knowledge an agent needs, but turning it into an effective training dataset normally requires substantial data engineering and manual labeling.&lt;/p&gt;
+    &lt;p&gt;That leads many teams to dismiss post-training for one of two reasons:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;"We don't have the training data."&lt;/item&gt;
+      &lt;item&gt;"Fine-tuning is too difficult and requires infrastructure we don't have."&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Castform addresses both. It turns an existing corpus into training tasks, then manages the RL loop needed to teach an open-source model how to use that data effectively.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Using Castform&lt;/head&gt;
+    &lt;p&gt;With Castform, you can turn your company knowledge base into a model:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Document (from your data): Trains booked through Navan will be paid by GitLab travel card. Train rides must be standard cabin class with 14 day booking lead time&lt;/item&gt;
+      &lt;item&gt;Ground truth (inferred from your data): Train rides must be standard cabin class with a 14 day booking lead time.&lt;/item&gt;
+      &lt;item&gt;Question (synthetically generated): When booking a rail trip in Navan, what are the rules for how early I need to reserve it and which seating level I'm expected to choose?&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;With the generated question-answer dataset, Castform lets you scaffold the training run by specifying the tools the agent has access to and a reward function.&lt;/p&gt;
+    &lt;p&gt;The reward function specifies what you want your model to get good at. In our case, we want it to retrieve the correct chunks, cite the right sources along with providing the right final answer.&lt;/p&gt;
+    &lt;p&gt;See a comprehensive code example here.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Observability: Watch the model learn&lt;/head&gt;
+    &lt;p&gt;Castform gives you full observability into your RL run. You can monitor your reward climb with each step, but more importantly you can drop into individual tasks/prompts to watch how the model performs qualitatively, allowing you to debug problems such as broken tools or reward hacking.&lt;/p&gt;
+    &lt;p&gt;For more details on how to monitor your training runs, you can check out the Castform blog here. You can also check out our example training run here.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Why Neon 'just works'&lt;/head&gt;
+    &lt;p&gt;During training, the agent repeatedly calls Lakebase Search until it has enough context to answer. Across thousands of parallel rollouts, each potentially making dozens of calls, this creates a highly bursty workload.&lt;/p&gt;
+    &lt;p&gt;Neon's dynamic compute scaling absorbs these peaks without requiring Castform to provision for maximum capacity around the clock. Training runs get low-latency search when demand spikes, while compute scales down during idle periods.&lt;/p&gt;
+    &lt;p&gt;This infrastructure becomes even more valuable as agents move beyond search and begin modifying data. Training stateful agents requires isolated environments that can be created and reset cheaply, preventing one rollout's actions from affecting another or touching production.&lt;/p&gt;
+    &lt;p&gt;Neon branching can give each rollout an isolated database state, while time-travel queries make it possible to reconstruct and inspect the state an agent encountered. Combined with autoscaling and scale-to-zero, this creates a path toward training thousands of stateful agent rollouts without maintaining thousands of continuously running environments.&lt;/p&gt;
+    &lt;p&gt;Castform makes it easy for any developer to post-train open-source models to be cheaper, faster, better than the frontier. Post-train your first model today at castform.com.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49186762</guid><pubDate>Wed, 05 Aug 2026 18:18:56 +0000</pubDate></item><item><title>Microsoft's AI Sales Mostly Come from OpenAI, Disclosures Show</title><link>https://www.bloomberg.com/news/articles/2026-08-05/microsoft-s-ai-sales-mostly-come-from-openai-disclosures-show</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49186766</guid><pubDate>Wed, 05 Aug 2026 18:19:10 +0000</pubDate></item><item><title>Born Against, or why hobby programming communities are against LLM usage</title><link>https://blog.fogus.me/llm/born-against.html</link><description>&lt;doc fingerprint="3f30aa1728c52353"&gt;
+  &lt;main&gt;
+    &lt;p&gt;2026.08.04&lt;/p&gt;
+    &lt;p&gt;I came across a GH thread related to chess engine development that made me think of why hobby programming communities are increasingly hostile toward LLM development. While the thread doesnât give a lot of insight into answering the question, it prompted me to think about it a bit. Iâve seen similar sentiments expressed in other niche hobby programming communities like OSDev, LangDev, TxtDev, EmuDev, RLDev, the demoscene, and code golfers. The general consensus seems to be that the knowledge that these communities work in is hard-fought and the use of LLMs is a form of missing the point entirely. In these communities (keep in mind that there is an implicit ânot allâ¦â throughout) the process of mastering a difficult field itself is the product, and something that runs is generally a nice-to-have.&lt;/p&gt;
+    &lt;p&gt;Further, Iâve noticed that even in the instances where there was earnest early engagement with LLMs in some of these niche communities, the well was quickly poisoned by a combination of a lack of a deep understanding by the LLM practitioners, and a vitriolic subset of those communities that view the LLM enterprise as a form of cheating. Granted these communities have, in general, historically been characterized by feverish gatekeeping and painstakingly slow progress, so it makes sense that there might be a desire to grab some easy cachet by bursting onto the scene like the Kool-Aid man. OH YEAHâ¦. OH NO!&lt;/p&gt;
+    &lt;p&gt;In traditional niche dev circles, respect is earned slowly through years of activity in their respective fora, sharing elegant code, displays of genuine curiosity, and through sharing deep domain knowledge along the way. At the end of the day, these communities donât care if your code works at all, but instead care that you know why and how it works. To me, an LLM functions best as a force multiplier, not a surrogate. In the hands of an expert who already understands a domain deeply, it could act like a lever.1 But in these niche communities, the entire exercise is in the learning. Using an LLM to generate the finished piece doesnât make us craftsmen; it just robs us of the craft.&lt;/p&gt;
+    &lt;p&gt;:F&lt;/p&gt;
+    &lt;p&gt;This is the latest in my evolving thoughts on LLMs. Also see: LLMe and Mind the van Emden Gap&lt;/p&gt;
+    &lt;p&gt;That said, expertise offers no natural immunity against being fooled by LLMs.â©ï¸&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49187061</guid><pubDate>Wed, 05 Aug 2026 18:37:49 +0000</pubDate></item><item><title>Zed DeltaDB</title><link>https://zed.dev/deltadb</link><description>&lt;doc fingerprint="fe9cfef34eb93d9d"&gt;
+  &lt;main&gt;&lt;p&gt;Early Access&lt;/p&gt;&lt;head rend="h1"&gt;Software is made&lt;lb/&gt; between commits&lt;/head&gt;&lt;p&gt;Be among the first to try DeltaDB, a version control system that records the work as it unfolds and keeps every change connected to the conversation that shaped it.&lt;/p&gt;Learn about DeltaDB&lt;p&gt;Rewind to any edit&lt;/p&gt;&lt;p&gt;DeltaDB captures every operation in between commits and gives each one a stable identity, so you can point to the code at any moment in its evolution.&lt;/p&gt;&lt;p&gt;Trace code to conversation&lt;/p&gt;&lt;p&gt;Every change is linked to the agent conversation that produced it. From any line of code, find the conversation. From any message, jump to the code it touched.&lt;/p&gt;&lt;p&gt;Branch at any moment&lt;/p&gt;&lt;p&gt;DeltaDB virtualizes the worktree, so spinning up a new agent branch is effectively free. Any point in history is a valid branch point, including mid-run.&lt;/p&gt;&lt;p&gt;Share the thread, not the PR&lt;/p&gt;&lt;p&gt;A teammate can join while the work is still happening, talk to the agent that did the work, and annotate as they go, without waiting for you to commit and push first.&lt;/p&gt;&lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49187256</guid><pubDate>Wed, 05 Aug 2026 18:52:54 +0000</pubDate></item></channel></rss>
