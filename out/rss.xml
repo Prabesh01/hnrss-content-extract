@@ -1,5 +1,239 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 08 Aug 2026 12:22:11 +0000</lastBuildDate><item><title>What happens if an entire class of workers loses faith in their careers</title><link>https://www.noemamag.com/why-is-everyone-in-tech-so-sad/</link><description>&lt;doc fingerprint="7ee0131289e680cd"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 08 Aug 2026 13:23:53 +0000</lastBuildDate><item><title>Making Postgres 300x faster for analytics: batching, operator fusion, and SIMD</title><link>https://malisper.me/how-we-made-postgres-hundreds-of-times-faster-the-query-engine/</link><description>&lt;doc fingerprint="7b5ba8f66cfd480a"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Last week we released version 0.2 of pgrust. This release was all about performance. It’s 10x faster than the previous version of pgrust. On OLTP benchmarks, pgrust is 30% faster than Postgres, and on Clickbench, Clickhouse’s benchmark for analytical databases, pgrust is 300x faster than Postgres. It’s even ahead of Clickhouse!&lt;/p&gt;
+    &lt;p&gt;The query engine is one of the biggest changes we made to achieve much better performance. On its own, the query engine drove ~10x of the 300x. We’ll start with a miniature version of the Postgres query engine and we’ll one by one add the same optimizations we made to make the pgrust query engine so fast.&lt;/p&gt;
+    &lt;p&gt;To give some background on why there’s so much room for improvement vs Postgres, Postgres was created in a different era. The original Postgres project dates back to the 80s. It was built at a time when the main bottleneck to database performance was disk I/O. Three trends have made that no longer the case:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Many datasets now fit in RAM, eliminating most disk I/O&lt;/item&gt;
+      &lt;item&gt;For datasets that don’t fit in RAM, the workloads differ. Data analytics scans data in bulk. The bottleneck is often no longer your disk throughput and is often either your CPU throughput or memory throughput&lt;/item&gt;
+      &lt;item&gt;Disks have gotten much faster in recent years. NVMe is hundreds of times faster than a hard drive.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;All three trends have made CPU and memory speeds more important than they were historically. Many of the optimizations we’ve made target this. The query engine is the main user of CPU in a database. We optimized the pgrust query engine to use less CPU and less memory bandwidth than Postgres when processing the same queries.&lt;/p&gt;
+    &lt;p&gt;To give you a sense of just how slow the Postgres query engine is, let’s take a simple query that sums the first 500 million numbers:&lt;/p&gt;
+    &lt;quote&gt; CREATE TABLE my_table AS select col::float8 from generate_series(1.0, 500000000.0) g(col); SELECT SUM(col) FROM my_table; &lt;/quote&gt;
+    &lt;p&gt;When I run this in Postgres, it takes ~20 seconds. This was done on a c8g.4xl with parallel queries disabled.&lt;/p&gt;
+    &lt;p&gt;For comparison, when I time the equivalent in Rust:&lt;/p&gt;
+    &lt;code&gt;
+let table: Vec&amp;lt;f64&amp;gt; = (1..=500_000_000usize).map(|i| i as f64).collect();
+
+let mut sum = 0.0;
+for &amp;amp;value in &amp;amp;table {
+    sum += value;
+}
+&lt;/code&gt;
+    &lt;p&gt;The query takes 358ms. That’s around 55x faster, and believe it or not, we can do even faster than 358ms. Now this example isn’t an apples-to-apples comparison. There’s a lot more going on under the hood in Postgres. At the same time, optimizing a database is all about removing as much of this overhead as possible. (If you’re curious two of the biggest causes of overhead from Postgres are 1. locking and 2. parsing the Postgres storage format and extracting the tuples relevant to the query).&lt;/p&gt;
+    &lt;p&gt;To narrow our focus to just the impact of the query engine, let’s build a miniature version of the Postgres query engine. First, a brief explanation of what a query engine is. When processing your SQL query, Postgres first converts your query into an internal representation called a “Query Plan,” which describes *how* Postgres will execute the query. In the example above, Postgres will produce a query plan that may look something like the following:&lt;/p&gt;
+    &lt;p&gt;This effectively says “get rows from my_table and sum the values in those rows”. This query plan is pretty simple given the nature of the query, but they can get much more complicated when you start working with joins/sorts/subqueries etc. In total Postgres has over 40 different types of plan nodes.&lt;/p&gt;
+    &lt;p&gt;After generating the query plan, Postgres passes it to the query engine. The Postgres query engine is the part of Postgres that takes the query plan and actually retrieves the rows and performs the aggregation. Postgres uses a style of executor known as the “Volcano model.” To get a sense of how it works, here’s a miniature implementation of the Postgres query engine:&lt;/p&gt;
+    &lt;code&gt;
+use std::hint::black_box;
+
+trait Node {
+    fn next(&amp;amp;mut self) -&amp;gt; Option&amp;lt;f64&amp;gt;;
+}
+
+struct SeqScan&amp;lt;'a&amp;gt; {
+    table: &amp;amp;'a [f64],
+    pos: usize,
+}
+
+impl Node for SeqScan&amp;lt;'_&amp;gt; {
+    fn next(&amp;amp;mut self) -&amp;gt; Option&amp;lt;f64&amp;gt; {
+        if self.pos &amp;gt;= self.table.len() {
+            return None; // end of table
+        }
+        let value = self.table[self.pos];
+        self.pos += 1;
+        Some(value)
+    }
+}
+
+struct SumAggregate&amp;lt;'a&amp;gt; {
+    child: Box&amp;lt;dyn Node + 'a&amp;gt;,
+    total: f64,
+    done: bool,
+}
+
+impl Node for SumAggregate&amp;lt;'_&amp;gt; {
+    fn next(&amp;amp;mut self) -&amp;gt; Option&amp;lt;f64&amp;gt; {
+        if self.done {
+            return None;
+        }
+        while let Some(value) = self.child.next() {
+            self.total += value;
+        }
+        self.done = true;
+        Some(self.total)
+    }
+}
+
+let table: Vec&amp;lt;f64&amp;gt; = (1..=500_000_000usize).map(|i| i as f64).collect();
+
+let mut plan = SumAggregate {
+    child: black_box(Box::new(SeqScan { table: &amp;amp;table, pos: 0 })),
+    total: 0.0,
+    done: false,
+};
+
+let sum = plan.next().unwrap();
+&lt;/code&gt;
+    &lt;p&gt;(The black_box is needed to prevent compiler optimizations from thwarting our benchmark)&lt;/p&gt;
+    &lt;p&gt;The key feature of the Volcano model is the `next()` method, which is supported by all nodes in the query plan. The job of `next()` is to return a single row. `next()` in a sequential scan returns the next row in the sequential scan. `next()` on an aggregation will compute the entire aggregation and then return the single row result. Executing a query plan is just a matter of calling `next()` on the root plan node until it no longer returns any rows. The advantage of the Volcano model is that it’s very simple. You implement a single method for each of your plan nodes, and that’s it. While simplified, the above code is very close to what Postgres does internally.&lt;/p&gt;
+    &lt;p&gt;While the Volcano model makes things simple, it also adds a lot of overhead. When I run this example, it takes 1.3s. That’s much faster than the Postgres version because we’re removing a lot of the non-query engine pieces, but it’s still slower than the raw for loop because of the Volcano model’s overhead.&lt;/p&gt;
+    &lt;p&gt;The biggest performance hit in the code above is that `next()` processes only one row at a time. There’s no batching. The `SeqScan.next()` function is called once per row. That adds significant overhead, especially because many CPU optimizations, such as pipelining, don’t work well when you are calling a function that isn’t known until runtime. The first optimization we can implement is batching:&lt;/p&gt;
+    &lt;code&gt;
+const BATCH: usize = 1024;
+
+trait BatchNode {
+    fn next_batch(&amp;amp;mut self, out: &amp;amp;mut [f64; BATCH]) -&amp;gt; usize;
+}
+
+struct BatchSeqScan&amp;lt;'a&amp;gt; {
+    table: &amp;amp;'a [f64],
+    pos: usize,
+}
+
+impl BatchNode for BatchSeqScan&amp;lt;'_&amp;gt; {
+    fn next_batch(&amp;amp;mut self, out: &amp;amp;mut [f64; BATCH]) -&amp;gt; usize {
+        let n = (self.table.len() - self.pos).min(BATCH);
+        out[..n].copy_from_slice(&amp;amp;self.table[self.pos..self.pos + n]);
+        self.pos += n;
+        n
+    }
+}
+
+struct BatchSumAggregate&amp;lt;'a&amp;gt; {
+    child: Box&amp;lt;dyn BatchNode + 'a&amp;gt;,
+    total: f64,
+}
+
+impl BatchSumAggregate&amp;lt;'_&amp;gt; {
+    fn run(&amp;amp;mut self) -&amp;gt; f64 {
+        let mut buf = [0.0f64; BATCH];
+        loop {
+            let n = self.child.next_batch(&amp;amp;mut buf);
+            if n == 0 {
+                break;
+            }
+            for &amp;amp;value in &amp;amp;buf[..n] {
+                self.total += value;
+            }
+        }
+        self.total
+    }
+}
+
+let mut plan = BatchSumAggregate {
+    child: black_box(Box::new(BatchSeqScan { table: &amp;amp;table, pos: 0 })),
+    total: 0.0,
+};
+let sum = plan.run();
+&lt;/code&gt;
+    &lt;p&gt;Batching on its own eliminates most of the overhead. It brings the time to run the query from 1.3 seconds down to around 480ms. Still slower than the for loop, but much closer. One very important detail is that the batch buffer is allocated on the stack. This means the aggregation node doesn’t need to allocate any memory while it’s running. Allocating memory tends to be one of the slower operations. Therefore, when writing ultra-fast code, you’ll want to minimize the number of memory allocations you make.&lt;/p&gt;
+    &lt;p&gt;Now, if you profile the batched version, the hotspot is now `copy_from_slice`. Even though we are now batching, we still need to copy the items into the buffer. This overhead can be eliminated with what’s known as “operator fusion”. If there are common operations that we know will be performed together, we can create a single node that replaces two nodes. In our case, we can create a single `SumAggregateSequentialScan` node that combines the logic of both the sequential scan and the sum:&lt;/p&gt;
+    &lt;code&gt;
+struct SumAggregateSequentialScan&amp;lt;'a&amp;gt; {
+    table: &amp;amp;'a [f64],
+    done: bool,
+}
+
+impl Node for SumAggregateSequentialScan&amp;lt;'_&amp;gt; {
+    fn next(&amp;amp;mut self) -&amp;gt; Option&amp;lt;f64&amp;gt; {
+        if self.done {
+            return None;
+        }
+        self.done = true;
+        let mut total = 0.0;
+        for &amp;amp;value in self.table {
+            total += value;
+        }
+        Some(total)
+    }
+}
+&lt;/code&gt;
+    &lt;p&gt;This gives us the same performance as the straight for loop because it is literally the same code as the for loop. Now this may seem like cheating, and it definitely is because we’re hardcoding in an optimization for a specific query we know in advance. With operator fusion, it makes sense to hardcode a couple of the most common cases, but you’ll still pretty quickly hit cases you didn’t prepare for ahead of time.&lt;/p&gt;
+    &lt;p&gt;This can be solved with JIT compilation. With JIT compilation, you can generate the ideal code you wish you had and “cheat” in every query. JIT compilation lets you generate the perfect code for your query, no matter what the query is and always do operator fusion. Unfortunately, this post is long enough as is, so I’ll have to talk about how pgrust leverages JIT compilation another time.&lt;/p&gt;
+    &lt;p&gt;For one final optimization, we can look to SIMD. SIMD refers to a set of CPU operations that can perform one operation across multiple pieces of data simultaneously. Using SIMD to perform an operation against multiple rows simultaneously is usually much faster than performing the operation on one row at a time. If we change our code to use SIMD:&lt;/p&gt;
+    &lt;code&gt;
+#[cfg(target_arch = "aarch64")]
+struct SumAggregateSequentialScanSimd&amp;lt;'a&amp;gt; {
+    table: &amp;amp;'a [f64],
+    done: bool,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Node for SumAggregateSequentialScanSimd&amp;lt;'_&amp;gt; {
+    fn next(&amp;amp;mut self) -&amp;gt; Option&amp;lt;f64&amp;gt; {
+        if self.done {
+            return None;
+        }
+        self.done = true;
+        use std::arch::aarch64::*;
+        let mut acc = unsafe { [vdupq_n_f64(0.0); 4] };
+        let (chunks, rest) = self.table.as_chunks::&amp;lt;8&amp;gt;();
+        for chunk in chunks {
+            for lane in 0..4 {
+                unsafe {
+                    let v = vld1q_f64(chunk.as_ptr().add(2 * lane));
+                    acc[lane] = vaddq_f64(acc[lane], v);
+                }
+            }
+        }
+        let mut tail = 0.0;
+        for &amp;amp;value in rest {
+            tail += value;
+        }
+        Some(unsafe {
+            let s01 = vaddq_f64(acc[0], acc[1]);
+            let s23 = vaddq_f64(acc[2], acc[3]);
+            vaddvq_f64(vaddq_f64(s01, s23)) + tail
+        })
+    }
+}
+&lt;/code&gt;
+    &lt;p&gt;Our code now takes 135ms which is now almost 3x faster than the for loop and 10x faster than our original Volcano code. While it is common for compilers to replace for loops with SIMD equivalents, I chose this example so that wouldn’t happen. Compilers will usually avoid introducing SIMD when operating on floats, because they will produce a slightly different result. This is because floating point arithmetic is not associative, so changing the order in which you do a sum can produce a slightly different result.&lt;/p&gt;
+    &lt;p&gt;—&lt;/p&gt;
+    &lt;p&gt;All in all, with three simple optimizations, we were able to make our query 10x faster. Here’s where things ended up:&lt;/p&gt;
+    &lt;table&gt;
+      &lt;row&gt;
+        &lt;cell role="head"&gt;implementation&lt;/cell&gt;
+        &lt;cell role="head"&gt;time&lt;/cell&gt;
+        &lt;cell role="head"&gt;speedup&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Postgres&lt;/cell&gt;
+        &lt;cell&gt;~20 s&lt;/cell&gt;
+        &lt;cell&gt;—&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Volcano model&lt;/cell&gt;
+        &lt;cell&gt;1.3 s&lt;/cell&gt;
+        &lt;cell&gt;1×&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;+ batching&lt;/cell&gt;
+        &lt;cell&gt;480 ms&lt;/cell&gt;
+        &lt;cell&gt;2.7×&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;+ operator fusion&lt;/cell&gt;
+        &lt;cell&gt;358 ms&lt;/cell&gt;
+        &lt;cell&gt;3.6×&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;+ SIMD&lt;/cell&gt;
+        &lt;cell&gt;135 ms&lt;/cell&gt;
+        &lt;cell&gt;9.6×&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;These types of optimizations, and many more, enable pgrust to perform hundreds of times faster than Postgres for analytical queries.&lt;/p&gt;
+    &lt;p&gt;Benchmark setup: AWS c8g.4xlarge (Graviton4, 16 vCPU), PostgreSQL 18.4 with `max_parallel_workers_per_gather = 0`, data warm in shared buffers, median of 5 runs. Rust built with `cargo build –release`, 4 runs per implementation, all measured in one process on one machine.&lt;/p&gt;
+    &lt;p&gt;Thanks for reading, and if you want to support the project, the best way to support pgrust is to give us a star on GitHub. If you want to follow along:&lt;/p&gt;
+    &lt;p&gt;1. GitHub&lt;lb/&gt; 2. Discord&lt;lb/&gt; 3. Mailing list — weekly updates on pgrust, including the follow-up on JIT compilation&lt;lb/&gt; 4. pgrust.com&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49208535</guid><pubDate>Fri, 07 Aug 2026 11:00:35 +0000</pubDate></item><item><title>What happens if an entire class of workers loses faith in their careers</title><link>https://www.noemamag.com/why-is-everyone-in-tech-so-sad/</link><description>&lt;doc fingerprint="7ee0131289e680cd"&gt;
   &lt;main&gt;
     &lt;p&gt;Aaron Horwath is the director of AI operations at a creative technology company where he is focused on implementing AI in a way that supports both humans and business.&lt;/p&gt;
     &lt;p&gt;On a recent morning commute, I sat on a train in one of those awkward four-person configurations with a shared table. Across from me sat a typical commuter: early 30s, slacks, dress shirt, dirty white sneakers, hair a little disheveled, AirPods in, basking in the glow of an open MacBook.&lt;/p&gt;
@@ -617,7 +851,7 @@ reboot
     &lt;p&gt;That helpful wildfire visualization enhancement comes from a script written in JavaScript by remote sensing expert Pierre Markuse. As explained by Geovisualization, Markuse’s script combines the red visible light band, the narrow near-infrared band to highlight the differences between healthy and burned vegetation, and the short-wave infrared 2 band to reveal burned landscape by revealing moisture levels in the soil.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220313</guid><pubDate>Sat, 08 Aug 2026 09:58:41 +0000</pubDate></item><item><title>US Military's Cyber Command Unit Grapples with Cluster of Deaths by Suicide</title><link>https://www.bloomberg.com/news/articles/2026-08-06/us-military-s-cyber-command-unit-grapples-with-cluster-of-deaths-by-suicide</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220339</guid><pubDate>Sat, 08 Aug 2026 10:04:25 +0000</pubDate></item><item><title>New Amazon Data Center Is Set to Have the Most Polluting Power Plant in the U.S.</title><link>https://www.nytimes.com/2026/08/08/climate/amazon-data-center-texas-pollution.html</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220350</guid><pubDate>Sat, 08 Aug 2026 10:07:06 +0000</pubDate></item><item><title>Apple Introduces Leasing Program for iPhones and Other Devices</title><link>https://www.nytimes.com/2026/07/28/technology/apple-leasing-program.html</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220390</guid><pubDate>Sat, 08 Aug 2026 10:16:01 +0000</pubDate></item><item><title>Now we have a timeline of the OpenAI accidental attack against Hugging Face</title><link>https://simonwillison.net/2026/Aug/7/openai-timeline/</link><description>&lt;doc fingerprint="b1335951a001d82a"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220313</guid><pubDate>Sat, 08 Aug 2026 09:58:41 +0000</pubDate></item><item><title>New Amazon Data Center Is Set to Have the Most Polluting Power Plant in the U.S.</title><link>https://www.nytimes.com/2026/08/08/climate/amazon-data-center-texas-pollution.html</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220350</guid><pubDate>Sat, 08 Aug 2026 10:07:06 +0000</pubDate></item><item><title>Apple Introduces Leasing Program for iPhones and Other Devices</title><link>https://www.nytimes.com/2026/07/28/technology/apple-leasing-program.html</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220390</guid><pubDate>Sat, 08 Aug 2026 10:16:01 +0000</pubDate></item><item><title>Now we have a timeline of the OpenAI accidental attack against Hugging Face</title><link>https://simonwillison.net/2026/Aug/7/openai-timeline/</link><description>&lt;doc fingerprint="b1335951a001d82a"&gt;
   &lt;main&gt;
     &lt;head rend="h2"&gt;Now we have a timeline of the OpenAI accidental attack against Hugging Face&lt;/head&gt;
     &lt;p&gt;7th August 2026&lt;/p&gt;
@@ -647,35 +881,112 @@ reboot
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220609</guid><pubDate>Sat, 08 Aug 2026 10:57:44 +0000</pubDate></item><item><title>The USSR in 100 Photographs</title><link>https://trinixy.ru/7039-sssr_v_fotografijakh_100_foto.html</link><description>&lt;doc fingerprint="e3d2adea313310aa"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220609</guid><pubDate>Sat, 08 Aug 2026 10:57:44 +0000</pubDate></item><item><title>The CPU is back: Rethinking the CPU-GPU split for LLM inference</title><link>https://www.redhat.com/en/blog/cpu-back-rethinking-cpu-gpu-split-llm-inference</link><description>&lt;doc fingerprint="6d4390798c9ac1db"&gt;
   &lt;main&gt;
-    &lt;p&gt;Я вообще-то не очень люблю размещать фотографии СССР, так как они уже были везде, где только могли быть.&lt;lb/&gt;Но эта подборка меня улыбнула. Тут собраны фотографии из различных больших подборок и получилось очень неплохо&lt;lb/&gt;Смотрим )&lt;/p&gt;
-    &lt;p&gt;Смотрим )&lt;/p&gt;
-    &lt;p&gt; Пожалуйста, зарегистрируйтесь или авторизуйтесь, чтобы оставлять комментарии на сайте. &lt;/p&gt;
+    &lt;p&gt;For the past 3 years, graphics processing units (GPUs) have dominated the large language model (LLM) conversation. In traditional chatbot applications, central processing units (CPUs) provide a fraction of the total compute per request, while GPUs do the heavy lifting. However, inference isn't a single model answering a single question. A growing reliance on tool calls, multistep reasoning, and orchestration across small, specialized models changes the math on where compute should live. Intel has called out this shift noting that the CPU-to-GPU ratio is moving from 1:8 in training workloads to 1:1, and in some cases 4:1 in agentic deployments.&lt;/p&gt;
+    &lt;p&gt;Here we'll examine why the assumptions making GPUs the obvious choice for LLM inference are being renegotiated, what's driving renewed demand for CPU-based serving, and what the data says about where the industry is heading.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What CPUs are good at&lt;/head&gt;
+    &lt;p&gt;At their core (no pun intended), CPUs and GPUs solve fundamentally different problems.&lt;/p&gt;
+    &lt;p&gt;A modern GPU contains tens of thousands of cores designed to execute the same operation on thousands of data elements simultaneously. This makes them extraordinarily fast at the dense matrix multiplications that dominate the forward pass of a transformer for inference. During training, and during high-concurrency batched inference, that parallelism translates directly into throughput: greater tokens per second (TPS), and many more requests served per dollar of compute.&lt;/p&gt;
+    &lt;p&gt;Modern CPUs, by contrast, have anywhere from one to hundreds of cores optimized for sequential, conditional, and branching logic. They're particularly fast at a single operation moving through a complex decision tree. They have direct access to main system memory, and they're the natural execution environment for the orchestration layer wrapping any model. Tool dispatch, code execution, Python runtimes, sandboxes, input/output (I/O), and the agent loop control flow all sit in the CPU.&lt;/p&gt;
+    &lt;p&gt;These architectures, while different in nature, aren't competitors; they work best in tandem. The real question isn't which architecture is better, but which workload belongs where.&lt;/p&gt;
+    &lt;p&gt;This division of labor comes down to how we measure their work: FLOPS versus instruction latency.&lt;/p&gt;
+    &lt;p&gt;GPUs live and die by floating-point operations per second (FLOPS). Because AI models are massive webs of decimal numbers being multiplied and added, a GPU's job is to brute-force trillions of these matrix calculations simultaneously. It's built entirely for raw mathematical throughput.&lt;/p&gt;
+    &lt;p&gt;CPUs, by contrast, specialize in instruction latency. Instruction latency measures how fast a single core can execute an unpredictable chain of diverse commands. A CPU core excels at the rapid logic shuffling needed to parse JavaScript Object Notation (JSON), handle network I/O, or check security permissions.&lt;/p&gt;
+    &lt;p&gt;If you force a GPU to run a chaotic Python runtime, its massive FLOP capacity sits idle, choked by constant task-switching. If you force a CPU to crunch an LLM's math, it works perfectly, but takes ages because it lacks the massive parallel pipelines. The GPU is the mathematical muscle; the CPU is the logic engine directing the show.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The traditional inference stack: Where CPUs were passengers&lt;/head&gt;
+    &lt;p&gt;When we think of the traditional inference stack, we think about the chatbot serving application. Here, the CPU often plays a supporting role.&lt;/p&gt;
+    &lt;p&gt;A request arrives at the API server, where the CPU tokenizes and schedules it. The CPU handles all these initial tasks. It then hands the request to the GPU for the forward pass, which dominates the compute budget. The GPU runs attention, feeds forward layers, and samples the next token with a brief CPU sync to retrieve it and update the scheduler. It then repeats until an end-of-sequence token is emitted. Finally, the CPU collects the output and returns it to end the session.&lt;/p&gt;
+    &lt;p&gt;In this model, the CPU acts as a receptionist, doing the coordination and organizational work, while the GPU does the computational heavy lifting. The ratio of CPUs to GPUs in AI data centers during the training era reflected this: roughly 1 to 2 CPUs for every 8 GPUs, a ratio dictated more by GPUs throughput than by CPU demand. Teams provisioned CPUs to keep GPUs fed. This setup is slowly shifting away from the de facto standard, as advancements in CPU inference increase global efficiency.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The first driver: How agents are changing the workload&lt;/head&gt;
+    &lt;p&gt;With the rise of agentic AI comes a new inference profile magnifying the need for CPU-specific compute.&lt;/p&gt;
+    &lt;p&gt;"Agentic AI" conjures up images of integrated agent harnesses, like Hermes and Openclaw, and developers with hosts of agents tied into their coding assistants. While these use cases are becoming more popular, agentic AI isn't as niche as it may seem at first glance. In fact, many people aren't using the "traditional" process of querying a chatbot. Popular AI assistants like Claude and ChatGPT are backed by enormous models that often incorporate "reasoning" stages into their more complex responses. During reasoning, the "chatbot" becomes a full agentic system. A single user-visible task may decompose into dozens of individual model calls, each of which is short, context-dependent, and conditionally branching.&lt;/p&gt;
+    &lt;p&gt;In an agentic system, the model doesn't issue a single prompt and wait for a response. It generates a plan of action, executes tool calls, compiles all the returned data, and culminates in completing an action or returning an answer to the user. The CPU is in charge of parsing that output, figuring out which tool to invoke, making the API calls or running the code, collecting the result, and feeding it back. Then the loop repeats—sometimes dozens of times per user request, with parallel sub-agents adding more CPU coordination work on top. The model quickly becomes one component of a larger reasoning loop. The ratio of organizational work to pure computation shifts, making the CPU a much bigger player, and potential bottleneck, in the full process.&lt;/p&gt;
+    &lt;p&gt;In a collaboration between researchers at Georgia Tech and Intel, researchers found that in agentic workloads, CPU-side tool processing accounts for 50–90% of total end-to-end latency. Intel's CEO Lip-Bu Tan, at Computex 2026, framed the shift precisely: "for reinforcement learning, orchestration, and agents, the CPU is a much better fit."&lt;/p&gt;
+    &lt;p&gt;The numbers from Intel's Q1 2026 earnings call quantify how far this has already moved:&lt;/p&gt;
     &lt;list rend="ul"&gt;
-      &lt;item&gt; Комментариев: 4&lt;head rend="h3"&gt;Немного юмора с просторов соцсетей (23 фото)&lt;/head&gt;&lt;/item&gt;
-      &lt;item&gt; Комментариев: 2&lt;head rend="h3"&gt;На мужчину напал голодный леопард&lt;/head&gt;&lt;/item&gt;
-      &lt;item&gt; Комментариев: 2&lt;head rend="h3"&gt;Аист неожиданно заглянул на шашлыки&lt;/head&gt;&lt;/item&gt;
-      &lt;item&gt; Комментариев: 1&lt;head rend="h3"&gt;Смешные картинки - 07.08.2026 (15 фото)&lt;/head&gt;&lt;/item&gt;
-      &lt;item&gt; Комментариев: 1&lt;head rend="h3"&gt;Интересные факты на все случаи жизни (15 фото)&lt;/head&gt;&lt;/item&gt;
-      &lt;item&gt; Комментариев: 1&lt;head rend="h3"&gt;Подборка гифок - 07.08.2026 (25 гифок)&lt;/head&gt;&lt;/item&gt;
-      &lt;item&gt; Комментариев: 1&lt;head rend="h3"&gt;Подборка картинок. Вечерний выпуск - 07.08.2026 (30 фото)&lt;/head&gt;&lt;/item&gt;
-      &lt;item&gt; Комментариев: 14&lt;head rend="h3"&gt;Лаврушка в трусы: лайфхак для девушек&lt;/head&gt;&lt;/item&gt;
+      &lt;item&gt;Training workloads: ~1 CPU per 8 GPUs&lt;/item&gt;
+      &lt;item&gt;Inference workloads: Already shifted to ~1 CPU per 4 GPUs&lt;/item&gt;
+      &lt;item&gt;Agentic workloads: Converging toward 1:1, with some customers reporting 4 CPUs deployed per GPU&lt;/item&gt;
     &lt;/list&gt;
+    &lt;p&gt;Intel's Q1 2026 Data Center and AI segment revenue came in at $5.1B, up 22% year-over-year, with demand running ahead of supply. Intel has deprioritized consumer chip production to redirect fab capacity to server Xeon parts.&lt;/p&gt;
+    &lt;p&gt;Arm's own analysis forecasts the shift more starkly. Traditional AI data centers require approximately 30 million CPU cores per gigawatt (GW) of capacity. Arm CEO Rene Haas estimates in the AI agent era, that figure rises to 120 million CPU cores per GW. The orchestration demands of agentic workloads drive this proposed 4× increase.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The second driver: Smaller, localized models&lt;/head&gt;
+    &lt;p&gt;Separate from the shift agentic AI is cultivating, a second structural change is pushing inference toward CPUs. This change is the move toward smaller, domain-specific models deployed close to where data is generated.&lt;/p&gt;
+    &lt;p&gt;We can attribute this change in tides to 4 main pressures on providers:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;Latency: A round-trip to a GPU cluster in a cloud data center takes time. For real-time applications like voice interfaces, autonomous systems, and industrial monitoring, that latency budget is measured in milliseconds. Local computing removes the network roundtrip.&lt;/item&gt;
+      &lt;item&gt;Privacy: Sending data off-device or off-premises to a cloud provider means data leaves the organization's control. Healthcare, finance, legal, and many other enterprise workflows increasingly cannot tolerate this. While this doesn't guarantee your data is being picked apart and auctioned off to the highest bidder or used for training, a local or CPU-resident model running on existing on-premises server infrastructure processes data without it ever leaving the facility, completely mitigating that risk.&lt;/item&gt;
+      &lt;item&gt;Cost: A single GPU can cost upwards of $45,000. For workloads that don't require the throughput of a GPU, that cost is unjustifiable. CPU inference on already-provisioned server infrastructure has a near-zero marginal hardware cost.&lt;/item&gt;
+      &lt;item&gt;Offline availability: Edge deployments frequently operate without reliable internet connectivity. Cloud GPU inference isn't an option in these scenarios. Local CPU inference is.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Small language models (SLMs) have matured to the point where this is viable. Hugging Face SmolLM2, ranging from 135M to 1.7B parameters, is designed for maximum efficiency on resource-constrained devices. The 135M variant fits entirely in CPU cache on modern smartphones. The performance gap between SLMs and large models narrows drastically when SLMs are augmented with retrieval-augmented generation (RAG), and reverses entirely on domain-specific tasks after fine-tuning.&lt;/p&gt;
+    &lt;p&gt;A model trained on carefully curated data can achieve domain-specific performance with 100× less compute than training a general-purpose LLM. That's the caveat though. When it comes to fine-tuning and training models on larger GPUs, you have a lot more headroom to throw things at the model. On these smaller deployments, users need to be much more aware of the actions they're taking to produce performant and competitive models.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What this looks like in the industry today&lt;/head&gt;
+    &lt;p&gt;These aren't theoretical workloads. The CPU era is fast approaching, if not already here.&lt;/p&gt;
+    &lt;p&gt;OpenAI and AWS signed a $38B, 7-year infrastructure partnership in November 2025. The press release states access to hundreds of thousands of NVIDIA GPUs, with the ability to expand to tens of millions of CPUs to rapidly scale agentic workloads.&lt;/p&gt;
+    &lt;p&gt;In March, Arm launched the AGI CPU, marking the company's first production silicon in its 35-year history. NVIDIA launched the Vera CPU at GTC San Jose in March 2026, calling it "the world's first processor purpose-built for agentic AI." Jensen Huang described it as NVIDIA's "next multibillion dollar business." The Vera CPU delivers:&lt;/p&gt;
     &lt;list rend="ul"&gt;
-      &lt;item&gt; 2810&lt;/item&gt;
-      &lt;item&gt; 2745&lt;/item&gt;
-      &lt;item&gt; 3092&lt;/item&gt;
-      &lt;item&gt; 2423&lt;/item&gt;
-      &lt;item&gt; 3137&lt;/item&gt;
-      &lt;item&gt; 1939&lt;/item&gt;
-      &lt;item&gt; 2801&lt;/item&gt;
-      &lt;item&gt; 1144&lt;/item&gt;
-      &lt;item&gt; 1897&lt;/item&gt;
-      &lt;item&gt; 1257&lt;/item&gt;
+      &lt;item&gt;1.8× faster sandbox performance compared to leading x86 CPUs for agentic inner-loop work (code compilation, Python tool chains, software code analysis)&lt;/item&gt;
+      &lt;item&gt;2× memory bandwidth and 3× bandwidth per core compared to leading x86 CPUs with DDR5, via LPDDR5X memory with SOCAMM&lt;/item&gt;
     &lt;/list&gt;
-    &lt;p&gt; Китай Москва аварии автомобили актеры актрисы видео водители девушки дети еда животные знаменитости интересное интересные факты картинка картинки кинематограф коронавирус коты мемы модели мужчины необычное новости отношения пост приколы природа работа россия собаки соцсети спорт сша твиты технологии фейлы шутки юмор&lt;lb/&gt;Показать все теги&lt;/p&gt;
-    &lt;p&gt;Показать все теги&lt;/p&gt;
+    &lt;p&gt;First deliveries went to Anthropic, OpenAI, SpaceXAI, and Oracle Cloud Infrastructure, who announced plans to deploy hundreds of thousands of Vera CPUs beginning in 2026.&lt;/p&gt;
+    &lt;p&gt;NVIDIA's flagship agentic inference platform, the Vera Rubin NVL72 rack, combines 72 Rubin GPUs with 36 Vera CPUs per rack, illustrating a pivot from the traditional 1:8 CPU:GPU ratio to a 1:2 ratio. The architecture is explicitly optimized to use GPUs for token generation and CPUs for everything wrapping it.&lt;/p&gt;
+    &lt;p&gt;Morgan Stanley estimates the agentic CPU shift represents $32.5–$60B in incremental CPU market growth by 2030.&lt;/p&gt;
+    &lt;p&gt;Figure 1: The industry shift toward CPU-heavy AI infrastructure, highlighting NVIDIA Vera CPU's 1.8× performance advantage, the NVL72 rack's 1:8 to 1:2 CPU-to-GPU ratio change, and key developments from Arm, OpenAI/AWS, and Morgan Stanley projecting $32.5–$60B in CPU market growth by 2030.&lt;/p&gt;
+    &lt;head rend="h2"&gt;Measuring and deploying LLMs on CPUs&lt;/head&gt;
+    &lt;p&gt;For GPU-dominated inference workloads, the GPU advantage is substantial and well-documented. A single H200 serving Llama 3.1 8B hits approximately 7,464 generation tokens/sec on chat workloads. The best-performing CPU virtual machine (VM) in the same Azure benchmark falls significantly short.&lt;/p&gt;
+    &lt;p&gt;But peak throughput under high concurrency isn't the benchmark that matters most for CPU inference. It's more relevant to measure the workload profile corresponding to CPU-appropriate deployments, which can be more complicated to test properly.&lt;/p&gt;
+    &lt;p&gt;GPU benchmarking has established norms, but CPU inference benchmarking is currently a mess of vendor-specific or not-so-reproducible numbers. The key difference is that CPUs share cores, memory bandwidth, and cache with everything else on the machine, so isolation requires careful socket-level or node-level separation GPU setups don't need. Red Hat's response is an open source 3-phase framework (vllm-cpu-perf-eval) using Red Hat Ansible Automation Platform and GuideLLM testing baseline capacity, realistic traffic variance, and production optimizations in a reproducible, standardized way.&lt;/p&gt;
+    &lt;p&gt;This can all sound pretty daunting, especially if your mental model of LLM deployment is still built around GPU clusters. In practice, the ecosystem has matured considerably. Red Hat has a wide collection of validated models on Hugging Face. Additionally, Intel's AI Software Catalog lists a broad range of production-ready models validated and optimized for Xeon Gen 4–6 processors with vLLM support.&lt;/p&gt;
+    &lt;p&gt;For a hands-on look at what deployment looks like, our recent vLLM office hours session walks through end-to-end inference deployment on Intel CPUs.&lt;/p&gt;
+    &lt;head rend="h2"&gt;The architecture that makes CPU inference work&lt;/head&gt;
+    &lt;p&gt;Several developments in the software stack have made CPU inference viable at a level it was not 2 years ago.&lt;/p&gt;
+    &lt;p&gt;vLLM's CPU backend supports continuous batching, PagedAttention, prefix caching, chunked prefill, and tensor parallelism. These are the same scheduling and memory management primitives driving high-throughput GPU serving, but now also on:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;x86 AVX-512&lt;/item&gt;
+      &lt;item&gt;Arm AArch64&lt;/item&gt;
+      &lt;item&gt;Apple Silicon (currently experimental)&lt;/item&gt;
+      &lt;item&gt;IBM Z&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The OpenAI-compatible API is identical across backends, which means a deployment starting on CPU infrastructure can migrate to GPU without application-layer changes.&lt;/p&gt;
+    &lt;p&gt;On Arm, the oneDNN and Arm Compute Library build path, combined with INT4 quantization via llmcompressor, is a production path tested on AWS Graviton4.&lt;/p&gt;
+    &lt;p&gt;On Intel, Intel Extension for PyTorch (IPEX) enables Advanced Matrix Extensions (AMX)-backed BF16 operations automatically when installed. The key environment variables give operators direct control over the memory and threading tradeoffs that matter most for CPU serving:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;&lt;code&gt;VLLM_CPU_KVCACHE_SPACE&lt;/code&gt;(KV cache allocation in GB)&lt;/item&gt;
+      &lt;item&gt;&lt;code&gt;VLLM_CPU_OMP_THREADS_BIND&lt;/code&gt;(OpenMP thread pinning)&lt;/item&gt;
+      &lt;item&gt;The experimental &lt;code&gt;VLLM_CPU_SGL_KERNEL&lt;/code&gt; (AMX + BF16 small-batch kernels)&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;head rend="h2"&gt;Conclusion&lt;/head&gt;
+    &lt;p&gt;The GPU isn't going anywhere. For high-concurrency production serving of large models, GPU is the right answer and will remain so.&lt;/p&gt;
+    &lt;p&gt;What's changed is the perimeter of that statement. Agentic AI introduced a class of workloads—orchestration, tool execution, code sandboxing, and multi-agent coordination—where CPUs are the correct tool for the job. The ratio shift from 1:8 to 1:1 in Intel's data center projections isn't a temporary anomaly. This momentous change is the consequence of inference becoming iterative rather than single-shot.&lt;/p&gt;
+    &lt;p&gt;At the same time, the economics and constraints of edge deployment—latency, privacy, cost, and offline availability—drive a parallel wave of CPU-based inference for small, localized models where GPU infrastructure was never the right fit.&lt;/p&gt;
+    &lt;p&gt;NVIDIA building Vera. Arm jumping back into the game. Intel's Xeon demand running ahead of supply. OpenAI contracting for tens of millions of CPUs. The CPU is back.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What next?&lt;/head&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Deploy models on CPUs with vLLM on OpenShift AI: Red Hat is a leading contributor to vLLM, and Red Hat OpenShift AI provides a supported, production-grade platform for serving models on both CPU and GPU infrastructure, with the same OpenAI-compatible API regardless of backend.&lt;/item&gt;
+      &lt;item&gt;Benchmark your CPU inference performance: Use the open source vllm-cpu-perf-eval framework, along with GuideLLM, to establish reproducible baselines for your hardware and workloads.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;Resource&lt;/p&gt;
+    &lt;head rend="h2"&gt;Get started with AI Inference&lt;/head&gt;
+    &lt;head rend="h3"&gt;About the authors&lt;/head&gt;
+    &lt;head rend="h2"&gt;Browse by channel&lt;/head&gt;
+    &lt;head rend="h3"&gt;Automation&lt;/head&gt;
+    &lt;p&gt;The latest on IT automation for tech, teams, and environments&lt;/p&gt;
+    &lt;head rend="h3"&gt;Artificial intelligence&lt;/head&gt;
+    &lt;p&gt;Updates on the platforms that free customers to run AI workloads anywhere&lt;/p&gt;
+    &lt;head rend="h3"&gt;Open hybrid cloud&lt;/head&gt;
+    &lt;p&gt;Explore how we build a more flexible future with hybrid cloud&lt;/p&gt;
+    &lt;head rend="h3"&gt;Security&lt;/head&gt;
+    &lt;p&gt;The latest on how we reduce risks across environments and technologies&lt;/p&gt;
+    &lt;head rend="h3"&gt;Edge computing&lt;/head&gt;
+    &lt;p&gt;Updates on the platforms that simplify operations at the edge&lt;/p&gt;
+    &lt;head rend="h3"&gt;Infrastructure&lt;/head&gt;
+    &lt;p&gt;The latest on the world’s leading enterprise Linux platform&lt;/p&gt;
+    &lt;head rend="h3"&gt;Applications&lt;/head&gt;
+    &lt;p&gt;Inside our solutions to the toughest application challenges&lt;/p&gt;
+    &lt;head rend="h3"&gt;Virtualization&lt;/head&gt;
+    &lt;p&gt;The future of enterprise virtualization for your workloads on-premise or across clouds&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49221041</guid><pubDate>Sat, 08 Aug 2026 12:07:25 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49221089</guid><pubDate>Sat, 08 Aug 2026 12:16:03 +0000</pubDate></item></channel></rss>
