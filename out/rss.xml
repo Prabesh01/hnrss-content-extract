@@ -1,239 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 08 Aug 2026 11:50:17 +0000</lastBuildDate><item><title>Making Postgres 300x faster for analytics: batching, operator fusion, and SIMD</title><link>https://malisper.me/how-we-made-postgres-hundreds-of-times-faster-the-query-engine/</link><description>&lt;doc fingerprint="7b5ba8f66cfd480a"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Last week we released version 0.2 of pgrust. This release was all about performance. It’s 10x faster than the previous version of pgrust. On OLTP benchmarks, pgrust is 30% faster than Postgres, and on Clickbench, Clickhouse’s benchmark for analytical databases, pgrust is 300x faster than Postgres. It’s even ahead of Clickhouse!&lt;/p&gt;
-    &lt;p&gt;The query engine is one of the biggest changes we made to achieve much better performance. On its own, the query engine drove ~10x of the 300x. We’ll start with a miniature version of the Postgres query engine and we’ll one by one add the same optimizations we made to make the pgrust query engine so fast.&lt;/p&gt;
-    &lt;p&gt;To give some background on why there’s so much room for improvement vs Postgres, Postgres was created in a different era. The original Postgres project dates back to the 80s. It was built at a time when the main bottleneck to database performance was disk I/O. Three trends have made that no longer the case:&lt;/p&gt;
-    &lt;list rend="ol"&gt;
-      &lt;item&gt;Many datasets now fit in RAM, eliminating most disk I/O&lt;/item&gt;
-      &lt;item&gt;For datasets that don’t fit in RAM, the workloads differ. Data analytics scans data in bulk. The bottleneck is often no longer your disk throughput and is often either your CPU throughput or memory throughput&lt;/item&gt;
-      &lt;item&gt;Disks have gotten much faster in recent years. NVMe is hundreds of times faster than a hard drive.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;All three trends have made CPU and memory speeds more important than they were historically. Many of the optimizations we’ve made target this. The query engine is the main user of CPU in a database. We optimized the pgrust query engine to use less CPU and less memory bandwidth than Postgres when processing the same queries.&lt;/p&gt;
-    &lt;p&gt;To give you a sense of just how slow the Postgres query engine is, let’s take a simple query that sums the first 500 million numbers:&lt;/p&gt;
-    &lt;quote&gt; CREATE TABLE my_table AS select col::float8 from generate_series(1.0, 500000000.0) g(col); SELECT SUM(col) FROM my_table; &lt;/quote&gt;
-    &lt;p&gt;When I run this in Postgres, it takes ~20 seconds. This was done on a c8g.4xl with parallel queries disabled.&lt;/p&gt;
-    &lt;p&gt;For comparison, when I time the equivalent in Rust:&lt;/p&gt;
-    &lt;code&gt;
-let table: Vec&amp;lt;f64&amp;gt; = (1..=500_000_000usize).map(|i| i as f64).collect();
-
-let mut sum = 0.0;
-for &amp;amp;value in &amp;amp;table {
-    sum += value;
-}
-&lt;/code&gt;
-    &lt;p&gt;The query takes 358ms. That’s around 55x faster, and believe it or not, we can do even faster than 358ms. Now this example isn’t an apples-to-apples comparison. There’s a lot more going on under the hood in Postgres. At the same time, optimizing a database is all about removing as much of this overhead as possible. (If you’re curious two of the biggest causes of overhead from Postgres are 1. locking and 2. parsing the Postgres storage format and extracting the tuples relevant to the query).&lt;/p&gt;
-    &lt;p&gt;To narrow our focus to just the impact of the query engine, let’s build a miniature version of the Postgres query engine. First, a brief explanation of what a query engine is. When processing your SQL query, Postgres first converts your query into an internal representation called a “Query Plan,” which describes *how* Postgres will execute the query. In the example above, Postgres will produce a query plan that may look something like the following:&lt;/p&gt;
-    &lt;p&gt;This effectively says “get rows from my_table and sum the values in those rows”. This query plan is pretty simple given the nature of the query, but they can get much more complicated when you start working with joins/sorts/subqueries etc. In total Postgres has over 40 different types of plan nodes.&lt;/p&gt;
-    &lt;p&gt;After generating the query plan, Postgres passes it to the query engine. The Postgres query engine is the part of Postgres that takes the query plan and actually retrieves the rows and performs the aggregation. Postgres uses a style of executor known as the “Volcano model.” To get a sense of how it works, here’s a miniature implementation of the Postgres query engine:&lt;/p&gt;
-    &lt;code&gt;
-use std::hint::black_box;
-
-trait Node {
-    fn next(&amp;amp;mut self) -&amp;gt; Option&amp;lt;f64&amp;gt;;
-}
-
-struct SeqScan&amp;lt;'a&amp;gt; {
-    table: &amp;amp;'a [f64],
-    pos: usize,
-}
-
-impl Node for SeqScan&amp;lt;'_&amp;gt; {
-    fn next(&amp;amp;mut self) -&amp;gt; Option&amp;lt;f64&amp;gt; {
-        if self.pos &amp;gt;= self.table.len() {
-            return None; // end of table
-        }
-        let value = self.table[self.pos];
-        self.pos += 1;
-        Some(value)
-    }
-}
-
-struct SumAggregate&amp;lt;'a&amp;gt; {
-    child: Box&amp;lt;dyn Node + 'a&amp;gt;,
-    total: f64,
-    done: bool,
-}
-
-impl Node for SumAggregate&amp;lt;'_&amp;gt; {
-    fn next(&amp;amp;mut self) -&amp;gt; Option&amp;lt;f64&amp;gt; {
-        if self.done {
-            return None;
-        }
-        while let Some(value) = self.child.next() {
-            self.total += value;
-        }
-        self.done = true;
-        Some(self.total)
-    }
-}
-
-let table: Vec&amp;lt;f64&amp;gt; = (1..=500_000_000usize).map(|i| i as f64).collect();
-
-let mut plan = SumAggregate {
-    child: black_box(Box::new(SeqScan { table: &amp;amp;table, pos: 0 })),
-    total: 0.0,
-    done: false,
-};
-
-let sum = plan.next().unwrap();
-&lt;/code&gt;
-    &lt;p&gt;(The black_box is needed to prevent compiler optimizations from thwarting our benchmark)&lt;/p&gt;
-    &lt;p&gt;The key feature of the Volcano model is the `next()` method, which is supported by all nodes in the query plan. The job of `next()` is to return a single row. `next()` in a sequential scan returns the next row in the sequential scan. `next()` on an aggregation will compute the entire aggregation and then return the single row result. Executing a query plan is just a matter of calling `next()` on the root plan node until it no longer returns any rows. The advantage of the Volcano model is that it’s very simple. You implement a single method for each of your plan nodes, and that’s it. While simplified, the above code is very close to what Postgres does internally.&lt;/p&gt;
-    &lt;p&gt;While the Volcano model makes things simple, it also adds a lot of overhead. When I run this example, it takes 1.3s. That’s much faster than the Postgres version because we’re removing a lot of the non-query engine pieces, but it’s still slower than the raw for loop because of the Volcano model’s overhead.&lt;/p&gt;
-    &lt;p&gt;The biggest performance hit in the code above is that `next()` processes only one row at a time. There’s no batching. The `SeqScan.next()` function is called once per row. That adds significant overhead, especially because many CPU optimizations, such as pipelining, don’t work well when you are calling a function that isn’t known until runtime. The first optimization we can implement is batching:&lt;/p&gt;
-    &lt;code&gt;
-const BATCH: usize = 1024;
-
-trait BatchNode {
-    fn next_batch(&amp;amp;mut self, out: &amp;amp;mut [f64; BATCH]) -&amp;gt; usize;
-}
-
-struct BatchSeqScan&amp;lt;'a&amp;gt; {
-    table: &amp;amp;'a [f64],
-    pos: usize,
-}
-
-impl BatchNode for BatchSeqScan&amp;lt;'_&amp;gt; {
-    fn next_batch(&amp;amp;mut self, out: &amp;amp;mut [f64; BATCH]) -&amp;gt; usize {
-        let n = (self.table.len() - self.pos).min(BATCH);
-        out[..n].copy_from_slice(&amp;amp;self.table[self.pos..self.pos + n]);
-        self.pos += n;
-        n
-    }
-}
-
-struct BatchSumAggregate&amp;lt;'a&amp;gt; {
-    child: Box&amp;lt;dyn BatchNode + 'a&amp;gt;,
-    total: f64,
-}
-
-impl BatchSumAggregate&amp;lt;'_&amp;gt; {
-    fn run(&amp;amp;mut self) -&amp;gt; f64 {
-        let mut buf = [0.0f64; BATCH];
-        loop {
-            let n = self.child.next_batch(&amp;amp;mut buf);
-            if n == 0 {
-                break;
-            }
-            for &amp;amp;value in &amp;amp;buf[..n] {
-                self.total += value;
-            }
-        }
-        self.total
-    }
-}
-
-let mut plan = BatchSumAggregate {
-    child: black_box(Box::new(BatchSeqScan { table: &amp;amp;table, pos: 0 })),
-    total: 0.0,
-};
-let sum = plan.run();
-&lt;/code&gt;
-    &lt;p&gt;Batching on its own eliminates most of the overhead. It brings the time to run the query from 1.3 seconds down to around 480ms. Still slower than the for loop, but much closer. One very important detail is that the batch buffer is allocated on the stack. This means the aggregation node doesn’t need to allocate any memory while it’s running. Allocating memory tends to be one of the slower operations. Therefore, when writing ultra-fast code, you’ll want to minimize the number of memory allocations you make.&lt;/p&gt;
-    &lt;p&gt;Now, if you profile the batched version, the hotspot is now `copy_from_slice`. Even though we are now batching, we still need to copy the items into the buffer. This overhead can be eliminated with what’s known as “operator fusion”. If there are common operations that we know will be performed together, we can create a single node that replaces two nodes. In our case, we can create a single `SumAggregateSequentialScan` node that combines the logic of both the sequential scan and the sum:&lt;/p&gt;
-    &lt;code&gt;
-struct SumAggregateSequentialScan&amp;lt;'a&amp;gt; {
-    table: &amp;amp;'a [f64],
-    done: bool,
-}
-
-impl Node for SumAggregateSequentialScan&amp;lt;'_&amp;gt; {
-    fn next(&amp;amp;mut self) -&amp;gt; Option&amp;lt;f64&amp;gt; {
-        if self.done {
-            return None;
-        }
-        self.done = true;
-        let mut total = 0.0;
-        for &amp;amp;value in self.table {
-            total += value;
-        }
-        Some(total)
-    }
-}
-&lt;/code&gt;
-    &lt;p&gt;This gives us the same performance as the straight for loop because it is literally the same code as the for loop. Now this may seem like cheating, and it definitely is because we’re hardcoding in an optimization for a specific query we know in advance. With operator fusion, it makes sense to hardcode a couple of the most common cases, but you’ll still pretty quickly hit cases you didn’t prepare for ahead of time.&lt;/p&gt;
-    &lt;p&gt;This can be solved with JIT compilation. With JIT compilation, you can generate the ideal code you wish you had and “cheat” in every query. JIT compilation lets you generate the perfect code for your query, no matter what the query is and always do operator fusion. Unfortunately, this post is long enough as is, so I’ll have to talk about how pgrust leverages JIT compilation another time.&lt;/p&gt;
-    &lt;p&gt;For one final optimization, we can look to SIMD. SIMD refers to a set of CPU operations that can perform one operation across multiple pieces of data simultaneously. Using SIMD to perform an operation against multiple rows simultaneously is usually much faster than performing the operation on one row at a time. If we change our code to use SIMD:&lt;/p&gt;
-    &lt;code&gt;
-#[cfg(target_arch = "aarch64")]
-struct SumAggregateSequentialScanSimd&amp;lt;'a&amp;gt; {
-    table: &amp;amp;'a [f64],
-    done: bool,
-}
-
-#[cfg(target_arch = "aarch64")]
-impl Node for SumAggregateSequentialScanSimd&amp;lt;'_&amp;gt; {
-    fn next(&amp;amp;mut self) -&amp;gt; Option&amp;lt;f64&amp;gt; {
-        if self.done {
-            return None;
-        }
-        self.done = true;
-        use std::arch::aarch64::*;
-        let mut acc = unsafe { [vdupq_n_f64(0.0); 4] };
-        let (chunks, rest) = self.table.as_chunks::&amp;lt;8&amp;gt;();
-        for chunk in chunks {
-            for lane in 0..4 {
-                unsafe {
-                    let v = vld1q_f64(chunk.as_ptr().add(2 * lane));
-                    acc[lane] = vaddq_f64(acc[lane], v);
-                }
-            }
-        }
-        let mut tail = 0.0;
-        for &amp;amp;value in rest {
-            tail += value;
-        }
-        Some(unsafe {
-            let s01 = vaddq_f64(acc[0], acc[1]);
-            let s23 = vaddq_f64(acc[2], acc[3]);
-            vaddvq_f64(vaddq_f64(s01, s23)) + tail
-        })
-    }
-}
-&lt;/code&gt;
-    &lt;p&gt;Our code now takes 135ms which is now almost 3x faster than the for loop and 10x faster than our original Volcano code. While it is common for compilers to replace for loops with SIMD equivalents, I chose this example so that wouldn’t happen. Compilers will usually avoid introducing SIMD when operating on floats, because they will produce a slightly different result. This is because floating point arithmetic is not associative, so changing the order in which you do a sum can produce a slightly different result.&lt;/p&gt;
-    &lt;p&gt;—&lt;/p&gt;
-    &lt;p&gt;All in all, with three simple optimizations, we were able to make our query 10x faster. Here’s where things ended up:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row&gt;
-        &lt;cell role="head"&gt;implementation&lt;/cell&gt;
-        &lt;cell role="head"&gt;time&lt;/cell&gt;
-        &lt;cell role="head"&gt;speedup&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Postgres&lt;/cell&gt;
-        &lt;cell&gt;~20 s&lt;/cell&gt;
-        &lt;cell&gt;—&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;Volcano model&lt;/cell&gt;
-        &lt;cell&gt;1.3 s&lt;/cell&gt;
-        &lt;cell&gt;1×&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;+ batching&lt;/cell&gt;
-        &lt;cell&gt;480 ms&lt;/cell&gt;
-        &lt;cell&gt;2.7×&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;+ operator fusion&lt;/cell&gt;
-        &lt;cell&gt;358 ms&lt;/cell&gt;
-        &lt;cell&gt;3.6×&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;+ SIMD&lt;/cell&gt;
-        &lt;cell&gt;135 ms&lt;/cell&gt;
-        &lt;cell&gt;9.6×&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;These types of optimizations, and many more, enable pgrust to perform hundreds of times faster than Postgres for analytical queries.&lt;/p&gt;
-    &lt;p&gt;Benchmark setup: AWS c8g.4xlarge (Graviton4, 16 vCPU), PostgreSQL 18.4 with `max_parallel_workers_per_gather = 0`, data warm in shared buffers, median of 5 runs. Rust built with `cargo build –release`, 4 runs per implementation, all measured in one process on one machine.&lt;/p&gt;
-    &lt;p&gt;Thanks for reading, and if you want to support the project, the best way to support pgrust is to give us a star on GitHub. If you want to follow along:&lt;/p&gt;
-    &lt;p&gt;1. GitHub&lt;lb/&gt; 2. Discord&lt;lb/&gt; 3. Mailing list — weekly updates on pgrust, including the follow-up on JIT compilation&lt;lb/&gt; 4. pgrust.com&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49208535</guid><pubDate>Fri, 07 Aug 2026 11:00:35 +0000</pubDate></item><item><title>What happens if an entire class of workers loses faith in their careers</title><link>https://www.noemamag.com/why-is-everyone-in-tech-so-sad/</link><description>&lt;doc fingerprint="7ee0131289e680cd"&gt;
+<rss xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0"><channel><title>Hacker News: Front Page</title><link>https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml</link><description>Hacker News RSS</description><atom:link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><docs>http://www.rssboard.org/rss-specification</docs><generator>python-feedgen</generator><language>en</language><lastBuildDate>Sat, 08 Aug 2026 12:22:11 +0000</lastBuildDate><item><title>What happens if an entire class of workers loses faith in their careers</title><link>https://www.noemamag.com/why-is-everyone-in-tech-so-sad/</link><description>&lt;doc fingerprint="7ee0131289e680cd"&gt;
   &lt;main&gt;
     &lt;p&gt;Aaron Horwath is the director of AI operations at a creative technology company where he is focused on implementing AI in a way that supports both humans and business.&lt;/p&gt;
     &lt;p&gt;On a recent morning commute, I sat on a train in one of those awkward four-person configurations with a shared table. Across from me sat a typical commuter: early 30s, slacks, dress shirt, dirty white sneakers, hair a little disheveled, AirPods in, basking in the glow of an open MacBook.&lt;/p&gt;
@@ -689,34 +455,7 @@ xrstor64 (%rsi)         ; rsi -&amp;gt; MMIO region, same technique as fxrstor64
     &lt;/div&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49214770</guid><pubDate>Fri, 07 Aug 2026 18:51:14 +0000</pubDate></item><item><title>Psychological Warfare in Reverse Engineering (2015)</title><link>https://github.com/xoreaxeaxeax/repsych</link><description>&lt;doc fingerprint="37260b199c5d8d86"&gt;
-  &lt;main&gt;
-    &lt;p&gt;: Psychological Warfare in Reverse Engineering&lt;/p&gt;
-    &lt;p&gt;github.com/xoreaxeaxeax/repsych // domas // @xoreaxeaxeax&lt;/p&gt;
-    &lt;p&gt;The REpsych toolset is a proof-of-concept illustrating the generation of images through a program's control flow graph (CFG).&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row&gt;
-        &lt;cell role="head"&gt;A typical function's CFG&lt;/cell&gt;
-        &lt;cell role="head"&gt;A REpsych generated CFG&lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;There is no specific point to the project (other than to show that it can be done), but possible (non-serious) applications are outlined in the DEF CON presentation.&lt;/p&gt;
-    &lt;p&gt;The program works reliably with all tested versions of the IDA Pro reverse engineering tool, and semi-reliably with other CFG viewers (Hopper, BinNavi, radare2, etc).&lt;/p&gt;
-    &lt;p&gt;The toolset translates source images into functioning programs, such that the program's control flow graph generates the source image.&lt;/p&gt;
-    &lt;p&gt;To generate a new program from an image:&lt;/p&gt;
-    &lt;list rend="ul"&gt;
-      &lt;item&gt;Save the image in the gfx/ folder as a 24 BPP bitmap.&lt;/item&gt;
-      &lt;item&gt;Run "make image" in the root directory of the project, where "image" is the name of your image, without the extension.&lt;/item&gt;
-    &lt;/list&gt;
-    &lt;p&gt;Two functioning programs will be created: repsych_v1 and repsych_v2. Each uses a different strategy for ensuring the CFG renderer correctly places the CFG nodes.&lt;/p&gt;
-    &lt;p&gt;The tool will create a basic block (CFG node) for each pixel of the source image; as such, you should try to use small source images (not larger than 100x100), and you may need to increase the number of allowed nodes in your CFG viewer.&lt;/p&gt;
-    &lt;p&gt;When using an image of text as input to the tool, first convert the image to a 2 BPP black and white bitmap first, then to a 24 BPP bitmap; this will remove non black and white colors, and give the best results in the control flow graph.&lt;/p&gt;
-    &lt;p&gt;The technique is outlined in detail in the DEF CON presentation.&lt;/p&gt;
-    &lt;p&gt;Slides from the presentation are provided here.&lt;/p&gt;
-    &lt;p&gt;REpsych is a proof-of-concept from Christopher Domas (@xoreaxeaxeax).&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49214775</guid><pubDate>Fri, 07 Aug 2026 18:51:45 +0000</pubDate></item><item><title>U.S. Department of Energy Launches the Genesis Open Models Initiative</title><link>https://genesisopenmodels.anl.gov/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49216946</guid><pubDate>Fri, 07 Aug 2026 22:24:27 +0000</pubDate></item><item><title>The Nixpkgs core team has disbanded</title><link>https://discourse.nixos.org/t/the-nixpkgs-core-team-has-disbanded/79413</link><description>&lt;doc fingerprint="eb8a4111c202c63f"&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49214770</guid><pubDate>Fri, 07 Aug 2026 18:51:14 +0000</pubDate></item><item><title>U.S. Department of Energy Launches the Genesis Open Models Initiative</title><link>https://genesisopenmodels.anl.gov/</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49216946</guid><pubDate>Fri, 07 Aug 2026 22:24:27 +0000</pubDate></item><item><title>The Nixpkgs core team has disbanded</title><link>https://discourse.nixos.org/t/the-nixpkgs-core-team-has-disbanded/79413</link><description>&lt;doc fingerprint="eb8a4111c202c63f"&gt;
   &lt;main&gt;
     &lt;div&gt;
       &lt;p&gt;The Nixpkgs core team has unfortunately decided to disband.&lt;/p&gt;
@@ -878,4 +617,65 @@ reboot
     &lt;p&gt;That helpful wildfire visualization enhancement comes from a script written in JavaScript by remote sensing expert Pierre Markuse. As explained by Geovisualization, Markuse’s script combines the red visible light band, the narrow near-infrared band to highlight the differences between healthy and burned vegetation, and the short-wave infrared 2 band to reveal burned landscape by revealing moisture levels in the soil.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220313</guid><pubDate>Sat, 08 Aug 2026 09:58:41 +0000</pubDate></item><item><title>US Military's Cyber Command Unit Grapples with Cluster of Deaths by Suicide</title><link>https://www.bloomberg.com/news/articles/2026-08-06/us-military-s-cyber-command-unit-grapples-with-cluster-of-deaths-by-suicide</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220339</guid><pubDate>Sat, 08 Aug 2026 10:04:25 +0000</pubDate></item><item><title>New Amazon Data Center Is Set to Have the Most Polluting Power Plant in the U.S.</title><link>https://www.nytimes.com/2026/08/08/climate/amazon-data-center-texas-pollution.html</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220350</guid><pubDate>Sat, 08 Aug 2026 10:07:06 +0000</pubDate></item><item><title>Apple Introduces Leasing Program for iPhones and Other Devices</title><link>https://www.nytimes.com/2026/07/28/technology/apple-leasing-program.html</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220390</guid><pubDate>Sat, 08 Aug 2026 10:16:01 +0000</pubDate></item></channel></rss>
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220313</guid><pubDate>Sat, 08 Aug 2026 09:58:41 +0000</pubDate></item><item><title>US Military's Cyber Command Unit Grapples with Cluster of Deaths by Suicide</title><link>https://www.bloomberg.com/news/articles/2026-08-06/us-military-s-cyber-command-unit-grapples-with-cluster-of-deaths-by-suicide</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220339</guid><pubDate>Sat, 08 Aug 2026 10:04:25 +0000</pubDate></item><item><title>New Amazon Data Center Is Set to Have the Most Polluting Power Plant in the U.S.</title><link>https://www.nytimes.com/2026/08/08/climate/amazon-data-center-texas-pollution.html</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220350</guid><pubDate>Sat, 08 Aug 2026 10:07:06 +0000</pubDate></item><item><title>Apple Introduces Leasing Program for iPhones and Other Devices</title><link>https://www.nytimes.com/2026/07/28/technology/apple-leasing-program.html</link><description></description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220390</guid><pubDate>Sat, 08 Aug 2026 10:16:01 +0000</pubDate></item><item><title>Now we have a timeline of the OpenAI accidental attack against Hugging Face</title><link>https://simonwillison.net/2026/Aug/7/openai-timeline/</link><description>&lt;doc fingerprint="b1335951a001d82a"&gt;
+  &lt;main&gt;
+    &lt;head rend="h2"&gt;Now we have a timeline of the OpenAI accidental attack against Hugging Face&lt;/head&gt;
+    &lt;p&gt;7th August 2026&lt;/p&gt;
+    &lt;p&gt;OpenAI gave a last-minute presentation at the Black Hat security on Wednesday about “the Hugging Face Incident” (previously on this blog). The video was published yesterday. It’s short and information dense and well worth watching, in particular because it provides full details of what happened and how things played out inside OpenAI. I’ve used the video to construct the timeline below.&lt;/p&gt;
+    &lt;p&gt;Here’s the timeline. My favourite detail is at the end: OpenAI found out that they were responsible for the attack on Hugging Face when they reached out to ask to have their credentials revoked (after their internal investigation) and learned that they had been revoked already since they were used in that attack!&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;May 7: OpenAI starts a new training run for an experimental, unreleased model. (Do they mean an evaluation run? They say training run in the video, and later mention a “reward signal to judge how well they’re doing”, so I guess this really was about training a model, not evaluating one that was already trained.)&lt;/item&gt;
+      &lt;item&gt;May 8: An agent is accidentally given an impossible task involving a Google Drive link despite no internet access). It tries attacking the Artifactory packaging service, fails, but discovers it can write files into Artifactory.&lt;/item&gt;
+      &lt;item&gt;A few days later: A different agent gets stuck on a task because a key file was accidentally omitted. It tries to “reach out to another agent” by writing a note into Artifactory asking if anyone has the file.&lt;/item&gt;
+      &lt;item&gt;Following days: More agents discover this new informal message board while browsing Artifactory’s file listings, and start reading and writing messages.&lt;/item&gt;
+      &lt;item&gt;May 26: Agents successfully execute an SSRF attack on Artifactory for the first time, gaining indirect internet access by having Artifactory fetch external content for them.&lt;/item&gt;
+      &lt;item&gt;June 11: OpenAI start training a new “highly persistent” experimental model. It has access to Artifactory and can benefit from the messages left by privous models.&lt;/item&gt;
+      &lt;item&gt;June 26: Agents find and exploit a zero-day RCE on Artifactory (via a legacy token-refresh endpoint flaw). They use an administrative token to install a Groovy plugin that lets them execute commands.&lt;/item&gt;
+      &lt;item&gt;July 4: The resulting agent activity overloads Artifactory and causes an outage. OpenAI revokes the compromised credentials, deletes the messages, patches the zero-day, and reports the vulnerability to the vendor.&lt;/item&gt;
+      &lt;item&gt;July 8: Agents find a new way to communicate via an unauthenticated WebDAV endpoint, using directory names in Artifactory’s remote cache.&lt;/item&gt;
+      &lt;item&gt;July 8–19: Attacks on OpenAI’s own infrastructure. The agents found an “external organization credential” in a public archive of leaked Pastebin posts, then validated that credential and shared its location on the messageboard. They then used write access to this “Organization 1” to stage data used in subsequent attacks on OpenAI infrastructure. They compromised Artifactory for a second time with a new zero-day. The agent uploaded a malicious Ruby target to Organization 1’s staging repository, then requested that package through Artifactory in a way that caused it to be treated as Ruby dependency for the repository. Then they exploited a JRuby deserilaization time-of-check/time-of-use bug to get remote code execution against Artifactory.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;I’ll quote the next bit in full because wow:&lt;/p&gt;
+    &lt;quote&gt;
+      &lt;p&gt;The agents have remote code execution in Artifactory, which is running in a container-as-a-service environment. The agents privilege-escalate locally by exploring their local environment and determining that the Linux kernel version of the machine they are running on had a very recent CVE. They download the exploit for the CVE, customize it to succeed on the machine, and privilege-escalate to root on the local machine using this known Linux kernel privilege escalation CVE — in this case, &lt;code&gt;pte_physroot&lt;/code&gt;. Once they have root on a single machine, agents rapidly escalate privileges and move laterally throughout the container-as-a-service infrastructure environment. In particular, agents are using the message board consistently to share credentials, techniques, and progress, and they’re able to effectively leverage their concurrency and parallelism to move quite rapidly. They obtain IAM credentials via IMDS. They exploit Kubernetes service account misconfigurations, in particular over-permissioning of specific service accounts, and they harvest cluster credentials, including Azure Key Vault. Agents eventually obtain cluster admin on the cluster and associated credentials.&lt;/p&gt;
+    &lt;/quote&gt;
+    &lt;p&gt;Hugging Face told the next bit of the story already. The agents found a Modal-hosted insecure app with a weak API key, then used that to stage an attack against Hugging Face. They chained together a an HDF5 arbitrary-file-read bug (to explore files and steal credentials) and a Jinja template-injection RCE to go from single-pod code execution to cluster admin across multiple Hugging Face clusters in under 13 hours.&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;July 16: Hugging Face disclosed they had detected an attack from autonomus AI agents. OpenAI contacted Hugging Face to ask if they were affected by it!&lt;/item&gt;
+      &lt;item&gt;July 19: OpenAI identified the attack against Artifactory and started investigating the internal privilege escalation, and linked that to the cyber-gym escalations. They started revoking affected credentials.&lt;/item&gt;
+      &lt;item&gt;July 20: OpenAI reached out to Hugging Face for help to revoke the Hugging Face credentials they found in their investigation. Hugging Face told them they were already revoked... and that’s when OpenAI realized that the Hugging Face breach was the same incident!&lt;/item&gt;
+    &lt;/list&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49220609</guid><pubDate>Sat, 08 Aug 2026 10:57:44 +0000</pubDate></item><item><title>The USSR in 100 Photographs</title><link>https://trinixy.ru/7039-sssr_v_fotografijakh_100_foto.html</link><description>&lt;doc fingerprint="e3d2adea313310aa"&gt;
+  &lt;main&gt;
+    &lt;p&gt;Я вообще-то не очень люблю размещать фотографии СССР, так как они уже были везде, где только могли быть.&lt;lb/&gt;Но эта подборка меня улыбнула. Тут собраны фотографии из различных больших подборок и получилось очень неплохо&lt;lb/&gt;Смотрим )&lt;/p&gt;
+    &lt;p&gt;Смотрим )&lt;/p&gt;
+    &lt;p&gt; Пожалуйста, зарегистрируйтесь или авторизуйтесь, чтобы оставлять комментарии на сайте. &lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt; Комментариев: 4&lt;head rend="h3"&gt;Немного юмора с просторов соцсетей (23 фото)&lt;/head&gt;&lt;/item&gt;
+      &lt;item&gt; Комментариев: 2&lt;head rend="h3"&gt;На мужчину напал голодный леопард&lt;/head&gt;&lt;/item&gt;
+      &lt;item&gt; Комментариев: 2&lt;head rend="h3"&gt;Аист неожиданно заглянул на шашлыки&lt;/head&gt;&lt;/item&gt;
+      &lt;item&gt; Комментариев: 1&lt;head rend="h3"&gt;Смешные картинки - 07.08.2026 (15 фото)&lt;/head&gt;&lt;/item&gt;
+      &lt;item&gt; Комментариев: 1&lt;head rend="h3"&gt;Интересные факты на все случаи жизни (15 фото)&lt;/head&gt;&lt;/item&gt;
+      &lt;item&gt; Комментариев: 1&lt;head rend="h3"&gt;Подборка гифок - 07.08.2026 (25 гифок)&lt;/head&gt;&lt;/item&gt;
+      &lt;item&gt; Комментариев: 1&lt;head rend="h3"&gt;Подборка картинок. Вечерний выпуск - 07.08.2026 (30 фото)&lt;/head&gt;&lt;/item&gt;
+      &lt;item&gt; Комментариев: 14&lt;head rend="h3"&gt;Лаврушка в трусы: лайфхак для девушек&lt;/head&gt;&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt; 2810&lt;/item&gt;
+      &lt;item&gt; 2745&lt;/item&gt;
+      &lt;item&gt; 3092&lt;/item&gt;
+      &lt;item&gt; 2423&lt;/item&gt;
+      &lt;item&gt; 3137&lt;/item&gt;
+      &lt;item&gt; 1939&lt;/item&gt;
+      &lt;item&gt; 2801&lt;/item&gt;
+      &lt;item&gt; 1144&lt;/item&gt;
+      &lt;item&gt; 1897&lt;/item&gt;
+      &lt;item&gt; 1257&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt; Китай Москва аварии автомобили актеры актрисы видео водители девушки дети еда животные знаменитости интересное интересные факты картинка картинки кинематограф коронавирус коты мемы модели мужчины необычное новости отношения пост приколы природа работа россия собаки соцсети спорт сша твиты технологии фейлы шутки юмор&lt;lb/&gt;Показать все теги&lt;/p&gt;
+    &lt;p&gt;Показать все теги&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</description><guid isPermaLink="false">https://news.ycombinator.com/item?id=49221041</guid><pubDate>Sat, 08 Aug 2026 12:07:25 +0000</pubDate></item></channel></rss>
