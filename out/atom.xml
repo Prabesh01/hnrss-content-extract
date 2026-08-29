@@ -1,243 +1,412 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-08-29T11:12:54.238216+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=49477212</id><title>Migrating to HTTPX2</title><updated>2026-08-29T11:13:01.327902+00:00</updated><content>&lt;doc fingerprint="b41def5c930c65d4"&gt;
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en"><id>hnrss.org/frontpage</id><title>Hacker News: Front Page</title><updated>2026-08-29T15:40:53.782050+00:00</updated><link href="https://news.ycombinator.com/" rel="alternate"/><link href="https://raw.githubusercontent.com/Prabesh01/hnrss-content-extract/refs/heads/main/out/rss.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><subtitle>Hacker News RSS</subtitle><entry><id>https://news.ycombinator.com/item?id=49450782</id><title>Hunting Down a Go Runtime Bug on 32-Bit Embedded Systems</title><updated>2026-08-29T15:41:02.655415+00:00</updated><content>&lt;doc fingerprint="fa67885f8686ae40"&gt;
   &lt;main&gt;
-    &lt;p&gt;The OpenAI Python SDK now uses HTTPX2 for its synchronous and asynchronous HTTP clients. HTTPX2 is installed automatically with &lt;code&gt;openai&lt;/code&gt;; the previous &lt;code&gt;httpx&lt;/code&gt; package is not. This guide explains what
-changes for applications that interact with the SDK's HTTP layer.&lt;/p&gt;
-    &lt;p&gt;If you construct an &lt;code&gt;OpenAI&lt;/code&gt; or
-&lt;code&gt;AsyncOpenAI&lt;/code&gt; client without providing &lt;code&gt;http_client&lt;/code&gt;, your existing API calls,
-parsed response models, streaming APIs, authentication, retries, and numeric
-timeouts continue to work:&lt;/p&gt;
-    &lt;code&gt;from openai import OpenAI
+    &lt;p&gt;Our daily work usually revolves around Linux and security topics, deep down in the software stack. Still, more often than you might think, we end up debugging applications which live much higher up. Sometimes such a problem has its roots in the Linux kernel, sometimes elsewhere. In this blog post we show how we found and fixed a bug inside the Go runtime.&lt;/p&gt;
+    &lt;p&gt;Recently a customer reported that an application written in Go crashes from time to time on one of their embedded Linux systems.&lt;/p&gt;
+    &lt;p&gt;The crash was always the same fatal error with the following signature:&lt;/p&gt;
+    &lt;code&gt;runtime: netpoll: eventfd ready for 5
+fatal error: runtime: netpoll: eventfd ready for something unexpected
+...stack trace...
+&lt;/code&gt;
+    &lt;p&gt;At first we assumed that the application itself was buggy and needed fixing. But after inspecting the error more closely, it looked much more like an internal assumption in Go’s netpoll mechanism no longer holds.&lt;/p&gt;
+    &lt;p&gt;The error message comes from &lt;code&gt;netpoll()&lt;/code&gt; in src/runtime/netpoll_epoll.go:&lt;/p&gt;
+    &lt;code&gt;if ev.Events != linux.EPOLLIN {
+        println("runtime: netpoll: eventfd ready for", ev.Events)
+        throw("runtime: netpoll: eventfd ready for something unexpected")
+}
+&lt;/code&gt;
+    &lt;p&gt;In this code path, the netpoll code expects &lt;code&gt;EPOLLIN&lt;/code&gt; to be the only firing event, but it got something else.
+In our case it got &lt;code&gt;5&lt;/code&gt;, which is &lt;code&gt;EPOLLIN|EPOLLOUT&lt;/code&gt;.
+Why would epoll suddenly report more than &lt;code&gt;EPOLLIN&lt;/code&gt; if the code asked only for &lt;code&gt;EPOLLIN&lt;/code&gt;?&lt;/p&gt;
+    &lt;p&gt;Before digging deeper, we threw the error message into a search engine, hoping that somebody else had faced the same issue before. This led us straight to a report in the Go project’s issue tracker: runtime: netpoll: eventfd ready for something unexpected.&lt;/p&gt;
+    &lt;p&gt;The issue describes exactly the fatal error we saw. Also on a 32-bit ARM embedded Linux system! The reporters also noted that the crash happens in applications which run for a long time. That matched our customer’s description, too. Bingo!&lt;/p&gt;
+    &lt;p&gt;The issue had been open and unresolved since March 2025. The Go maintainers had also rejected one attempt to fix the problem.&lt;/p&gt;
+    &lt;p&gt;From the comments on the issue we learned that the fatal error only ever showed up on 32-bit ARM and i386 Linux systems, with all kinds of kernel versions. Some kernels were rather old, others recent. Not a single reporter saw it on an x86_64 or arm64 system.&lt;/p&gt;
+    &lt;p&gt;The problem had multiple reporters but no fix, so we decided to dig into the issue ourselves. At the very least we could give the Go folks better input.&lt;/p&gt;
+    &lt;p&gt;Initially we suspected that epoll behaves differently on 32-bit ARM or i386. We ditched this idea quickly since epoll is generic core code in the kernel. Why would it return a spurious event set only on 32-bit ARM or i386?&lt;/p&gt;
+    &lt;p&gt;Still, the fact that the error showed up only on 32-bit systems gnawed at us. As a next step we reviewed the epoll usage in Go’s netpoll code. With the help of an LLM we went through &lt;code&gt;src/runtime/netpoll_epoll.go&lt;/code&gt;, focusing on 32-bit pitfalls such as integer conversions.&lt;/p&gt;
+    &lt;p&gt;The review revealed that Go’s netpoll code uses the &lt;code&gt;data&lt;/code&gt; field of &lt;code&gt;struct epoll_event&lt;/code&gt;.
+Linux epoll can store an 8 byte cookie in the kernel and returns it as part of the firing event to user space.
+Applications use this cookie to attach metadata to an event, for example to tell different event sources apart.&lt;/p&gt;
+    &lt;code&gt;struct epoll_event {
+    __poll_t  events;   /* ev.Events in Go netpoll */
+    __u64     data;     /* ev.Data in Go netpoll */
+};
+&lt;/code&gt;
+    &lt;p&gt;Deep inside the Go runtime, the main event handler needs to know whether an event belongs to an event fd or a socket fd. It decides by comparing &lt;code&gt;ev.Data&lt;/code&gt; to the address of its internal event fd object:&lt;/p&gt;
+    &lt;code&gt;if *(**uintptr)(unsafe.Pointer(&amp;amp;ev.Data)) == &amp;amp;netpollEventFd {
+...
+}
+&lt;/code&gt;
+    &lt;p&gt;Reading further through the code showed that &lt;code&gt;ev.Data&lt;/code&gt; holds either a raw pointer to &lt;code&gt;netpollEventFd&lt;/code&gt; or a tagged pointer to a per-socket object, &lt;code&gt;pollDesc&lt;/code&gt;.
+The pointer tag is a counter, &lt;code&gt;fdseq&lt;/code&gt;, which distinguishes recycled &lt;code&gt;pollDesc&lt;/code&gt; objects.&lt;/p&gt;
+    &lt;p&gt;So far so good. Mixing raw and tagged pointers in the same field looked fishy to us. But how this relates to the crash was not clear yet.&lt;/p&gt;
+    &lt;p&gt;Inspecting how Go lays out tagged pointers in memory finally revealed the core of the issue.&lt;/p&gt;
+    &lt;p&gt;On 32-bit platforms, Go’s tagged pointer logic packs the full 32-bit address and up to 32 tag bits into an 8 byte word. The tag goes into the lower 4 bytes and the address into the upper 4 bytes.&lt;/p&gt;
+    &lt;p&gt;Storing a tagged pointer with address &lt;code&gt;0x00123456&lt;/code&gt; and tag &lt;code&gt;0x12&lt;/code&gt; fills &lt;code&gt;ev.Data&lt;/code&gt; like this:&lt;/p&gt;
+    &lt;code&gt; ev.Data[0:4]        ev.Data[4:8]
++------------------+-------------------+
+|  fdseq           |  *pollDesc        |
+|  e.g. 0x00000012 |  e.g. 0x00123456  |
++------------------+-------------------+
+&lt;/code&gt;
+    &lt;p&gt;Storing the raw pointer, on the other hand, leaves the following contents in &lt;code&gt;ev.Data&lt;/code&gt;:&lt;/p&gt;
+    &lt;code&gt; ev.Data[0:4]       ev.Data[4:8]
++------------------+-------------------+
+|  &amp;amp;netpollEventFd |  0 (untouched)    |
+|  e.g. 0x00123456 |  0x00000000       |
++------------------+-------------------+
+&lt;/code&gt;
+    &lt;p&gt;The lower 4 bytes hold the address of the object. The upper 4 bytes stay untouched since an address is only 4 bytes long on a 32-bit system.&lt;/p&gt;
+    &lt;p&gt;This finally shows the root of the problem. The comparison of &lt;code&gt;ev.Data&lt;/code&gt; with &lt;code&gt;&amp;amp;netpollEventFd&lt;/code&gt; evaluates only the lower 4 bytes of &lt;code&gt;ev.Data&lt;/code&gt;.
+The code casts &lt;code&gt;ev.Data&lt;/code&gt; to &lt;code&gt;uintptr&lt;/code&gt;, which is 4 bytes on 32-bit platforms.
+So the address of the &lt;code&gt;netpollEventFd&lt;/code&gt; object aliases with &lt;code&gt;fdseq&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;As soon as &lt;code&gt;fdseq&lt;/code&gt; grows large enough to match &lt;code&gt;&amp;amp;netpollEventFd&lt;/code&gt;, the netpoll logic mistakes a socket fd for an event fd.
+Internal assumptions fall apart, among them the assumption that the ready event is just &lt;code&gt;EPOLLIN&lt;/code&gt;.&lt;/p&gt;
+    &lt;p&gt;Note that this aliasing can only happen on 32-bit little endian systems. On a 64-bit system, the comparison always covers the whole 8 bytes. On a 32-bit big endian system, the comparison would read the upper 4 bytes, which contain the address.&lt;/p&gt;
+    &lt;p&gt;&lt;code&gt;fdseq&lt;/code&gt; needs to grow into the millions before it matches &lt;code&gt;&amp;amp;netpollEventFd&lt;/code&gt;.
+That’s why the problem shows up only in long-running programs which create lots of &lt;code&gt;pollDesc&lt;/code&gt; objects over time.
+On a typical 32-bit ARM Linux system, &lt;code&gt;netpollEventFd&lt;/code&gt; resides in a read-only section within the first 3 MiB of the address space, as the memory map of our test program shows:&lt;/p&gt;
+    &lt;code&gt;$ pmap `pidof netpoll_test`
+204:   /opt/netpoll_test
+00010000   2696K r-x-- netpoll_test
+002c0000   2192K r---- netpoll_test
+004f0000    180K rw--- netpoll_test
+...
+&lt;/code&gt;
+    &lt;p&gt;So &lt;code&gt;fdseq&lt;/code&gt; needs to reach a value of about 3 million before the crash can happen.&lt;/p&gt;
+    &lt;p&gt;We also created a standalone test case for the problem. On our test systems, it triggered the crash within a few minutes:&lt;/p&gt;
+    &lt;code&gt;$ /tmp/repro.arm.system
+netpoll eventfd-alias reproducer (GOOS=linux GOARCH=arm)
+runtime.netpollEventFd is at address 0x223008
+crash expected around cycle 2240520
 
-client = OpenAI(timeout=30.0)
-response = client.responses.create(model="gpt-5.5", input="Hello")&lt;/code&gt;
-    &lt;p&gt;No HTTPX2 extra or separate installation is required:&lt;/p&gt;
-    &lt;code&gt;pip install openai&lt;/code&gt;
-    &lt;p&gt;If your application imported &lt;code&gt;httpx&lt;/code&gt; only because an earlier SDK installed it
-transitively, add your own &lt;code&gt;httpx&lt;/code&gt; dependency or migrate those imports to
-&lt;code&gt;httpx2&lt;/code&gt;. Installing the SDK no longer installs &lt;code&gt;httpx&lt;/code&gt; for you.&lt;/p&gt;
-    &lt;p&gt;HTTPX2 changes the default TLS trust store, including for applications that use the SDK's default HTTP client. HTTPX previously verified certificates against the CA bundle provided by &lt;code&gt;certifi&lt;/code&gt;. HTTPX2 instead uses the
-operating-system trust store, and the SDK no longer installs &lt;code&gt;certifi&lt;/code&gt;.&lt;/p&gt;
-    &lt;p&gt;This can break certificate verification in minimal container images without system CA certificates, environments using corporate TLS-inspecting proxies, and deployments that relied on a custom or modified &lt;code&gt;certifi&lt;/code&gt; bundle. Install
-the required CA certificates in the operating-system trust store, or configure
-an explicit certificate bundle:&lt;/p&gt;
-    &lt;code&gt;export SSL_CERT_FILE=/path/to/ca-bundle.pem&lt;/code&gt;
-    &lt;p&gt;Alternatively, configure a directory of trusted CA certificates:&lt;/p&gt;
-    &lt;code&gt;export SSL_CERT_DIR=/path/to/ca-directory&lt;/code&gt;
-    &lt;p&gt;These environment variables are honored when &lt;code&gt;trust_env=True&lt;/code&gt;, which is the
-default. To control trust explicitly on a custom client, pass an
-&lt;code&gt;ssl.SSLContext&lt;/code&gt; through &lt;code&gt;verify&lt;/code&gt;:&lt;/p&gt;
-    &lt;code&gt;import ssl
-from openai import OpenAI, DefaultHttpx2Client
+cycle 2236988runtime: netpoll: eventfd ready for 4
+fatal error: runtime: netpoll: eventfd ready for something unexpected
 
-ssl_context = ssl.create_default_context(cafile="/path/to/ca-bundle.pem")
-client = OpenAI(http_client=DefaultHttpx2Client(verify=ssl_context))&lt;/code&gt;
-    &lt;p&gt;Use &lt;code&gt;DefaultAsyncHttpx2Client(verify=ssl_context)&lt;/code&gt; for the equivalent async
-configuration. The SDK's aiohttp transport uses the same HTTPX2 TLS settings.&lt;/p&gt;
-    &lt;p&gt;Use HTTPX2 clients and HTTPX2 configuration objects. The SDK provides helpers that preserve its recommended timeout, connection-pool, and redirect defaults:&lt;/p&gt;
-    &lt;code&gt;import httpx2
-from openai import OpenAI, AsyncOpenAI, DefaultHttpx2Client, DefaultAsyncHttpx2Client
-
-proxy_client = OpenAI(http_client=DefaultHttpx2Client(proxy="http://proxy.example.com:8080"))
-
-transport_client = OpenAI(
-    http_client=DefaultHttpx2Client(
-        transport=httpx2.HTTPTransport(local_address="0.0.0.0"),
-        timeout=httpx2.Timeout(30.0, connect=5.0),
-    )
-)
-
-async_client = AsyncOpenAI(http_client=DefaultAsyncHttpx2Client(timeout=httpx2.Timeout(30.0)))&lt;/code&gt;
-    &lt;p&gt;Directly constructed &lt;code&gt;httpx2.Client&lt;/code&gt; and &lt;code&gt;httpx2.AsyncClient&lt;/code&gt; instances are
-also supported. When you construct a client directly, its own HTTPX2 defaults
-apply unless you configure them yourself.&lt;/p&gt;
-    &lt;p&gt;The existing &lt;code&gt;DefaultHttpxClient&lt;/code&gt; and &lt;code&gt;DefaultAsyncHttpxClient&lt;/code&gt; names continue
-to work, but now construct HTTPX2 clients. Prefer &lt;code&gt;DefaultHttpx2Client&lt;/code&gt; and
-&lt;code&gt;DefaultAsyncHttpx2Client&lt;/code&gt; when making the HTTP client family explicit.&lt;/p&gt;
-    &lt;p&gt;Module-level configuration follows the same rule:&lt;/p&gt;
-    &lt;code&gt;import openai
-
-openai.http_client = openai.DefaultHttpx2Client()&lt;/code&gt;
-    &lt;p&gt;Replace HTTPX-specific objects with the corresponding HTTPX2 objects:&lt;/p&gt;
-    &lt;table&gt;
-      &lt;row&gt;
-        &lt;cell role="head"&gt;Previous object&lt;/cell&gt;
-        &lt;cell role="head"&gt;HTTPX2 object&lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx.Client&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx2.Client&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx.AsyncClient&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx2.AsyncClient&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx.Timeout&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx2.Timeout&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx.URL&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx2.URL&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx.Limits&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx2.Limits&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx.HTTPTransport&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx2.HTTPTransport&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx.AsyncHTTPTransport&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx2.AsyncHTTPTransport&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-      &lt;row&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx.MockTransport&lt;/code&gt;
-        &lt;/cell&gt;
-        &lt;cell&gt;
-          &lt;code&gt;httpx2.MockTransport&lt;/code&gt;
-        &lt;/cell&gt;
-      &lt;/row&gt;
-    &lt;/table&gt;
-    &lt;p&gt;For example, a granular SDK timeout becomes:&lt;/p&gt;
-    &lt;code&gt;import httpx2
-from openai import OpenAI
-
-client = OpenAI(timeout=httpx2.Timeout(60.0, connect=5.0, read=20.0))&lt;/code&gt;
-    &lt;p&gt;Numeric timeout values do not change. Existing string URLs do not change. Custom transport subclasses, mounted transports, proxy integrations, and connection-pool instrumentation must target HTTPX2's transport interfaces.&lt;/p&gt;
-    &lt;p&gt;Authentication handlers and hooks receive HTTPX2 request and response objects. Update custom auth classes and annotations accordingly:&lt;/p&gt;
-    &lt;code&gt;import httpx2
-from openai import OpenAI, DefaultHttpx2Client
-
-
-def log_request(request: httpx2.Request) -&amp;gt; None:
-    print(request.method, request.url)
-
-
-client = OpenAI(http_client=DefaultHttpx2Client(event_hooks={"request": [log_request]}))&lt;/code&gt;
-    &lt;p&gt;If you subclass an HTTP authentication or transport interface, subclass the matching &lt;code&gt;httpx2&lt;/code&gt; class. Third-party instrumentation, tracing middleware, and
-auth integrations must explicitly support HTTPX2.&lt;/p&gt;
-    &lt;p&gt;Parsed SDK response models are unchanged. When using a native HTTPX2 client, transport-facing objects belong to HTTPX2:&lt;/p&gt;
-    &lt;code&gt;import httpx2
-from openai import OpenAI
-
-client = OpenAI()
-response = client.models.with_raw_response.list()
-
-assert isinstance(response.http_response, httpx2.Response)
-assert isinstance(response.http_request, httpx2.Request)&lt;/code&gt;
-    &lt;p&gt;With a native client, use &lt;code&gt;cast_to=httpx2.Response&lt;/code&gt; when requesting an unparsed
-HTTP response. Streaming response wrappers also expose HTTPX2 response objects.
-Application code should usually catch SDK exceptions such as
-&lt;code&gt;openai.APITimeoutError&lt;/code&gt; and &lt;code&gt;openai.APIConnectionError&lt;/code&gt;; with a native client,
-an exception's underlying transport cause is an HTTPX2 exception.&lt;/p&gt;
-    &lt;p&gt;These type guarantees apply only to native HTTPX2 clients. An injected legacy HTTPX client produces &lt;code&gt;httpx.Request&lt;/code&gt;, &lt;code&gt;httpx.Response&lt;/code&gt;, and HTTPX transport
-exceptions instead, even if &lt;code&gt;cast_to=httpx2.Response&lt;/code&gt; is supplied.&lt;/p&gt;
-    &lt;p&gt;The supported aiohttp extra uses an HTTPX2-native transport. It does not install legacy HTTPX or the external &lt;code&gt;httpx-aiohttp&lt;/code&gt; adapter:&lt;/p&gt;
-    &lt;code&gt;pip install 'openai[aiohttp]'&lt;/code&gt;
-    &lt;code&gt;from openai import AsyncOpenAI, DefaultAioHttpClient
-
-client = AsyncOpenAI(http_client=DefaultAioHttpClient())&lt;/code&gt;
-    &lt;p&gt;&lt;code&gt;DefaultAioHttpClient()&lt;/code&gt; is an &lt;code&gt;httpx2.AsyncClient&lt;/code&gt;. Applications using this
-helper do not need to construct or import the transport directly.&lt;/p&gt;
-    &lt;p&gt;Mocks must intercept HTTPX2 requests and return HTTPX2 responses. For example:&lt;/p&gt;
-    &lt;code&gt;import httpx2
-from openai import OpenAI
-
-
-def handler(request: httpx2.Request) -&amp;gt; httpx2.Response:
-    return httpx2.Response(
-        200,
-        request=request,
-        json={"object": "list", "data": []},
-    )
-
-
-client = OpenAI(http_client=httpx2.Client(transport=httpx2.MockTransport(handler)))
-assert client.models.list().data == []&lt;/code&gt;
-    &lt;p&gt;If your test suite uses RESPX, update to an HTTPX2-compatible RESPX version or fork. A RESPX version that patches only legacy HTTPX cannot intercept the SDK's default HTTPX2 client. If you cannot migrate that integration immediately, the temporary legacy-client escape hatch below lets existing HTTPX-only RESPX setups continue to work while you migrate.&lt;/p&gt;
-    &lt;p&gt;Applications that depend on an HTTPX-only transport, integration, or mocking library can explicitly install legacy HTTPX and inject a legacy client:&lt;/p&gt;
-    &lt;code&gt;pip install openai httpx&lt;/code&gt;
-    &lt;p&gt;Legacy HTTPX support is runtime-only. The SDK's public type annotations accept HTTPX2 clients, so passing a legacy client directly fails static type checking in mypy, Pyright, and similar tools. Use &lt;code&gt;cast(Any, ...)&lt;/code&gt; or a
-targeted type-ignore when deliberately choosing this compatibility path:&lt;/p&gt;
-    &lt;code&gt;from typing import Any, cast
-
-import httpx
-from openai import OpenAI
-
-client = OpenAI(http_client=cast(Any, httpx.Client()))&lt;/code&gt;
-    &lt;p&gt;The asynchronous form requires the same workaround:&lt;/p&gt;
-    &lt;code&gt;from typing import Any, cast
-
-import httpx
-from openai import AsyncOpenAI
-
-client = AsyncOpenAI(http_client=cast(Any, httpx.AsyncClient()))&lt;/code&gt;
-    &lt;p&gt;Legacy clients preserve the HTTPX request, response, and exception families. Request raw responses as &lt;code&gt;httpx.Response&lt;/code&gt;, using the same type-checking
-workaround for the legacy response class:&lt;/p&gt;
-    &lt;code&gt;from typing import Any, cast
-
-import httpx
-from openai import OpenAI
-
-client = OpenAI(http_client=cast(Any, httpx.Client()))
-response = client.get("/models", cast_to=cast(Any, httpx.Response))
-
-assert isinstance(response, httpx.Response)&lt;/code&gt;
-    &lt;p&gt;Passing &lt;code&gt;cast_to=httpx2.Response&lt;/code&gt; does not convert a legacy HTTPX response into
-an HTTPX2 response. Install and maintain the legacy dependency yourself.
-Legacy HTTPX support is provided as a migration aid and may be discontinued.&lt;/p&gt;
-    &lt;p&gt;If you must retain an existing &lt;code&gt;httpx-aiohttp&lt;/code&gt; integration, install it
-explicitly and inject its legacy client:&lt;/p&gt;
-    &lt;code&gt;pip install openai httpx-aiohttp&lt;/code&gt;
-    &lt;code&gt;from typing import Any, cast
-
-from httpx_aiohttp import HttpxAiohttpClient
-from openai import AsyncOpenAI
-
-client = AsyncOpenAI(http_client=cast(Any, HttpxAiohttpClient()))&lt;/code&gt;
-    &lt;p&gt;This path is covered by dedicated compatibility tests, including a real request through the aiohttp transport, but remains a temporary escape hatch. Prefer &lt;code&gt;openai[aiohttp]&lt;/code&gt; and &lt;code&gt;DefaultAioHttpClient()&lt;/code&gt; for new code.&lt;/p&gt;
+runtime stack:
+...
+&lt;/code&gt;
+    &lt;p&gt;We proposed a fix which changes how netpoll tells event fds and socket fds apart. Instead of storing the raw pointer &lt;code&gt;&amp;amp;netpollEventFd&lt;/code&gt;, the fix stores a &lt;code&gt;nil&lt;/code&gt; &lt;code&gt;pollDesc&lt;/code&gt; as a tagged pointer.
+When unpacking the tagged pointer yields &lt;code&gt;nil&lt;/code&gt;, the event belongs to the event fd, otherwise to a socket fd.
+This way &lt;code&gt;ev.Data&lt;/code&gt; always contains a tagged pointer and the aliasing is gone.
+A few days later our fix was merged.&lt;/p&gt;
+    &lt;p&gt;A Go application crashed sporadically on a 32-bit ARM embedded Linux system with a fatal netpoll error. The error looked like an epoll problem, but epoll worked just fine. The Go runtime stores both a raw pointer to &lt;code&gt;netpollEventFd&lt;/code&gt; and tagged &lt;code&gt;pollDesc&lt;/code&gt; pointers in the 8 byte &lt;code&gt;ev.Data&lt;/code&gt; field.
+On 32-bit little endian systems, the raw pointer aliases with the &lt;code&gt;fdseq&lt;/code&gt; tag.
+Once a long-running program has recycled millions of &lt;code&gt;pollDesc&lt;/code&gt; objects, netpoll mistakes a socket fd for the event fd and crashes.
+Our fix stores a tagged &lt;code&gt;nil&lt;/code&gt; &lt;code&gt;pollDesc&lt;/code&gt; for the event fd instead, which removes the aliasing.&lt;/p&gt;
+    &lt;p&gt;The bug slipped into the Go runtime with Go 1.14 in 2020. It went unnoticed until the first report in March 2025 and finally got fixed in 2026. We can only speculate, but this suggests that Google itself no longer runs any 32-bit Go programs. Otherwise they would have hit the bug themselves long before we did.&lt;/p&gt;
+    &lt;p&gt;We’d like to thank Frequentis AG for providing the budget to analyze and fix the problem.&lt;/p&gt;
+    &lt;p&gt;Publish date&lt;/p&gt;
+    &lt;p&gt;22.08.2026&lt;/p&gt;
+    &lt;p&gt;Category&lt;/p&gt;
+    &lt;p&gt;embedded&lt;/p&gt;
+    &lt;p&gt;Authors&lt;/p&gt;
+    &lt;p&gt;Richard Weinberger&lt;/p&gt;
+    &lt;p&gt;sigma star gmbh&lt;lb/&gt;Eduard-Bodem-Gasse 6, 1st floor&lt;lb/&gt;6020 Innsbruck | Austria&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/openai/openai-python/blob/main/httpx2.md"/><published>2026-08-28T11:51:20+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49477564</id><title>Inception-style curved map for turn-by-turn directions</title><updated>2026-08-29T11:13:00.925808+00:00</updated><content>&lt;doc fingerprint="924c7f700e676f31"&gt;
+&lt;/doc&gt;</content><link href="https://sigma-star.at/blog/2026/08/go-runtime-netpoll-bug/"/><published>2026-08-26T15:22:48+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49456819</id><title>Europe's last regular standard-gauge steam passenger service</title><updated>2026-08-29T15:41:01.178540+00:00</updated><content>&lt;doc fingerprint="c90547b0974f5daf"&gt;
+  &lt;main&gt;
+    &lt;head rend="h3"&gt;Uwaga! Ze względu na przegląd okresowy parowozu Pt47-65 w okresie od 20 sierpnia 2026 r do 28 sierpnia 2026 r. włącznie, ruch planowy będzie prowadzony zastępczo przez lokomotywę spalinową SM42 6D.&lt;/head&gt;
+    &lt;head rend="h4"&gt;Rozkład jazdy pociągu z parowozem&lt;/head&gt;
+    &lt;p&gt;Codziennie od poniedziałku do piątku pociąg z lokomotywą parową kursuje na trasie Wolsztyn – Zbąszynek, w soboty na trasie Wolsztyn – Poznań. Pociąg z parowozem nie kursuje w ruchu planowym w niedziele i święta!&lt;/p&gt;
+    &lt;p&gt;Bilety dostępne na stronie www.koleje-wielkopolskie.com.pl, w kasie na dworcu lub u kierownika pociągu.&lt;/p&gt;
+    &lt;p&gt;Odjazd pociągu ze stacji kolejowej!&lt;/p&gt;
+    &lt;p&gt;UWAGA!&lt;/p&gt;
+    &lt;p&gt;Obowiązuje od 07.03.2026&lt;/p&gt;
+    &lt;p&gt;ROZKŁAD JAZDY The timetable&lt;/p&gt;
+    &lt;p&gt;Od poniedziałku do piątku: Wolsztyn – Zbąszynek – Wolsztyn&lt;/p&gt;
+    &lt;head rend="h5"&gt;Wolsztyn – Zbąszynek&lt;/head&gt;
+    &lt;table&gt;
+      &lt;row&gt;
+        &lt;cell role="head"&gt;Terminy kursowania&lt;/cell&gt;
+        &lt;cell role="head"&gt;Dni robocze&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Numer pociągu&lt;/cell&gt;
+        &lt;cell&gt;77385&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Wolsztyn&lt;/cell&gt;
+        &lt;cell&gt;14:23&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Tuchorza&lt;/cell&gt;
+        &lt;cell&gt;14:34&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Belęcin Wlkp.&lt;/cell&gt;
+        &lt;cell&gt;14:41&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Stefanowo&lt;/cell&gt;
+        &lt;cell&gt;14:48&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Zbąszyń Przedmieście&lt;/cell&gt;
+        &lt;cell&gt;14:55&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Zbąszyń&lt;/cell&gt;
+        &lt;cell&gt;14:59&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Zbąszynek&lt;/cell&gt;
+        &lt;cell&gt;15:09&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;head rend="h5"&gt;Zbąszynek – Wolsztyn&lt;/head&gt;
+    &lt;table&gt;
+      &lt;row&gt;
+        &lt;cell role="head"&gt;Terminy kursowania&lt;/cell&gt;
+        &lt;cell role="head"&gt;Dni robocze&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Numer pociągu&lt;/cell&gt;
+        &lt;cell&gt;77256&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Zbąszynek&lt;/cell&gt;
+        &lt;cell&gt;15:37&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Zbąszyń&lt;/cell&gt;
+        &lt;cell&gt;15:47&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Zbąszyń Przedmieście&lt;/cell&gt;
+        &lt;cell&gt;15:51&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Stefanowo&lt;/cell&gt;
+        &lt;cell&gt;15:58&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Belęcin Wlkp.&lt;/cell&gt;
+        &lt;cell&gt;16:05&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Tuchorza&lt;/cell&gt;
+        &lt;cell&gt;16:12&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Wolsztyn&lt;/cell&gt;
+        &lt;cell&gt;16:23&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;p&gt;W soboty: Wolsztyn – Poznań Główny – Wolsztyn&lt;/p&gt;
+    &lt;head rend="h5"&gt;Wolsztyn – Poznań&lt;/head&gt;
+    &lt;table&gt;
+      &lt;row&gt;
+        &lt;cell role="head"&gt;Terminy kursowania&lt;/cell&gt;
+        &lt;cell role="head"&gt;Sobota&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Numer pociągu&lt;/cell&gt;
+        &lt;cell&gt;77217&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Wolsztyn&lt;/cell&gt;
+        &lt;cell&gt;10:46&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Adamowo&lt;/cell&gt;
+        &lt;cell&gt;10:52&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Tłoki&lt;/cell&gt;
+        &lt;cell&gt;10:56&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Rostarzewo&lt;/cell&gt;
+        &lt;cell&gt;11:01&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Rakoniewice&lt;/cell&gt;
+        &lt;cell&gt;11:12&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Drzymałowo&lt;/cell&gt;
+        &lt;cell&gt;11:16&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Ruchocice&lt;/cell&gt;
+        &lt;cell&gt;11:22&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Grodzisk Wlkp.&lt;/cell&gt;
+        &lt;cell&gt;11:30&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Grąblewo&lt;/cell&gt;
+        &lt;cell&gt;11:36&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Ptaszkowo&lt;/cell&gt;
+        &lt;cell&gt;11:41&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Kotowo&lt;/cell&gt;
+        &lt;cell&gt;11:46&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Granowo Nowotom.&lt;/cell&gt;
+        &lt;cell&gt;11:50&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Strykowo Poz.&lt;/cell&gt;
+        &lt;cell&gt;11:58&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Stęszew&lt;/cell&gt;
+        &lt;cell&gt;12:17&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Trzebaw Rosnówko&lt;/cell&gt;
+        &lt;cell&gt;12:23&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Szreniawa&lt;/cell&gt;
+        &lt;cell&gt;12:28&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Wiry&lt;/cell&gt;
+        &lt;cell&gt;12:34&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Luboń k. Poznania&lt;/cell&gt;
+        &lt;cell&gt;12:39&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Poznań Dębiec&lt;/cell&gt;
+        &lt;cell&gt;12:44&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Poznań Główny&lt;/cell&gt;
+        &lt;cell&gt;12:50&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+    &lt;head rend="h5"&gt;Poznań – Wolsztyn&lt;/head&gt;
+    &lt;table&gt;
+      &lt;row&gt;
+        &lt;cell role="head"&gt;Terminy kursowania&lt;/cell&gt;
+        &lt;cell role="head"&gt;Sobota&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Numer pociągu&lt;/cell&gt;
+        &lt;cell&gt;77246&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Poznań Główny&lt;/cell&gt;
+        &lt;cell&gt;15:21&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Poznań Dębiec&lt;/cell&gt;
+        &lt;cell&gt;15:27&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Luboń k. Poznania&lt;/cell&gt;
+        &lt;cell&gt;15:32&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Wiry&lt;/cell&gt;
+        &lt;cell&gt;15:39&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Szreniawa&lt;/cell&gt;
+        &lt;cell&gt;15:47&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Trzebaw Rosnówko&lt;/cell&gt;
+        &lt;cell&gt;15:53&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Stęszew&lt;/cell&gt;
+        &lt;cell&gt;16:00&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Strykowo Poz.&lt;/cell&gt;
+        &lt;cell&gt;16:12&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Granowo Nowotom.&lt;/cell&gt;
+        &lt;cell&gt;16:35&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Kotowo&lt;/cell&gt;
+        &lt;cell&gt;16:40&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Ptaszkowo&lt;/cell&gt;
+        &lt;cell&gt;16:45&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Grąblewo&lt;/cell&gt;
+        &lt;cell&gt;16:51&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Grodzisk Wlkp.&lt;/cell&gt;
+        &lt;cell&gt;16:57&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Ruchocice&lt;/cell&gt;
+        &lt;cell&gt;17:08&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Drzymałowo&lt;/cell&gt;
+        &lt;cell&gt;17:14&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Rakoniewice&lt;/cell&gt;
+        &lt;cell&gt;17:20&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Rostarzewo&lt;/cell&gt;
+        &lt;cell&gt;17:26&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Tłoki&lt;/cell&gt;
+        &lt;cell&gt;17:33&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Adamowo&lt;/cell&gt;
+        &lt;cell&gt;17:37&lt;/cell&gt;
+      &lt;/row&gt;
+      &lt;row&gt;
+        &lt;cell&gt;Wolsztyn&lt;/cell&gt;
+        &lt;cell&gt;17:44&lt;/cell&gt;
+      &lt;/row&gt;
+    &lt;/table&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://parowozowniawolsztyn.pl/?page_id=2141"/><published>2026-08-26T22:32:00+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49472216</id><title>The Twelve-Factor App (2025)</title><updated>2026-08-29T15:41:00.960500+00:00</updated><content>&lt;doc fingerprint="ddda8b7924b4138a"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Introduction&lt;/head&gt;
+    &lt;p&gt;In the modern era, software is commonly delivered as a service: called web apps, or software-as-a-service. The twelve-factor app is a methodology for building software-as-a-service apps that:&lt;/p&gt;
+    &lt;list rend="ul"&gt;
+      &lt;item&gt;Use declarative formats for setup automation, to minimize time and cost for new developers joining the project;&lt;/item&gt;
+      &lt;item&gt;Have a clean contract with the underlying operating system, offering maximum portability between execution environments;&lt;/item&gt;
+      &lt;item&gt;Are suitable for deployment on modern cloud platforms, obviating the need for servers and systems administration;&lt;/item&gt;
+      &lt;item&gt;Minimize divergence between development and production, enabling continuous deployment for maximum agility;&lt;/item&gt;
+      &lt;item&gt;And can scale up without significant changes to tooling, architecture, or development practices.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;The twelve-factor methodology can be applied to apps written in any programming language, and which use any combination of backing services (database, queue, memory cache, etc).&lt;/p&gt;
+    &lt;head rend="h1"&gt;Background&lt;/head&gt;
+    &lt;p&gt;The contributors to this document have been directly involved in the development and deployment of hundreds of apps, and indirectly witnessed the development, operation, and scaling of hundreds of thousands of apps via our work on the Heroku platform.&lt;/p&gt;
+    &lt;p&gt;This document synthesizes all of our experience and observations on a wide variety of software-as-a-service apps in the wild. It is a triangulation on ideal practices for app development, paying particular attention to the dynamics of the organic growth of an app over time, the dynamics of collaboration between developers working on the app’s codebase, and avoiding the cost of software erosion.&lt;/p&gt;
+    &lt;p&gt;Our motivation is to raise awareness of some systemic problems we’ve seen in modern application development, to provide a shared vocabulary for discussing those problems, and to offer a set of broad conceptual solutions to those problems with accompanying terminology. The format is inspired by Martin Fowler’s books Patterns of Enterprise Application Architecture and Refactoring.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://12factor.net/"/><published>2026-08-27T22:41:11+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49477564</id><title>Inception-style curved map for turn-by-turn directions</title><updated>2026-08-29T15:41:00.535678+00:00</updated><content>&lt;doc fingerprint="924c7f700e676f31"&gt;
   &lt;main&gt;
     &lt;p&gt;Start navigation Patent pending · PCT/EP2026/058725 Navigation Reimagined. Preparing Demo 2 - v72… 0% Loading Orbify scene Loading… Demo 2 - v72 · © 2026 Orbify · Patent Pending · PCT/EP2026/058725&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.orbify.eu/demo/"/><published>2026-08-28T12:29:05+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49477854</id><title>U.S. sanctions against the A/I Collective</title><updated>2026-08-29T11:13:00.093801+00:00</updated><content>&lt;doc fingerprint="f61093434957c394"&gt;
+&lt;/doc&gt;</content><link href="https://www.orbify.eu/demo/"/><published>2026-08-28T12:29:05+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49477854</id><title>U.S. sanctions against the A/I Collective</title><updated>2026-08-29T15:40:59.641272+00:00</updated><content>&lt;doc fingerprint="f61093434957c394"&gt;
   &lt;main&gt;&lt;head rend="h1"&gt;Welcome to A/I&lt;/head&gt;&lt;head rend="h1"&gt;U.S. SANCTIONS AGAINST THE A/I COLLECTIVE&lt;/head&gt;&lt;p&gt;A/I (Autistici/Inventati, pronounced [au’tistiÊ§i]-[iÅ’vÉntati], or [iÅvÉn’tati]) was born in 2001 from an encounter of individuals and collectives of the autonomous anticapitalist movement interested in technology and active in the digital rights struggle. We believe that this world is far from being the best world possible. We react by providing a platform and tools for digital self-defense addressing the need of free communication for activists and other individuals.&lt;/p&gt;&lt;p&gt;All of our services are provided for free, without any form of control or commoditization of the personal user data. We don’t receive any form of compensation for our work. We are volunteers exploiting the experiences we accumulated over years of technological, political and legal research while doing radical activism, and we are motivated and inspired by the principles of solidarity and self organization.&lt;/p&gt;&lt;p&gt;Our financial strategy relies exclusively on voluntary donations.&lt;/p&gt;&lt;p&gt;We provide our services strictly for non-commercial use, in order to provide support exclusively to individuals or groups we feel we have an affinity with. In order to verify the existence of these pre-conditions, each and every service request is processed manually by one of our volunteers and is in a dialogical form. All requests are anonymized and will be destroyed.&lt;/p&gt;&lt;p&gt;If you would like to use our services, please check if you agree with our manifesto, pledge respect to our policy and read carefully our privacy policy.&lt;/p&gt;&lt;p&gt;Don’t send a request without having read these documents!&lt;/p&gt;JavaScript license information&lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.inventati.org/"/><published>2026-08-28T12:58:53+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49478178</id><title>Htmx 4.0</title><updated>2026-08-29T11:12:59.821708+00:00</updated><content>&lt;doc fingerprint="bea7987a2e8384f4"&gt;
+&lt;/doc&gt;</content><link href="https://www.inventati.org/"/><published>2026-08-28T12:58:53+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49478178</id><title>Htmx 4.0</title><updated>2026-08-29T15:40:59.311441+00:00</updated><content>&lt;doc fingerprint="bea7987a2e8384f4"&gt;
   &lt;main&gt;
     &lt;head rend="h2"&gt;htmx 4.0.0 Release&lt;/head&gt;
     &lt;p&gt;The htmx team is very happy to announce the release of htmx 4.0.0! This is the culmination of 8 months of work (plus a game) and we are very happy with the results.&lt;/p&gt;
@@ -431,35 +600,67 @@ templates/index.html:9: [old-api] htmx.addClass() is removed -&amp;gt; use eleme
     &lt;p&gt;Wouldn’t be an htmx update without upgrade music:&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://four.htmx.org/announcements/2026-08-28-htmx-4.0.0-is-released"/><published>2026-08-28T13:28:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49478401</id><title>State of the Map 2026</title><updated>2026-08-29T11:12:59.581837+00:00</updated><content>&lt;doc fingerprint="7ac5735c0feef379"&gt;
+&lt;/doc&gt;</content><link href="https://four.htmx.org/announcements/2026-08-28-htmx-4.0.0-is-released"/><published>2026-08-28T13:28:56+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49479546</id><title>Creating the Aetheryte Radio</title><updated>2026-08-29T15:40:59.042691+00:00</updated><content>&lt;doc fingerprint="a62c0850f9ed409d"&gt;
   &lt;main&gt;
-    &lt;p&gt;State of the Map is the annual event for all mappers and OpenStreetMap users. In 2026 the State of the Map conference will be taking place in Paris and online. It will be a three day conference packed with talks, workshops, discussion rounds and more.&lt;/p&gt;
-    &lt;p&gt;Your organising team.&lt;/p&gt;
-    &lt;p&gt;If you are attending the conference either in person in Paris or online, here are some useful links to find information:&lt;/p&gt;
-    &lt;p&gt; Paris, France&lt;lb/&gt; Cité Descartes, Champs-sur-Marne &lt;lb/&gt; 48° 50′ 30″ N, 2° 35′ 15″ E &lt;/p&gt;
-    &lt;p&gt;August 28 - 30, 2026&lt;/p&gt;
-    &lt;p&gt;“Every year, State of the Map brings together individuals and organizations that are pushing the boundaries of what open mapping can achieve. It is a unique space where local knowledge meets global impact, and where ideas evolve into collaborations that benefit the entire OpenStreetMap ecosystem.&lt;/p&gt;
-    &lt;p&gt;TomTom is proud to support an event that continues to strengthen the OSM ecosystem and foster meaningful collaboration across the mapping community. We look forward to the conversations, innovations, and partnerships that will emerge from this year's State of the Map, helping to drive the future of open mapping forward.”&lt;/p&gt;
-    &lt;p&gt;“Michelin is building a world-leading manufacturer of life-changing composites and experiences. Pioneering engineered materials for more than 130 years, Michelin is uniquely positioned to make decisive contributions to human progress and to a more sustainable world. Drawing on its deep know-how in polymer composites, Michelin is constantly innovating to manufacture high-quality tires and components for critical applications in demanding fields as varied as mobility, construction, aeronautics, low-carbon energies, and healthcare. The care placed in its products and deep customer knowledge inspire Michelin to offer the finest experiences. This spans from providing data- and AI-based connected solutions for professional fleets to recommending outstanding restaurants and hotels curated by the MICHELIN Guide. Headquartered in Clermont-Ferrand, France, Michelin is present in 175 countries and employs 122,600 people.”&lt;/p&gt;
+    &lt;head rend="h1"&gt;creating the aetheryte radio&lt;/head&gt;
+    &lt;p&gt;sometimes when i work i like to listen to ambiance. one video in particular is the "aetheryte asmr", which is an in game recording of the aetheryte crystal. for the past 6 years i've been listening to the same youtube video on repeat. there are a number of problems with this approach:&lt;/p&gt;
+    &lt;list rend="ol"&gt;
+      &lt;item&gt;the youtube player's "loop" functionality doesn't always work. it might loop 20 or 200 times before failing(?) and auto-playing another video. this is jarring.&lt;/item&gt;
+      &lt;item&gt;the audio in the video is a ~7 minute recording, but the loop isn't seamless (i spent far too long re-architecting my music player's internals to support gapless playback), and while it's long enough that i don't care when it cuts and loops, it would be nice if it were seamless.&lt;/item&gt;
+      &lt;item&gt;of course i can't keep the game open.. that's far too resource intensive, other players (ffxiv is an mmorpg) could approach nearby and create noise and ruin the effect, etc.&lt;/item&gt;
+    &lt;/list&gt;
+    &lt;p&gt;none of these were deal breakers for me. 6 years is a pretty long time to go facing some struggles before sitting down and deciding to tackle a problem.&lt;/p&gt;
+    &lt;p&gt;nevertheless, one day i finally sat down and thought to myself.. "how can i get the best experience for the ambience without sacrifice?"&lt;/p&gt;
+    &lt;p&gt;the first answer is that i needed to get the game assets. whatever the game was using to play the noise, i needed to extract. with those in hand, i could recreate or play with them in whichever way i wanted.&lt;/p&gt;
+    &lt;head rend="h2"&gt;getting the source assets&lt;/head&gt;
+    &lt;p&gt;ffxiv isn't a super well protected game (at least i don't think.) if you web search "ffxiv data explorer" there are old java apps that load up the asset packages from the games install directory and let you export (presumably) compressed assets. i don't remember which fork i used, but i do know that it came with a hash table that mapped the file to an english file name.&lt;/p&gt;
+    &lt;p&gt;you're going to laugh at me (and honestly that's ok.) i spent 4 hours coming through 4000 audio assets trying to find the audio assets. i literally ctrl+a'd all 4000 .wav files and pressed the left and right arrow keys to move back and forth within the large mpv playlist, looking for the aetheryte noise. the funny part is that i didn't find them, and had to go to sleep at 3am.&lt;/p&gt;
+    &lt;p&gt;i'm an engineer though, right? work smarter, not harder (why didn't i do this before doing the tedious work? idk.) was there any better way to get the sound? did i miss it during my 3am comb over? (hint. i did.) turns out, there is! ffxiv has an extensive modding community and platform, and while i don't play the game much anymore, it was exhilarating to see how much effort people put into customizing their experience.&lt;/p&gt;
+    &lt;head rend="h3"&gt;xivlauncher, vfxeditor, and soundfilter&lt;/head&gt;
+    &lt;p&gt; if you boot ffxiv using xivlauncher (endorsed by my roommate who has 180 days of play time) you can load up plugins. one plugin of interest was soundfilter. i know the name is a bit misleading, but it has the ability to display the names of now playing assets. this helped a ton because i was able to teleport to a new area in the game (the aetherytes are basically waypoint / teleport crystals) and figure out which sound was being played. quickly after i found that the asset i was looking for was &lt;code&gt;bgcommon/sound/fst/placednpc_ethelight_big_loop.scd/0&lt;/code&gt;. i quickly
+exported said asset and was on my way.
+&lt;/p&gt;
+    &lt;p&gt; an interesting note about that asset is the &lt;code&gt;/0&lt;/code&gt; at the end. i'm
+pretty sure the sound "asset" contains multiple sounds (i think they
+were called tracks in game.) 0 was simply the "hum" or the low
+frequency of ambiance.
+&lt;/p&gt;
+    &lt;p&gt;sadly, getting the actual ambiance would require a bit more elbow grease. i could have just thrown these together in logic pro and called it a day, but where's the fun in that? plus, i'd have to create an excessively long track. i didn't want to be subconsciously aware of when the loop repeats. i wasn't too worried about this though, as i had the right tools up my sleeve to solve my first world made up problem.&lt;/p&gt;
+    &lt;head rend="h3"&gt;web audio api&lt;/head&gt;
+    &lt;p&gt;enter the web audio api. im not sure who (or what) did it first, but av processing tends to converge on the idea of "nodes" that produce, transmute, or consume samples. i'm pretty sure this comes from the status quo before large investments in pro-av workflows on computers, which i'd guess would be modular synths.&lt;/p&gt;
+    &lt;head rend="h4"&gt;the hum&lt;/head&gt;
+    &lt;p&gt; i didn't do much analysis on this asset in particular. i assumed (and was correct) that the loop is mostly a perfect loop. a friend of mine helped get it sample correct so that it'd loop without a click when playing with web audio api (you can instruct a "sink" node to continue supplying samples by resetting it's offset), but there wasn't any other post processing on that asset. the audio node graph is pretty simple at this point: &lt;code&gt;source node (hum.wav) -&amp;gt; gain node
+(-25db) -&amp;gt; output node&lt;/code&gt;. the gain node is there to match the volume
+adjustment made in game. the interesting (but only relatively) part of
+the graph however is the whir nodes.
+&lt;/p&gt;
+    &lt;head rend="h4"&gt;the whirs&lt;/head&gt;
+    &lt;p&gt;ffxiv plays the whirs at random intervals, pitches, and gain (volume). these are all added to create an illusion of life(?) that make it harder to detect when an asset is repeating. thankfully, ffxiv also provided values that gave the min and max values for each of the random parameters, so it was easy to translate into javascript:&lt;/p&gt;
+    &lt;quote&gt;// select a random whir const whirIndex = Math.floor(Math.random() * whirs.length); // select a random pitch const whirPlaybackRate = Math.random() * (1 - 0.794) + 0.794; // select a random volume whirGainNode.gain.value = Math.random() * (1 - 0.6) + 0.6; &lt;/quote&gt;
+    &lt;p&gt;if you've ever built a graph by hand the flow is usually something like: allocate a node, set metadata, and connect. i do the following to setup the hum:&lt;/p&gt;
+    &lt;quote&gt;const humSource = audioContext.createBufferSource(); humSource.buffer = await loadSample( audioContext, isSafari ? "assets/hum.wav.opus.aac" : "assets/hum.wav.opus", ); humSource.playbackRate.value = 0.63; humSource.connect(humGainNode); humSource.loop = true; humSource.start(0); &lt;/quote&gt;
+    &lt;p&gt; it's actually ok that i connect the node before i set loop, because the node doesn't produce samples until i call &lt;code&gt;start&lt;/code&gt;.
+&lt;/p&gt;
+    &lt;p&gt; the other part of the ceremony is the whir loop. it's not actually a loop using conventional loop control flow. instead of using a &lt;code&gt;while
+(true)&lt;/code&gt; with a random "sleep" in between, i instead use &lt;code&gt;setTimeout&lt;/code&gt; to
+schedule the next whir at a random interval.
+&lt;/p&gt;
+    &lt;quote&gt;function chooseWhir() { const whirSource = audioContext.createBufferSource(); const whirIndex = Math.floor(Math.random() * whirs.length); const whirPlaybackRate = Math.random() * (1 - 0.794) + 0.794; whirGainNode.gain.value = Math.random() * (1 - 0.6) + 0.6; whirSource.buffer = whirs[whirIndex]; whirSource.playbackRate.value = whirPlaybackRate; whirSource.connect(whirGainNode); whirSource.start(0); whirSource.onended = () =&amp;gt; { // disconnect self and re-queue another whir whirSource.disconnect(whirGainNode); const nextWhirDelay = Math.floor(Math.random() * 2001); setTimeout(chooseWhir, nextWhirDelay); }; } &lt;/quote&gt;
+    &lt;p&gt; same deal here: create a source node, select a random asset, playback rate (pitch), gain (volume), and connect it to the gain node (which stays constant in this process and only has it's value changed.) the key here is that when the source asset ends, instead of looping, we remove that node from the graph and add a new one (by calling &lt;code&gt;chooseWhir&lt;/code&gt; again.) because there is an expected delay before the
+next whir, i'm ok with adding whatever latency is added by doing the
+random calculation, it's likely marginal.
+&lt;/p&gt;
+    &lt;head rend="h3"&gt;conclusion&lt;/head&gt;
+    &lt;p&gt;this was a fun project to work on. you can demo the final result here. because we've ruined playing audio in browsers you need to interact with the page first before you can hear anything, so make sure you unmute both the whir and the hum and click "connect" to listen.&lt;/p&gt;
+    &lt;head rend="h4"&gt;vanilla js&lt;/head&gt;
+    &lt;p&gt; growing up as an engineer i didn't care too much about the web or web technologies. i was more focused on systems applications, games, and networking. im not sure where i learned to interact with the web or build web apps, but it sure wasn't the bog standard npm + react + jsx/tsx dance we have today. im not building enterprise grade web apps meant for collaboration between 100+ devs, it's just me. i didn't mind creating static elements and using &lt;code&gt;document.getElemenyById&lt;/code&gt;. it
+greatly simplified the creation process and let me move quicker and
+care about the project at hand. no frustrations with transpilation or
+jsx, my project wasn't that complicated. 
+&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://2026.stateofthemap.org/"/><published>2026-08-28T13:46:28+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49479072</id><title>Verschlimmbesserung: The Word Your Software Updates Need</title><updated>2026-08-29T11:12:59.465311+00:00</updated><content>&lt;doc fingerprint="59d675516df70474"&gt;
-  &lt;main&gt;
-    &lt;p&gt;The German language has a word for what your last software update did.&lt;/p&gt;
-    &lt;p&gt;It is called Verschlimmbesserung: an attempted improvement that only makes things worse.&lt;/p&gt;
-    &lt;p&gt;We have all lived through the SaaS update that moved a button, renamed a menu, and broke a workflow we relied on daily. Some product team shipped a “better experience” that solved a problem nobody had.&lt;/p&gt;
-    &lt;p&gt;Eliyahu Goldratt nailed the root cause decades ago:&lt;/p&gt;
-    &lt;quote&gt;
-      &lt;p&gt;“Tell me how you measure me, and I will tell you how I will behave. If you measure me in an illogical way… do not complain about illogical behaviour…”&lt;/p&gt;
-    &lt;/quote&gt;
-    &lt;p&gt;When point releases become more important than the product itself, you are incentivising Verschlimmbesserung. Your engineering teams are not failing. They are optimising for the metrics you gave them.&lt;/p&gt;
-    &lt;p&gt;How you measure and incentivise your teams tells them exactly what you value. If the metric rewards churn, you get churn. If the metric rewards shipping, you get shipping; whether it improves anything or not.&lt;/p&gt;
-    &lt;p&gt;Is new always better? Probably not. Office 2003 is still incredibly useful because nobody forced it to constantly reinvent itself.&lt;/p&gt;
-    &lt;p&gt;Stability is a feature. Knowing when not to ship is an engineering discipline.&lt;/p&gt;
-    &lt;p&gt;The Germans built a word for it. Perhaps we should start using it.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://geekyschmidt.com/post/2026-08-25-verschlimmbesserung/"/><published>2026-08-28T14:30:33+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49479837</id><title>GUIs should be fully keyboard-driven</title><updated>2026-08-29T11:12:59.350279+00:00</updated><content>&lt;doc fingerprint="7f4e825345556dff"&gt;
+&lt;/doc&gt;</content><link href="https://haz.ee/posts/aetheryte-radio.html"/><published>2026-08-28T14:59:15+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49479837</id><title>GUIs should be fully keyboard-driven</title><updated>2026-08-29T15:40:58.849221+00:00</updated><content>&lt;doc fingerprint="7f4e825345556dff"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;GUIs should be fully keyboard-driven&lt;/head&gt;
     &lt;p&gt;This post has made it to the Hacker News front page. See the discussion.&lt;/p&gt;
@@ -492,119 +693,7 @@ templates/index.html:9: [old-api] htmx.addClass() is removed -&amp;gt; use eleme
     &lt;/list&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://ckardaris.com/blog/2026/08/28/keyboard-driven-guis.html"/><published>2026-08-28T15:17:09+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49479878</id><title>GLM-5.3 is now open-weight</title><updated>2026-08-29T11:12:58.985881+00:00</updated><content>&lt;doc fingerprint="d5c286d368bb9ac8"&gt;
-  &lt;main&gt;&lt;head rend="h4"&gt;GLM-5.3&lt;/head&gt;&lt;p&gt; Collection&lt;/p&gt;&lt;p&gt; 4 items • Updated • 28&lt;/p&gt;&lt;p&gt;How to use zai-org/GLM-5.3 with Transformers:&lt;/p&gt;&lt;code&gt;# Use a pipeline as a high-level helper
-from transformers import pipeline
-
-pipe = pipeline("text-generation", model="zai-org/GLM-5.3")
-messages = [
-    {"role": "user", "content": "Who are you?"},
-]
-pipe(messages)&lt;/code&gt;&lt;code&gt;# Load model directly
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
-tokenizer = AutoTokenizer.from_pretrained("zai-org/GLM-5.3")
-model = AutoModelForCausalLM.from_pretrained("zai-org/GLM-5.3", device_map="auto")
-messages = [
-    {"role": "user", "content": "Who are you?"},
-]
-inputs = tokenizer.apply_chat_template(
-	messages,
-	add_generation_prompt=True,
-	tokenize=True,
-	return_dict=True,
-	return_tensors="pt",
-).to(model.device)
-
-outputs = model.generate(**inputs, max_new_tokens=40)
-print(tokenizer.decode(outputs[0][inputs["input_ids"].shape[-1]:]))&lt;/code&gt;&lt;p&gt;How to use zai-org/GLM-5.3 with vLLM:&lt;/p&gt;&lt;code&gt;# Install vLLM from pip:
-pip install vllm
-# Start the vLLM server:
-vllm serve "zai-org/GLM-5.3"
-# Call the server using curl (OpenAI-compatible API):
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-	-H "Content-Type: application/json" \
-	--data '{
-		"model": "zai-org/GLM-5.3",
-		"messages": [
-			{
-				"role": "user",
-				"content": "What is the capital of France?"
-			}
-		]
-	}'&lt;/code&gt;&lt;quote&gt;docker model run hf.co/zai-org/GLM-5.3&lt;/quote&gt;&lt;p&gt;How to use zai-org/GLM-5.3 with SGLang:&lt;/p&gt;&lt;code&gt;# Install SGLang from pip:
-pip install sglang
-# Start the SGLang server:
-python3 -m sglang.launch_server \
-    --model-path "zai-org/GLM-5.3" \
-    --host 0.0.0.0 \
-    --port 30000
-# Call the server using curl (OpenAI-compatible API):
-curl -X POST "http://localhost:30000/v1/chat/completions" \
-	-H "Content-Type: application/json" \
-	--data '{
-		"model": "zai-org/GLM-5.3",
-		"messages": [
-			{
-				"role": "user",
-				"content": "What is the capital of France?"
-			}
-		]
-	}'&lt;/code&gt;&lt;code&gt;docker run --gpus all \
-    --shm-size 32g \
-    -p 30000:30000 \
-    -v ~/.cache/huggingface:/root/.cache/huggingface \
-    --env "HF_TOKEN=&amp;lt;secret&amp;gt;" \
-    --ipc=host \
-    lmsysorg/sglang:latest \
-    python3 -m sglang.launch_server \
-        --model-path "zai-org/GLM-5.3" \
-        --host 0.0.0.0 \
-        --port 30000
-# Call the server using curl (OpenAI-compatible API):
-curl -X POST "http://localhost:30000/v1/chat/completions" \
-	-H "Content-Type: application/json" \
-	--data '{
-		"model": "zai-org/GLM-5.3",
-		"messages": [
-			{
-				"role": "user",
-				"content": "What is the capital of France?"
-			}
-		]
-	}'&lt;/code&gt;&lt;p&gt;How to use zai-org/GLM-5.3 with Docker Model Runner:&lt;/p&gt;&lt;p&gt;GLM-5.3 uses the same base model as GLM-5.2 — every gain comes from post-training. Compared with GLM-5.2, it is much better at complex coding and long-horizon tasks:&lt;/p&gt;&lt;table&gt;&lt;row&gt;&lt;cell role="head"&gt;Benchmark&lt;/cell&gt;&lt;cell role="head"&gt;GLM-5.3&lt;/cell&gt;&lt;cell role="head"&gt;GLM-5.2&lt;/cell&gt;&lt;cell role="head"&gt;Kimi K3&lt;/cell&gt;&lt;cell role="head"&gt;DeepSeek-V4 Pro-0813&lt;/cell&gt;&lt;cell role="head"&gt;Qwen3.8-Max&lt;/cell&gt;&lt;cell role="head"&gt;Opus 4.8&lt;/cell&gt;&lt;cell role="head"&gt;Fable 5 (w/ fallback)&lt;/cell&gt;&lt;cell role="head"&gt;GPT-5.6 Sol&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Terminal Bench 2.1&lt;/cell&gt;&lt;cell&gt;88.2&lt;/cell&gt;&lt;cell&gt;81.0&lt;/cell&gt;&lt;cell&gt;88.3&lt;/cell&gt;&lt;cell&gt;87.9&lt;/cell&gt;&lt;cell&gt;86.6&lt;/cell&gt;&lt;cell&gt;85.0&lt;/cell&gt;&lt;cell&gt;88.0&lt;/cell&gt;&lt;cell&gt;88.8&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Terminal Bench 3.0&lt;/cell&gt;&lt;cell&gt;28.3&lt;/cell&gt;&lt;cell&gt;4.6&lt;/cell&gt;&lt;cell&gt;17.4&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;cell&gt;21.1&lt;/cell&gt;&lt;cell&gt;33.7&lt;/cell&gt;&lt;cell&gt;34.6&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;DeepSWE (v1.1)&lt;/cell&gt;&lt;cell&gt;66.9&lt;/cell&gt;&lt;cell&gt;46.2&lt;/cell&gt;&lt;cell&gt;67.5&lt;/cell&gt;&lt;cell&gt;62.7&lt;/cell&gt;&lt;cell&gt;56.6&lt;/cell&gt;&lt;cell&gt;58.0&lt;/cell&gt;&lt;cell&gt;69.7&lt;/cell&gt;&lt;cell&gt;72.7&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;NL2Repo&lt;/cell&gt;&lt;cell&gt;58.0&lt;/cell&gt;&lt;cell&gt;48.9&lt;/cell&gt;&lt;cell&gt;58.0&lt;/cell&gt;&lt;cell&gt;61.1&lt;/cell&gt;&lt;cell&gt;55.9&lt;/cell&gt;&lt;cell&gt;69.7&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;ProgramBench (Almost Solved)&lt;/cell&gt;&lt;cell&gt;19.0&lt;/cell&gt;&lt;cell&gt;9.5&lt;/cell&gt;&lt;cell&gt;17.5&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;cell&gt;10.5&lt;/cell&gt;&lt;cell&gt;15.5&lt;/cell&gt;&lt;cell&gt;33.0&lt;/cell&gt;&lt;cell&gt;23.0&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;FrontierSWE&lt;/cell&gt;&lt;cell&gt;78.1&lt;/cell&gt;&lt;cell&gt;67.5&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;cell&gt;66.5&lt;/cell&gt;&lt;cell&gt;88.2&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;SWE-Marathon (v1.1)&lt;/cell&gt;&lt;cell&gt;42.5&lt;/cell&gt;&lt;cell&gt;19.4&lt;/cell&gt;&lt;cell&gt;48.1&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;cell&gt;48.8&lt;/cell&gt;&lt;cell&gt;33.1&lt;/cell&gt;&lt;cell&gt;42.5&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;PostTrainBench&lt;/cell&gt;&lt;cell&gt;39.8&lt;/cell&gt;&lt;cell&gt;31.7&lt;/cell&gt;&lt;cell&gt;32.0&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;cell&gt;32.9&lt;/cell&gt;&lt;cell&gt;41.8&lt;/cell&gt;&lt;cell&gt;36.2&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;CyberGym&lt;/cell&gt;&lt;cell&gt;84.5&lt;/cell&gt;&lt;cell&gt;77.2&lt;/cell&gt;&lt;cell&gt;80.0&lt;/cell&gt;&lt;cell&gt;83.3&lt;/cell&gt;&lt;cell&gt;78.5&lt;/cell&gt;&lt;cell&gt;78.1&lt;/cell&gt;&lt;cell&gt;83.8&lt;/cell&gt;&lt;cell&gt;83.6&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;ExploitGym (2h / 6h)&lt;/cell&gt;&lt;cell&gt;105 / 130&lt;/cell&gt;&lt;cell&gt;29 / 39&lt;/cell&gt;&lt;cell&gt;36 / 70&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;cell&gt;14 / 26&lt;/cell&gt;&lt;cell&gt;80 / 120&lt;/cell&gt;&lt;cell&gt;181 / 247&lt;/cell&gt;&lt;cell&gt;216 / 293&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;ExploitBench&lt;/cell&gt;&lt;cell&gt;54.4&lt;/cell&gt;&lt;cell&gt;24.4&lt;/cell&gt;&lt;cell&gt;32.2&lt;/cell&gt;&lt;cell&gt;–&lt;/cell&gt;&lt;cell&gt;28.8&lt;/cell&gt;&lt;cell&gt;40.0&lt;/cell&gt;&lt;cell&gt;78.0&lt;/cell&gt;&lt;cell&gt;76.5&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Toolathlon Verified&lt;/cell&gt;&lt;cell&gt;73.0&lt;/cell&gt;&lt;cell&gt;59.9&lt;/cell&gt;&lt;cell&gt;76.5&lt;/cell&gt;&lt;cell&gt;74.1&lt;/cell&gt;&lt;cell&gt;72.5&lt;/cell&gt;&lt;cell&gt;76.2&lt;/cell&gt;&lt;cell&gt;74.7&lt;/cell&gt;&lt;cell&gt;74.9&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;AutomationBench (v1.0.6)&lt;/cell&gt;&lt;cell&gt;48.2&lt;/cell&gt;&lt;cell&gt;26.2&lt;/cell&gt;&lt;cell&gt;46.7&lt;/cell&gt;&lt;cell&gt;43.2&lt;/cell&gt;&lt;cell&gt;39.8&lt;/cell&gt;&lt;cell&gt;41.0&lt;/cell&gt;&lt;cell&gt;46.2&lt;/cell&gt;&lt;cell&gt;45.8&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;Agents' Last Exam (ALE-CLI)&lt;/cell&gt;&lt;cell&gt;28.5&lt;/cell&gt;&lt;cell&gt;23.8&lt;/cell&gt;&lt;cell&gt;27.6&lt;/cell&gt;&lt;cell&gt;25.7&lt;/cell&gt;&lt;cell&gt;27.0&lt;/cell&gt;&lt;cell&gt;25.7&lt;/cell&gt;&lt;cell&gt;23.8&lt;/cell&gt;&lt;cell&gt;28.6&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;HLE w/ Tools&lt;/cell&gt;&lt;cell&gt;62.5&lt;/cell&gt;&lt;cell&gt;54.7&lt;/cell&gt;&lt;cell&gt;59.8&lt;/cell&gt;&lt;cell&gt;60.0&lt;/cell&gt;&lt;cell&gt;56.2&lt;/cell&gt;&lt;cell&gt;57.9&lt;/cell&gt;&lt;cell&gt;63.9&lt;/cell&gt;&lt;cell&gt;64.5&lt;/cell&gt;&lt;/row&gt;&lt;row&gt;&lt;cell&gt;GDPval-AA v2&lt;/cell&gt;&lt;cell&gt;1769&lt;/cell&gt;&lt;cell&gt;1508&lt;/cell&gt;&lt;cell&gt;1682&lt;/cell&gt;&lt;cell&gt;1590&lt;/cell&gt;&lt;cell&gt;1739&lt;/cell&gt;&lt;cell&gt;1588&lt;/cell&gt;&lt;cell&gt;1743&lt;/cell&gt;&lt;cell&gt;1730&lt;/cell&gt;&lt;/row&gt;&lt;/table&gt;&lt;p&gt;GLM-5.3 supports deployment with the following frameworks. Feel free to try them out:&lt;/p&gt;&lt;code&gt;Ascend NPU&lt;/code&gt; platform, inference frameworks such as vLLM-Ascend, xLLM and SGLang are supported — see here.&lt;code&gt;reasoning_effort&lt;/code&gt; parameter, which accepts three levels: &lt;code&gt;low&lt;/code&gt;, &lt;code&gt;high&lt;/code&gt;, and &lt;code&gt;max&lt;/code&gt;. It defaults to &lt;code&gt;clear_thinking&lt;/code&gt; defaults to &lt;code&gt;false&lt;/code&gt; if not passed. For chat scenarios, explicitly pass &lt;code&gt;clear_thinking=true&lt;/code&gt;.&lt;code&gt;temperature=1.0&lt;/code&gt; and &lt;code&gt;top_p=0.95&lt;/code&gt; for evaluation, with a maximum generation length of &lt;code&gt;163,840&lt;/code&gt; tokens. The evaluation is conducted with a maximum context length of &lt;code&gt;300,000&lt;/code&gt; tokens, using a context management strategy. We use GPT-5.6-luna (medium) as the judge model.&lt;code&gt;top_p=1.0&lt;/code&gt;, and &lt;code&gt;max_new_tokens=64k&lt;/code&gt; under 1M context. To prevent hacking, we use rule-based and a LLM-based judgement to prevent malicious behaviors (e.g., unauthorized pip or curl operations).&lt;code&gt;temperature=0.95&lt;/code&gt;, &lt;code&gt;timeout=6h&lt;/code&gt; and 400K context.&lt;code&gt;top_p=1&lt;/code&gt;, &lt;code&gt;max_new_tokens=65536&lt;/code&gt; with 6h timeout.&lt;code&gt;null&lt;/code&gt;-type handling issue introduced in PR #13.&lt;code&gt;max_new_tokens=128000&lt;/code&gt;). All evaluations are under unlimited timeout per task and results are single-run Pass@1 over 1,507 tasks. To simulate real-world usage scenarios, we place the agent inside the task container. We also remove all Git-related information and apply a domain whitelist (allowing only essential domains such as pypi.org and deb.debian.org for basic tool installation) to prevent the agent from cheating.&lt;code&gt;temperature = 1.0&lt;/code&gt;, &lt;code&gt;top_p = 1.0&lt;/code&gt;, &lt;code&gt;max_new_tokens = 128000&lt;/code&gt;, and a 1M-token context window. We report the weighted average over 3 runs. Runs that fail to produce a score fall back to the official zero-shot base-model baseline score. For checks intended to prevent the use of third-party APIs, we removed the original pattern-matching-based checks, as they produced false positives when a local vLLM endpoint was accessed through the OpenAI SDK. Instead, we use an LLM agent to inspect solutions for external API usage.&lt;code&gt;top_p = 0.95&lt;/code&gt;, &lt;code&gt;strip-clone&lt;/code&gt;, the original anti-cheat checks used overly broad import detection that could reject valid implementations. We removed the affected checks and performed llm-based inspection instead to avoid false positives. For &lt;code&gt;parameter-golf&lt;/code&gt; and &lt;code&gt;trimul-cuda&lt;/code&gt;, changes to the NVIDIA wheels caused the Docker image builds to fail, so we added &lt;code&gt;--extra-index-url https://pypi.org/simple&lt;/code&gt; to restore successful builds.&lt;p&gt;If you find GLM-5.3 useful in your research, please cite our technical report:&lt;/p&gt;&lt;code&gt;@misc{glm5team2026glm5vibecodingagentic,
-      title={GLM-5: from Vibe Coding to Agentic Engineering},
-      author={GLM-5-Team and : and Aohan Zeng and Xin Lv and Zhenyu Hou and Zhengxiao Du and Qinkai Zheng and Bin Chen and Da Yin and Chendi Ge and Chenghua Huang and Chengxing Xie and Chenzheng Zhu and Congfeng Yin and Cunxiang Wang and Gengzheng Pan and Hao Zeng and Haoke Zhang and Haoran Wang and Huilong Chen and Jiajie Zhang and Jian Jiao and Jiaqi Guo and Jingsen Wang and Jingzhao Du and Jinzhu Wu and Kedong Wang and Lei Li and Lin Fan and Lucen Zhong and Mingdao Liu and Mingming Zhao and Pengfan Du and Qian Dong and Rui Lu and Shuang-Li and Shulin Cao and Song Liu and Ting Jiang and Xiaodong Chen and Xiaohan Zhang and Xuancheng Huang and Xuezhen Dong and Yabo Xu and Yao Wei and Yifan An and Yilin Niu and Yitong Zhu and Yuanhao Wen and Yukuo Cen and Yushi Bai and Zhongpei Qiao and Zihan Wang and Zikang Wang and Zilin Zhu and Ziqiang Liu and Zixuan Li and Bojie Wang and Bosi Wen and Can Huang and Changpeng Cai and Chao Yu and Chen Li and Chengwei Hu and Chenhui Zhang and Dan Zhang and Daoyan Lin and Dayong Yang and Di Wang and Ding Ai and Erle Zhu and Fangzhou Yi and Feiyu Chen and Guohong Wen and Hailong Sun and Haisha Zhao and Haiyi Hu and Hanchen Zhang and Hanrui Liu and Hanyu Zhang and Hao Peng and Hao Tai and Haobo Zhang and He Liu and Hongwei Wang and Hongxi Yan and Hongyu Ge and Huan Liu and Huanpeng Chu and Jia'ni Zhao and Jiachen Wang and Jiajing Zhao and Jiamin Ren and Jiapeng Wang and Jiaxin Zhang and Jiayi Gui and Jiayue Zhao and Jijie Li and Jing An and Jing Li and Jingwei Yuan and Jinhua Du and Jinxin Liu and Junkai Zhi and Junwen Duan and Kaiyue Zhou and Kangjian Wei and Ke Wang and Keyun Luo and Laiqiang Zhang and Leigang Sha and Liang Xu and Lindong Wu and Lintao Ding and Lu Chen and Minghao Li and Nianyi Lin and Pan Ta and Qiang Zou and Rongjun Song and Ruiqi Yang and Shangqing Tu and Shangtong Yang and Shaoxiang Wu and Shengyan Zhang and Shijie Li and Shuang Li and Shuyi Fan and Wei Qin and Wei Tian and Weining Zhang and Wenbo Yu and Wenjie Liang and Xiang Kuang and Xiangmeng Cheng and Xiangyang Li and Xiaoquan Yan and Xiaowei Hu and Xiaoying Ling and Xing Fan and Xingye Xia and Xinyuan Zhang and Xinze Zhang and Xirui Pan and Xu Zou and Xunkai Zhang and Yadi Liu and Yandong Wu and Yanfu Li and Yidong Wang and Yifan Zhu and Yijun Tan and Yilin Zhou and Yiming Pan and Ying Zhang and Yinpei Su and Yipeng Geng and Yong Yan and Yonglin Tan and Yuean Bi and Yuhan Shen and Yuhao Yang and Yujiang Li and Yunan Liu and Yunqing Wang and Yuntao Li and Yurong Wu and Yutao Zhang and Yuxi Duan and Yuxuan Zhang and Zezhen Liu and Zhengtao Jiang and Zhenhe Yan and Zheyu Zhang and Zhixiang Wei and Zhuo Chen and Zhuoer Feng and Zijun Yao and Ziwei Chai and Ziyuan Wang and Zuzhou Zhang and Bin Xu and Minlie Huang and Hongning Wang and Juanzi Li and Yuxiao Dong and Jie Tang},
-      year={2026},
-      eprint={2602.15763},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2602.15763},
-}
-&lt;/code&gt;
-&lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://huggingface.co/zai-org/GLM-5.3"/><published>2026-08-28T15:20:13+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49479924</id><title>EasyEffects can improve laptop speaker sound quality</title><updated>2026-08-29T11:12:58.774903+00:00</updated><content>&lt;doc fingerprint="5d6cc033f142fe9d"&gt;
-  &lt;main&gt;
-    &lt;p&gt;Virtually all laptop speakers suck. It’s the one area where even really expensive laptops tend to fall on their ass, leaving users with a tinny, harsh, and hollow sound experience. While you can’t exactly overcome physics – laptop speakers are necessarily small and thus just cannot ever sound as good as proper speakers – there’s a lot you can do with proper tuning and software magic. If you’re a desktop Linux user, you actually already possess all the plumbing needed to fix your audio; it’s just not exposed to you in any way. Luckily, an application called EasyEffects allows you to actually make use of desktop Linux’ advanced audio features to massively improve the sound quality of your laptop’s speakers.&lt;/p&gt;
-    &lt;head rend="h5"&gt;The OSNews 2026 Fundraiser&lt;/head&gt;
-    &lt;p&gt;&lt;lb/&gt;➡️ Donate through Ko-Fi ➡️ Donate through SEPA transfer* ➡️ Buy merch from our store ➡️ Why a fundraiser?&lt;/p&gt;
-    &lt;p&gt;&lt;del&gt;€5000 incentive: Make me use Windows 11 for a month&lt;/del&gt; (the results were not great)&lt;lb/&gt;&amp;gt; €10000: Video tour of my office and my computers/devices collection &amp;lt;&lt;lb/&gt;€15000: Buy a Mac and use macOS for a month (and review it)&lt;lb/&gt;€20000: I get an OSNews tattoo&lt;/p&gt;
-    &lt;p&gt;*Name: Thom Holwerda – IBAN: SE08 8000 0820 1684 4657 8414 – BIC: SWEDSESS&lt;/p&gt;
-    &lt;p&gt;EasyEffects’ own description on its GitHub page doesn’t really explain what it does or what it’s capable of, so here’s the description from Wikipedia instead.&lt;/p&gt;
-    &lt;quote&gt;&lt;p&gt;EasyEffects uses PipeWire to process incoming and outgoing audio streams independently and can apply various sound effects in the form of plug-ins made by different developer teams such as Calf Studio Gear, MDA.LV2 and GStreamer. All plugins have their own presets and can be applicable inside the suite rather than having to use a different mixer or executing a script from the command line.&lt;/p&gt;&lt;p&gt;Available output effects are limiter, auto volume, compressor of dynamic range, filter, 30 bands parametric equalizer, bass enhancer, exciter, reverbation, crossfeed, delay, maximizer and spectrum analyzer. Available input effects are WebRTC, limiter, compressor, filter, equalizer, de-esser, reverbation, pitch shift and spectrum analyzer.&lt;/p&gt;↫ EasEffects’ Wikipedia page&lt;/quote&gt;
-    &lt;p&gt;None of this matters, and you can forget everything from these two paragraphs.&lt;/p&gt;
-    &lt;p&gt;What matters is that using EasyEffects, you can tune the audio coming out of your speakers to make them sound a lot better. The few laptops on the market that do have decent audio – MacBooks, some Dell XPS laptops, and surely a few more – aren’t magically defying physics. While they probably do have objectively higher-quality speakers, the main difference between those laptops and laptops with crappy-sounding speakers is that the former come with built-in tuning from the factory to make them sound much better than they would without any software trickery.&lt;/p&gt;
-    &lt;p&gt;If you know your way around audio, you can very much use EasyEffects and tune your laptop speakers from scratch to massively improve how they sound. However, that requires time, experience, knowledge, and expertise that most people lack, including myself. Lucky for us, though, there are countless downloadable presets out there for EasyEffects designed specifically to make laptops sound better.&lt;/p&gt;
-    &lt;p&gt;In an ideal world, you’d pick a preset created specifically for your laptop make and model, but odds are you won’t find one, so for most laptops you’ll have to settle for a generic preset that tries to do its best. I’ve long settled on the &lt;code&gt;Advanced Auto Gain.json&lt;/code&gt; preset from JackHack96, which greatly improves the audio performance on any laptops I’ve tried it on, but of course, there’s countless other presets for you to try to see if there’s anything that suits your particular laptop and ears better.&lt;/p&gt;
-    &lt;p&gt;Getting all of this up and running is really easy. EasyEffects is most likely packaged by your Linux distribution, and the latest version is always available as a Flatpak from Flathub. Download the preset(s) you want to try, copy them either to &lt;code&gt;~/.config/easyeffects&lt;/code&gt; (if you use your distribution’s package) or to &lt;code&gt;~/.var/app/com.github.wwmm.easyeffects/data/easyeffects/output/&lt;/code&gt; (if you use the Flatpak version). They’ll show up right away in the Presets tab in EasyEffects, ready to be turned on and off whenever you want, making it very easy to compare and contrast to find the one you like best. EasyEffects can live in your system tray giving you easy access to your presets without having to open the main window, and it can be set to start automatically at boot. EasyEffects can also be turned on and off on the fly.&lt;/p&gt;
-    &lt;p&gt;There’s obvious downsides to all of this, too, of course. First, since you’re most likely going to be using a generic preset not specifically crafted for your laptop, there’s no guarantee the results will be positive for you. Second, not every preset is ideal for every type of audio. Most of my audio consists of YouTube videos with mostly speech; if you listen mostly to music, different presets may yield better results. Third, audio quality is deeply subjective, and what sounds good to my ears may sound like total garbage to yours. Fourth, EasyEffects does take up a tiny fraction of CPU power (I’m talking 0.1-0.2% according to KDE’s System Monitor), but I have never seen it have any noticeable performance impact on anything.&lt;/p&gt;
-    &lt;p&gt;Even the generic preset I use makes such a massive difference for me on every laptop I’ve ever tried it on, that I’ve become convinced EasyEffects and a few of the generic presets should be installed by default by any desktop-oriented Linux distribution. On top of that, Linux laptops OEMs like System76, Nova Custom, Star Labs, and so on, should really take the time to create proper presets for their laptops to improve their sound quality out of the box. I feel like if you’re already designing and selling laptops, you probably also have the skills and means to create a decent preset.&lt;/p&gt;
-    &lt;p&gt;In fact, I’d take it a step further and urge desktop environments like KDE and GNOME to properly integrate EasyEffects into their sound settings. They shouldn’t include the entire application and its user interface, but should make it so that you can configure and manage presets right from the sound settings panels, and switch between presets from their volume applets (as well as turn it off entirely, of course). This would leave the full EasyEffects application for people who need more control, manual tuning, and more advanced features.&lt;/p&gt;
-    &lt;p&gt;There’s absolutely no reason why speakers on Linux laptops should sound tinny, harsh, and hollow. The Linux desktop has all the technologies and features built right in to make speakers sound much better than they do without any tuning, and yet, very few people seem to actually be aware of this. This needs to change, and I think it’s up to distributions, desktop environments, and Linux OEMs to make this happen.&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.osnews.com/story/145883/easyeffects-should-be-part-of-every-linux-distribution-and-desktop-environment-to-massively-improve-laptop-speaker-sound-quality/"/><published>2026-08-28T15:23:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49480466</id><title>Just the rumour of a bug is enough to find an exploit these days</title><updated>2026-08-29T11:12:58.074435+00:00</updated><content>&lt;doc fingerprint="e53309940ca674da"&gt;
+&lt;/doc&gt;</content><link href="https://ckardaris.com/blog/2026/08/28/keyboard-driven-guis.html"/><published>2026-08-28T15:17:09+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49480466</id><title>Just the rumour of a bug is enough to find an exploit these days</title><updated>2026-08-29T15:40:57.789286+00:00</updated><content>&lt;doc fingerprint="e53309940ca674da"&gt;
   &lt;main&gt;
     &lt;p&gt;I released a security fix for OCaml's cohttp 6.3.0 today, fixing a path traversal issue. The patch itself was straightforward and in normal times, the security procedure would have been to fix it privately, inform affected users, and then issue a public advisory. This time around though, I noticed probes in my live webserver logs with the exact bug pattern just minutes after opening the PR to fix the issue.&lt;/p&gt;
     &lt;p&gt;What's worse, I found I could use my own agents to find the exploit just by knowing roughly what it was about and so could have been exploiting it well before the public patch was available! Given that just the rumour of a security issue seems enough to give attackers enough info to find new exploits, we're going to need to change the way we deal with security responses in open source.&lt;/p&gt;
@@ -657,10 +746,48 @@ curl -X POST "http://localhost:30000/v1/chat/completions" \
     &lt;p&gt;(The cohttp fix was not a solo effort. Sapphire Livingstone found and reported the issue, guided the fix and co-developed the remediation; Michael Dales, Török Edwin and Patrick Ferris reviewed the patch; Hannes Mehnert coordinated the advisory; and Thomas Gazagnaire has been thinking through the wider triage problem. Thank you all! The bugonomics may be against us, but we will crest this hump.)&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://anil.recoil.org/notes/rumour-is-the-exploit"/><published>2026-08-28T15:58:46+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49481455</id><title>Autonomous Mathematical Discovery in an Open-World Multi-Agent Environment</title><updated>2026-08-29T11:12:57.761934+00:00</updated><content>&lt;doc fingerprint="ecbca40b04d981ad"&gt;
-  &lt;main&gt;&lt;head rend="h1"&gt;Computer Science &amp;gt; Artificial Intelligence&lt;/head&gt;&lt;p&gt; [Submitted on 24 Aug 2026]&lt;/p&gt;&lt;head rend="h1"&gt;Title:Autonomous Mathematical Discovery in an Open-World Multi-Agent Environment&lt;/head&gt;View PDF HTML (experimental)&lt;quote&gt; Abstract:We study autonomous mathematical discovery in the Station, an open-world multi-agent environment in which AI agents from different model families pursue a shared research goal without a central coordinator or scripted pipeline. Agents choose their own research directions, conduct experiments, collaborate, and build a shared scientific literature. Across 12 construction problems from the AlphaEvolve catalogue and two additional case studies, the Station obtained results novel relative to the prior literature on five problems: a new infinite family of finite-field Kakeya sets, new exact 604-point kissing configurations in dimension 11, new records for the discretized Kakeya needle and sign uncertainty problems, and a substantially improved lower bound for Erdős's minimum-overlap problem. Agents also discovered novel infinite families for Book Ramsey numbers. Importantly, the agents produced not only numerical constructions but also theorems and analyses explaining how those constructions work, making the results more interpretable and easier for mathematicians to build upon. We release all raw agent dialogues, proofs, and verification code, providing a transparent record of how these discoveries emerged. &lt;/quote&gt;&lt;head rend="h3"&gt;Current browse context:&lt;/head&gt;&lt;p&gt;cs.AI&lt;/p&gt;&lt;head rend="h3"&gt;References &amp;amp; Citations&lt;/head&gt;&lt;p&gt; Loading... &lt;/p&gt;&lt;head rend="h1"&gt;Bibliographic and Citation Tools&lt;/head&gt;&lt;p&gt; Bibliographic Explorer (What is the Explorer?) &lt;/p&gt;&lt;p&gt; Connected Papers (What is Connected Papers?) &lt;/p&gt;&lt;p&gt; Litmaps (What is Litmaps?) &lt;/p&gt;&lt;p&gt; scite Smart Citations (What are Smart Citations?) &lt;/p&gt;&lt;head rend="h1"&gt;Code, Data and Media Associated with this Article&lt;/head&gt;&lt;p&gt; alphaXiv (What is alphaXiv?) &lt;/p&gt;&lt;p&gt; CatalyzeX Code Finder for Papers (What is CatalyzeX?) &lt;/p&gt;&lt;p&gt; DagsHub (What is DagsHub?) &lt;/p&gt;&lt;p&gt; Gotit.pub (What is GotitPub?) &lt;/p&gt;&lt;p&gt; Hugging Face (What is Huggingface?) &lt;/p&gt;&lt;p&gt; ScienceCast (What is ScienceCast?) &lt;/p&gt;&lt;head rend="h1"&gt;Demos&lt;/head&gt;&lt;head rend="h1"&gt;Recommenders and Search Tools&lt;/head&gt;&lt;p&gt; Influence Flower (What are Influence Flowers?) &lt;/p&gt;&lt;p&gt; CORE Recommender (What is CORE?) &lt;/p&gt;&lt;head rend="h1"&gt;arXivLabs: experimental projects with community collaborators&lt;/head&gt;&lt;p&gt;arXivLabs is a framework that allows collaborators to develop and share new arXiv features directly on our website.&lt;/p&gt;&lt;p&gt;Both individuals and organizations that work with arXivLabs have embraced and accepted our values of openness, community, excellence, and user data privacy. arXiv is committed to these values and only works with partners that adhere to them.&lt;/p&gt;&lt;p&gt;Have an idea for a project that will add value for arXiv's community? Learn more about arXivLabs.&lt;/p&gt;&lt;/main&gt;
+&lt;/doc&gt;</content><link href="https://anil.recoil.org/notes/rumour-is-the-exploit"/><published>2026-08-28T15:58:46+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49481423</id><title>Attimet (YC F24) Is Hiring Members of Technical Staff – Engineering and Research</title><updated>2026-08-29T15:40:57.360028+00:00</updated><content>&lt;doc fingerprint="bedc70535f25e4a9"&gt;
+  &lt;main&gt;
+    &lt;div&gt;
+      &lt;p&gt;Why you should join us&lt;/p&gt;
+      &lt;list rend="ul"&gt;
+        &lt;item&gt;We’re building a research lab with a real-time feedback loop.&lt;/item&gt;
+        &lt;item&gt;We’re building AI systems that expand how quickly a small research team can understand, build, and experiment.&lt;/item&gt;
+        &lt;item&gt;Our edge is the speed at which we can form ideas, build systems, run experiments, and learn from reality.&lt;/item&gt;
+        &lt;item&gt;You’ll work directly with the founders and have real ownership over what we build and how we build it.&lt;/item&gt;
+        &lt;item&gt;We’re a small team with over a decade of experience at places like Optiver, DRW, and Argo AI.&lt;/item&gt;
+      &lt;/list&gt;
+      &lt;p&gt;What you’ll do&lt;/p&gt;
+      &lt;list rend="ul"&gt;
+        &lt;item&gt;Build LLM-powered systems and agent harnesses that help us research, engineer, and operate faster.&lt;/item&gt;
+        &lt;item&gt;Design the infrastructure around them: tools, context, memory, evals, orchestration, observability, and execution environments.&lt;/item&gt;
+        &lt;item&gt;Find new ways to turn frontier models into reliable systems that do useful work.&lt;/item&gt;
+        &lt;item&gt;Work across the stack when needed. At our size, the problem matters more than the job boundary.&lt;/item&gt;
+        &lt;item&gt;Own projects end-to-end: identify opportunities, prototype quickly, ship, measure what works, and iterate.&lt;/item&gt;
+      &lt;/list&gt;
+      &lt;p&gt;What we’re looking for&lt;/p&gt;
+      &lt;list rend="ul"&gt;
+        &lt;item&gt;You have unusually high initiative: you notice important problems, figure out what should exist, and make it happen without waiting to be told.&lt;/item&gt;
+        &lt;item&gt;You’re technically sharp and learn extremely quickly.&lt;/item&gt;
+        &lt;item&gt;You’ve built seriously with LLMs, agents, harnesses, or adjacent AI infrastructure.&lt;/item&gt;
+        &lt;item&gt;You move quickly, reason from first principles, and enjoy problems where the right architecture has not been figured out yet.&lt;/item&gt;
+        &lt;item&gt;You care more about what works in practice than following established patterns.&lt;/item&gt;
+        &lt;item&gt;Curiosity, intensity, and technical judgment matter much more to us than credentials or years of experience.&lt;/item&gt;
+      &lt;/list&gt;
+      &lt;head rend="h3"&gt;Your first 30 days&lt;/head&gt;
+      &lt;list rend="ul"&gt;
+        &lt;item&gt;First week: learn how we work, find something important that could be dramatically better, and start making it better.&lt;/item&gt;
+        &lt;item&gt;By 15 days: take ownership of a meaningful technical problem end-to-end, including deciding what to build and how to measure whether it works.&lt;/item&gt;
+        &lt;item&gt;By 30 days: we want you independently identifying what matters and driving projects that materially increase what the team can do.&lt;/item&gt;
+      &lt;/list&gt;
+      &lt;p&gt;You’ll have the autonomy and resources to do some of the best work of your life.&lt;/p&gt;
+      &lt;p&gt;Website: https://attimet.com&lt;/p&gt;
+      &lt;p&gt;Jobs: https://www.ycombinator.com/companies/attimet/jobs&lt;/p&gt;
+      &lt;p&gt;This is an on-site role based in San Francisco, CA.&lt;/p&gt;
+    &lt;/div&gt;
+  &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://arxiv.org/abs/2608.23691"/><published>2026-08-28T17:01:12+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49485267</id><title>Boot a Virtual iPhone via Apple's Virtualization.framework</title><updated>2026-08-29T11:12:57.303321+00:00</updated><content>&lt;doc fingerprint="ed55cddb45863581"&gt;
+&lt;/doc&gt;</content><link href="https://www.ycombinator.com/companies/attimet/jobs/6btZFDg-member-of-technical-staff-engineering"/><published>2026-08-28T17:00:06+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49485267</id><title>Boot a Virtual iPhone via Apple's Virtualization.framework</title><updated>2026-08-29T15:40:57.247923+00:00</updated><content>&lt;doc fingerprint="ed55cddb45863581"&gt;
   &lt;main&gt;
     &lt;p&gt;Boot a virtual iPhone via Apple's Virtualization.framework using PCC research VM infrastructure.&lt;/p&gt;
     &lt;p&gt;Host:&lt;/p&gt;
@@ -987,7 +1114,7 @@ csrutil allow-research-guests enable&lt;/code&gt;
     &lt;p&gt;&lt;code&gt;vphone-cli&lt;/code&gt; exposes a host control socket (&lt;code&gt;&amp;lt;bundle&amp;gt;/vphone.sock&lt;/code&gt;) for programmatic control — screenshots, touch, swipes, hardware keys, clipboard — each action returning an inline screenshot for AI-driven E2E testing. See vphone-mcp for an MCP server wrapping it.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/Lakr233/vphone-cli"/><published>2026-08-28T23:02:21+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49485416</id><title>I accidentally turned LLM memory into program analysis</title><updated>2026-08-29T11:12:57.060488+00:00</updated><content>&lt;doc fingerprint="3a434811bae3aa91"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/Lakr233/vphone-cli"/><published>2026-08-28T23:02:21+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49485416</id><title>I accidentally turned LLM memory into program analysis</title><updated>2026-08-29T15:40:57.055391+00:00</updated><content>&lt;doc fingerprint="3a434811bae3aa91"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;I accidentally turned LLM memory into program analysis&lt;/head&gt;
     &lt;p&gt;Over the past few months I have been playing around quite a bit with LLM agents, particularly for vulnerability research.&lt;/p&gt;
@@ -1661,7 +1788,7 @@ B implies C
     &lt;p&gt;Cheers!&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://pwning.systems/posts/llm-memory-program-analysis/"/><published>2026-08-28T23:27:45+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49485452</id><title>9th Circuit sides with states in Kalshi gambling fight</title><updated>2026-08-29T11:12:56.962277+00:00</updated><content/><link href="https://azmirror.com/2026/08/28/9th-circuit-sides-with-states-in-kalshi-gambling-fight-potentially-reviving-arizonas-prosecution/"/><published>2026-08-28T23:32:22+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49485532</id><title>Does the Sumerian King List Align with Paleoclimate Events?</title><updated>2026-08-29T11:12:56.785168+00:00</updated><content>&lt;doc fingerprint="620ad3dc97b0fa8e"&gt;
+&lt;/doc&gt;</content><link href="https://pwning.systems/posts/llm-memory-program-analysis/"/><published>2026-08-28T23:27:45+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49485532</id><title>Does the Sumerian King List Align with Paleoclimate Events?</title><updated>2026-08-29T15:40:56.302520+00:00</updated><content>&lt;doc fingerprint="620ad3dc97b0fa8e"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Does the Sumerian King List Align With Paleoclimate Events?&lt;/head&gt;
     &lt;head rend="h2"&gt;Context&lt;/head&gt;
@@ -1801,7 +1928,7 @@ B implies C
     &lt;p&gt;This analysis explores a specific alignment claim. It finds no statistically significant evidence that the Sumerian reign order encodes the paleoclimate catalog used here.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.vectorian.be/articles/2026-06-07/sumerian-king-list-paleoclimate-alignment-explorer/"/><published>2026-08-28T23:46:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49486081</id><title>StemDeck, a free, open-source and local AI stem separator</title><updated>2026-08-29T11:12:56.409878+00:00</updated><content>&lt;doc fingerprint="6c3c115d5186d9e3"&gt;
+&lt;/doc&gt;</content><link href="https://www.vectorian.be/articles/2026-06-07/sumerian-king-list-paleoclimate-alignment-explorer/"/><published>2026-08-28T23:46:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49486081</id><title>StemDeck, a free, open-source and local AI stem separator</title><updated>2026-08-29T15:40:56.159724+00:00</updated><content>&lt;doc fingerprint="6c3c115d5186d9e3"&gt;
   &lt;main&gt;
     &lt;p&gt;Drop in an MP3, WAV, FLAC, OGG/Opus, MP4, or M4A file, or paste a YouTube URL, and StemDeck splits the audio into up to six stems (vocals, drums, bass, guitar, piano, other). Play them back in a DAW-style multitrack mixer: mute, solo, balance levels, zoom the waveform, loop a region, and export individual stems or a custom mix. Everything runs locally on your own machine.&lt;/p&gt;
     &lt;quote&gt;
@@ -2446,7 +2573,7 @@ Ctrl-C waits for that stream instead of exiting.&lt;/p&gt;
     &lt;p&gt;Issues, feature suggestions, and pull requests are welcome. See open issues for what's planned.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/stemdeckapp/stemdeck"/><published>2026-08-29T01:24:13+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49486172</id><title>Our decision on Cursor following its acquisition by SpaceX</title><updated>2026-08-29T11:12:56.276097+00:00</updated><content>&lt;doc fingerprint="3e503bd5632485bc"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/stemdeckapp/stemdeck"/><published>2026-08-29T01:24:13+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49486172</id><title>Our decision on Cursor following its acquisition by SpaceX</title><updated>2026-08-29T15:40:56.018737+00:00</updated><content>&lt;doc fingerprint="3e503bd5632485bc"&gt;
   &lt;main&gt;
     &lt;head rend="h1"&gt;Our decision on Cursor following its acquisition by SpaceX&lt;/head&gt;
     &lt;p&gt;Today, we notified SpaceX that we intend to wind down our contract providing OpenAI models to Cursor, with a proposed shutoff date of November 12, 2026. To maximize the time that developers can retain access to our models through Cursor, we are giving the maximum notice provided by our contract. This decision was incredibly tough, as we care deeply about our models being broadly available for developers. We are making this choice because we cannot be confident that SpaceX will use our technology within our terms of service, based on our experience with Elon Musk's companies violating contracts.&lt;/p&gt;
@@ -2455,22 +2582,7 @@ Ctrl-C waits for that stream instead of exiting.&lt;/p&gt;
     &lt;p&gt;We’ve worked with Cursor for nearly four years and have enormous respect for their team, their product, and what they’ve built for the developer community. We know that the people most affected by this decision are the developers who rely on OpenAI models in Cursor. We care about their experience in this transition and we’re ready to go above and beyond to support them.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://openai.com/index/our-decision-on-cursor-following-its-acquisition-by-spacex/"/><published>2026-08-29T01:47:53+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49486176</id><title>Kumander Linux – A Linux Distro with a Windows 7 Desktop</title><updated>2026-08-29T11:12:55.841020+00:00</updated><content>&lt;doc fingerprint="9d5b3b7fb88535ee"&gt;
-  &lt;main&gt;
-    &lt;p&gt;La experiencia de Windows 7 en Linux. Basado en Debian con el escritorio XFCE. Ligero, estable y familiar para todos.&lt;/p&gt;
-    &lt;p&gt;Una experiencia de escritorio familiar y potente, diseÃ±ada para hacer la transiciÃ³n desde Windows lo mÃ¡s sencilla posible. Con una interfaz intuitiva inspirada en Windows 7 y miles de aplicaciones gratuitas a tu disposiciÃ³n.&lt;/p&gt;
-    &lt;p&gt;Disfruta de miles de aplicaciones gratuitas y de alta calidad&lt;/p&gt;
-    &lt;p&gt;La transiciÃ³n de Windows a Linux nunca ha sido tan fÃ¡cil&lt;/p&gt;
-    &lt;p&gt;Alrededor del 80% de los juegos mÃ¡s populares en Steam funcionan directamente en Linux&lt;/p&gt;
-    &lt;p&gt;LibreOffice es compatible con Microsoft Office&lt;/p&gt;
-    &lt;p&gt;Kumander Linux viene precargado con la Ãºltima versiÃ³n del editor de video Kdenlive&lt;/p&gt;
-    &lt;p&gt;Graba, mezcla y masteriza tu prÃ³xima obra maestra con Ardour 7&lt;/p&gt;
-    &lt;p&gt;EjecÃºtalo como una mÃ¡quina virtual con VirtualBox&lt;/p&gt;
-    &lt;p&gt;Prueba Kumander Linux sin instalarlo usando la opciÃ³n de arranque en vivo&lt;/p&gt;
-    &lt;p&gt;Si necesitas ayuda, puedes publicar tus preguntas en el foro&lt;/p&gt;
-  &lt;/main&gt;
-  &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://www.kumander.org/"/><published>2026-08-29T01:48:15+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49486334</id><title>TurboKV: Insanely fast Rust key-value store</title><updated>2026-08-29T11:12:55.493983+00:00</updated><content>&lt;doc fingerprint="e4d67554a9a1db9c"&gt;
+&lt;/doc&gt;</content><link href="https://openai.com/index/our-decision-on-cursor-following-its-acquisition-by-spacex/"/><published>2026-08-29T01:47:53+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49486334</id><title>TurboKV: Insanely fast Rust key-value store</title><updated>2026-08-29T15:40:55.900571+00:00</updated><content>&lt;doc fingerprint="e4d67554a9a1db9c"&gt;
   &lt;main&gt;
     &lt;p&gt;TurboKV is an async embedded key-value database with atomic batches, ordered range scans, configurable durability, compression, and background compaction.&lt;/p&gt;
     &lt;code&gt;cargo add turbokv
@@ -2975,7 +3087,7 @@ The full methodology and rerun command are in
 &lt;code&gt;benchmarks/README.md&lt;/code&gt;.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://github.com/kingroryg/turbokv"/><published>2026-08-29T02:23:37+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49487341</id><title>Samsung's Processing-in-Memory (PIM)</title><updated>2026-08-29T11:12:55.347151+00:00</updated><content>&lt;doc fingerprint="a27ad559643b4ac8"&gt;
+&lt;/doc&gt;</content><link href="https://github.com/kingroryg/turbokv"/><published>2026-08-29T02:23:37+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49487341</id><title>Samsung's Processing-in-Memory (PIM)</title><updated>2026-08-29T15:40:55.732014+00:00</updated><content>&lt;doc fingerprint="a27ad559643b4ac8"&gt;
   &lt;main&gt;
     &lt;p&gt;In-memory compute has been an attractive proposition for many years because compute within a memory chip can exploit its higher internal bandwidth. Additionally, in-memory compute avoids the long latency path between DRAM and traditional compute cores. At Hot Chips 2026, Samsung discusses their continued pursuit of in-memory compute with their PIM (Processing-in-Memory) push. They’re implementing MAC units within LPDDR5X chips, while preserving the chip’s ability to interface with a standard memory controller.&lt;/p&gt;
     &lt;p&gt;DRAM chips are internally divided into banks, each with their own read and write logic. During a normal DRAM access, the memory controller selects a bank, activates a row within it, and then accesses data via column access strobe (CAS) commands. Bandwidth is limited by the chip’s external DRAM interface. Even if the memory controller could activate all of the banks simultaneously, it wouldn’t be able to get its hands the full bandwidth available across all the banks.&lt;/p&gt;
@@ -2986,7 +3098,7 @@ The full methodology and rerun command are in
     &lt;head rend="h2"&gt;Accessing Compute with Standard DDR Commands&lt;/head&gt;
     &lt;p&gt;One highlight of LPDDR5X-PIM is that it stays within the standard LPDDR5X protocol while exposing compute capabilities that aren’t part of the memory standard. Samsung achieves this by setting aside special row addresses, which act like MMIO addresses of sorts. Each channel has a pair of predefined rows for mode control. Activating one of those rows sets the chip to single-bank mode, while the other sets the chip to multi-bank mode. Single-bank is the regular mode, while multi-bank applies commands across all 16 banks to exploit the chip’s internal bandwidth.&lt;/p&gt;
     &lt;p&gt;Special per-bank rows change how read and write commands behave. Activating one of these special rows makes read and write commands access PIM registers instead of regular DRAM bank contents (PIM Registers Activated mode). Samsung envisions a ML use case where software loads model weights into DRAM while the chip is in normal single-bank mode. Then, software switches into multi-bank mode and enters PIM Registers Activated mode. This lets code write activation values into PIM source registers, set scale factors in PIM scale registers, and specify an operation that’s filled into PIM instruction registers.&lt;/p&gt;
-    &lt;p&gt;Because the chip is in multi-bank mode, each PIM register write gets broadcast across all 16 banks. PIM compute therefore works like a very constrained SIMD processor, where the operation, scale factor, and one source operand are the same across all banks. Samsung does allow writing PIM registers in single-bank mode, but that functionality is meant for debugging purposes. Each DRAM packet is 256 bits (BL=16) Filling each source register takes 16 write commands. Doing that one bank at a time across each of the 16 banks would mean 256 write commands, turning host to PIM register write bandwidth into the limiting factor. Samsung actually allows PIM register access in single bank mode, but that’s intended as a debugging feature.&lt;/p&gt;
+    &lt;p&gt;Because the chip is in multi-bank mode, each PIM register write gets broadcast across all 16 banks. PIM compute therefore works like a very constrained SIMD processor, where the operation, scale factor, and one source operand are the same across all banks. Samsung does allow writing PIM registers in single-bank mode, but that functionality is meant for debugging purposes. Each DRAM packet is 256 bits (BL=16) Filling each source register takes 16 write commands. Doing that one bank at a time across each of the 16 banks would mean 256 write commands, turning host to PIM register write bandwidth into the limiting factor.&lt;/p&gt;
     &lt;p&gt;After priming PIM registers, software switches back into multi-bank mode and issues read commands. Instead of reading DRAM contents, these read commands initiate computations and get results accumulated into PIM vector register files. Then, write commands tell PIM blocks to write VRF contents back into the DRAM banks.&lt;/p&gt;
     &lt;p&gt;PIM has to handle reordering that a normal memory controller might carry out. When code sets up PIM by activating the bank, PIM conventionally sets up its instruction register files so that instructions sequentially access each source register element. For instance, the first instruction would reference the first source register element, the second instruction would reference the second source register element, and so on. However, that falls apart if the memory controller reorders accesses. Samsung gets around this with an Address Align Mode (AAM), which makes each instruction infer its source register index from the column address being accessed.&lt;/p&gt;
     &lt;p&gt;When the host finishes using in-memory compute and wants to read results, it switches the DRAM chip back into single-bank mode. Then, regular DRAM reads and writes will start accessing DRAM contents as normal.&lt;/p&gt;
@@ -3018,4 +3130,127 @@ The full methodology and rerun command are in
     &lt;p&gt;With those hardware changes, software would be able to use in-memory compute from a multitasking operating system without reserving memory or losing thread-level parallelism to PIM-related locks and synchronization. A transparent CPU instruction avoids the problem of shipping hardware specific binaries, and allows forward-compatible code that automatically takes advantage of new hardware capabilities including different in-memory compute implementations. It also lets hardware use implementation-specific knowledge and real-time data (like a no-fill-on-miss cache lookup) to make the best decision about where to carry out compute. I don’t like the software alternative of reserving memory regions, marking them uncacheable, and blocking threads. There’s just too many tradeoffs around performance, memory capacity, and responsiveness.&lt;/p&gt;
   &lt;/main&gt;
   &lt;comments/&gt;
-&lt;/doc&gt;</content><link href="https://chipsandcheese.com/p/hot-chips-2026-samsungs-processing"/><published>2026-08-29T06:06:51+00:00</published></entry></feed>
+&lt;/doc&gt;</content><link href="https://chipsandcheese.com/p/hot-chips-2026-samsungs-processing"/><published>2026-08-29T06:06:51+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49489057</id><title>Iceland votes on whether to restart talks on joining EU</title><updated>2026-08-29T15:40:55.528985+00:00</updated><content>&lt;doc fingerprint="c1ce91b51e21debf"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Close race as Iceland votes on whether to restart talks on joining EU&lt;/head&gt;
+    &lt;p&gt;Icelanders are voting in a referendum to decide whether to resume talks on joining the European Union, 13 years after they were broken off.&lt;/p&gt;
+    &lt;p&gt;In an indication of how tight the result is expected to be, the latest opinion poll put the No campaign in the lead with 51.6%. An earlier poll had put the Yes campaign ahead.&lt;/p&gt;
+    &lt;p&gt;Prime Minister Kristrún Frostadóttir's centre-left government had already intended to hold a referendum, but turbulent international affairs prompted her to bring it forward.&lt;/p&gt;
+    &lt;p&gt;But the debate was fought less over Nato member Iceland's security concerns than over its vital fishing industry and sovereignty.&lt;/p&gt;
+    &lt;p&gt;Voting is due to go on from 09:00 to 22:00 GMT on Saturday and the result is expected in the early hours of Sunday.&lt;/p&gt;
+    &lt;p&gt;Iceland has a population of under 400,000. More than one in five voters had already cast their ballots in early voting before Saturday, according to Iceland's public broadcaster RUV.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What is the vote about?&lt;/head&gt;
+    &lt;p&gt;The question on the ballot is: "Should Iceland resume accession negotiations with the European Union?"&lt;/p&gt;
+    &lt;p&gt;Although Iceland is already part of the EU's single market and Schengen border-free zone as part of the European Economic Area, EU membership would bring it into the customs union and eventually the euro.&lt;/p&gt;
+    &lt;p&gt;Iceland's application to join the EU was already well advanced when it put talks on hold in 2013, and European Commission officials have indicated that talks could be finalised in one or two years. Of the 35 so-called chapters of talks ranging from fisheries and economic policy to freedom of speech and free movement of goods, 27 had begun and 11 of them were provisionally complete.&lt;/p&gt;
+    &lt;p&gt;A Yes vote would not be a final decision on joining the EU. It would mean backing a move towards an accession agreement. Any deal would then have to be approved by a second referendum, as well by parliament, and the constitution would have to be amended. The EU's 27 member states would also have to sign it off.&lt;/p&gt;
+    &lt;p&gt;One Yes-campaign group, "Yes to See", says Icelanders should at least see what deal they can get, so they have all the information before a final decision.&lt;/p&gt;
+    &lt;p&gt;Equally, a No vote would not rule out the chance of Iceland resuming talks in the future.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What are the key issues?&lt;/head&gt;
+    &lt;p&gt;Sovereignty has been a crucial issue in the pre-referendum debate. Iceland fought hard to become fully independent from Denmark in 1944, and its fishing and marine industries make up almost 40% of exports.&lt;/p&gt;
+    &lt;p&gt;The No campaign fears losing control over Iceland's prized fishing grounds under the EU's Common Fisheries Policy and has vowed never to share the country's waters with anyone. Brussels has indicated Iceland could earn some kind of exemption, but it is considered potentially the biggest obstacle to any agreement.&lt;/p&gt;
+    &lt;p&gt;Many Icelanders remember the so-called Cod Wars with the UK that Iceland won in the 1970s. And fisheries was always the issue that stopped Iceland joining the EU before.&lt;/p&gt;
+    &lt;p&gt;However, in the wake of the 2008 financial crisis and the collapse of Iceland's banking system, Reykjavik moved to start accession talks in 2009, only to bring them to a halt in 2013.&lt;/p&gt;
+    &lt;p&gt;Iceland is now one of Europe's most affluent nations and Eirikur Bergmann, professor of politics at Bifröst University, told the BBC that "many people attribute this to Iceland's independence".&lt;/p&gt;
+    &lt;p&gt;One Icelandic trade union survey suggested this year that the country was the most expensive in the world, far pricier than its Nordic neighbours.&lt;/p&gt;
+    &lt;p&gt;Although it has the fifth highest GDP (economic output) per capita in the world, interest rates are stubbornly high at 8% and inflation has climbed to 5.6%.&lt;/p&gt;
+    &lt;p&gt;Yes campaigners argue that the economic benefits of the EU would help bring the rates down.&lt;/p&gt;
+    &lt;head rend="h2"&gt;What are Iceland's security concerns?&lt;/head&gt;
+    &lt;p&gt;Iceland may be a founder member of Nato but it has no military and relies on its allies for defence.&lt;/p&gt;
+    &lt;p&gt;A bilateral US defence agreement has been in place since 1951 and the No campaign has said Iceland's security rests on both Nato and the US, and that EU membership is not a substitute for Nato.&lt;/p&gt;
+    &lt;p&gt;Iceland has been a strong supporter of Ukraine during Russia's full-scale invasion and officials have viewed Russia's increased maritime manoeuvres near the island with alarm.&lt;/p&gt;
+    &lt;p&gt;However, there has also been concern at US President Donald Trump's expressed interest in taking over Greenland - especially the fact that he has confused it with Iceland.&lt;/p&gt;
+    &lt;p&gt;This year the EU and Iceland signed a security and defence partnership, and EU officials said the EU "offers an anchor in a community of values, prosperity and security".&lt;/p&gt;
+    &lt;head rend="h2"&gt;What do the Yes and No campaigns say?&lt;/head&gt;
+    &lt;p&gt;Ahead of the referendum, the two sides held a televised debate where the Yes campaign team was headed by Prime Minister Kristrún Frostadóttir and the No campaign was led by Guðrún Hafsteinsdóttir, chair of the opposition Independence Party.&lt;/p&gt;
+    &lt;p&gt;Kristrún told the audience that Iceland was already well integrated in the European Union, and becoming a member would be "one of the biggest risk-reducing steps we can take".&lt;/p&gt;
+    &lt;p&gt;She also made clear that a Yes vote did not necessarily mean that Iceland would join, and that if there was a No vote, the result would be respected.&lt;/p&gt;
+    &lt;p&gt;Guðrún, meanwhile, stressed that the vote was not about whether Iceland should work well with Europe: "We already do, and we want that to continue."&lt;/p&gt;
+    &lt;p&gt;Instead, she portrayed the referendum as a vote on whether Icelanders wanted to hand "decision-making powers" to Brussels on fisheries, agriculture and their natural resources.&lt;/p&gt;
+    &lt;p&gt;Although geopolitics kick-started the government's decision to push for a return to EU talks, there has been little discussion of it during the campaign.&lt;/p&gt;
+    &lt;p&gt;"It's lower on the agenda than many would think," says Hallgrimur Oddsson, director of EU-Iceland think-tank European Currents.&lt;/p&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://www.bbc.com/news/articles/cn45vdxyvvlo"/><published>2026-08-29T11:39:38+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49489982</id><title>Debian votes to allow "responsible use of generative AI"</title><updated>2026-08-29T15:40:55.114223+00:00</updated><content>&lt;doc fingerprint="acf34a99ba07d283"&gt;
+  &lt;main&gt;
+    &lt;head rend="h1"&gt;Debian votes to allow "responsible use of generative AI"&lt;/head&gt;
+    &lt;quote&gt; Debian neither endorses nor prohibits the use of generative AI tools in the development, maintenance, or documentation of software, packaging, documentation, and other media published within the Debian Project. We recognize that such tools can substantially improve the productivity of contributors when used responsibly, allowing volunteers to spend more of their limited time on work that requires technical expertise, judgment, review, and collaboration. &lt;p&gt;The Debian Project nevertheless expects that all contributions submitted to Debian, regardless of how and with which tools they were produced, satisfy the same standards of quality, correctness, maintainability, and legal compliance. The use of a generative AI tool does not diminish the contributor's responsibility for the work they submit. Contributors are expected to understand, review, test, and, where appropriate, modify AI-assisted output before incorporating it into Debian.&lt;/p&gt;&lt;/quote&gt;
+  &lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://lwn.net/Articles/1091231/"/><published>2026-08-29T14:02:10+00:00</published></entry><entry><id>https://news.ycombinator.com/item?id=49490138</id><title>Indirect Calling of Nested Functions on GCC Without Executable Stack</title><updated>2026-08-29T15:40:54.390973+00:00</updated><content>&lt;doc fingerprint="aa20b93bef2bbf42"&gt;
+  &lt;main&gt;&lt;p&gt; Martin Uecker, 2026-08-29&lt;/p&gt;&lt;p&gt;We discussed last time how one can use nested functions on GCC 17 and Clang for callbacks with requiring an executable stack. But what if ones needs to support older versions of GCC? Of course, one can simply accept an executable stack (it is not quite as terrible as some people claim), but it is also possible to avoid this with a hack.&lt;/p&gt;&lt;p&gt;Let's discuss first how GCC supports taking the address of a nested function. Our toy example without the use of the new macros is shown below (Godbolt Example).&lt;/p&gt;&lt;code&gt;
+	typedef int cb_f(int y);
+
+	int baz(cb_f p, int x)
+	{
+		return p(x);
+	}
+
+	int foo(int k)
+	{
+		int bar(int x) { return k + x; }
+    		return baz(bar, 2 * k);
+	}
+	&lt;/code&gt;
+	
+	On x86_64, the generated assembly is the following.
+	&lt;code&gt;
+bar.0:
+        movl    %edi, %eax
+        addl    (%r10), %eax
+        ret
+foo:
+        subq    $56, %rsp
+        leaq    64(%rsp), %rax
+        movq    %rax, 32(%rsp)
+        movl    %edi, (%rsp)
+        leaq    4(%rsp), %rax
+        movw    $-17591, 4(%rsp)
+        movabsq $bar.0, %rcx
+        movq    %rcx, 6(%rsp)
+        movw    $-17847, 14(%rsp)
+        movq    %rsp, 16(%rsp)
+        movl    $-1864106167, 24(%rsp)
+        addl    %edi, %edi
+        call    *%rax
+        addq    $56, %rsp
+        ret
+	&lt;/code&gt;
+	&lt;p&gt;This code places a trampoline on the stack and immediately invokes it via the inlined &lt;code&gt;baz&lt;/code&gt; function. The trampoline
+	is a short code sequence that loads the static frame register to a
+	structure on the stack that contains the captured variables from the
+	parent function and then jumps to the local function. If one
+	translates the constants -17591, -17847, and -1864106167 back to
+	assembly instructions one obtains the following x86_64 code.
+	&lt;/p&gt;&lt;code&gt;
+        movq	$bar.0, r11
+        movq    $frame, r10
+	jump	*r11
+	&lt;/code&gt;
+	&lt;p&gt; Both, the static chain and the code address are immediate constants used by move instructions in the code of the trampoline. Instead of using the address of the trampoline to call the function, we can extract the code address and the static chain from the trampoline and use them with the &lt;code&gt;__builtin_call_with_static_chain&lt;/code&gt;
+	built-in function to call the local function directly.  For example,
+	using noplate's &lt;code&gt;peek&lt;/code&gt; and
+	&lt;code&gt;array_slice&lt;/code&gt; macros,
+	this could be done in the following way for x64_64 (and a large memory
+	model).
+	&lt;/p&gt;&lt;code&gt;
+	unsigned char (*tramp)[24] = (void*)bar;
+	void *code = peek(uint64_t, &amp;amp;array_slice(tramp, 2, 10));
+	void *chain = peek(uint64_t, &amp;amp;array_slice(tramp, 12, 20));
+	&lt;/code&gt;
+	&lt;p&gt; These pointers are then exactly the same information that can be obtained on the yet to-be-released GCC 17 with the new built-ins &lt;code&gt;__builtin_call_static_chain&lt;/code&gt; and &lt;code&gt;__builtin_call_code_adress&lt;/code&gt;
+	and can be used to call the local function with as discussed previously.  
+	&lt;/p&gt;&lt;code&gt;
+	__builtin_call_with_static_chain(((typeof(bar)*)code)(arg), chain);
+	&lt;/code&gt;
+	&lt;p&gt;Thus, we can use reading of these two pointer values from a trampoline as a fallback mechanism in older versions of GCC. The downsides are that a trampoline is still created, the compiler can still not devirtualize the indirect call, and the stack will still be marked executable. So what was gained? Since we never actually invoke the trampoline, we can make the stack non-executable again with the following command, which at least addresses the security concerns of this feature.&lt;/p&gt;&lt;code&gt;
+	patchelf --clear-execstack program
+	&lt;/code&gt;
+	&lt;p&gt;This idea is implemented in my experimental library, noplate, where a wide pointer is constructed from the code address and the static chain.&lt;/p&gt;&lt;p&gt; There is another idea I find worth exploring: One could also use the trampoline itself as a function descriptor. Instead of extracting the static chain and code pointer where the trampoline is created we just pass on the address of the trampoline as usually. But everywhere where we might call the trampoline, we first check whether the pointer points to a trampoline, and then extract code address and static chain to call the nested function directly using &lt;code&gt;__builtin_call_with_static_chain&lt;/code&gt;. In some sense we could say that
+	instead of invoking the trampoline, we are interpreting the code of the
+	trampoline at the call site using a super simple interpreter that only can
+	interpret this specific code sequence and that is so simple that it can be inlined
+	(Godbolt Example).
+	&lt;/p&gt;&lt;/main&gt;
+  &lt;comments/&gt;
+&lt;/doc&gt;</content><link href="https://uecker.codeberg.page/2026-08-29.html"/><published>2026-08-29T14:20:33+00:00</published></entry></feed>
